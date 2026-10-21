@@ -4,8 +4,8 @@ use std::path::Path;
 use anyrender::recording::RenderCommand;
 use anyrender::{Paint, Scene};
 use fontdue::{Font, FontSettings};
-use kurbo::{Affine, BezPath, PathEl, Point, Stroke};
-use peniko::{Color, Fill as AnyFill};
+use kurbo::{Affine, BezPath, PathEl, Point, Shape, Stroke};
+use peniko::{Color, Fill as AnyFill, ImageFormat};
 use tiny_skia::{
     FillRule, LineCap, LineJoin, Mask, Paint as SkPaint, PathBuilder, Pixmap, Shader,
     Stroke as SkStroke, Transform,
@@ -52,18 +52,32 @@ pub fn render_page(
 
     for command in &scene.commands {
         match command {
-            RenderCommand::Fill(cmd) => {
-                if let Some(color) = solid_color(&cmd.brush) {
+            RenderCommand::Fill(cmd) => match &cmd.brush {
+                Paint::Solid(color) => {
                     draw_fill(
                         &mut pixmap,
                         &cmd.shape,
                         page_transform * cmd.transform,
-                        color,
+                        *color,
                         cmd.fill,
                         clip_mask.as_ref(),
                     );
                 }
-            }
+                Paint::Image(image_brush) => {
+                    draw_image_fill(
+                        &mut pixmap,
+                        &image_brush.image,
+                        image_brush.sampler.alpha,
+                        &cmd.shape,
+                        page_transform * cmd.transform,
+                        cmd.brush_transform,
+                        local_top,
+                        local_bottom,
+                        clip_mask.as_ref(),
+                    );
+                }
+                _ => {}
+            },
             RenderCommand::Stroke(cmd) => {
                 if let Some(color) = solid_color(&cmd.brush) {
                     draw_stroke(
@@ -336,5 +350,102 @@ fn apply_el(el: PathEl, transform: Affine) -> PathEl {
             PathEl::CurveTo(transform * p1, transform * p2, transform * p3)
         }
         PathEl::ClosePath => PathEl::ClosePath,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_image_fill(
+    pixmap: &mut Pixmap,
+    image: &peniko::ImageData,
+    alpha: f32,
+    shape: &BezPath,
+    fill_transform: Affine,
+    brush_transform: Option<Affine>,
+    clip_top: f32,
+    clip_bottom: f32,
+    clip_mask: Option<&Mask>,
+) {
+    if alpha <= 0.0 || image.width == 0 || image.height == 0 {
+        return;
+    }
+    let img_data: &[u8] = image.data.data();
+    let bpp = 4usize;
+
+    let inv_fill = fill_transform.inverse();
+    let brush_inv = brush_transform.unwrap_or(Affine::IDENTITY).inverse();
+    let to_image = brush_inv * inv_fill;
+
+    let raw = shape.bounding_box();
+    let corners = [
+        fill_transform * Point::new(raw.x0, raw.y0),
+        fill_transform * Point::new(raw.x1, raw.y0),
+        fill_transform * Point::new(raw.x0, raw.y1),
+        fill_transform * Point::new(raw.x1, raw.y1),
+    ];
+    let bx0 = corners.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
+    let by0 = corners.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
+    let bx1 = corners
+        .iter()
+        .map(|p| p.x)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let by1 = corners
+        .iter()
+        .map(|p| p.y)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let x0 = bx0.max(0.0).min(pixmap.width() as f64) as i32;
+    let x1 = bx1.max(0.0).min(pixmap.width() as f64) as i32;
+    let y0 = by0
+        .max(clip_top as f64)
+        .max(0.0)
+        .min(pixmap.height() as f64) as i32;
+    let y1 = by1
+        .min(clip_bottom as f64)
+        .max(0.0)
+        .min(pixmap.height() as f64) as i32;
+
+    let mask_data = clip_mask.map(|m| m.data());
+
+    for py in y0..y1 {
+        for px in x0..x1 {
+            if let Some(md) = mask_data {
+                let mi = (py as u32 * pixmap.width() + px as u32) as usize;
+                if md[mi] == 0 {
+                    continue;
+                }
+            }
+            let p = to_image * Point::new(px as f64 + 0.5, py as f64 + 0.5);
+            let sx = p.x.floor() as i32;
+            let sy = p.y.floor() as i32;
+            if sx < 0 || sy < 0 || sx >= image.width as i32 || sy >= image.height as i32 {
+                continue;
+            }
+            let si = ((sy as u32 * image.width + sx as u32) as usize) * bpp;
+            if si + 3 >= img_data.len() {
+                continue;
+            }
+            let (r, g, b, a) = match image.format {
+                ImageFormat::Rgba8 => (
+                    img_data[si],
+                    img_data[si + 1],
+                    img_data[si + 2],
+                    img_data[si + 3],
+                ),
+                ImageFormat::Bgra8 => (
+                    img_data[si + 2],
+                    img_data[si + 1],
+                    img_data[si],
+                    img_data[si + 3],
+                ),
+                _ => continue,
+            };
+            let src_a = (a as f32 / 255.0) * alpha;
+            if src_a <= 0.0 {
+                continue;
+            }
+            let mask_a = clip_mask.map_or(1.0, |m| {
+                m.data()[(py as u32 * pixmap.width() + px as u32) as usize] as f32 / 255.0
+            });
+            blend_pixel(pixmap, px as u32, py as u32, r, g, b, src_a * mask_a);
+        }
     }
 }

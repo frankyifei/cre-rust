@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use anyrender::Scene;
+use anyrender::recording::RenderCommand;
+use anyrender::{Paint, Scene};
 use blitz_dom::{DocumentConfig, Node, StyleThreading, build_single_font_ctx};
 use blitz_html::HtmlDocument;
 use blitz_traits::net::{Bytes, NetHandler, NetProvider, Request};
@@ -61,6 +62,14 @@ fn main() -> Result<()> {
     doc.resolve(0.0);
     println!("layout resolved");
 
+    // Images are fetched during resolve_stylist() in the first resolve(); their results
+    // arrive via the message channel and are processed only in the next resolve().
+    // Loop until no new pending image messages are generated.
+    for _pass in 0..4 {
+        doc.handle_messages();
+        doc.resolve(0.0);
+    }
+
     let lines = collect_lines(doc.root_element());
     println!("line boxes: {}", lines.len());
     if let (Some(first), Some(last)) = (lines.first(), lines.last()) {
@@ -76,6 +85,22 @@ fn main() -> Result<()> {
     let mut scene = Scene::default();
     blitz_paint::paint_scene(&mut scene, &mut doc, 1.0, args.width, layout_height, 0, 0);
     println!("paint commands: {}", scene.commands.len());
+    let fill_count = scene
+        .commands
+        .iter()
+        .filter(|c| matches!(c, RenderCommand::Fill(_)))
+        .count();
+    let img_count = scene
+        .commands
+        .iter()
+        .filter(|c| matches!(c, RenderCommand::Fill(cmd) if matches!(&cmd.brush, Paint::Image(_))))
+        .count();
+    let glyph_count = scene
+        .commands
+        .iter()
+        .filter(|c| matches!(c, RenderCommand::GlyphRun(_)))
+        .count();
+    println!("  fills: {fill_count} (images: {img_count}), glyph_runs: {glyph_count}");
 
     let pages_to_render = args.max_pages.min(page_starts.len());
     for (index, page) in page_starts.iter().take(pages_to_render).enumerate() {
