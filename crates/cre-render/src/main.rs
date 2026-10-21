@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -10,40 +10,115 @@ use blitz_html::HtmlDocument;
 use blitz_traits::net::{Bytes, NetHandler, NetProvider, Request};
 use blitz_traits::shell::{ColorScheme, Viewport};
 use cre_epub::{EpubBook, HtmlOptions};
+use cre_fb2::{Fb2Book, Fb2HtmlOptions};
 use cre_paint::render_page;
+use cre_text::{TextBook, TextHtmlOptions};
 use percent_encoding::percent_decode_str;
 
 #[derive(Debug)]
 struct Args {
-    epub: PathBuf,
+    input: PathBuf,
     out_dir: PathBuf,
     max_pages: usize,
     width: u32,
     height: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Format {
+    Epub,
+    Fb2,
+    Txt,
+}
+
+fn detect_format(path: &Path) -> Format {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase()
+        .as_str()
+    {
+        "epub" => Format::Epub,
+        "fb2" => Format::Fb2,
+        "txt" => Format::Txt,
+        _ => Format::Epub,
+    }
+}
+
 fn main() -> Result<()> {
     let args = parse_args()?;
-    let book = EpubBook::open(&args.epub)?;
-    println!("title: {}", book.title.as_deref().unwrap_or("<untitled>"));
-    println!(
-        "creator: {}",
-        book.creator.as_deref().unwrap_or("<unknown>")
-    );
-    println!("spine items: {}", book.spine.len());
+    let format = detect_format(&args.input);
 
-    let html = book.to_html(&HtmlOptions::default())?;
+    let (html, base_url, net, title, creator): (
+        String,
+        String,
+        Arc<dyn NetProvider>,
+        String,
+        String,
+    ) = match format {
+        Format::Epub => {
+            let book = EpubBook::open(&args.input)?;
+            let t = book.title.clone().unwrap_or_else(|| "<untitled>".into());
+            let c = book.creator.clone().unwrap_or_else(|| "<unknown>".into());
+            println!("format: epub");
+            println!("title: {t}");
+            println!("creator: {c}");
+            println!("spine items: {}", book.spine.len());
+            let html = book.to_html(&HtmlOptions::default())?;
+            let res = Arc::new(book.resources.clone());
+            (
+                html,
+                "epub://book/".into(),
+                Arc::new(EpubNet { resources: res }),
+                t,
+                c,
+            )
+        }
+        Format::Fb2 => {
+            let book = Fb2Book::open(&args.input)?;
+            let t = book.title.clone().unwrap_or_else(|| "<untitled>".into());
+            let c = book.creator.clone().unwrap_or_else(|| "<unknown>".into());
+            println!("format: fb2");
+            println!("title: {t}");
+            println!("creator: {c}");
+            println!("binary items: {}", book.binary.len());
+            let html = book.to_html(&Fb2HtmlOptions::default())?;
+            let res = Arc::new(book.binary.clone());
+            (
+                html,
+                "fb2://book/".into(),
+                Arc::new(Fb2Net { resources: res }),
+                t,
+                c,
+            )
+        }
+        Format::Txt => {
+            let book = TextBook::open(&args.input)?;
+            let t = book.title.clone().unwrap_or_else(|| "<untitled>".into());
+            println!("format: txt");
+            println!("title: {t}");
+            let html = book.to_html(&TextHtmlOptions::default());
+            (
+                html,
+                "text://book/".into(),
+                Arc::new(EmptyNet),
+                t,
+                String::new(),
+            )
+        }
+    };
+
+    let _ = (&title, &creator);
     println!("html bytes: {}", html.len());
 
-    let resources = Arc::new(book.resources.clone());
-    let net = Arc::new(EpubNet { resources });
     let font_data = std::fs::read(
         std::env::var("CRE_FONT_PATH")
             .unwrap_or_else(|_| "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf".to_string()),
     )
     .context("read font")?;
 
-    let layout_height = 100_000;
+    let layout_height = 100_000u32;
     let config = DocumentConfig {
         viewport: Some(Viewport::new(
             args.width,
@@ -51,7 +126,7 @@ fn main() -> Result<()> {
             1.0,
             ColorScheme::Light,
         )),
-        base_url: Some("epub://book/".to_string()),
+        base_url: Some(base_url),
         net_provider: Some(net),
         font_ctx: Some(build_single_font_ctx(&font_data)),
         style_threading: StyleThreading::Sequential,
@@ -62,9 +137,7 @@ fn main() -> Result<()> {
     doc.resolve(0.0);
     println!("layout resolved");
 
-    // Images are fetched during resolve_stylist() in the first resolve(); their results
-    // arrive via the message channel and are processed only in the next resolve().
-    // Loop until no new pending image messages are generated.
+    // Process async resource messages (images, stylesheets) by running extra resolve passes.
     for _pass in 0..4 {
         doc.handle_messages();
         doc.resolve(0.0);
@@ -84,7 +157,6 @@ fn main() -> Result<()> {
 
     let mut scene = Scene::default();
     blitz_paint::paint_scene(&mut scene, &mut doc, 1.0, args.width, layout_height, 0, 0);
-    println!("paint commands: {}", scene.commands.len());
     let fill_count = scene
         .commands
         .iter()
@@ -100,7 +172,13 @@ fn main() -> Result<()> {
         .iter()
         .filter(|c| matches!(c, RenderCommand::GlyphRun(_)))
         .count();
-    println!("  fills: {fill_count} (images: {img_count}), glyph_runs: {glyph_count}");
+    println!(
+        "paint commands: {} (fills: {} images: {} glyphs: {})",
+        scene.commands.len(),
+        fill_count,
+        img_count,
+        glyph_count
+    );
 
     let pages_to_render = args.max_pages.min(page_starts.len());
     for (index, page) in page_starts.iter().take(pages_to_render).enumerate() {
@@ -118,51 +196,45 @@ fn main() -> Result<()> {
         );
         let path = args.out_dir.join(format!("page-{:03}.pgm", index + 1));
         bitmap.write_pgm(&path)?;
-        println!(
-            "rendered page {} at y={:.1} (content from {:.1}) -> {}",
-            index + 1,
-            page.top,
-            page.clip_top,
-            path.display()
-        );
+        println!("rendered page {} -> {}", index + 1, path.display());
     }
 
     Ok(())
 }
 
 fn parse_args() -> Result<Args> {
-    let mut args = std::env::args().skip(1);
-    let epub = args
+    let mut it = std::env::args().skip(1);
+    let input = it
         .next()
         .map(PathBuf::from)
-        .context("usage: cre-render <epub> <out-dir> [max-pages] [width] [height]")?;
-    let out_dir = args
+        .context("usage: cre-render <file> <out-dir> [max-pages] [width] [height]")?;
+    let out_dir = it
         .next()
         .map(PathBuf::from)
-        .context("usage: cre-render <epub> <out-dir> [max-pages] [width] [height]")?;
-    let max_pages = args
+        .context("usage: cre-render <file> <out-dir> [max-pages] [width] [height]")?;
+    let max_pages = it
         .next()
         .map(|s| s.parse())
         .transpose()
-        .context("max-pages must be an integer")?
+        .context("max-pages must be integer")?
         .unwrap_or(3);
-    let width = args
+    let width = it
         .next()
         .map(|s| s.parse())
         .transpose()
-        .context("width must be an integer")?
-        .unwrap_or(600);
-    let height = args
+        .context("width must be integer")?
+        .unwrap_or(600u32);
+    let height = it
         .next()
         .map(|s| s.parse())
         .transpose()
-        .context("height must be an integer")?
-        .unwrap_or(800);
+        .context("height must be integer")?
+        .unwrap_or(800u32);
     if width == 0 || height == 0 {
         bail!("width and height must be positive");
     }
     Ok(Args {
-        epub,
+        input,
         out_dir,
         max_pages,
         width,
@@ -200,8 +272,6 @@ fn collect_lines_inner(node: &Node, out: &mut Vec<LineBox>) {
             out.push(LineBox { top, bottom });
         }
     }
-
-    // Walk layout tree (includes anonymous blocks that wrap bare text nodes)
     if let Some(layout_children) = node.layout_children.borrow().as_ref() {
         for child in layout_children.iter() {
             collect_lines_inner(node.with(*child), out);
@@ -250,5 +320,30 @@ impl NetProvider for EpubNet {
         let key = cre_epub::normalize_path(&path);
         let bytes = self.resources.get(&key).cloned().unwrap_or_default();
         handler.bytes(request.url.to_string(), Bytes::from(bytes));
+    }
+}
+
+struct Fb2Net {
+    resources: Arc<HashMap<String, Vec<u8>>>,
+}
+
+impl NetProvider for Fb2Net {
+    fn fetch(&self, _doc_id: usize, request: Request, handler: Box<dyn NetHandler>) {
+        // FB2 images use fb2://binary/NAME URLs
+        let path = percent_decode_str(request.url.path())
+            .decode_utf8_lossy()
+            .trim_start_matches('/')
+            .to_string();
+        let name = path.strip_prefix("binary/").unwrap_or(&path).to_string();
+        let bytes = self.resources.get(&name).cloned().unwrap_or_default();
+        handler.bytes(request.url.to_string(), Bytes::from(bytes));
+    }
+}
+
+struct EmptyNet;
+
+impl NetProvider for EmptyNet {
+    fn fetch(&self, _doc_id: usize, request: Request, handler: Box<dyn NetHandler>) {
+        handler.bytes(request.url.to_string(), Bytes::from(Vec::new()));
     }
 }

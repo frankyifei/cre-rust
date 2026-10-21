@@ -2,9 +2,9 @@
 resolver = "2"
 members = [
     "crates/cre-blitz-spike",
-    "crates/cre-epub",
+    "crates/cre-epub", "crates/cre-fb2",
     "crates/cre-paint",
-    "crates/cre-render",
+    "crates/cre-render", "crates/cre-text",
 ]
 
 [workspace.package]
