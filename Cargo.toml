@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["crates/cre-blitz-spike"]
+
+[workspace.package]
+edition = "2024"
+license = "AGPL-3.0-or-later"
+rust-version = "1.91"
+
+[profile.release]
+panic = "unwind"
