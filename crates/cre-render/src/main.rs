@@ -201,8 +201,11 @@ fn collect_lines_inner(node: &Node, out: &mut Vec<LineBox>) {
         }
     }
 
-    for child in &node.children {
-        collect_lines_inner(node.with(*child), out);
+    // Walk layout tree (includes anonymous blocks that wrap bare text nodes)
+    if let Some(layout_children) = node.layout_children.borrow().as_ref() {
+        for child in layout_children.iter() {
+            collect_lines_inner(node.with(*child), out);
+        }
     }
 }
 
