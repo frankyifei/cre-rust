@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/cre-blitz-spike"]
+members = [
+    "crates/cre-blitz-spike",
+    "crates/cre-epub",
+    "crates/cre-paint",
+    "crates/cre-render",
+]
 
 [workspace.package]
 edition = "2024"
