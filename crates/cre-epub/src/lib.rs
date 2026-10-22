@@ -35,6 +35,14 @@ pub struct SpineDocument {
 }
 
 #[derive(Clone, Debug)]
+pub struct TocItem {
+    pub title: String,
+    /// Resolved resource path with optional `#fragment`.
+    pub href: String,
+    pub depth: usize,
+}
+
+#[derive(Clone, Debug)]
 pub struct HtmlOptions {
     pub font_size: f32,
     pub line_height: f32,
@@ -61,6 +69,7 @@ pub struct EpubBook {
     pub opf_dir: String,
     pub manifest: Vec<ManifestItem>,
     pub spine: Vec<SpineItem>,
+    pub toc: Vec<TocItem>,
     pub resources: HashMap<String, Vec<u8>>,
 }
 
@@ -153,6 +162,8 @@ impl EpubBook {
             bail!("epub spine is empty");
         }
 
+        let toc = parse_toc(opf, spine_node, &manifest, &opf_dir, &resources);
+
         Ok(Self {
             title,
             creator,
@@ -161,6 +172,7 @@ impl EpubBook {
             opf_dir,
             manifest,
             spine,
+            toc,
             resources,
         })
     }
@@ -246,9 +258,10 @@ impl EpubBook {
         html.push_str("</style></head><body>");
         for doc in &docs {
             html.push_str(&format!(
-                "<section class=\"cre-spine\" data-spine-index=\"{}\" data-spine-id=\"{}\">",
+                "<section class=\"cre-spine\" data-spine-index=\"{}\" data-spine-id=\"{}\" data-spine-href=\"{}\">",
                 doc.index,
-                escape_attr(&doc.id)
+                escape_attr(&doc.id),
+                escape_attr(&normalize_path(&doc.href))
             ));
             html.push_str(&doc.body_html);
             html.push_str("</section>");
@@ -563,6 +576,190 @@ pub fn normalize_path(path: &str) -> String {
     parts.join("/")
 }
 
+fn parse_toc(
+    ncx_bytes_hint: &[u8],
+    spine_node: roxmltree::Node<'_, '_>,
+    manifest: &[ManifestItem],
+    opf_dir: &str,
+    resources: &HashMap<String, Vec<u8>>,
+) -> Vec<TocItem> {
+    let _ = ncx_bytes_hint;
+    let _ = opf_dir;
+    let mut out = Vec::new();
+
+    if let Some(toc_id) = spine_node.attribute("toc")
+        && let Some(item) = manifest.iter().find(|item| item.id == toc_id)
+        && let Some(bytes) = resources.get(&item.href)
+    {
+        parse_ncx(bytes, parent_dir(&item.href), &mut out);
+    }
+
+    if out.is_empty() {
+        let nav_item = manifest
+            .iter()
+            .find(|item| item.properties.split_whitespace().any(|prop| prop == "nav"));
+        if let Some(item) = nav_item
+            && let Some(bytes) = resources.get(&item.href)
+        {
+            parse_epub3_nav(bytes, parent_dir(&item.href), &mut out);
+        }
+    }
+
+    out
+}
+
+fn parse_ncx(bytes: &[u8], base_dir: &str, out: &mut Vec<TocItem>) {
+    let text = decode_text(bytes);
+    let options = roxmltree::ParsingOptions {
+        allow_dtd: true,
+        ..Default::default()
+    };
+    let doc = match roxmltree::Document::parse_with_options(&text, options) {
+        Ok(doc) => doc,
+        Err(_) => return,
+    };
+    let root = doc.root_element();
+    if root.tag_name().name() != "ncx" {
+        return;
+    }
+    let Some(nav_map) = root
+        .children()
+        .find(|n| n.is_element() && n.tag_name().name() == "navMap")
+    else {
+        return;
+    };
+    for nav_point in nav_map
+        .children()
+        .filter(|n| n.is_element() && n.tag_name().name() == "navPoint")
+    {
+        parse_ncx_point(nav_point, 1, base_dir, out);
+    }
+}
+
+fn parse_ncx_point(
+    node: roxmltree::Node<'_, '_>,
+    depth: usize,
+    base_dir: &str,
+    out: &mut Vec<TocItem>,
+) {
+    let title = child_text(node, "navLabel").unwrap_or_default();
+    let href = node
+        .children()
+        .find(|n| n.is_element() && n.tag_name().name() == "content")
+        .and_then(|n| n.attribute("src"))
+        .unwrap_or_default();
+    let href = resolve_toc_href(base_dir, href);
+    if !href.is_empty() {
+        out.push(TocItem { title, href, depth });
+    }
+    for child in node
+        .children()
+        .filter(|n| n.is_element() && n.tag_name().name() == "navPoint")
+    {
+        parse_ncx_point(child, depth + 1, base_dir, out);
+    }
+}
+
+fn parse_epub3_nav(bytes: &[u8], base_dir: &str, out: &mut Vec<TocItem>) {
+    let text = decode_text(bytes);
+    let options = roxmltree::ParsingOptions {
+        allow_dtd: true,
+        ..Default::default()
+    };
+    let Ok(doc) = roxmltree::Document::parse_with_options(&text, options) else {
+        return;
+    };
+    let root = doc.root_element();
+    let Some(nav) = root
+        .descendants()
+        .find(|n| n.is_element() && n.tag_name().name() == "nav" && has_epub_type(*n, "toc"))
+    else {
+        return;
+    };
+    let Some(ol) = nav
+        .children()
+        .find(|n| n.is_element() && n.tag_name().name() == "ol")
+    else {
+        return;
+    };
+    parse_nav_ol(ol, 1, base_dir, out);
+}
+
+fn parse_nav_ol(ol: roxmltree::Node<'_, '_>, depth: usize, base_dir: &str, out: &mut Vec<TocItem>) {
+    for li in ol
+        .children()
+        .filter(|n| n.is_element() && n.tag_name().name() == "li")
+    {
+        if let Some(anchor) = li
+            .children()
+            .find(|n| n.is_element() && n.tag_name().name() == "a")
+        {
+            let title = descendant_text(anchor).unwrap_or_default();
+            let href = resolve_toc_href(base_dir, anchor.attribute("href").unwrap_or_default());
+            if !href.is_empty() {
+                out.push(TocItem { title, href, depth });
+            }
+        }
+        for child in li
+            .children()
+            .filter(|n| n.is_element() && n.tag_name().name() == "ol")
+        {
+            parse_nav_ol(child, depth + 1, base_dir, out);
+        }
+    }
+}
+
+fn child_text(node: roxmltree::Node<'_, '_>, name: &str) -> Option<String> {
+    node.children()
+        .find(|n| n.is_element() && n.tag_name().name() == name)
+        .and_then(descendant_text)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn descendant_text(node: roxmltree::Node<'_, '_>) -> Option<String> {
+    let text: String = node
+        .descendants()
+        .filter(|n| n.is_text())
+        .filter_map(|n| n.text())
+        .collect();
+    let text = text.trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+fn has_epub_type(node: roxmltree::Node<'_, '_>, value: &str) -> bool {
+    node.attributes().any(|attr| {
+        let matches = match attr.namespace() {
+            Some(uri) => {
+                uri == "http://www.idpf.org/2007/ops"
+                    && (attr.name() == "type" || attr.name().ends_with(":type"))
+            }
+            None => attr.name() == "epub:type",
+        };
+        matches && attr.value().split_ascii_whitespace().any(|v| v == value)
+    })
+}
+
+fn split_fragment(href: &str) -> (&str, Option<&str>) {
+    match href.find('#') {
+        Some(index) => (&href[..index], Some(&href[index + 1..])),
+        None => (href, None),
+    }
+}
+
+fn resolve_toc_href(base_dir: &str, href: &str) -> String {
+    let href = href.trim();
+    let (path, fragment) = split_fragment(href);
+    if path.is_empty() {
+        return fragment.map_or_else(String::new, |fragment| format!("#{fragment}"));
+    }
+    let resolved = resolve_href(base_dir, path);
+    match fragment {
+        Some(fragment) => format!("{resolved}#{fragment}"),
+        None => resolved,
+    }
+}
+
 fn parent_dir(path: &str) -> &str {
     path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("")
 }
@@ -608,12 +805,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_juliet_ncx_toc() {
+        let book = juliet();
+        assert!(book.toc.len() > 20);
+        assert_eq!(book.toc[0].title, "Title");
+        assert_eq!(book.toc[0].href, "OPS/title.xml");
+        assert_eq!(book.toc[0].depth, 1);
+        assert!(
+            book.toc
+                .iter()
+                .any(|item| item.depth > 1 && item.href.contains("#section_"))
+        );
+    }
+
+    #[test]
     fn builds_combined_html_with_rewritten_resources() {
         let book = juliet();
         let html = book.to_html(&HtmlOptions::default()).unwrap();
         assert!(html.contains("epub://book/OPS/css/main.css"));
         assert!(html.contains("epub://book/OPS/images/logo-feedbooks-tiny.png"));
         assert!(html.contains("data-spine-index=\"1\""));
+        assert!(html.contains("data-spine-href=\"OPS/cover.xml\""));
         assert!(html.contains("Romeo and Juliet"));
     }
 }
