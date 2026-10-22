@@ -1,0 +1,170 @@
+use std::path::{Path, PathBuf};
+
+use cre_lib::{Document, parse_text_position};
+
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/koreader-test-data")
+        .join(name)
+}
+
+fn require_resources() {
+    let font = Path::new("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf");
+    assert!(
+        font.exists(),
+        "missing required test font: {}",
+        font.display()
+    );
+    for name in ["juliet.epub", "sample.txt"] {
+        let path = fixture(name);
+        assert!(
+            path.exists(),
+            "missing required fixture: {}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn xpointer_parse_accepts_generated_point_format() {
+    let input = "/body/DocFragment[2]/body/p[3]/span[1]/text().42";
+    let position = parse_text_position(input).unwrap();
+    assert_eq!(position.spine_index, 2);
+    assert_eq!(position.codepoint_offset, 42);
+    assert_eq!(position.path[0].tag, "p");
+    assert_eq!(position.path[0].index, 3);
+    assert_eq!(position.path[1].tag, "span");
+    assert_eq!(position.path[1].index, 1);
+}
+
+#[test]
+fn xpointer_parse_accepts_xpointer_scheme() {
+    let input = "xpointer(/body/DocFragment[1]/body/text().0)";
+    let position = parse_text_position(input).unwrap();
+    assert_eq!(position.spine_index, 1);
+    assert_eq!(position.path.len(), 0);
+    assert_eq!(position.codepoint_offset, 0);
+}
+
+#[test]
+fn xpointer_parse_rejects_invalid_paths() {
+    for input in [
+        "not-an-xpointer",
+        "/body/DocFragment[0]/body/text().0",
+        "/body/text().0",
+        "/body/DocFragment[1]/body/p[0]/text().0",
+        "/body/DocFragment[1]/body/p[1]/wrong().0",
+    ] {
+        assert!(parse_text_position(input).is_err(), "accepted {input}");
+    }
+}
+
+#[test]
+fn txt_page_xpointers_round_trip_all_pages() {
+    require_resources();
+
+    let mut doc = Document::open(fixture("sample.txt")).unwrap();
+    let page_count = doc.page_count();
+    assert!(page_count >= 1);
+
+    for page in 1..=page_count {
+        let xpointer = doc.xpointer_from_page(page).unwrap();
+        assert!(
+            xpointer.starts_with("/body/DocFragment[1]/body"),
+            "unexpected XPointer for page {page}: {xpointer}"
+        );
+
+        let resolved = doc.page_from_xpointer(&xpointer).unwrap();
+        assert_eq!(resolved, page, "failed to resolve XPointer for page {page}");
+        assert_eq!(doc.go_to_xpointer(&xpointer).unwrap(), page);
+        assert_eq!(doc.current_page(), page);
+    }
+
+    assert!(doc.xpointer_from_page(0).is_err());
+    assert!(doc.xpointer_from_page(page_count + 1).is_err());
+    assert!(
+        doc.page_from_xpointer("/body/DocFragment[2]/body/text().0")
+            .is_err()
+    );
+}
+
+#[test]
+fn current_position_and_position_to_xpointer_round_trip() {
+    require_resources();
+
+    let mut doc = Document::open(fixture("sample.txt")).unwrap();
+    doc.go_to_page(2).unwrap();
+
+    let generated = doc.xpointer_from_page(2).unwrap();
+    let current = doc.current_position().unwrap();
+    let from_position = doc.xpointer_from_position(&current).unwrap();
+
+    assert_eq!(generated, from_position);
+    assert_eq!(doc.page_from_xpointer(&from_position).unwrap(), 2);
+}
+
+#[test]
+fn epub_page_xpointers_round_trip_for_selected_pages() {
+    require_resources();
+
+    let doc = Document::open(fixture("juliet.epub")).unwrap();
+    let page_count = doc.page_count();
+    assert!(page_count > 10);
+
+    let pages = [1, page_count / 2, page_count];
+    for page in pages {
+        let xpointer = doc.xpointer_from_page(page).unwrap();
+        assert!(
+            xpointer.starts_with("/body/DocFragment["),
+            "unexpected XPointer for page {page}: {xpointer}"
+        );
+
+        let parsed = parse_text_position(&xpointer).unwrap();
+        assert!(parsed.spine_index >= 1);
+
+        let resolved = doc.page_from_xpointer(&xpointer).unwrap();
+        assert_eq!(resolved, page, "failed to resolve XPointer for page {page}");
+    }
+}
+
+#[test]
+fn epub_toc_entries_expose_page_and_xpointer_round_trip() {
+    require_resources();
+
+    let mut doc = Document::open(fixture("juliet.epub")).unwrap();
+    let page_count = doc.page_count();
+    let toc = doc.toc().to_vec();
+    assert!(!toc.is_empty());
+    assert!(toc.iter().all(|entry| entry.page.is_some()));
+
+    for entry in toc {
+        let Some(page) = entry.page else {
+            continue;
+        };
+        assert!(page >= 1 && page <= page_count);
+
+        let Some(xpointer) = entry.xpointer.as_ref() else {
+            panic!("TOC entry {} has no XPointer", entry.title);
+        };
+        assert!(
+            xpointer.starts_with("/body/DocFragment["),
+            "unexpected XPointer for TOC entry {}: {xpointer}",
+            entry.title
+        );
+
+        let parsed = parse_text_position(xpointer).unwrap();
+        assert!(parsed.spine_index >= 1);
+        assert_eq!(
+            doc.page_from_xpointer(xpointer).unwrap(),
+            page,
+            "failed to resolve TOC XPointer for {}",
+            entry.title
+        );
+        assert_eq!(
+            doc.go_to_xpointer(xpointer).unwrap(),
+            page,
+            "failed to navigate TOC XPointer for {}",
+            entry.title
+        );
+    }
+}

@@ -215,9 +215,44 @@ impl EpubBook {
 
     pub fn to_html(&self, options: &HtmlOptions) -> Result<String> {
         let docs = self.spine_documents()?;
+        let mut html = self.html_head(options, &docs);
+        for doc in &docs {
+            push_section_html(&mut html, doc);
+        }
+        html.push_str("</body></html>");
+        Ok(html)
+    }
+
+    pub fn to_html_chunks(&self, options: &HtmlOptions, max_bytes: usize) -> Result<Vec<String>> {
+        let docs = self.spine_documents()?;
+        let head = self.html_head(options, &docs);
+        let mut chunks = Vec::new();
+        let mut body = String::new();
+        for doc in &docs {
+            let mut section = String::new();
+            push_section_html(&mut section, doc);
+            if !body.is_empty() && body.len() + section.len() > max_bytes {
+                let mut html = head.clone();
+                html.push_str(&body);
+                html.push_str("</body></html>");
+                chunks.push(html);
+                body.clear();
+            }
+            body.push_str(&section);
+        }
+        if !body.is_empty() || chunks.is_empty() {
+            let mut html = head;
+            html.push_str(&body);
+            html.push_str("</body></html>");
+            chunks.push(html);
+        }
+        Ok(chunks)
+    }
+
+    fn html_head(&self, options: &HtmlOptions, docs: &[SpineDocument]) -> String {
         let mut css_urls = Vec::new();
         let mut inline_styles = Vec::new();
-        for doc in &docs {
+        for doc in docs {
             for url in &doc.css_urls {
                 if !css_urls.contains(url) {
                     css_urls.push(url.clone());
@@ -256,19 +291,19 @@ impl EpubBook {
             options.font_size, options.line_height, options.margin_y, options.margin_x
         ));
         html.push_str("</style></head><body>");
-        for doc in &docs {
-            html.push_str(&format!(
-                "<section class=\"cre-spine\" data-spine-index=\"{}\" data-spine-id=\"{}\" data-spine-href=\"{}\">",
-                doc.index,
-                escape_attr(&doc.id),
-                escape_attr(&normalize_path(&doc.href))
-            ));
-            html.push_str(&doc.body_html);
-            html.push_str("</section>");
-        }
-        html.push_str("</body></html>");
-        Ok(html)
+        html
     }
+}
+
+fn push_section_html(out: &mut String, doc: &SpineDocument) {
+    out.push_str(&format!(
+        "<section class=\"cre-spine\" data-spine-index=\"{}\" data-spine-id=\"{}\" data-spine-href=\"{}\">",
+        doc.index,
+        escape_attr(&doc.id),
+        escape_attr(&normalize_path(&doc.href))
+    ));
+    out.push_str(&doc.body_html);
+    out.push_str("</section>");
 }
 
 fn parse_container(bytes: &[u8]) -> Result<String> {

@@ -7,20 +7,4 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow = "1"
-anyrender = "0.14"
-blitz-dom = { version = "=0.3.0-beta.4", default-features = false, features = [
-    "floats",
-    "complex-scripts",
-    "text-transform-icu",
-    "woff",
-] }
-blitz-html = "=0.3.0-beta.4"
-blitz-paint = { version = "=0.3.0-beta.4", default-features = false }
-blitz-traits = "=0.3.0-beta.4"
-cre-epub = { path = "../cre-epub" }
-cre-fb2 = { path = "../cre-fb2" }
-cre-paint = { path = "../cre-paint" }
-cre-text = { path = "../cre-text" }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-percent-encoding = "2"
-url = "2"
+cre-lib = { path = "../cre-lib" }
