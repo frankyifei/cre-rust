@@ -4,10 +4,10 @@ use std::ptr;
 
 use cre_ffi::{
     CreDocumentOptions, cre_close, cre_current_page, cre_find_text_count, cre_find_text_page,
-    cre_first_page, cre_format, cre_goto_page, cre_goto_xpointer, cre_last_error, cre_metadata,
-    cre_next_page, cre_open, cre_open_with_options, cre_page_count, cre_page_height, cre_page_text,
-    cre_page_width, cre_previous_page, cre_render_page, cre_toc_count, cre_toc_page, cre_toc_title,
-    cre_xpointer_from_page,
+    cre_first_page, cre_format, cre_goto_href, cre_goto_page, cre_goto_xpointer, cre_last_error,
+    cre_metadata, cre_next_page, cre_open, cre_open_with_options, cre_page_count, cre_page_height,
+    cre_page_text, cre_page_width, cre_previous_page, cre_render_page, cre_toc_count, cre_toc_href,
+    cre_toc_page, cre_toc_title, cre_xpointer_from_page,
 };
 
 fn fixture(name: &str) -> PathBuf {
@@ -132,6 +132,32 @@ fn ffi_opens_document_with_options() {
     let doc = unsafe { cre_open_with_options(path.as_ptr(), &invalid) };
     assert!(doc.is_null());
     assert!(!last_error().is_empty());
+}
+
+#[test]
+fn ffi_exposes_fb2_toc_and_navigation() {
+    let path = c_string(fixture("sample.fb2").to_str().unwrap());
+    let doc = unsafe { cre_open(path.as_ptr()) };
+    assert!(!doc.is_null(), "{}", last_error());
+
+    assert_eq!(cre_format(doc), 2);
+    assert_eq!(cre_toc_count(doc), 1);
+
+    let mut title = vec![0 as c_char; 256];
+    let required = cre_toc_title(doc, 0, title.as_mut_ptr(), title.len());
+    assert_eq!(read_string(&title, required), "Chapter One");
+
+    let mut href = vec![0 as c_char; 256];
+    let required = cre_toc_href(doc, 0, href.as_mut_ptr(), href.len());
+    assert_eq!(read_string(&href, required), "#fb2-body-0");
+
+    let page = cre_toc_page(doc, 0);
+    assert!(page >= 1);
+    assert_eq!(
+        unsafe { cre_goto_href(doc, c_string("#fb2-body-0").as_ptr()) },
+        page
+    );
+    unsafe { cre_close(doc) };
 }
 
 fn last_error() -> String {
