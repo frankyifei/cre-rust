@@ -102,6 +102,39 @@ fn document_exposes_fb2_metadata_text_and_images() {
 }
 
 #[test]
+fn document_resolves_fb2_fragment_links() {
+    require_resources();
+
+    let doc = Document::open(fixture("sample.fb2")).unwrap();
+    let hits = doc.find_text("Jump").unwrap();
+    assert!(!hits.is_empty());
+
+    let hit = &hits[0];
+    let text_box = doc
+        .page_text_boxes(hit.page)
+        .unwrap()
+        .into_iter()
+        .find(|text_box| text_box.text.contains("Jump"))
+        .unwrap();
+    let link_hit = doc
+        .hit_test(PagePosition {
+            page: hit.page,
+            x: text_box.x + 1.0,
+            y: text_box.y + text_box.height / 2.0,
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(link_hit.link.as_deref(), Some("#chapter-two"));
+
+    let target_page = doc.page_from_href("#chapter-two").unwrap();
+    assert!(
+        doc.page_text(target_page)
+            .unwrap()
+            .contains("Target chapter")
+    );
+}
+
+#[test]
 fn document_extracts_page_text_and_text_boxes() {
     require_resources();
 

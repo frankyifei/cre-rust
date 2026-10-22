@@ -1044,25 +1044,25 @@ fn collect_toc_anchors(node: &Node, current_resource: Option<String>, out: &mut 
         resource = Some(href);
     }
 
-    if let Some(resource) = resource.as_deref() {
-        if let Some(id) = element_id(node) {
-            out.push(TocAnchorId {
-                resource: resource.to_string(),
-                fragment: Some(id),
-                node_id: node.id,
-            });
-        }
-        if let Some(name) = node_attr(node, "name") {
-            out.push(TocAnchorId {
-                resource: resource.to_string(),
-                fragment: Some(name.to_string()),
-                node_id: node.id,
-            });
-        }
+    let resource = resource.as_deref().unwrap_or_default();
+    if let Some(id) = element_id(node) {
+        out.push(TocAnchorId {
+            resource: resource.to_string(),
+            fragment: Some(id.to_string()),
+            node_id: node.id,
+        });
+    }
+    if let Some(name) = node_attr(node, "name") {
+        out.push(TocAnchorId {
+            resource: resource.to_string(),
+            fragment: Some(name.to_string()),
+            node_id: node.id,
+        });
     }
 
+    let inherited_resource = (!resource.is_empty()).then(|| resource.to_string());
     for child in node.children.iter() {
-        collect_toc_anchors(node.with(*child), resource.clone(), out);
+        collect_toc_anchors(node.with(*child), inherited_resource.clone(), out);
     }
 }
 

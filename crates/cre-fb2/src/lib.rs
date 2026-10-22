@@ -213,6 +213,13 @@ fn author_of(title_info: &roxmltree::Node) -> Option<String> {
     }
 }
 
+fn element_id_attr(node: roxmltree::Node) -> String {
+    match node.attribute("id") {
+        Some(id) => format!(" id=\"{}\"", escape_html(id)),
+        None => String::new(),
+    }
+}
+
 fn body_node_to_html(node: roxmltree::Node) -> String {
     let mut h = 0u32;
     node.children()
@@ -233,36 +240,47 @@ fn node_to_html(
     }
     let name = node.tag_name().name();
     match name {
-        "p" => format!("<p>{}</p>", inner_html(node, binary, h_level)),
+        "p" => format!(
+            "<p{}>{}</p>",
+            element_id_attr(node),
+            inner_html(node, binary, h_level)
+        ),
         "empty-line" => "<br/><br/>".to_string(),
         "title" => {
             *h_level = (*h_level + 1).min(6);
             let level = *h_level;
             let inner = inner_html(node, binary, h_level);
             *h_level = (*h_level).saturating_sub(1);
-            format!("<h{level}>{inner}</h{level}>")
+            format!("<h{level}{}>{inner}</h{level}>", element_id_attr(node))
         }
         "subtitle" => {
             *h_level = (*h_level + 1).min(6);
             let level = *h_level;
             let inner = inner_html(node, binary, h_level);
             *h_level = (*h_level).saturating_sub(1);
-            format!("<h{level} class=\"cre-subtitle\">{inner}</h{level}>")
+            format!(
+                "<h{level} class=\"cre-subtitle\"{}>{inner}</h{level}>",
+                element_id_attr(node)
+            )
         }
         "cite" => format!(
-            "<blockquote>{}</blockquote>",
+            "<blockquote{}>{}</blockquote>",
+            element_id_attr(node),
             inner_html(node, binary, h_level)
         ),
         "poem" => format!(
-            "<div class=\"poem\">{}</div>",
+            "<div class=\"poem\"{}>{}</div>",
+            element_id_attr(node),
             inner_html(node, binary, h_level)
         ),
         "stanza" => format!(
-            "<div class=\"stanza\">{}</div>",
+            "<div class=\"stanza\"{}>{}</div>",
+            element_id_attr(node),
             inner_html(node, binary, h_level)
         ),
         "text-author" => format!(
-            "<p class=\"cre-author\">{}</p>",
+            "<p class=\"cre-author\"{}>{}</p>",
+            element_id_attr(node),
             inner_html(node, binary, h_level)
         ),
         "strong" => format!("<strong>{}</strong>", inner_html(node, binary, h_level)),
@@ -289,14 +307,19 @@ fn node_to_html(
             }
         }
         "epigraph" => format!(
-            "<blockquote class=\"epigraph\">{}</blockquote>",
+            "<blockquote class=\"epigraph\"{}>{}</blockquote>",
+            element_id_attr(node),
             inner_html(node, binary, h_level)
         ),
         "annotation" => format!(
             "<div class=\"cre-annotation\">{}</div>",
             inner_html(node, binary, h_level)
         ),
-        "section" => format!("<section>{}</section>", inner_html(node, binary, h_level)),
+        "section" => format!(
+            "<section{}>{}</section>",
+            element_id_attr(node),
+            inner_html(node, binary, h_level)
+        ),
         _ => inner_html(node, binary, h_level),
     }
 }

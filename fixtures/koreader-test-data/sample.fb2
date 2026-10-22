@@ -24,7 +24,8 @@
     <p>FB2 body paragraph with anchor target.</p>
     <p>Image follows.</p>
     <p><image href="pixel.png"/></p>
-    <a id="chapter-two"></a>
+    <p><a href="#chapter-two">Jump</a></p>
+    <p id="chapter-two">Target chapter</p>
     <p>Second paragraph.</p>
   </body>
 </FictionBook>
