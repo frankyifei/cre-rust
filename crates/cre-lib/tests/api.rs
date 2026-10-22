@@ -221,18 +221,31 @@ fn document_handles_large_epub() {
 
     let mut doc = Document::open(&path).unwrap();
     assert_eq!(doc.metadata().format, DocumentFormat::Epub);
-    assert!(doc.page_count() > 100);
+    let page_count = doc.page_count();
+    assert!(page_count > 100);
 
-    let first = doc.page_text(1).unwrap();
-    assert!(!first.trim().is_empty());
-    let last_page = doc.page_count();
-    let last = doc.page_text(last_page).unwrap();
-    assert!(!last.trim().is_empty());
+    let samples = [
+        1,
+        page_count / 3,
+        page_count / 2,
+        (page_count * 2) / 3,
+        page_count,
+    ];
+    let mut last_sample = 0;
+    for page in samples {
+        if page == last_sample {
+            continue;
+        }
+        last_sample = page;
 
-    let bitmap = doc.render_page(last_page).unwrap();
-    assert_eq!(bitmap.width, doc.page_width());
-    assert_eq!(bitmap.height, doc.page_height());
-    assert!(has_ink(&bitmap));
+        let text = doc.page_text(page).unwrap();
+        assert!(!text.trim().is_empty(), "page {page} is blank");
+
+        let bitmap = doc.render_page(page).unwrap();
+        assert_eq!(bitmap.width, doc.page_width());
+        assert_eq!(bitmap.height, doc.page_height());
+        assert!(has_ink(&bitmap), "page {page} has no rendered ink");
+    }
 }
 
 #[test]
@@ -437,6 +450,29 @@ fn document_rejects_invalid_page_numbers() {
     assert_eq!(doc.current_page(), page_count);
     doc.go_to_first_page();
     assert_eq!(doc.current_page(), 1);
+}
+
+#[test]
+fn document_rejects_invalid_xpointers() {
+    require_resources();
+
+    let mut doc = Document::open(fixture("sample.txt")).unwrap();
+    let invalid_cases = [
+        "",
+        "not-an-xpointer",
+        "/body/DocFragment[999]/body/text().0",
+        "xpointer(/body/DocFragment[999]/body/text().0)",
+    ];
+    for xpointer in invalid_cases {
+        assert!(
+            doc.page_from_xpointer(xpointer).is_err(),
+            "expected {xpointer:?} to be rejected"
+        );
+        assert!(
+            doc.go_to_xpointer(xpointer).is_err(),
+            "expected {xpointer:?} navigation to be rejected"
+        );
+    }
 }
 
 #[test]
