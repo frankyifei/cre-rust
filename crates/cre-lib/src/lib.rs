@@ -231,14 +231,22 @@ impl Document {
                     language: book.language.clone(),
                     item_count: book.binary.len(),
                 };
-                let html = book.to_html(&Fb2HtmlOptions::default())?;
+                let (html, fb2_toc) = book.to_html_with_toc(&Fb2HtmlOptions::default())?;
+                let raw_toc = fb2_toc
+                    .into_iter()
+                    .map(|item| RawTocItem {
+                        title: item.title,
+                        href: item.href,
+                        depth: item.depth,
+                    })
+                    .collect();
                 let resources = Arc::new(book.binary);
                 Self::build(
                     vec![html],
                     "fb2://book/",
                     Arc::new(Fb2Net { resources }),
                     metadata,
-                    Vec::new(),
+                    raw_toc,
                     options,
                 )
             }

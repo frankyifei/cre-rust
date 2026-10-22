@@ -89,10 +89,15 @@ impl Fb2Book {
     }
 
     pub fn to_html(&self, opts: &Fb2HtmlOptions) -> Result<String> {
+        Ok(self.to_html_with_toc(opts)?.0)
+    }
+
+    pub fn to_html_with_toc(&self, opts: &Fb2HtmlOptions) -> Result<(String, Vec<Fb2TocItem>)> {
         let doc = roxmltree::Document::parse(&self.fb2_xml)?;
         let root = doc.root_element();
 
         let mut body_html = String::new();
+        let mut toc = Vec::new();
 
         if let Some(desc_html) = &self.description {
             body_html.push_str(&format!(
@@ -100,10 +105,22 @@ impl Fb2Book {
             ));
         }
 
-        for body in root.children().filter(|n| n.has_tag_name("body")) {
+        for (index, body) in root
+            .children()
+            .filter(|n| n.has_tag_name("body"))
+            .enumerate()
+        {
             let sect = body.attribute("name").unwrap_or("");
+            let section_id = format!("fb2-body-{index}");
+            if let Some(title) = first_section_title(body) {
+                toc.push(Fb2TocItem {
+                    title,
+                    href: format!("#{section_id}"),
+                    depth: 1,
+                });
+            }
             body_html.push_str(&format!(
-                "<section class=\"cre-body\" data-name=\"{sect}\">\n"
+                "<section id=\"{section_id}\" class=\"cre-body\" data-name=\"{sect}\">\n"
             ));
             for child in body.children() {
                 let mut heading_level = 0u32;
@@ -141,8 +158,15 @@ blockquote {{ border-left: 3px solid #888; padding-left: 1em; margin: 1em 0; fon
             "<!DOCTYPE html><html lang=\"{}\"><head><meta charset=\"utf-8\"><title>{title_html}</title><style>{css}</style></head><body>{meta_html}{body_html}</body></html>",
             self.language.as_deref().unwrap_or("und"),
         );
-        Ok(html)
+        Ok((html, toc))
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct Fb2TocItem {
+    pub title: String,
+    pub href: String,
+    pub depth: usize,
 }
 
 pub struct Fb2HtmlOptions {
@@ -211,6 +235,18 @@ fn author_of(title_info: &roxmltree::Node) -> Option<String> {
     } else {
         Some(authors.join(", "))
     }
+}
+
+fn first_section_title(body: roxmltree::Node<'_, '_>) -> Option<String> {
+    let title = body.descendants().find(|n| n.has_tag_name("title"))?;
+    let text = title
+        .descendants()
+        .filter(|n| n.is_text())
+        .filter_map(|n| n.text())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!text.is_empty()).then_some(text)
 }
 
 fn element_id_attr(node: roxmltree::Node) -> String {

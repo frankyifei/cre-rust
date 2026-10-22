@@ -135,6 +135,36 @@ fn document_resolves_fb2_fragment_links() {
 }
 
 #[test]
+fn document_exposes_fb2_section_toc() {
+    require_resources();
+
+    let mut doc = Document::open(fixture("sample.fb2")).unwrap();
+    assert!(!doc.toc().is_empty());
+
+    let (href, entry_page, xpointer) = {
+        let entry = doc
+            .toc()
+            .iter()
+            .find(|entry| entry.title == "Chapter One")
+            .unwrap();
+        assert_eq!(entry.href, "#fb2-body-0");
+        assert_eq!(entry.depth, 1);
+        (
+            entry.href.clone(),
+            entry.page.unwrap(),
+            entry.xpointer.clone().unwrap(),
+        )
+    };
+    let page = entry_page;
+    assert!(page >= 1);
+    assert!(doc.page_text(page).unwrap().contains("Chapter One"));
+
+    assert_eq!(doc.page_from_xpointer(&xpointer).unwrap(), page);
+    assert_eq!(doc.go_to_href(&href).unwrap(), page);
+    assert_eq!(doc.go_to_xpointer(&xpointer).unwrap(), page);
+}
+
+#[test]
 fn document_extracts_page_text_and_text_boxes() {
     require_resources();
 
