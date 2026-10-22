@@ -4,10 +4,19 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::result::Result as StdResult;
 
-use cre_lib::{Document, DocumentFormat};
+use cre_lib::{Document, DocumentFormat, DocumentOptions};
 
 pub struct CreDocument {
     inner: Document,
+}
+
+#[repr(C)]
+pub struct CreDocumentOptions {
+    pub width: u32,
+    pub height: u32,
+    pub layout_height: u32,
+    pub page_margin: f32,
+    pub font_path: *const c_char,
 }
 
 thread_local! {
@@ -112,7 +121,56 @@ pub unsafe extern "C" fn cre_open(path: *const c_char) -> *mut CreDocument {
 
 /// # Safety
 ///
-/// `doc` must be null or a pointer returned by [`cre_open`] that has not been closed.
+/// `path` must be a valid NUL-terminated UTF-8 string. `options` must be null or point to a
+/// valid [`CreDocumentOptions`] for the duration of the call; its `font_path` must be null or a
+/// valid NUL-terminated UTF-8 string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cre_open_with_options(
+    path: *const c_char,
+    options: *const CreDocumentOptions,
+) -> *mut CreDocument {
+    run(ptr::null_mut(), || {
+        if path.is_null() {
+            return Err("path is null".to_string());
+        }
+        // SAFETY: the caller supplied a NUL-terminated path string.
+        let path = unsafe { CStr::from_ptr(path) }
+            .to_str()
+            .map_err(|error| format!("path is not valid UTF-8: {error}"))?;
+        let inner = if options.is_null() {
+            Document::open(path).map_err(|error| format!("{error:#}"))?
+        } else {
+            // SAFETY: the caller supplied a valid options object.
+            let options = unsafe { &*options };
+            let font_path = if options.font_path.is_null() {
+                None
+            } else {
+                // SAFETY: the caller supplied a NUL-terminated font path string.
+                let font_path = unsafe { CStr::from_ptr(options.font_path) }
+                    .to_str()
+                    .map_err(|error| format!("font path is not valid UTF-8: {error}"))?;
+                Some(std::path::PathBuf::from(font_path))
+            };
+            Document::with_options(
+                path,
+                &DocumentOptions {
+                    width: options.width,
+                    height: options.height,
+                    layout_height: options.layout_height,
+                    page_margin: options.page_margin,
+                    font_path,
+                },
+            )
+            .map_err(|error| format!("{error:#}"))?
+        };
+        Ok(Box::into_raw(Box::new(CreDocument { inner })))
+    })
+}
+
+/// # Safety
+///
+/// `doc` must be null or a pointer returned by [`cre_open`] or [`cre_open_with_options`] that
+/// has not been closed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cre_close(doc: *mut CreDocument) {
     if doc.is_null() {

@@ -10,6 +10,15 @@ extern "C" {
 
 typedef struct CreDocument CreDocument;
 
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t layout_height;
+    float page_margin;
+    /* Nullable. NULL selects the default font. */
+    const char *font_path;
+} CreDocumentOptions;
+
 enum CreMetadataField {
     CRE_METADATA_TITLE = 1,
     CRE_METADATA_CREATOR = 2,
@@ -24,6 +33,7 @@ enum CreFormat {
 };
 
 CreDocument *cre_open(const char *path);
+CreDocument *cre_open_with_options(const char *path, const CreDocumentOptions *options);
 void cre_close(CreDocument *doc);
 
 int32_t cre_last_error(char *out, size_t out_len);

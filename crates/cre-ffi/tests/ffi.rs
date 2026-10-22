@@ -3,10 +3,11 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 
 use cre_ffi::{
-    cre_close, cre_current_page, cre_find_text_count, cre_find_text_page, cre_first_page,
-    cre_format, cre_goto_page, cre_goto_xpointer, cre_last_error, cre_metadata, cre_next_page,
-    cre_open, cre_page_count, cre_page_height, cre_page_text, cre_page_width, cre_previous_page,
-    cre_render_page, cre_toc_count, cre_toc_page, cre_toc_title, cre_xpointer_from_page,
+    CreDocumentOptions, cre_close, cre_current_page, cre_find_text_count, cre_find_text_page,
+    cre_first_page, cre_format, cre_goto_page, cre_goto_xpointer, cre_last_error, cre_metadata,
+    cre_next_page, cre_open, cre_open_with_options, cre_page_count, cre_page_height, cre_page_text,
+    cre_page_width, cre_previous_page, cre_render_page, cre_toc_count, cre_toc_page, cre_toc_title,
+    cre_xpointer_from_page,
 };
 
 fn fixture(name: &str) -> PathBuf {
@@ -100,6 +101,36 @@ fn ffi_exposes_toc_and_errors() {
     assert!(!last_error().is_empty());
 
     assert_eq!(cre_page_count(ptr::null()), -1);
+    assert!(!last_error().is_empty());
+}
+
+#[test]
+fn ffi_opens_document_with_options() {
+    let path = c_string(fixture("sample.txt").to_str().unwrap());
+    let options = CreDocumentOptions {
+        width: 320,
+        height: 480,
+        layout_height: 100_000,
+        page_margin: 8.0,
+        font_path: ptr::null(),
+    };
+
+    let doc = unsafe { cre_open_with_options(path.as_ptr(), &options) };
+    assert!(!doc.is_null(), "{}", last_error());
+    assert_eq!(cre_page_width(doc), 320);
+    assert_eq!(cre_page_height(doc), 480);
+    assert!(cre_page_count(doc) >= 1);
+    unsafe { cre_close(doc) };
+
+    let invalid = CreDocumentOptions {
+        width: 0,
+        height: 480,
+        layout_height: 100_000,
+        page_margin: 0.0,
+        font_path: ptr::null(),
+    };
+    let doc = unsafe { cre_open_with_options(path.as_ptr(), &invalid) };
+    assert!(doc.is_null());
     assert!(!last_error().is_empty());
 }
 
