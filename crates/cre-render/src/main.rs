@@ -5,11 +5,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use anyrender::recording::RenderCommand;
 use anyrender::{Paint, Scene};
-use blitz_dom::{DocumentConfig, Node, StyleThreading, build_single_font_ctx};
+use blitz_dom::{DocumentConfig, Node, NodeId, StyleThreading, build_single_font_ctx};
 use blitz_html::HtmlDocument;
 use blitz_traits::net::{Bytes, NetHandler, NetProvider, Request};
 use blitz_traits::shell::{ColorScheme, Viewport};
-use cre_epub::{EpubBook, HtmlOptions};
+use cre_epub::{EpubBook, HtmlOptions, TocItem, normalize_path};
 use cre_fb2::{Fb2Book, Fb2HtmlOptions};
 use cre_paint::render_page;
 use cre_text::{TextBook, TextHtmlOptions};
@@ -22,6 +22,7 @@ struct Args {
     max_pages: usize,
     width: u32,
     height: u32,
+    toc: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -49,6 +50,7 @@ fn detect_format(path: &Path) -> Format {
 fn main() -> Result<()> {
     let args = parse_args()?;
     let format = detect_format(&args.input);
+    let mut toc_entries: Vec<TocItem> = Vec::new();
 
     let (html, base_url, net, title, creator): (
         String,
@@ -67,6 +69,7 @@ fn main() -> Result<()> {
             println!("spine items: {}", book.spine.len());
             let html = book.to_html(&HtmlOptions::default())?;
             let res = Arc::new(book.resources.clone());
+            toc_entries = book.toc.clone();
             (
                 html,
                 "epub://book/".into(),
@@ -152,6 +155,10 @@ fn main() -> Result<()> {
     let page_starts = paginate(&lines, args.height as f32, 32.0, 32.0);
     println!("pages: {}", page_starts.len());
 
+    if args.toc {
+        print_toc_pages(&doc, &toc_entries, &page_starts);
+    }
+
     std::fs::create_dir_all(&args.out_dir)
         .with_context(|| format!("create {}", args.out_dir.display()))?;
 
@@ -203,15 +210,17 @@ fn main() -> Result<()> {
 }
 
 fn parse_args() -> Result<Args> {
-    let mut it = std::env::args().skip(1);
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let toc = raw.iter().any(|arg| arg == "--toc");
+    let mut it = raw.into_iter().filter(|arg| arg != "--toc");
     let input = it
         .next()
         .map(PathBuf::from)
-        .context("usage: cre-render <file> <out-dir> [max-pages] [width] [height]")?;
+        .context("usage: cre-render [--toc] <file> <out-dir> [max-pages] [width] [height]")?;
     let out_dir = it
         .next()
         .map(PathBuf::from)
-        .context("usage: cre-render <file> <out-dir> [max-pages] [width] [height]")?;
+        .context("usage: cre-render [--toc] <file> <out-dir> [max-pages] [width] [height]")?;
     let max_pages = it
         .next()
         .map(|s| s.parse())
@@ -239,6 +248,7 @@ fn parse_args() -> Result<Args> {
         max_pages,
         width,
         height,
+        toc,
     })
 }
 
@@ -305,6 +315,119 @@ fn paginate(
         }
     }
     starts
+}
+
+struct TocAnchorId {
+    resource: String,
+    fragment: Option<String>,
+    node_id: NodeId,
+}
+
+fn print_toc_pages(doc: &HtmlDocument, toc: &[TocItem], page_starts: &[PageStart]) {
+    println!("toc entries: {}", toc.len());
+    if toc.is_empty() {
+        return;
+    }
+
+    let mut ids = Vec::new();
+    collect_toc_anchors(doc.root_element(), None, &mut ids);
+    let mut anchors = HashMap::<(String, Option<String>), NodeId>::new();
+    for anchor in ids {
+        anchors
+            .entry((anchor.resource, anchor.fragment))
+            .or_insert(anchor.node_id);
+    }
+
+    for item in toc {
+        let (path, fragment) = split_toc_href(&item.href);
+        let path = normalize_path(&percent_decode_str(path).decode_utf8_lossy());
+        let fragment = fragment.map(|fragment| {
+            percent_decode_str(fragment)
+                .decode_utf8_lossy()
+                .into_owned()
+        });
+        let node_id = anchors
+            .get(&(path.clone(), fragment.clone()))
+            .or_else(|| anchors.get(&(path.clone(), None)))
+            .copied();
+        let page = node_id.and_then(|node_id| page_for_node(doc, node_id, page_starts));
+
+        println!(
+            "depth={} page={} target={} title={}",
+            item.depth,
+            page.map_or_else(|| "?".to_string(), |page| page.to_string()),
+            item.href,
+            item.title
+        );
+    }
+}
+
+fn collect_toc_anchors(node: &Node, current_resource: Option<String>, out: &mut Vec<TocAnchorId>) {
+    let mut resource = current_resource;
+
+    if let Some(href) = node_attr(node, "data-spine-href") {
+        let href = normalize_path(&percent_decode_str(href).decode_utf8_lossy());
+        out.push(TocAnchorId {
+            resource: href.clone(),
+            fragment: None,
+            node_id: node.id,
+        });
+        resource = Some(href);
+    }
+
+    if let Some(resource) = resource.as_deref() {
+        if let Some(id) = element_id(node) {
+            out.push(TocAnchorId {
+                resource: resource.to_string(),
+                fragment: Some(id),
+                node_id: node.id,
+            });
+        }
+        if let Some(name) = node_attr(node, "name") {
+            out.push(TocAnchorId {
+                resource: resource.to_string(),
+                fragment: Some(name.to_string()),
+                node_id: node.id,
+            });
+        }
+    }
+
+    for child in node.children.iter() {
+        collect_toc_anchors(node.with(*child), resource.clone(), out);
+    }
+}
+
+fn node_attr<'a>(node: &'a Node, name: &str) -> Option<&'a str> {
+    node.attrs()?
+        .iter()
+        .find(|attr| attr.name.local.to_string() == name)
+        .map(|attr| attr.value.as_str())
+}
+
+fn element_id(node: &Node) -> Option<String> {
+    node.element_data()
+        .and_then(|element| element.id.as_ref())
+        .map(|id| id.to_string())
+}
+
+fn split_toc_href(href: &str) -> (&str, Option<&str>) {
+    match href.find('#') {
+        Some(index) => (&href[..index], Some(&href[index + 1..])),
+        None => (href, None),
+    }
+}
+
+fn page_for_node(doc: &HtmlDocument, node_id: NodeId, page_starts: &[PageStart]) -> Option<usize> {
+    let top = doc.get_client_bounding_rect(node_id)?.y as f32;
+    let mut page = 1usize;
+    for (index, start) in page_starts.iter().enumerate() {
+        if top + 1.0 >= start.clip_top {
+            page = index + 1;
+        } else {
+            break;
+        }
+    }
+    Some(page)
 }
 
 struct EpubNet {
