@@ -372,16 +372,20 @@ mod tests {
     }
 
     #[test]
-    fn real_fb2_fixture() {
+    fn parses_real_fb2_fixture() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../fixtures/koreader-test-data/leaves.fb2"
+            "/../../fixtures/koreader-test-data/sample.fb2"
         );
-        if std::path::Path::new(path).exists() {
-            let b = Fb2Book::open(path).unwrap();
-            assert!(b.title.is_some());
-            let html = b.to_html(&Fb2HtmlOptions::default()).unwrap();
-            assert!(html.len() > 1000);
-        }
+        let book = Fb2Book::open(path).unwrap();
+        assert_eq!(book.title.as_deref(), Some("FB2 Fixture"));
+        assert_eq!(book.creator.as_deref(), Some("Test M. Author"));
+        assert_eq!(book.language.as_deref(), Some("en"));
+        assert!(book.binary.contains_key("pixel.png"));
+
+        let html = book.to_html(&Fb2HtmlOptions::default()).unwrap();
+        assert!(html.len() > 1000);
+        assert!(html.contains("fb2://binary/pixel.png"));
+        assert!(html.contains("Chapter One"));
     }
 }

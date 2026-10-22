@@ -15,7 +15,7 @@ fn require_resources() {
         "missing required test font: {}",
         font.display()
     );
-    for name in ["juliet.epub", "links.epub", "sample.txt"] {
+    for name in ["juliet.epub", "links.epub", "sample.fb2", "sample.txt"] {
         let path = fixture(name);
         assert!(
             path.exists(),
@@ -74,6 +74,30 @@ fn document_exposes_sample_text_pages() {
     assert_eq!(bitmap.width, 600);
     assert_eq!(bitmap.height, 800);
     assert_eq!(bitmap.data.len(), 600 * 800);
+    assert!(has_ink(&bitmap));
+}
+
+#[test]
+fn document_exposes_fb2_metadata_text_and_images() {
+    require_resources();
+
+    let mut doc = Document::open(fixture("sample.fb2")).unwrap();
+    let metadata = doc.metadata();
+    assert_eq!(metadata.format, DocumentFormat::Fb2);
+    assert_eq!(metadata.title.as_deref(), Some("FB2 Fixture"));
+    assert_eq!(metadata.creator.as_deref(), Some("Test M. Author"));
+    assert_eq!(metadata.language.as_deref(), Some("en"));
+    assert_eq!(metadata.item_count, 1);
+
+    assert!(doc.page_count() >= 1);
+    let text = doc.page_text(1).unwrap();
+    assert!(text.contains("FB2 Fixture"));
+    assert!(text.contains("Chapter One"));
+    assert!(text.contains("Annotation paragraph"));
+
+    let bitmap = doc.render_page(1).unwrap();
+    assert_eq!(bitmap.width, doc.page_width());
+    assert_eq!(bitmap.height, doc.page_height());
     assert!(has_ink(&bitmap));
 }
 
