@@ -828,4 +828,105 @@ mod tests {
         assert!(html.contains("data-spine-href=\"OPS/cover.xml\""));
         assert!(html.contains("Romeo and Juliet"));
     }
+
+    #[test]
+    fn parses_epub3_nav_toc_from_synthetic_epub() {
+        let book = EpubBook::from_bytes(synthetic_epub3_nav()).unwrap();
+        assert_eq!(book.toc.len(), 2);
+        assert_eq!(book.toc[0].title, "Chapter One");
+        assert_eq!(book.toc[0].href, "sec1.xhtml#sec1");
+        assert_eq!(book.toc[0].depth, 1);
+        assert_eq!(book.toc[1].title, "Nested");
+        assert_eq!(book.toc[1].href, "sec1.xhtml#sub");
+        assert_eq!(book.toc[1].depth, 2);
+    }
+
+    fn synthetic_epub3_nav() -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buf);
+            let options = zip::write::SimpleFileOptions::default();
+
+            write_zip_file(&mut writer, options, "mimetype", "application/epub+zip");
+            write_zip_file(
+                &mut writer,
+                options,
+                "META-INF/container.xml",
+                r#"<?xml version="1.0"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+  <rootfiles>
+    <rootfile full-path="pkg.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#,
+            );
+            write_zip_file(
+                &mut writer,
+                options,
+                "pkg.opf",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="id">urn:uuid:test</dc:identifier>
+    <dc:title>Nav Test</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+    <item id="s1" href="sec1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="s1"/>
+  </spine>
+</package>"#,
+            );
+            write_zip_file(
+                &mut writer,
+                options,
+                "nav.xhtml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+  <head><title>Nav</title></head>
+  <body>
+    <nav epub:type="toc">
+      <ol>
+        <li>
+          <a href="sec1.xhtml#sec1">Chapter One</a>
+          <ol>
+            <li><a href="sec1.xhtml#sub">Nested</a></li>
+          </ol>
+        </li>
+      </ol>
+    </nav>
+  </body>
+</html>"#,
+            );
+            write_zip_file(
+                &mut writer,
+                options,
+                "sec1.xhtml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head><title>Sec1</title></head>
+  <body>
+    <h1 id="sec1">Chapter One</h1>
+    <h2 id="sub">Nested</h2>
+  </body>
+</html>"#,
+            );
+
+            writer.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    fn write_zip_file(
+        writer: &mut zip::ZipWriter<&mut Cursor<Vec<u8>>>,
+        options: zip::write::SimpleFileOptions,
+        name: &str,
+        contents: &str,
+    ) {
+        use std::io::Write;
+        writer.start_file(name, options).unwrap();
+        writer.write_all(contents.as_bytes()).unwrap();
+    }
 }
