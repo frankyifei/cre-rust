@@ -129,7 +129,15 @@ fn line_for_page<'a>(
 }
 
 fn fallback_position_for_line(root: &Node, line: &LineBox) -> Result<TextPosition> {
-    let text_id = text_node_for_line(root, line)?;
+    let text_id = match text_node_for_line(root, line) {
+        Ok(text_id) => text_id,
+        Err(_) => {
+            let element_id = nearest_real_element_id(root, line.node_id).with_context(
+                || "page line has no text node or element that can produce an XPointer",
+            )?;
+            return position_for_text_node(root, element_id, 0);
+        }
+    };
     let content_len = root
         .with(text_id)
         .text_data()
@@ -389,6 +397,7 @@ pub(crate) fn resolve_text_position(root: &Node, position: &TextPosition) -> Res
     let current = root.with(current_id);
     first_text_node(current, false)
         .or_else(|| first_text_node(current, true))
+        .or(Some(current_id))
         .context("XPointer target element has no text node")
 }
 

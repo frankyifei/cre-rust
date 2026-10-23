@@ -1325,10 +1325,9 @@ impl Document {
             let root = active.doc.root_element();
             let current_id = xpointer::resolve_text_position(root, &position)?;
             let flat = flat_text_characters(root);
-            let current_start = flat
-                .iter()
-                .position(|entry| entry.node == current_id)
-                .context("XPointer target node has no visible text")?;
+            let Some(current_start) = flat.iter().position(|entry| entry.node == current_id) else {
+                return Ok(None);
+            };
             let start_index = (current_start + position.codepoint_offset as usize).min(flat.len());
             let target = match (direction, unit) {
                 (Direction::Forward, NeighborUnit::Char) => {
@@ -1438,10 +1437,11 @@ impl Document {
         self.with_active_chunk(chunk_index, |active| {
             let root = active.doc.root_element();
             let text_id = xpointer::resolve_text_position(root, &position)?;
-            root.with(text_id)
+            Ok(root
+                .with(text_id)
                 .text_data()
                 .map(|text| text.content.clone())
-                .context("XPointer text node has no content")
+                .unwrap_or_default())
         })
     }
 

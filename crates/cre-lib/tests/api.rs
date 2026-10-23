@@ -714,7 +714,25 @@ fn document_exposes_resources_cover_and_html() {
     let cover = doc.cover_image().expect("juliet.epub exposes a cover");
     assert!(!cover.is_empty());
 
-    let xpointer = doc.xpointer_from_page(2).unwrap();
+    let image_page_xpointer = doc.xpointer_from_page(2).unwrap();
+    assert!(
+        doc.text_from_xpointer(&image_page_xpointer)
+            .unwrap()
+            .trim()
+            .is_empty(),
+        "page 2 is the image-only About page"
+    );
+    assert!(
+        doc.html_from_xpointer(&image_page_xpointer)
+            .unwrap()
+            .is_some(),
+        "image-only pages still resolve to HTML: {image_page_xpointer}"
+    );
+
+    let xpointer = (1..=doc.page_count())
+        .map(|page| doc.xpointer_from_page(page).unwrap())
+        .find(|xpointer| !doc.text_from_xpointer(xpointer).unwrap().trim().is_empty())
+        .expect("juliet.epub has text pages");
     let text = doc.text_from_xpointer(&xpointer).unwrap();
     assert!(!text.trim().is_empty());
     let html = doc.html_from_xpointer(&xpointer).unwrap();
