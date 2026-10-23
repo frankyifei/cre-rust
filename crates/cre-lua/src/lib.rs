@@ -1063,7 +1063,75 @@ unsafe extern "C-unwind" fn doc_get_string_property(l: *mut lua_State) -> c_int 
 
 unsafe extern "C-unwind" fn doc_get_page_links(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
-    unsafe { lua::lua_newtable(l) };
+    unsafe {
+        let internal_only = arg_bool(l, 2);
+        let links = doc_ref(l).and_then(|doc| {
+            let inner = doc.inner.as_ref()?;
+            inner.page_links(inner.current_page(), internal_only).ok()
+        });
+        let Some(links) = links else {
+            lua::lua_newtable(l);
+            return 1;
+        };
+
+        lua::lua_createtable(l, links.len() as c_int, 0);
+        for (index, link) in links.iter().enumerate() {
+            let start_x = link
+                .rects
+                .iter()
+                .map(|rect| rect.x)
+                .fold(f32::INFINITY, f32::min);
+            let start_y = link
+                .rects
+                .iter()
+                .map(|rect| rect.y)
+                .fold(f32::INFINITY, f32::min);
+            let end_x = link
+                .rects
+                .iter()
+                .map(|rect| rect.x + rect.width)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let end_y = link
+                .rects
+                .iter()
+                .map(|rect| rect.y + rect.height)
+                .fold(f32::NEG_INFINITY, f32::max);
+
+            lua::lua_createtable(l, 0, 6);
+            for (key, value) in [
+                ("start_x", start_x),
+                ("start_y", start_y),
+                ("end_x", end_x),
+                ("end_y", end_y),
+            ] {
+                push_str(l, key);
+                push_int(l, value.round() as i64);
+                lua::lua_rawset(l, -3);
+            }
+            push_str(l, if link.internal { "section" } else { "uri" });
+            push_str(l, &link.href);
+            lua::lua_rawset(l, -3);
+
+            push_str(l, "segments");
+            lua::lua_createtable(l, link.rects.len() as c_int, 0);
+            for (segment_index, rect) in link.rects.iter().enumerate() {
+                lua::lua_createtable(l, 0, 4);
+                for (key, value) in [
+                    ("x0", rect.x),
+                    ("y0", rect.y),
+                    ("x1", rect.x + rect.width),
+                    ("y1", rect.y + rect.height),
+                ] {
+                    push_str(l, key);
+                    push_int(l, value.round() as i64);
+                    lua::lua_rawset(l, -3);
+                }
+                lua::lua_rawseti_(l, -2, (segment_index + 1) as c_int);
+            }
+            lua::lua_rawset(l, -3);
+            lua::lua_rawseti_(l, -2, (index + 1) as c_int);
+        }
+    }
     1
 }
 
@@ -1081,7 +1149,19 @@ unsafe extern "C-unwind" fn doc_get_text_from_xpointer(l: *mut lua_State) -> c_i
 
 unsafe extern "C-unwind" fn doc_compare_xpointers(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
-    unsafe { push_int(l, 0) };
+    unsafe {
+        let Some(left) = arg_str(l, 2) else {
+            return 0;
+        };
+        let Some(right) = arg_str(l, 3) else {
+            return 0;
+        };
+        let result = doc_ref(l)
+            .and_then(|doc| doc.inner.as_ref())
+            .and_then(|inner| inner.compare_xpointers(&left, &right).ok())
+            .unwrap_or(0);
+        push_int(l, i64::from(result));
+    }
     1
 }
 

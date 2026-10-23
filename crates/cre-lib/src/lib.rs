@@ -120,6 +120,13 @@ pub struct WordHit {
     pub rects: Vec<TextBox>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PageLink {
+    pub href: String,
+    pub internal: bool,
+    pub rects: Vec<TextBox>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bookmark {
     pub page: usize,
@@ -710,6 +717,70 @@ impl Document {
         Ok(boxes)
     }
 
+    pub fn page_links(&self, page: usize, internal_only: bool) -> Result<Vec<PageLink>> {
+        let Some(snapshot) = self.pages.get(page.saturating_sub(1)) else {
+            bail!("page {page} is outside 1..={}", self.page_count());
+        };
+        let chunk_index = snapshot.chunk;
+        let line_base = self.chunks[chunk_index].line_base;
+        let lines = self.page_text_boxes_with_lines(page)?;
+
+        let mut links: Vec<PageLink> = Vec::new();
+        for (line_index, rect) in lines {
+            let Some(local_line) = line_index.checked_sub(line_base) else {
+                continue;
+            };
+            self.with_active_chunk(chunk_index, |active| {
+                let Some(line) = active.lines.get(local_line) else {
+                    return Ok(());
+                };
+                let root = active.doc.root_element();
+                let char_count = rect.text.chars().count().max(1);
+                let mut current: Option<(String, usize, usize)> = None;
+
+                for (char_index, (byte_offset, _)) in rect.text.char_indices().enumerate() {
+                    let href = source_element_at_line_offset(root, line, byte_offset)
+                        .and_then(|source_id| nearest_link(root, source_id));
+                    match (&mut current, href) {
+                        (Some((active_href, _, end)), Some(href)) if *active_href == href => {
+                            *end = char_index + 1;
+                        }
+                        (_, href) => {
+                            if let Some((href, start, end)) = current.take() {
+                                push_link_segment(
+                                    &mut links,
+                                    &href,
+                                    &rect,
+                                    start,
+                                    end,
+                                    char_count,
+                                    self.page_from_href(&href).is_ok(),
+                                );
+                            }
+                            current = href.map(|href| (href, char_index, char_index + 1));
+                        }
+                    }
+                }
+
+                if let Some((href, start, end)) = current {
+                    push_link_segment(
+                        &mut links,
+                        &href,
+                        &rect,
+                        start,
+                        end,
+                        char_count,
+                        self.page_from_href(&href).is_ok(),
+                    );
+                }
+                Ok(())
+            })?;
+        }
+
+        links.retain(|link| !internal_only || link.internal);
+        Ok(links)
+    }
+
     pub fn text_between_xpointers(&self, start: &str, end: &str) -> Result<String> {
         let mut text = String::new();
         for (rect, slice_start, slice_end) in self.clipped_lines_between_xpointers(start, end)? {
@@ -1081,7 +1152,10 @@ impl Document {
             return Ok(*page);
         }
 
-        let position = parse_text_position(trimmed)?;
+        let position = match parse_text_position(trimmed) {
+            Ok(position) => position,
+            Err(_) => return self.page_from_href(trimmed),
+        };
         let chunk_index = *self
             .spine_to_chunk
             .get(&position.spine_index)
@@ -1101,6 +1175,16 @@ impl Document {
         let page = self.page_from_xpointer(xpointer)?;
         self.current_page = page;
         Ok(page)
+    }
+
+    pub fn compare_xpointers(&self, left: &str, right: &str) -> Result<i32> {
+        let left = parse_text_position(left)?;
+        let right = parse_text_position(right)?;
+        Ok(match right.cmp(&left) {
+            std::cmp::Ordering::Greater => 1,
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+        })
     }
 
     pub fn current_position(&self) -> Result<TextPosition> {
@@ -1310,6 +1394,39 @@ fn node_attr<'a>(node: &'a Node, name: &str) -> Option<&'a str> {
 
 fn is_word_char(ch: char) -> bool {
     ch.is_alphanumeric() || matches!(ch, '\'' | '\u{2019}' | '-' | '_')
+}
+
+fn push_link_segment(
+    links: &mut Vec<PageLink>,
+    href: &str,
+    rect: &TextBox,
+    start: usize,
+    end: usize,
+    char_count: usize,
+    internal: bool,
+) {
+    if start >= end {
+        return;
+    }
+    let x0 = rect.x + rect.width * (start as f32 / char_count as f32);
+    let x1 = rect.x + rect.width * (end as f32 / char_count as f32);
+    let segment = TextBox {
+        text: String::new(),
+        page: rect.page,
+        x: x0,
+        y: rect.y,
+        width: (x1 - x0).max(1.0),
+        height: rect.height,
+    };
+    if let Some(link) = links.iter_mut().find(|link| link.href == href) {
+        link.rects.push(segment);
+    } else {
+        links.push(PageLink {
+            href: href.to_string(),
+            internal,
+            rects: vec![segment],
+        });
+    }
 }
 
 fn byte_offset_for_char(text: &str, char_offset: usize) -> usize {

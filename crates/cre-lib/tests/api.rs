@@ -46,9 +46,31 @@ fn document_exposes_juliet_metadata_pages_and_toc() {
     assert!(toc.iter().all(|entry| entry.page.is_some()));
 
     let first = toc[0].clone();
+    let second = toc
+        .iter()
+        .find(|entry| entry.page != first.page)
+        .unwrap()
+        .clone();
+    let first_xpointer = first.xpointer.clone().unwrap();
+    let second_xpointer = second.xpointer.clone().unwrap();
     let resolved = doc.page_from_href(&first.href).unwrap();
     assert_eq!(resolved, first.page.unwrap());
     assert_eq!(doc.go_to_href(&first.href).unwrap(), resolved);
+    assert_eq!(
+        doc.compare_xpointers(&first_xpointer, &second_xpointer)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        doc.compare_xpointers(&second_xpointer, &first_xpointer)
+            .unwrap(),
+        -1
+    );
+    assert_eq!(
+        doc.compare_xpointers(&first_xpointer, &first_xpointer)
+            .unwrap(),
+        0
+    );
 
     let first_bitmap = doc.render_page(1).unwrap();
     assert_eq!(first_bitmap.width, 600);
@@ -348,6 +370,22 @@ fn document_hit_tests_internal_epub_links() {
     );
     assert_eq!(
         doc.page_from_href(&links[0]).unwrap(),
+        doc.toc()[1].page.unwrap()
+    );
+
+    let page_links = doc.page_links(1, true).unwrap();
+    assert!(!page_links.is_empty());
+    for link in &page_links {
+        assert!(link.internal);
+        assert!(link.href.ends_with("ch2.xhtml#target"));
+        assert!(!link.rects.is_empty());
+        for rect in &link.rects {
+            assert_eq!(rect.page, 1);
+            assert!(rect.width > 0.0 && rect.height > 0.0);
+        }
+    }
+    assert_eq!(
+        doc.page_from_xpointer(&page_links[0].href).unwrap(),
         doc.toc()[1].page.unwrap()
     );
 }
