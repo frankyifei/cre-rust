@@ -5,6 +5,7 @@ members = [
     "crates/cre-epub", "crates/cre-fb2",
     "crates/cre-ffi",
     "crates/cre-lib",
+    "crates/cre-lua",
     "crates/cre-paint",
     "crates/cre-render", "crates/cre-text",
 ]
