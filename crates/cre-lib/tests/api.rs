@@ -728,3 +728,28 @@ fn document_exposes_resources_cover_and_html() {
     let segment = doc.extend_to_sentence(&xpointer, &xpointer).unwrap();
     assert!(segment.is_some(), "expected a sentence segment");
 }
+
+#[test]
+fn renders_svg_image_to_rgba() {
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="20">
+        <rect width="10" height="20" fill="red"/>
+    </svg>"#;
+
+    let (pixels, width, height) = cre_lib::render_svg_image(svg, None, None).expect("renders SVG");
+    assert_eq!((width, height), (10, 20));
+    assert_eq!(pixels.len(), 10 * 20 * 4);
+    assert!(
+        pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel[0] > 200 && pixel[1] < 50 && pixel[2] < 50),
+        "expected a red fill"
+    );
+
+    let (_, scaled_width, scaled_height) =
+        cre_lib::render_svg_image(svg, Some(5), Some(10)).unwrap();
+    assert_eq!((scaled_width, scaled_height), (5, 10));
+
+    assert!(cre_lib::render_svg_image(b"not an svg", None, None).is_none());
+}

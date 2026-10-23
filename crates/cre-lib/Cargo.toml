@@ -22,4 +22,8 @@ cre-fb2 = { path = "../cre-fb2" }
 cre-paint = { path = "../cre-paint" }
 cre-text = { path = "../cre-text" }
 percent-encoding = "2"
+resvg = { version = "0.48.1", default-features = false, features = [
+    "text",
+    "system-fonts",
+] }
 url = "2"

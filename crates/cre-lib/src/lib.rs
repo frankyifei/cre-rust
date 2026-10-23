@@ -1990,6 +1990,48 @@ fn epub_cover_image(book: &EpubBook) -> Option<Vec<u8>> {
     book.resources.get(&key).cloned()
 }
 
+/// Rasterizes an SVG document into premultiplied RGBA bytes on a white background.
+///
+/// When `target_width`/`target_height` are provided the intrinsic size is scaled
+/// proportionally to fit inside that box. Returns `None` when the data is not a
+/// valid scalable SVG document.
+pub fn render_svg_image(
+    data: &[u8],
+    target_width: Option<u32>,
+    target_height: Option<u32>,
+) -> Option<(Vec<u8>, u32, u32)> {
+    let mut options = resvg::usvg::Options::default();
+    let mut fontdb = resvg::usvg::fontdb::Database::new();
+    fontdb.load_system_fonts();
+    options.fontdb = std::sync::Arc::new(fontdb);
+
+    let tree = resvg::usvg::Tree::from_data(data, &options).ok()?;
+    let size = tree.size();
+    let (src_width, src_height) = (size.width(), size.height());
+    if !(src_width > 0.0 && src_height > 0.0) {
+        return None;
+    }
+
+    let scale = match (target_width, target_height) {
+        (Some(width), Some(height)) => (width as f32 / src_width).min(height as f32 / src_height),
+        (Some(width), None) => width as f32 / src_width,
+        (None, Some(height)) => height as f32 / src_height,
+        (None, None) => 1.0,
+    };
+    let out_width = ((src_width * scale).round() as u32).max(1);
+    let out_height = ((src_height * scale).round() as u32).max(1);
+
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(out_width, out_height)?;
+    pixmap.fill(resvg::tiny_skia::Color::WHITE);
+    let transform = resvg::tiny_skia::Transform::from_scale(
+        out_width as f32 / src_width,
+        out_height as f32 / src_height,
+    );
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+    Some((pixmap.take(), out_width, out_height))
+}
+
 fn element_id(node: &Node) -> Option<String> {
     node.element_data()
         .and_then(|element| element.id.as_ref())

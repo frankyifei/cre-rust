@@ -393,6 +393,17 @@ unsafe fn arg_str(l: *mut lua_State, index: c_int) -> Option<String> {
     Some(String::from_utf8_lossy(bytes).into_owned())
 }
 
+unsafe fn arg_bytes(l: *mut lua_State, index: c_int) -> Option<Vec<u8>> {
+    let mut len = 0;
+    // SAFETY: `index` is a valid Lua stack index for this call.
+    let ptr = unsafe { lua::lua_tolstring(l, index, &mut len) };
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: Lua guarantees `ptr` points to `len` readable bytes.
+    Some(unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) }.to_vec())
+}
+
 unsafe fn arg_int(l: *mut lua_State, index: c_int) -> i64 {
     // SAFETY: `index` is a valid Lua stack index for this call.
     unsafe { lua::lua_tointeger_(l, index) }
@@ -705,8 +716,39 @@ unsafe extern "C-unwind" fn module_soft_hyphenate(l: *mut lua_State) -> c_int {
     1
 }
 
-unsafe extern "C-unwind" fn module_render_image_data(_l: *mut lua_State) -> c_int {
-    0
+unsafe extern "C-unwind" fn module_render_image_data(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state; the image data comes from Lua and is
+    // either a lightuserdata buffer with an explicit size or a string.
+    unsafe {
+        let data = if lua::lua_islightuserdata(l, 1) != 0 {
+            let size = arg_int(l, 2).max(0) as usize;
+            let ptr = lua::lua_touserdata(l, 1).cast::<u8>();
+            if ptr.is_null() {
+                return 0;
+            }
+            std::slice::from_raw_parts(ptr, size).to_vec()
+        } else if let Some(bytes) = arg_bytes(l, 1) {
+            bytes
+        } else {
+            return 0;
+        };
+        let target_width = (lua::lua_isnumber(l, 3) != 0).then(|| arg_int(l, 3).max(0) as u32);
+        let target_height = (lua::lua_isnumber(l, 4) != 0).then(|| arg_int(l, 4).max(0) as u32);
+        let Some((pixels, width, height)) =
+            cre_lib::render_svg_image(&data, target_width, target_height)
+        else {
+            return 0;
+        };
+        let buffer = libc::malloc(pixels.len().max(1)).cast::<u8>();
+        if buffer.is_null() {
+            return 0;
+        }
+        ptr::copy_nonoverlapping(pixels.as_ptr(), buffer, pixels.len());
+        lua::lua_pushlightuserdata(l, buffer.cast());
+        push_int(l, i64::from(width));
+        push_int(l, i64::from(height));
+    }
+    3
 }
 
 unsafe extern "C-unwind" fn module_get_balanced_html(l: *mut lua_State) -> c_int {
