@@ -13,4 +13,5 @@ doctest = false
 [dependencies]
 anyhow = "1"
 cre-lib = { path = "../cre-lib" }
+libc = "0.2"
 mlua = { version = "0.11", features = ["luajit", "module"] }

@@ -1,7 +1,11 @@
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_int};
+use std::hash::{Hash, Hasher};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use cre_lib::{Document, DocumentFormat, DocumentOptions};
 use mlua::ffi as lua;
@@ -20,6 +24,14 @@ struct BlitBuffer {
     config: u8,
 }
 
+#[derive(Clone)]
+struct PageMapEntry {
+    page: usize,
+    xpointer: String,
+    doc_y: i64,
+    label: String,
+}
+
 struct Doc {
     inner: Option<Document>,
     width: u32,
@@ -27,14 +39,33 @@ struct Doc {
     layout_height: u32,
     margins: (i32, i32, i32, i32),
     font_face: String,
+    font_path: Option<PathBuf>,
     font_size: i32,
     path: Option<PathBuf>,
     last_range: Option<(String, String)>,
     last_boxes: Vec<cre_lib::TextBox>,
+    properties: HashMap<String, String>,
+    alt_properties: HashMap<String, String>,
+    view_mode: i32,
+    visible_page_count: i32,
+    header_height: i32,
+    interline: i32,
+    stylesheet: String,
+    background_color: String,
+    background_image: String,
+    battery: i32,
+    partial_rerendering: bool,
+    rerender_count: usize,
+    history: Vec<String>,
+    history_index: usize,
+    page_map: Vec<PageMapEntry>,
+    page_map_source: String,
+    page_map_chars: usize,
+    highlight: Option<(String, String)>,
 }
 
 impl Doc {
-    fn new(width: u32, height: u32) -> Self {
+    fn new(width: u32, height: u32, view_mode: i32) -> Self {
         Self {
             inner: None,
             width: width.max(1),
@@ -42,10 +73,29 @@ impl Doc {
             layout_height: 100_000,
             margins: (0, 0, 0, 0),
             font_face: "Noto Serif".to_string(),
+            font_path: None,
             font_size: 22,
             path: None,
             last_range: None,
             last_boxes: Vec::new(),
+            properties: HashMap::new(),
+            alt_properties: HashMap::new(),
+            view_mode,
+            visible_page_count: 1,
+            header_height: 0,
+            interline: 100,
+            stylesheet: String::new(),
+            background_color: String::new(),
+            background_image: String::new(),
+            battery: 0,
+            partial_rerendering: false,
+            rerender_count: 0,
+            history: Vec::new(),
+            history_index: 0,
+            page_map: Vec::new(),
+            page_map_source: String::new(),
+            page_map_chars: 0,
+            highlight: None,
         }
     }
 
@@ -56,10 +106,13 @@ impl Doc {
             layout_height: self.layout_height,
             page_margin: self.margins.0.max(0) as f32,
             font_size: self.font_size.max(1) as f32,
-            font_path: None,
+            font_path: self.font_path.clone(),
         };
         self.inner = Some(Document::with_options(&path, &options)?);
         self.path = Some(path);
+        self.page_map.clear();
+        self.page_map_source.clear();
+        self.page_map_chars = 0;
         Ok(())
     }
 
@@ -81,6 +134,66 @@ impl Doc {
         if let (Some(xpointer), Some(inner)) = (xpointer, self.inner.as_mut()) {
             let _ = inner.go_to_xpointer(&xpointer);
         }
+        self.page_map.clear();
+        self.page_map_source.clear();
+        self.page_map_chars = 0;
+    }
+
+    fn current_xpointer(&self) -> Option<String> {
+        self.inner.as_ref().and_then(|inner| {
+            inner
+                .xpointer_from_page(inner.current_page())
+                .ok()
+                .filter(|xpointer| !xpointer.is_empty())
+        })
+    }
+
+    fn record_history(&mut self) {
+        let Some(xpointer) = self.current_xpointer() else {
+            return;
+        };
+        if self.history.get(self.history_index) == Some(&xpointer) {
+            return;
+        }
+        self.history.truncate(self.history_index + 1);
+        if self.history.last() == Some(&xpointer) {
+            return;
+        }
+        self.history.push(xpointer);
+        self.history_index = self.history.len().saturating_sub(1);
+    }
+
+    fn build_synthetic_page_map(&mut self, chars_per_page: usize) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        let chars_per_page = chars_per_page.max(1);
+        let mut entries = Vec::new();
+        let mut characters = 0usize;
+        let mut next_label_at = 0usize;
+        let mut label = 1usize;
+        for page in 1..=inner.page_count() {
+            if (characters >= next_label_at || page == 1)
+                && let Ok(xpointer) = inner.xpointer_from_page(page)
+            {
+                entries.push(PageMapEntry {
+                    page,
+                    xpointer,
+                    doc_y: (page.saturating_sub(1) * self.height as usize) as i64,
+                    label: label.to_string(),
+                });
+                label += 1;
+                next_label_at = characters + chars_per_page;
+            }
+            characters += inner.page_text(page).map_or(0, |text| text.chars().count());
+        }
+        self.page_map = entries;
+        self.page_map_chars = chars_per_page;
+        self.page_map_source = "synthetic".to_string();
+    }
+
+    fn page_map_index_for_page(&self, page: usize) -> Option<usize> {
+        self.page_map.iter().rposition(|entry| entry.page <= page)
     }
 
     fn current_page(&self) -> usize {
@@ -90,6 +203,144 @@ impl Doc {
     fn page_count(&self) -> usize {
         self.inner.as_ref().map_or(0, Document::page_count)
     }
+}
+
+struct FontFace {
+    name: String,
+    path: PathBuf,
+    index: i32,
+}
+
+static FONT_CACHE: OnceLock<Vec<FontFace>> = OnceLock::new();
+static REGISTERED_FONTS: OnceLock<Mutex<Vec<FontFace>>> = OnceLock::new();
+static GAMMA_INDEX: AtomicI32 = AtomicI32::new(2);
+static GAMMA_LEVEL: AtomicU32 = AtomicU32::new(1.0f32.to_bits());
+static IMAGE_REPLACEMENT_CHAR: AtomicU32 = AtomicU32::new(' ' as u32);
+
+fn font_dir_state() -> &'static Mutex<String> {
+    static STATE: OnceLock<Mutex<String>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(String::new()))
+}
+
+fn hyph_state() -> &'static Mutex<String> {
+    static STATE: OnceLock<Mutex<String>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(String::new()))
+}
+
+fn user_hyph_state() -> &'static Mutex<HashSet<String>> {
+    static STATE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn font_faces() -> &'static Vec<FontFace> {
+    FONT_CACHE.get_or_init(|| {
+        let mut roots = vec![
+            PathBuf::from("/usr/share/fonts"),
+            PathBuf::from("/usr/local/share/fonts"),
+            PathBuf::from("/system/fonts"),
+            PathBuf::from("/mnt/us/fonts"),
+        ];
+        if let Ok(home) = std::env::var("HOME") {
+            roots.push(Path::new(&home).join(".fonts"));
+            roots.push(Path::new(&home).join(".local/share/fonts"));
+        }
+        if let Ok(extra) = std::env::var("CRE_FONT_DIR") {
+            roots.push(PathBuf::from(extra));
+        }
+
+        let mut faces = Vec::new();
+        let mut seen = HashSet::new();
+        for root in roots {
+            collect_font_faces(&root, 0, &mut faces, &mut seen);
+        }
+        faces.sort_by(|left, right| left.name.cmp(&right.name));
+        faces
+    })
+}
+
+fn collect_font_faces(
+    directory: &Path,
+    depth: usize,
+    faces: &mut Vec<FontFace>,
+    seen: &mut HashSet<String>,
+) {
+    if depth > 6 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_font_faces(&path, depth + 1, faces, seen);
+            continue;
+        }
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !matches!(extension.as_str(), "ttf" | "otf" | "ttc") {
+            continue;
+        }
+        let Some(name) = font_name_from_path(&path) else {
+            continue;
+        };
+        let key = name.to_ascii_lowercase();
+        if !seen.insert(key) {
+            continue;
+        }
+        faces.push(FontFace {
+            name,
+            path,
+            index: 0,
+        });
+    }
+}
+
+fn font_name_from_path(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let family = stem.split(['-', '_']).next().unwrap_or(stem);
+    let mut name = String::new();
+    for ch in family.chars() {
+        if ch.is_uppercase() && !name.is_empty() && !name.ends_with(' ') {
+            name.push(' ');
+        }
+        name.push(ch);
+    }
+    (!name.is_empty()).then_some(name)
+}
+
+fn normalize_face_name(name: &str) -> String {
+    name.chars()
+        .filter(|ch| !ch.is_whitespace() && *ch != '-' && *ch != '_')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn find_font_face(name: &str) -> Option<FontFace> {
+    let normalized = normalize_face_name(name);
+    let registered = REGISTERED_FONTS.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(registered) = registered.lock()
+        && let Some(face) = registered
+            .iter()
+            .find(|face| normalize_face_name(&face.name) == normalized)
+    {
+        return Some(FontFace {
+            name: face.name.clone(),
+            path: face.path.clone(),
+            index: face.index,
+        });
+    }
+    font_faces()
+        .iter()
+        .find(|face| normalize_face_name(&face.name) == normalized)
+        .map(|face| FontFace {
+            name: face.name.clone(),
+            path: face.path.clone(),
+            index: face.index,
+        })
 }
 
 unsafe fn doc_ref<'a>(l: *mut lua_State) -> Option<&'a Doc> {
@@ -109,6 +360,25 @@ unsafe fn doc_mut<'a>(l: *mut lua_State) -> Option<&'a mut Doc> {
 unsafe fn push_str(l: *mut lua_State, value: &str) {
     // SAFETY: `value` is valid for the duration of the call and Lua copies it.
     unsafe { lua::lua_pushlstring_(l, value.as_ptr().cast(), value.len()) };
+}
+
+unsafe fn push_bytes(l: *mut lua_State, value: &[u8]) {
+    // SAFETY: `value` is valid for the duration of the call and Lua copies it.
+    unsafe { lua::lua_pushlstring_(l, value.as_ptr().cast(), value.len()) };
+}
+
+unsafe fn push_malloc_bytes(l: *mut lua_State, value: &[u8]) -> bool {
+    // SAFETY: `malloc` is matched by the caller's `free` (KOReader ffi.C.free).
+    unsafe {
+        let buffer = libc::malloc(value.len().max(1)).cast::<u8>();
+        if buffer.is_null() {
+            return false;
+        }
+        ptr::copy_nonoverlapping(value.as_ptr(), buffer, value.len());
+        lua::lua_pushlightuserdata(l, buffer.cast());
+        push_int(l, value.len() as i64);
+    }
+    true
 }
 
 unsafe fn arg_str(l: *mut lua_State, index: c_int) -> Option<String> {
@@ -143,6 +413,32 @@ unsafe fn push_int(l: *mut lua_State, value: i64) {
     unsafe { lua::lua_pushinteger(l, value) };
 }
 
+fn cfi_for_position(position: &cre_lib::TextPosition) -> String {
+    let mut path = String::new();
+    for segment in &position.path {
+        path.push('/');
+        path.push_str(&(segment.index.saturating_mul(2)).to_string());
+    }
+    format!(
+        "epubcfi(/6/{}!/4{}:{})",
+        position.spine_index.saturating_mul(2),
+        path,
+        position.codepoint_offset
+    )
+}
+
+fn cfi_range_for_positions(start: &cre_lib::TextPosition, end: &cre_lib::TextPosition) -> String {
+    let base = cfi_for_position(start);
+    let base = base
+        .strip_prefix("epubcfi(")
+        .and_then(|value| value.strip_suffix(')'))
+        .unwrap_or(base.as_str());
+    format!(
+        "epubcfi({},/1:{},/1:{})",
+        base, start.codepoint_offset, end.codepoint_offset
+    )
+}
+
 unsafe fn format_name(format: DocumentFormat) -> &'static str {
     match format {
         DocumentFormat::Epub => "EPUB",
@@ -155,14 +451,348 @@ unsafe extern "C-unwind" fn stub(_l: *mut lua_State) -> c_int {
     0
 }
 
-unsafe extern "C-unwind" fn return_one(_l: *mut lua_State) -> c_int {
+unsafe extern "C-unwind" fn module_init_cache(_l: *mut lua_State) -> c_int {
+    0
+}
+
+unsafe extern "C-unwind" fn module_init_hyph_dict(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let path = arg_str(l, 1).unwrap_or_default();
+        if let Ok(mut state) = font_dir_state().lock() {
+            *state = path;
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn module_get_font_faces(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let faces = font_faces();
+        lua::lua_createtable(l, faces.len() as c_int, 0);
+        for (index, face) in faces.iter().enumerate() {
+            push_str(l, &face.name);
+            lua::lua_rawseti_(l, -2, (index + 1) as c_int);
+        }
+    }
     1
 }
 
-unsafe extern "C-unwind" fn return_true(l: *mut lua_State) -> c_int {
+unsafe extern "C-unwind" fn module_font_face_filename(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
-    unsafe { lua::lua_pushboolean(l, 1) };
+    unsafe {
+        let Some(name) = arg_str(l, 1) else {
+            return 0;
+        };
+        let Some(face) = find_font_face(&name) else {
+            return 0;
+        };
+        push_str(l, &face.path.to_string_lossy());
+        push_int(l, i64::from(face.index));
+        push_bool(l, false);
+        push_bool(l, false);
+        push_bool(l, false);
+    }
+    5
+}
+
+unsafe extern "C-unwind" fn module_font_face_weights(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(name) = arg_str(l, 1) else {
+            return 0;
+        };
+        if find_font_face(&name).is_none() {
+            lua::lua_newtable(l);
+            return 1;
+        }
+        lua::lua_createtable(l, 2, 0);
+        push_int(l, 400);
+        lua::lua_rawseti_(l, -2, 1);
+        push_int(l, 700);
+        lua::lua_rawseti_(l, -2, 2);
+    }
     1
+}
+
+unsafe extern "C-unwind" fn module_get_gamma_level(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        lua::lua_pushnumber(
+            l,
+            f32::from_bits(GAMMA_LEVEL.load(Ordering::Relaxed)) as f64,
+        )
+    };
+    1
+}
+
+unsafe extern "C-unwind" fn module_get_gamma_index(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe { push_int(l, i64::from(GAMMA_INDEX.load(Ordering::Relaxed))) };
+    1
+}
+
+unsafe extern "C-unwind" fn module_set_gamma_index(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let index = arg_int(l, 1).clamp(0, 4) as i32;
+        let level = [0.8f32, 0.9, 1.0, 1.1, 1.2][index as usize];
+        GAMMA_INDEX.store(index, Ordering::Relaxed);
+        GAMMA_LEVEL.store(level.to_bits(), Ordering::Relaxed);
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn module_register_font(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(path) = arg_str(l, 1) else {
+            return 0;
+        };
+        let path = PathBuf::from(&path);
+        if !path.exists() {
+            return 0;
+        }
+        let name = font_name_from_path(&path).unwrap_or_else(|| {
+            path.file_stem().map_or_else(
+                || "Registered Font".to_string(),
+                |stem| stem.to_string_lossy().into_owned(),
+            )
+        });
+        let registered = REGISTERED_FONTS.get_or_init(|| Mutex::new(Vec::new()));
+        if let Ok(mut fonts) = registered.lock() {
+            if fonts.iter().any(|font| font.path == path) {
+                return 0;
+            }
+            fonts.push(FontFace {
+                name,
+                path,
+                index: 0,
+            });
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn module_set_preferred_font(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let face = arg_str(l, 1).unwrap_or_default();
+        if let Ok(mut state) = hyph_state().lock() {
+            *state = face;
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn module_get_hyph_dict_list(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe { lua::lua_newtable(l) };
+    1
+}
+
+unsafe extern "C-unwind" fn module_get_selected_hyph_dict(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let dict = hyph_state()
+            .lock()
+            .map(|state| state.clone())
+            .unwrap_or_default();
+        push_str(l, &dict);
+        push_int(l, 2);
+        push_int(l, 2);
+    }
+    3
+}
+
+unsafe extern "C-unwind" fn module_set_hyph_dict(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let dict = arg_str(l, 1).unwrap_or_default();
+        if let Ok(mut state) = hyph_state().lock() {
+            *state = dict;
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn module_get_text_lang_status(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let dict = hyph_state()
+            .lock()
+            .map(|state| state.clone())
+            .unwrap_or_default();
+        push_str(l, "en");
+        push_str(l, &dict);
+        lua::lua_createtable(l, 0, 1);
+        push_str(l, "en");
+        lua::lua_createtable(l, 0, 3);
+        push_str(l, "hyph_dict_name");
+        push_str(l, &dict);
+        lua::lua_rawset(l, -3);
+        push_str(l, "lang_tag");
+        push_str(l, "en");
+        lua::lua_rawset(l, -3);
+        push_str(l, "hyph_left_min");
+        push_int(l, 2);
+        lua::lua_rawset(l, -3);
+        lua::lua_rawset(l, -3);
+    }
+    3
+}
+
+unsafe extern "C-unwind" fn module_dom_version(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe { push_int(l, 1) };
+    1
+}
+
+unsafe extern "C-unwind" fn module_set_user_hyph(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(filename) = arg_str(l, 1) else {
+            return 0;
+        };
+        let ok = Path::new(&filename).exists();
+        if ok && let Ok(mut files) = user_hyph_state().lock() {
+            files.insert(filename);
+        }
+        push_int(l, i64::from(ok));
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn module_get_hyphenation(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let word = arg_str(l, 1).unwrap_or_default();
+        push_str(l, &word);
+    }
+    1
+}
+
+fn soft_hyphenate(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for word in text.split_inclusive(char::is_whitespace) {
+        let chars = word.chars().collect::<Vec<_>>();
+        let letters = chars.iter().filter(|ch| ch.is_alphabetic()).count();
+        if letters < 6 {
+            out.push_str(word);
+            continue;
+        }
+        let mut letters_seen = 0usize;
+        for ch in chars {
+            out.push(ch);
+            if ch.is_alphabetic() {
+                letters_seen += 1;
+                if letters_seen.is_multiple_of(3) && letters_seen + 2 < letters {
+                    out.push('\u{00AD}');
+                }
+            }
+        }
+    }
+    out
+}
+
+unsafe extern "C-unwind" fn module_soft_hyphenate(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let text = arg_str(l, 2).unwrap_or_default();
+        push_str(l, &soft_hyphenate(&text));
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn module_render_image_data(_l: *mut lua_State) -> c_int {
+    0
+}
+
+unsafe extern "C-unwind" fn module_get_balanced_html(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(html) = arg_str(l, 1) else {
+            return 0;
+        };
+        push_str(l, &html);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn module_smooth_scale(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state; the BlitBuffer comes from Lua cdata.
+    unsafe {
+        let bb = lua::lua_topointer(l, 1).cast::<BlitBuffer>();
+        let dw = arg_int(l, 2).clamp(1, 16_384) as u32;
+        let dh = arg_int(l, 3).clamp(1, 16_384) as u32;
+        if bb.is_null() || (*bb).data.is_null() || (*bb).w == 0 || (*bb).h == 0 {
+            return 0;
+        }
+        let bb = &*bb;
+        let width = bb.w;
+        let height = bb.h;
+        let stride = bb.stride;
+        let source = std::slice::from_raw_parts(bb.data, stride.saturating_mul(height as usize));
+        let size = (dw as usize) * (dh as usize) * 4;
+        let buffer = libc::malloc(size).cast::<u8>();
+        if buffer.is_null() {
+            return 0;
+        }
+        let output = std::slice::from_raw_parts_mut(buffer, size);
+        for y in 0..dh {
+            let src_y = if dh > 1 {
+                (y as f64) * ((height - 1) as f64) / ((dh - 1) as f64)
+            } else {
+                0.0
+            };
+            for x in 0..dw {
+                let src_x = if dw > 1 {
+                    (x as f64) * ((width - 1) as f64) / ((dw - 1) as f64)
+                } else {
+                    0.0
+                };
+                let sample = |sx: u32, sy: u32| -> [u8; 4] {
+                    let offset = sy as usize * stride + sx as usize * 4;
+                    [
+                        source.get(offset).copied().unwrap_or(255),
+                        source.get(offset + 1).copied().unwrap_or(255),
+                        source.get(offset + 2).copied().unwrap_or(255),
+                        source.get(offset + 3).copied().unwrap_or(255),
+                    ]
+                };
+                let x0 = src_x.floor() as u32;
+                let y0 = src_y.floor() as u32;
+                let x1 = (x0 + 1).min(width - 1);
+                let y1 = (y0 + 1).min(height - 1);
+                let fx = (src_x - x0 as f64) as f32;
+                let fy = (src_y - y0 as f64) as f32;
+                let a = sample(x0, y0);
+                let b = sample(x1, y0);
+                let c = sample(x0, y1);
+                let d = sample(x1, y1);
+                let offset = (y as usize * dw as usize + x as usize) * 4;
+                for channel in 0..4 {
+                    let top = a[channel] as f32 * (1.0 - fx) + b[channel] as f32 * fx;
+                    let bottom = c[channel] as f32 * (1.0 - fx) + d[channel] as f32 * fx;
+                    output[offset + channel] =
+                        (top * (1.0 - fy) + bottom * fy).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        lua::lua_pushlightuserdata(l, buffer.cast());
+        push_int(l, size as i64);
+    }
+    2
+}
+
+unsafe extern "C-unwind" fn module_set_image_replacement_char(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let value = arg_int(l, 1).clamp(0, i64::from(u32::MAX)) as u32;
+        IMAGE_REPLACEMENT_CHAR.store(value, Ordering::Relaxed);
+    }
+    0
 }
 
 unsafe extern "C-unwind" fn return_false(l: *mut lua_State) -> c_int {
@@ -189,12 +819,6 @@ unsafe extern "C-unwind" fn return_empty_table(l: *mut lua_State) -> c_int {
     1
 }
 
-unsafe extern "C-unwind" fn return_arg2(l: *mut lua_State) -> c_int {
-    // SAFETY: the argument may be absent; `lua_pushvalue` preserves nil.
-    unsafe { lua::lua_pushvalue(l, 2) };
-    1
-}
-
 unsafe extern "C-unwind" fn module_noop(_l: *mut lua_State) -> c_int {
     0
 }
@@ -205,8 +829,9 @@ unsafe extern "C-unwind" fn new_doc_view(l: *mut lua_State) -> c_int {
         unsafe {
             let width = arg_int(l, 1).max(1) as u32;
             let height = arg_int(l, 2).max(1) as u32;
+            let view_mode = arg_int(l, 3) as i32;
             let ptr = lua::lua_newuserdata(l, std::mem::size_of::<Doc>()).cast::<Doc>();
-            ptr::write(ptr, Doc::new(width, height));
+            ptr::write(ptr, Doc::new(width, height, view_mode));
             lua::luaL_getmetatable(l, CREDOC.as_ptr().cast());
             lua::lua_setmetatable(l, -2);
         }
@@ -240,7 +865,12 @@ unsafe extern "C-unwind" fn doc_load(l: *mut lua_State) -> c_int {
             let Some(path) = arg_str(l, 2) else {
                 return false;
             };
-            doc.open(PathBuf::from(path)).is_ok()
+            if doc.open(PathBuf::from(path)).is_ok() {
+                doc.record_history();
+                true
+            } else {
+                false
+            }
         }
     }))
     .unwrap_or(false);
@@ -345,6 +975,12 @@ unsafe extern "C-unwind" fn doc_goto_page(l: *mut lua_State) -> c_int {
             let _ = inner.go_to_page(page);
         }
     }));
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        if let Some(doc) = doc_mut(l) {
+            doc.record_history();
+        }
+    }
     0
 }
 
@@ -367,6 +1003,12 @@ unsafe extern "C-unwind" fn doc_goto_percent(l: *mut lua_State) -> c_int {
             let _ = inner.go_to_page(page);
         }
     }));
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        if let Some(doc) = doc_mut(l) {
+            doc.record_history();
+        }
+    }
     0
 }
 
@@ -390,6 +1032,12 @@ unsafe extern "C-unwind" fn doc_goto_pos(l: *mut lua_State) -> c_int {
             let _ = inner.go_to_page(page);
         }
     }));
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        if let Some(doc) = doc_mut(l) {
+            doc.record_history();
+        }
+    }
     0
 }
 
@@ -408,6 +1056,12 @@ unsafe extern "C-unwind" fn doc_goto_xpointer(l: *mut lua_State) -> c_int {
             }
         }
     }));
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        if let Some(doc) = doc_mut(l) {
+            doc.record_history();
+        }
+    }
     0
 }
 
@@ -1027,7 +1681,14 @@ unsafe extern "C-unwind" fn doc_set_font_face(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
         if let Some(doc) = doc_mut(l) {
-            doc.font_face = arg_str(l, 2).unwrap_or_default();
+            let face = arg_str(l, 2).unwrap_or_default();
+            let font_path = find_font_face(&face).map(|font| font.path.clone());
+            let changed = doc.font_face != face || doc.font_path != font_path;
+            doc.font_face = face;
+            doc.font_path = font_path;
+            if changed && doc.inner.is_some() {
+                doc.relayout();
+            }
         }
     }
     0
@@ -1051,13 +1712,1117 @@ unsafe extern "C-unwind" fn doc_set_font_size(l: *mut lua_State) -> c_int {
 
 unsafe extern "C-unwind" fn doc_get_int_property(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
-    unsafe { push_int(l, 0) };
+    unsafe {
+        let Some(name) = arg_str(l, 2) else {
+            return 0;
+        };
+        let Some(doc) = doc_ref(l) else {
+            return 0;
+        };
+        let (left, top, right, bottom) = doc.margins;
+        let value = match name.as_str() {
+            "font.size" => i64::from(doc.font_size),
+            "view.mode" => i64::from(doc.view_mode),
+            "crengine.page.margin.left" => i64::from(left),
+            "crengine.page.margin.top" => i64::from(top),
+            "crengine.page.margin.right" => i64::from(right),
+            "crengine.page.margin.bottom" => i64::from(bottom),
+            "crengine.interline.space" => i64::from(doc.interline),
+            "crengine.page.header.height" => i64::from(doc.header_height),
+            "window.pages.two.visible.as.one.page.number" => i64::from(doc.visible_page_count > 1),
+            "window.status.battery.percent" => i64::from(doc.battery),
+            _ => doc
+                .properties
+                .get(&name)
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0),
+        };
+        push_int(l, value);
+    }
     1
 }
 
 unsafe extern "C-unwind" fn doc_get_string_property(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
-    unsafe { push_str(l, "") };
+    unsafe {
+        let Some(name) = arg_str(l, 2) else {
+            return 0;
+        };
+        let Some(doc) = doc_ref(l) else {
+            return 0;
+        };
+        let value = match name.as_str() {
+            "font.face.default" | "font.face" => doc.font_face.clone(),
+            "crengine.textlang.main.lang" => doc
+                .inner
+                .as_ref()
+                .and_then(|inner| inner.metadata().language.clone())
+                .unwrap_or_default(),
+            _ => doc.properties.get(&name).cloned().unwrap_or_default(),
+        };
+        push_str(l, &value);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_set_int_property(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(name) = arg_str(l, 2) else {
+            return 0;
+        };
+        let value = arg_int(l, 3);
+        let Some(doc) = doc_mut(l) else {
+            return 0;
+        };
+        doc.properties.insert(name.clone(), value.to_string());
+        let mut relayout = false;
+        match name.as_str() {
+            "font.size" => {
+                let size = value.clamp(1, 512) as i32;
+                if size != doc.font_size {
+                    doc.font_size = size;
+                    relayout = true;
+                }
+            }
+            "view.mode" => doc.view_mode = value as i32,
+            "crengine.page.margin.left" => {
+                doc.margins.0 = value as i32;
+                relayout = true;
+            }
+            "crengine.page.margin.top" => {
+                doc.margins.1 = value as i32;
+                relayout = true;
+            }
+            "crengine.page.margin.right" => {
+                doc.margins.2 = value as i32;
+                relayout = true;
+            }
+            "crengine.page.margin.bottom" => {
+                doc.margins.3 = value as i32;
+                relayout = true;
+            }
+            "crengine.interline.space" => doc.interline = value as i32,
+            "window.status.battery.percent" => doc.battery = value as i32,
+            _ => {}
+        }
+        if relayout && doc.inner.is_some() {
+            doc.relayout();
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn doc_set_string_property(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(name) = arg_str(l, 2) else {
+            return 0;
+        };
+        let value = arg_str(l, 3).unwrap_or_default();
+        let Some(doc) = doc_mut(l) else {
+            return 0;
+        };
+        doc.properties.insert(name.clone(), value.clone());
+        match name.as_str() {
+            "font.face.default" | "font.face" => {
+                let font_path = find_font_face(&value).map(|font| font.path.clone());
+                let changed = doc.font_face != value || doc.font_path != font_path;
+                doc.font_face = value;
+                doc.font_path = font_path;
+                if changed && doc.inner.is_some() {
+                    doc.relayout();
+                }
+            }
+            "crengine.highlight.selection.color" => {}
+            _ => {}
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn doc_request_render(_l: *mut lua_State) -> c_int {
+    0
+}
+
+unsafe extern "C-unwind" fn doc_set_alt_prop(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(name) = arg_str(l, 2) else {
+            return 0;
+        };
+        if let Some(doc) = doc_mut(l) {
+            if let Some(value) = arg_str(l, 3) {
+                doc.alt_properties.insert(name, value);
+            } else {
+                doc.alt_properties.remove(&name);
+            }
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn doc_can_partial_rerender(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe { push_bool(l, doc_ref(l).is_some_and(|doc| doc.inner.is_some())) };
+    1
+}
+
+unsafe extern "C-unwind" fn doc_is_partial_enabled(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe { push_bool(l, doc_ref(l).is_some_and(|doc| doc.partial_rerendering)) };
+    1
+}
+
+unsafe extern "C-unwind" fn doc_enable_partial(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let enabled = arg_bool(l, 2);
+        if let Some(doc) = doc_mut(l) {
+            doc.partial_rerendering = enabled;
+        }
+        push_bool(
+            l,
+            enabled && doc_ref(l).is_some_and(|doc| doc.inner.is_some()),
+        );
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_partial_count(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let count = doc_ref(l).map_or(0, |doc| doc.rerender_count as i64);
+        push_int(l, count);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_rerender_delayed(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe { push_bool(l, false) };
+    1
+}
+
+unsafe extern "C-unwind" fn doc_set_view_mode(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let mode = arg_int(l, 2) as i32;
+        if let Some(doc) = doc_mut(l) {
+            doc.view_mode = mode;
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn doc_set_header_info(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let info = arg_int(l, 2);
+        if let Some(doc) = doc_mut(l) {
+            doc.properties
+                .insert("header.info".to_string(), info.to_string());
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn doc_set_page_info_override(_l: *mut lua_State) -> c_int {
+    0
+}
+
+unsafe extern "C-unwind" fn doc_set_header_font(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        if let Some(doc) = doc_mut(l) {
+            let face = arg_str(l, 2).unwrap_or_default();
+            doc.properties.insert("header.font.face".to_string(), face);
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn doc_set_header_progress(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        if let Some(doc) = doc_mut(l) {
+            let marks = arg_str(l, 2).unwrap_or_default();
+            doc.properties
+                .insert("header.progress.marks".to_string(), marks);
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn doc_set_default_interline(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        if let Some(doc) = doc_mut(l) {
+            doc.interline = arg_int(l, 2).clamp(0, 1000) as i32;
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn doc_set_stylesheet(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(doc) = doc_mut(l) else {
+            return 0;
+        };
+        let mut stylesheet = String::new();
+        if let Some(path) = arg_str(l, 2)
+            && let Ok(content) = std::fs::read_to_string(&path)
+        {
+            stylesheet.push_str(&content);
+        }
+        if let Some(content) = arg_str(l, 3) {
+            if !stylesheet.is_empty() {
+                stylesheet.push_str("\r\n");
+            }
+            stylesheet.push_str(&content);
+        }
+        doc.stylesheet = stylesheet.clone();
+        doc.properties.insert("stylesheet".to_string(), stylesheet);
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn doc_set_embedded_stylesheet(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let enabled = arg_int(l, 2);
+        if let Some(doc) = doc_mut(l) {
+            doc.properties.insert(
+                "crengine.doc.embedded.styles.enabled".to_string(),
+                enabled.to_string(),
+            );
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn doc_set_embedded_fonts(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let enabled = arg_int(l, 2);
+        if let Some(doc) = doc_mut(l) {
+            doc.properties.insert(
+                "crengine.doc.embedded.fonts.enabled".to_string(),
+                enabled.to_string(),
+            );
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn doc_set_background_image(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        if let Some(doc) = doc_mut(l) {
+            doc.background_image = arg_str(l, 2).unwrap_or_default();
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn doc_set_visible_page_count(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        if let Some(doc) = doc_mut(l) {
+            doc.visible_page_count = arg_int(l, 2).clamp(1, 4) as i32;
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn doc_adjust_font_sizes(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let dpi = arg_int(l, 2);
+        if let Some(doc) = doc_mut(l) {
+            doc.properties
+                .insert("crengine.render.dpi".to_string(), dpi.to_string());
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn doc_set_battery_state(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let battery = arg_int(l, 2);
+        if let Some(doc) = doc_mut(l) {
+            doc.battery = battery as i32;
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn doc_set_callback(_l: *mut lua_State) -> c_int {
+    0
+}
+
+unsafe extern "C-unwind" fn doc_cache_false(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe { push_bool(l, false) };
+    1
+}
+
+unsafe extern "C-unwind" fn doc_cache_path(_l: *mut lua_State) -> c_int {
+    0
+}
+
+unsafe extern "C-unwind" fn doc_invalidate_cache(_l: *mut lua_State) -> c_int {
+    0
+}
+
+unsafe extern "C-unwind" fn doc_update_toc(_l: *mut lua_State) -> c_int {
+    0
+}
+
+unsafe extern "C-unwind" fn doc_statistics(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(inner) = doc_ref(l).and_then(|doc| doc.inner.as_ref()) else {
+            push_str(l, "");
+            return 1;
+        };
+        let mut characters = 0usize;
+        let mut words = 0usize;
+        for page in 1..=inner.page_count() {
+            if let Ok(text) = inner.page_text(page) {
+                characters += text.chars().count();
+                words += text.split_whitespace().count();
+            }
+        }
+        push_str(
+            l,
+            &format!(
+                "characters: {characters}, words: {words}, pages: {}",
+                inner.page_count()
+            ),
+        );
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_unknown_entities(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        push_str(l, "");
+        push_str(l, "");
+        push_str(l, "");
+    }
+    3
+}
+
+unsafe extern "C-unwind" fn doc_build_alternative_toc(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        if let Some(doc) = doc_mut(l) {
+            doc.properties
+                .insert("toc.alternative".to_string(), "1".to_string());
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn doc_is_alternative_toc(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let value = doc_ref(l)
+            .and_then(|doc| doc.properties.get("toc.alternative"))
+            .is_some_and(|value| value == "1");
+        push_bool(l, value);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_get_page_flow(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe { push_int(l, 0) };
+    1
+}
+
+unsafe extern "C-unwind" fn doc_get_page_offset_x(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe { push_int(l, 0) };
+    1
+}
+
+unsafe extern "C-unwind" fn doc_get_header_height(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let height = doc_ref(l).map_or(0, |doc| i64::from(doc.header_height));
+        push_int(l, height);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_get_embedded_font_list(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe { lua::lua_newtable(l) };
+    1
+}
+
+unsafe extern "C-unwind" fn doc_get_lang_tag(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let language = doc_ref(l)
+            .and_then(|doc| doc.inner.as_ref())
+            .and_then(|inner| inner.metadata().language.clone())
+            .unwrap_or_else(|| "en".to_string());
+        push_str(l, &language);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_get_document_file_content(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(path) = arg_str(l, 2) else {
+            return 0;
+        };
+        let data = doc_ref(l)
+            .and_then(|doc| doc.inner.as_ref())
+            .and_then(|inner| inner.resource(&path));
+        let Some(data) = data else {
+            return 0;
+        };
+        push_bytes(l, &data);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_get_html_from_xpointer(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let html = arg_str(l, 2).and_then(|xpointer| {
+            doc_ref(l)
+                .and_then(|doc| doc.inner.as_ref())
+                .and_then(|inner| inner.html_from_xpointer(&xpointer).ok().flatten())
+        });
+        let Some(html) = html else {
+            return 0;
+        };
+        push_str(l, &html);
+        lua::lua_newtable(l);
+        push_str(l, "");
+    }
+    3
+}
+
+unsafe extern "C-unwind" fn doc_get_html_from_xpointers(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(start) = arg_str(l, 2) else {
+            return 0;
+        };
+        let Some(end) = arg_str(l, 3) else {
+            return 0;
+        };
+        let html = doc_ref(l).and_then(|doc| {
+            doc.inner
+                .as_ref()?
+                .html_between_xpointers(&start, &end)
+                .ok()
+                .flatten()
+        });
+        let Some(html) = html else {
+            return 0;
+        };
+        push_str(l, &html);
+        lua::lua_newtable(l);
+        push_str(l, "");
+    }
+    3
+}
+
+unsafe extern "C-unwind" fn doc_extend_sentence(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(start) = arg_str(l, 2) else {
+            return 0;
+        };
+        let Some(end) = arg_str(l, 3) else {
+            return 0;
+        };
+        let extended = doc_ref(l).and_then(|doc| {
+            doc.inner
+                .as_ref()?
+                .extend_to_sentence(&start, &end)
+                .ok()
+                .flatten()
+        });
+        let Some((text, start, end)) = extended else {
+            return 0;
+        };
+        lua::lua_createtable(l, 0, 3);
+        push_str(l, "text");
+        push_str(l, &text);
+        lua::lua_rawset(l, -3);
+        push_str(l, "pos0");
+        push_str(l, &start);
+        lua::lua_rawset(l, -3);
+        push_str(l, "pos1");
+        push_str(l, &end);
+        lua::lua_rawset(l, -3);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_is_link_to_footnote(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(source) = arg_str(l, 2) else {
+            return 0;
+        };
+        let Some(target) = arg_str(l, 3) else {
+            return 0;
+        };
+        let max_text_size = if arg_int(l, 5) > 0 {
+            arg_int(l, 5) as usize
+        } else {
+            10_000
+        };
+        let Some(inner) = doc_ref(l).and_then(|doc| doc.inner.as_ref()) else {
+            return 0;
+        };
+        let source_page = inner.page_from_xpointer(&source).ok();
+        let target_page = inner.page_from_xpointer(&target).ok();
+        let target_text = inner.text_from_xpointer(&target).unwrap_or_default();
+        let is_footnote = target_page.is_some()
+            && target_text.chars().count() <= max_text_size
+            && source_page
+                .zip(target_page)
+                .is_some_and(|(source, target)| target.abs_diff(source) <= 1);
+        push_bool(l, is_footnote);
+        push_str(
+            l,
+            if is_footnote {
+                "target is short and close to the source"
+            } else {
+                "target is not a short nearby text block"
+            },
+        );
+    }
+    2
+}
+
+unsafe extern "C-unwind" fn doc_highlight(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(doc) = doc_mut(l) else {
+            return 0;
+        };
+        if let Some(xpointer) = arg_str(l, 2) {
+            doc.highlight = Some((xpointer.clone(), xpointer));
+        } else {
+            doc.highlight = None;
+        }
+        push_bool(l, true);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_get_cover_image_data(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let data = doc_ref(l)
+            .and_then(|doc| doc.inner.as_ref())
+            .and_then(|inner| inner.cover_image())
+            .map(<[u8]>::to_vec);
+        let Some(data) = data else {
+            return 0;
+        };
+        if !push_malloc_bytes(l, &data) {
+            return 0;
+        }
+    }
+    2
+}
+
+unsafe extern "C-unwind" fn doc_get_image_data(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let x = arg_int(l, 2) as f32;
+        let y = arg_int(l, 3) as f32;
+        let data = doc_ref(l).and_then(|doc| {
+            let inner = doc.inner.as_ref()?;
+            inner
+                .image_data_at(cre_lib::PagePosition {
+                    page: inner.current_page(),
+                    x,
+                    y,
+                })
+                .ok()
+                .flatten()
+        });
+        let Some(data) = data else {
+            return 0;
+        };
+        if !push_malloc_bytes(l, &data) {
+            return 0;
+        }
+    }
+    2
+}
+
+unsafe extern "C-unwind" fn doc_goto_link(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(link) = arg_str(l, 2) else {
+            return 0;
+        };
+        if let Some(doc) = doc_mut(l) {
+            let moved = doc.inner.as_mut().is_some_and(|inner| {
+                inner.go_to_xpointer(&link).is_ok() || inner.go_to_href(&link).is_ok()
+            });
+            if moved {
+                doc.record_history();
+            }
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn doc_go_back(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        if let Some(doc) = doc_mut(l)
+            && doc.history_index > 0
+            && doc.history_index < doc.history.len()
+        {
+            let target = doc.history[doc.history_index - 1].clone();
+            if let Some(inner) = doc.inner.as_mut() {
+                let _ = inner.go_to_xpointer(&target);
+                doc.history_index -= 1;
+            }
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn doc_go_forward(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        if let Some(doc) = doc_mut(l)
+            && doc.history_index + 1 < doc.history.len()
+        {
+            let target = doc.history[doc.history_index + 1].clone();
+            if let Some(inner) = doc.inner.as_mut() {
+                let _ = inner.go_to_xpointer(&target);
+                doc.history_index += 1;
+            }
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn doc_clear_selection(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        if let Some(doc) = doc_mut(l) {
+            doc.last_range = None;
+            doc.last_boxes.clear();
+            doc.highlight = None;
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn doc_next_visible_word_start(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let value = arg_str(l, 2).and_then(|xp| {
+            doc_ref(l)
+                .and_then(|doc| doc.inner.as_ref())
+                .and_then(|inner| inner.next_visible_word_start(&xp).ok().flatten())
+        });
+        let Some(value) = value else {
+            return 0;
+        };
+        push_str(l, &value);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_next_visible_word_end(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let value = arg_str(l, 2).and_then(|xp| {
+            doc_ref(l)
+                .and_then(|doc| doc.inner.as_ref())
+                .and_then(|inner| inner.next_visible_word_end(&xp).ok().flatten())
+        });
+        let Some(value) = value else {
+            return 0;
+        };
+        push_str(l, &value);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_prev_visible_word_start(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let value = arg_str(l, 2).and_then(|xp| {
+            doc_ref(l)
+                .and_then(|doc| doc.inner.as_ref())
+                .and_then(|inner| inner.prev_visible_word_start(&xp).ok().flatten())
+        });
+        let Some(value) = value else {
+            return 0;
+        };
+        push_str(l, &value);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_prev_visible_word_end(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let value = arg_str(l, 2).and_then(|xp| {
+            doc_ref(l)
+                .and_then(|doc| doc.inner.as_ref())
+                .and_then(|inner| inner.prev_visible_word_end(&xp).ok().flatten())
+        });
+        let Some(value) = value else {
+            return 0;
+        };
+        push_str(l, &value);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_next_visible_char(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let value = arg_str(l, 2).and_then(|xp| {
+            doc_ref(l)
+                .and_then(|doc| doc.inner.as_ref())
+                .and_then(|inner| inner.next_visible_char(&xp).ok().flatten())
+        });
+        let Some(value) = value else {
+            return 0;
+        };
+        push_str(l, &value);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_prev_visible_char(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let value = arg_str(l, 2).and_then(|xp| {
+            doc_ref(l)
+                .and_then(|doc| doc.inner.as_ref())
+                .and_then(|inner| inner.prev_visible_char(&xp).ok().flatten())
+        });
+        let Some(value) = value else {
+            return 0;
+        };
+        push_str(l, &value);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_epub_cfi(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let cfi = doc_ref(l)
+            .and_then(|doc| doc.inner.as_ref())
+            .and_then(|inner| inner.xpointer_from_page(inner.current_page()).ok())
+            .and_then(|xp| cre_lib::parse_text_position(&xp).ok())
+            .map(|position| cfi_for_position(&position));
+        let Some(cfi) = cfi else {
+            return 0;
+        };
+        push_str(l, &cfi);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_page_epub_cfi(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let page = arg_int(l, 2).max(1) as usize;
+        let cfi = doc_ref(l)
+            .and_then(|doc| doc.inner.as_ref())
+            .and_then(|inner| inner.xpointer_from_page(page).ok())
+            .and_then(|xp| cre_lib::parse_text_position(&xp).ok())
+            .map(|position| cfi_for_position(&position));
+        let Some(cfi) = cfi else {
+            return 0;
+        };
+        push_str(l, &cfi);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_epub_cfi_from_xpointer(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let cfi = arg_str(l, 2)
+            .and_then(|xp| cre_lib::parse_text_position(&xp).ok())
+            .map(|position| cfi_for_position(&position));
+        let Some(cfi) = cfi else {
+            return 0;
+        };
+        push_str(l, &cfi);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_epub_cfi_range(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(start) = arg_str(l, 2) else {
+            return 0;
+        };
+        let Some(end) = arg_str(l, 3) else {
+            return 0;
+        };
+        let (Ok(start), Ok(end)) = (
+            cre_lib::parse_text_position(&start),
+            cre_lib::parse_text_position(&end),
+        ) else {
+            return 0;
+        };
+        push_str(l, &cfi_range_for_positions(&start, &end));
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_has_page_map_document_provided(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe { push_bool(l, false) };
+    1
+}
+
+unsafe extern "C-unwind" fn doc_is_page_map_document_provided(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe { push_bool(l, false) };
+    1
+}
+
+unsafe extern "C-unwind" fn doc_has_non_linear_flows(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let value = doc_ref(l)
+            .and_then(|doc| doc.inner.as_ref())
+            .is_some_and(Document::has_non_linear_flows);
+        push_bool(l, value);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_build_synthetic_page_map(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let chars = arg_int(l, 2).max(1) as usize;
+        if let Some(doc) = doc_mut(l) {
+            doc.build_synthetic_page_map(chars);
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn doc_build_synthetic_if_none(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let chars = arg_int(l, 2).max(1) as usize;
+        if let Some(doc) = doc_mut(l)
+            && doc.page_map.is_empty()
+        {
+            doc.build_synthetic_page_map(chars);
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn doc_is_page_map_synthetic(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let synthetic = doc_ref(l)
+            .is_some_and(|doc| !doc.page_map.is_empty() && doc.page_map_source == "synthetic");
+        push_bool(l, synthetic);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_get_synthetic_chars(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let chars = doc_ref(l).map_or(0, |doc| doc.page_map_chars as i64);
+        push_int(l, chars);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_has_page_map(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let has_map = doc_ref(l).is_some_and(|doc| !doc.page_map.is_empty());
+        push_bool(l, has_map);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_get_page_map(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(doc) = doc_ref(l) else {
+            return 0;
+        };
+        if doc.page_map.is_empty() {
+            return 0;
+        }
+        lua::lua_createtable(l, doc.page_map.len() as c_int, 0);
+        for (index, entry) in doc.page_map.iter().enumerate() {
+            lua::lua_createtable(l, 0, 4);
+            push_str(l, "page");
+            push_int(l, entry.page as i64);
+            lua::lua_rawset(l, -3);
+            push_str(l, "xpointer");
+            push_str(l, &entry.xpointer);
+            lua::lua_rawset(l, -3);
+            push_str(l, "doc_y");
+            push_int(l, entry.doc_y);
+            lua::lua_rawset(l, -3);
+            push_str(l, "label");
+            push_str(l, &entry.label);
+            lua::lua_rawset(l, -3);
+            lua::lua_rawseti_(l, -2, (index + 1) as c_int);
+        }
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_get_page_map_source(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(doc) = doc_ref(l) else {
+            return 0;
+        };
+        if doc.page_map_source.is_empty() {
+            return 0;
+        }
+        push_str(l, &doc.page_map_source);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_get_page_map_first(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let label = doc_ref(l)
+            .and_then(|doc| doc.page_map.first())
+            .map(|entry| entry.label.clone());
+        let Some(label) = label else {
+            return 0;
+        };
+        push_str(l, &label);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_get_page_map_last(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let label = doc_ref(l)
+            .and_then(|doc| doc.page_map.last())
+            .map(|entry| entry.label.clone());
+        let Some(label) = label else {
+            return 0;
+        };
+        push_str(l, &label);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_get_page_map_current(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(doc) = doc_ref(l) else {
+            return 0;
+        };
+        let page = doc.current_page();
+        let Some(index) = doc.page_map_index_for_page(page) else {
+            return 0;
+        };
+        push_str(l, &doc.page_map[index].label);
+        push_int(l, (index + 1) as i64);
+        push_int(l, doc.page_map.len() as i64);
+    }
+    3
+}
+
+unsafe extern "C-unwind" fn doc_get_page_map_xpointer(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(xpointer) = arg_str(l, 2) else {
+            return 0;
+        };
+        let Some(doc) = doc_ref(l) else {
+            return 0;
+        };
+        let Some(page) = doc
+            .inner
+            .as_ref()
+            .and_then(|inner| inner.page_from_xpointer(&xpointer).ok())
+        else {
+            return 0;
+        };
+        let Some(index) = doc.page_map_index_for_page(page) else {
+            return 0;
+        };
+        push_str(l, &doc.page_map[index].label);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_get_page_map_visible(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(doc) = doc_ref(l) else {
+            return 0;
+        };
+        if doc.page_map.is_empty() {
+            return 0;
+        }
+        let start_page = doc.current_page();
+        let end_page = start_page + doc.visible_page_count.max(1) as usize;
+        let entries = doc
+            .page_map
+            .iter()
+            .filter(|entry| entry.page >= start_page && entry.page < end_page)
+            .collect::<Vec<_>>();
+        lua::lua_createtable(l, entries.len() as c_int, 0);
+        for (index, entry) in entries.iter().enumerate() {
+            lua::lua_createtable(l, 0, 6);
+            push_str(l, "screen_page");
+            push_int(l, (entry.page - start_page + 1) as i64);
+            lua::lua_rawset(l, -3);
+            push_str(l, "screen_y");
+            push_int(l, 0);
+            lua::lua_rawset(l, -3);
+            push_str(l, "page");
+            push_int(l, entry.page as i64);
+            lua::lua_rawset(l, -3);
+            push_str(l, "xpointer");
+            push_str(l, &entry.xpointer);
+            lua::lua_rawset(l, -3);
+            push_str(l, "doc_y");
+            push_int(l, entry.doc_y);
+            lua::lua_rawset(l, -3);
+            push_str(l, "label");
+            push_str(l, &entry.label);
+            lua::lua_rawset(l, -3);
+            lua::lua_rawseti_(l, -2, (index + 1) as c_int);
+        }
+    }
     1
 }
 
@@ -1135,12 +2900,6 @@ unsafe extern "C-unwind" fn doc_get_page_links(l: *mut lua_State) -> c_int {
     1
 }
 
-unsafe extern "C-unwind" fn doc_get_document_file_content(l: *mut lua_State) -> c_int {
-    // SAFETY: `l` is the active Lua state.
-    unsafe { push_str(l, "") };
-    1
-}
-
 unsafe extern "C-unwind" fn doc_get_text_from_xpointer(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
@@ -1160,10 +2919,17 @@ unsafe extern "C-unwind" fn doc_get_text_from_xpointer(l: *mut lua_State) -> c_i
 unsafe extern "C-unwind" fn doc_normalized_xpointer(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let xpointer = arg_str(l, 2).unwrap_or_default();
-        let normalized = cre_lib::parse_text_position(&xpointer)
-            .map_or_else(|_| xpointer, |position| position.to_xpointer());
-        push_str(l, &normalized);
+        let Some(xpointer) = arg_str(l, 2) else {
+            push_bool(l, false);
+            return 1;
+        };
+        let normalized =
+            cre_lib::parse_text_position(&xpointer).map(|position| position.to_xpointer());
+        if let Ok(normalized) = normalized {
+            push_str(l, &normalized);
+        } else {
+            push_bool(l, false);
+        }
     }
     1
 }
@@ -1188,17 +2954,38 @@ unsafe extern "C-unwind" fn doc_compare_xpointers(l: *mut lua_State) -> c_int {
 
 unsafe extern "C-unwind" fn doc_visible_page_count(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
-    unsafe { push_int(l, 1) };
+    unsafe {
+        let count = doc_ref(l).map_or(1, |doc| i64::from(doc.visible_page_count.max(1)));
+        push_int(l, count);
+    }
     1
 }
 
 unsafe extern "C-unwind" fn doc_render_hash(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
-    unsafe { push_int(l, 1) };
+    unsafe {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        if let Some(doc) = doc_ref(l) {
+            doc.width.hash(&mut hasher);
+            doc.height.hash(&mut hasher);
+            doc.font_size.hash(&mut hasher);
+            doc.font_face.hash(&mut hasher);
+            doc.margins.hash(&mut hasher);
+            doc.view_mode.hash(&mut hasher);
+            doc.path.hash(&mut hasher);
+        }
+        push_int(l, hasher.finish() as i64);
+    }
     1
 }
 
-unsafe extern "C-unwind" fn doc_set_background_color(_l: *mut lua_State) -> c_int {
+unsafe extern "C-unwind" fn doc_set_background_color(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        if let Some(doc) = doc_mut(l) {
+            doc.background_color = arg_str(l, 2).unwrap_or_default();
+        }
+    }
     0
 }
 
@@ -1208,10 +2995,12 @@ unsafe extern "C-unwind" fn doc_check_regex(l: *mut lua_State) -> c_int {
     1
 }
 
-unsafe extern "C-unwind" fn doc_read_defaults(l: *mut lua_State) -> c_int {
-    // SAFETY: `l` is the active Lua state.
-    unsafe { lua::lua_newtable(l) };
-    1
+unsafe extern "C-unwind" fn doc_read_defaults(_l: *mut lua_State) -> c_int {
+    0
+}
+
+unsafe extern "C-unwind" fn doc_save_defaults(_l: *mut lua_State) -> c_int {
+    0
 }
 
 macro_rules! reg {
@@ -1238,82 +3027,82 @@ macro_rules! regs {
 const DOC_METHODS: &[lua::luaL_Reg] = &regs![
     ("loadDocument", doc_load),
     ("renderDocument", doc_render),
-    ("requestRender", stub),
+    ("requestRender", doc_request_render),
     ("getIntProperty", doc_get_int_property),
     ("getStringProperty", doc_get_string_property),
     ("getDocumentFormat", doc_format),
     ("getDocumentProps", doc_props),
-    ("setAltDocumentProp", stub),
+    ("setAltDocumentProp", doc_set_alt_prop),
     ("getDocumentRenderingHash", doc_render_hash),
-    ("canBePartiallyRerendered", return_false),
-    ("isPartialRerenderingEnabled", return_false),
-    ("enablePartialRerendering", return_false),
-    ("getPartialRerenderingsCount", return_zero),
-    ("isRerenderingDelayed", return_false),
+    ("canBePartiallyRerendered", doc_can_partial_rerender),
+    ("isPartialRerenderingEnabled", doc_is_partial_enabled),
+    ("enablePartialRerendering", doc_enable_partial),
+    ("getPartialRerenderingsCount", doc_partial_count),
+    ("isRerenderingDelayed", doc_rerender_delayed),
     ("getPages", doc_pages),
     ("getCurrentPage", doc_current_page),
-    ("getPageFlow", return_zero),
+    ("getPageFlow", doc_get_page_flow),
     ("getPageFromXPointer", doc_page_from_xpointer),
     ("getPosFromXPointer", doc_pos_from_xpointer),
     ("getCurrentPos", doc_current_pos),
     ("getCurrentPercent", doc_current_percent),
     ("getXPointer", doc_xpointer),
     ("getPageXPointer", doc_page_xpointer),
-    ("getEPubCFI", return_empty_string),
-    ("getPageEPubCFI", return_empty_string),
-    ("getEPubCFIFromXPointer", return_empty_string),
-    ("getEPubCFIRangeFromXPointers", return_empty_string),
-    ("getPageOffsetX", return_zero),
+    ("getEPubCFI", doc_epub_cfi),
+    ("getPageEPubCFI", doc_page_epub_cfi),
+    ("getEPubCFIFromXPointer", doc_epub_cfi_from_xpointer),
+    ("getEPubCFIRangeFromXPointers", doc_epub_cfi_range),
+    ("getPageOffsetX", doc_get_page_offset_x),
     ("getPageStartY", doc_page_start_y),
     ("getPageHeight", doc_page_height),
     ("getFullHeight", doc_full_height),
     ("getFontSize", doc_font_size),
     ("getFontFace", doc_font_face),
-    ("getEmbeddedFontList", return_empty_table),
+    ("getEmbeddedFontList", doc_get_embedded_font_list),
     ("getPageMargins", doc_page_margins),
-    ("getHeaderHeight", return_zero),
+    ("getHeaderHeight", doc_get_header_height),
     ("getToc", doc_toc),
     ("getVisiblePageCount", doc_visible_page_count),
     ("getVisiblePageNumberCount", doc_visible_page_count),
-    ("getNextVisibleWordStart", return_arg2),
-    ("getNextVisibleWordEnd", return_arg2),
-    ("getPrevVisibleWordStart", return_arg2),
-    ("getPrevVisibleWordEnd", return_arg2),
-    ("getPrevVisibleChar", return_arg2),
-    ("getNextVisibleChar", return_arg2),
+    ("getNextVisibleWordStart", doc_next_visible_word_start),
+    ("getNextVisibleWordEnd", doc_next_visible_word_end),
+    ("getPrevVisibleWordStart", doc_prev_visible_word_start),
+    ("getPrevVisibleWordEnd", doc_prev_visible_word_end),
+    ("getPrevVisibleChar", doc_prev_visible_char),
+    ("getNextVisibleChar", doc_next_visible_char),
     ("getTextFromXPointers", doc_text_from_xpointers),
     ("compareXPointers", doc_compare_xpointers),
-    ("setIntProperty", stub),
-    ("setStringProperty", stub),
-    ("setViewMode", stub),
+    ("setIntProperty", doc_set_int_property),
+    ("setStringProperty", doc_set_string_property),
+    ("setViewMode", doc_set_view_mode),
     ("setViewDimen", doc_set_view_dimen),
-    ("setHeaderInfo", stub),
-    ("setPageInfoOverride", stub),
-    ("setHeaderFont", stub),
-    ("setHeaderProgressMarks", stub),
+    ("setHeaderInfo", doc_set_header_info),
+    ("setPageInfoOverride", doc_set_page_info_override),
+    ("setHeaderFont", doc_set_header_font),
+    ("setHeaderProgressMarks", doc_set_header_progress),
     ("setFontFace", doc_set_font_face),
     ("setFontSize", doc_set_font_size),
-    ("setDefaultInterlineSpace", stub),
-    ("setStyleSheet", stub),
-    ("setEmbeddedStyleSheet", stub),
-    ("setEmbeddedFonts", stub),
+    ("setDefaultInterlineSpace", doc_set_default_interline),
+    ("setStyleSheet", doc_set_stylesheet),
+    ("setEmbeddedStyleSheet", doc_set_embedded_stylesheet),
+    ("setEmbeddedFonts", doc_set_embedded_fonts),
     ("setBackgroundColor", doc_set_background_color),
-    ("setBackgroundImage", stub),
+    ("setBackgroundImage", doc_set_background_image),
     ("setPageMargins", doc_set_page_margins),
-    ("setVisiblePageCount", stub),
-    ("adjustFontSizes", stub),
-    ("setBatteryState", stub),
-    ("setCallback", stub),
-    ("isBuiltDomStale", return_false),
-    ("hasCacheFile", return_false),
-    ("isCacheFileStale", return_false),
-    ("invalidateCacheFile", stub),
-    ("getCacheFilePath", return_empty_string),
-    ("updateTocAndPageMap", stub),
-    ("getStatistics", return_empty_string),
-    ("getUnknownEntities", return_empty_string),
-    ("buildAlternativeToc", stub),
-    ("isTocAlternativeToc", return_false),
+    ("setVisiblePageCount", doc_set_visible_page_count),
+    ("adjustFontSizes", doc_adjust_font_sizes),
+    ("setBatteryState", doc_set_battery_state),
+    ("setCallback", doc_set_callback),
+    ("isBuiltDomStale", doc_cache_false),
+    ("hasCacheFile", doc_cache_false),
+    ("isCacheFileStale", doc_cache_false),
+    ("invalidateCacheFile", doc_invalidate_cache),
+    ("getCacheFilePath", doc_cache_path),
+    ("updateTocAndPageMap", doc_update_toc),
+    ("getStatistics", doc_statistics),
+    ("getUnknownEntities", doc_unknown_entities),
+    ("buildAlternativeToc", doc_build_alternative_toc),
+    ("isTocAlternativeToc", doc_is_alternative_toc),
     ("gotoPage", doc_goto_page),
     ("gotoPercent", doc_goto_percent),
     ("gotoPos", doc_goto_pos),
@@ -1327,79 +3116,89 @@ const DOC_METHODS: &[lua::luaL_Reg] = &regs![
     ("getLinkFromPosition", doc_link_from_position),
     ("getWordFromPosition", doc_word_from_position),
     ("getTextFromPositions", doc_text_from_positions),
-    ("extendXPointersToSentenceSegment", return_arg2),
+    ("extendXPointersToSentenceSegment", doc_extend_sentence),
     ("getWordBoxesFromPositions", doc_word_boxes_from_positions),
-    ("getImageDataFromPosition", stub),
+    ("getImageDataFromPosition", doc_get_image_data),
     ("getNearestWordFromPosition", doc_word_from_position),
-    ("getLangTagForTextFromPosition", return_empty_string),
+    ("getLangTagForTextFromPosition", doc_get_lang_tag),
     ("getDocumentFileContent", doc_get_document_file_content),
     ("getTextFromXPointer", doc_get_text_from_xpointer),
-    ("getHTMLFromXPointer", return_empty_string),
-    ("getHTMLFromXPointers", return_empty_string),
+    ("getHTMLFromXPointer", doc_get_html_from_xpointer),
+    ("getHTMLFromXPointers", doc_get_html_from_xpointers),
     ("getStylesheetsMatchingRulesets", return_empty_table),
     ("getPageLinks", doc_get_page_links),
-    ("isLinkToFootnote", return_false),
-    ("highlightXPointer", stub),
+    ("isLinkToFootnote", doc_is_link_to_footnote),
+    ("highlightXPointer", doc_highlight),
     ("getNormalizedXPointer", doc_normalized_xpointer),
-    ("getCoverPageImageData", stub),
-    ("gotoLink", stub),
-    ("goBack", stub),
-    ("goForward", stub),
-    ("clearSelection", stub),
-    ("hasPageMap", return_false),
-    ("getPageMap", return_empty_table),
-    ("getPageMapSource", return_empty_string),
-    ("getPageMapFirstPageLabel", return_empty_string),
-    ("getPageMapLastPageLabel", return_empty_string),
-    ("getPageMapCurrentPageLabel", return_empty_string),
-    ("getPageMapXPointerPageLabel", return_empty_string),
-    ("getPageMapVisiblePageLabels", return_empty_table),
-    ("buildSyntheticPageMapIfNoneDocumentProvided", stub),
-    ("isPageMapSynthetic", return_true),
-    ("buildSyntheticPageMap", stub),
-    ("getSyntheticPageMapCharsPerPage", return_zero),
-    ("hasPageMapDocumentProvided", return_false),
-    ("isPageMapDocumentProvided", return_false),
-    ("hasNonLinearFlows", return_false),
+    ("getCoverPageImageData", doc_get_cover_image_data),
+    ("gotoLink", doc_goto_link),
+    ("goBack", doc_go_back),
+    ("goForward", doc_go_forward),
+    ("clearSelection", doc_clear_selection),
+    ("hasPageMap", doc_has_page_map),
+    ("getPageMap", doc_get_page_map),
+    ("getPageMapSource", doc_get_page_map_source),
+    ("getPageMapFirstPageLabel", doc_get_page_map_first),
+    ("getPageMapLastPageLabel", doc_get_page_map_last),
+    ("getPageMapCurrentPageLabel", doc_get_page_map_current),
+    ("getPageMapXPointerPageLabel", doc_get_page_map_xpointer),
+    ("getPageMapVisiblePageLabels", doc_get_page_map_visible),
+    (
+        "buildSyntheticPageMapIfNoneDocumentProvided",
+        doc_build_synthetic_if_none
+    ),
+    ("isPageMapSynthetic", doc_is_page_map_synthetic),
+    ("buildSyntheticPageMap", doc_build_synthetic_page_map),
+    ("getSyntheticPageMapCharsPerPage", doc_get_synthetic_chars),
+    (
+        "hasPageMapDocumentProvided",
+        doc_has_page_map_document_provided
+    ),
+    (
+        "isPageMapDocumentProvided",
+        doc_is_page_map_document_provided
+    ),
+    ("hasNonLinearFlows", doc_has_non_linear_flows),
     ("hasHiddenFlows", return_false),
     ("checkRegex", doc_check_regex),
     ("getAndClearRegexSearchError", return_empty_string),
     ("readDefaults", doc_read_defaults),
-    ("saveDefaults", stub),
+    ("saveDefaults", doc_save_defaults),
     ("close", doc_close),
     ("__gc", doc_gc),
 ];
 
 const MODULE_FUNCS: &[lua::luaL_Reg] = &regs![
-    ("initCache", module_noop),
-    ("initHyphDict", module_noop),
+    ("initCache", module_init_cache),
+    ("initHyphDict", module_init_hyph_dict),
     ("newDocView", new_doc_view),
-    ("getFontFaces", return_empty_table),
-    ("getFontFaceFilenameAndFaceIndex", return_empty_table),
-    ("getFontFaceAvailableWeights", return_empty_table),
-    ("getGammaLevel", return_zero),
-    ("getGammaIndex", return_zero),
-    ("setGammaIndex", module_noop),
-    ("registerFont", module_noop),
+    ("getFontFaces", module_get_font_faces),
+    ("getFontFaceFilenameAndFaceIndex", module_font_face_filename),
+    ("getFontFaceAvailableWeights", module_font_face_weights),
+    ("getGammaLevel", module_get_gamma_level),
+    ("getGammaIndex", module_get_gamma_index),
+    ("setGammaIndex", module_set_gamma_index),
+    ("registerFont", module_register_font),
     ("regularizeRegisteredFontsWeights", module_noop),
-    ("setAsPreferredFontWithBias", module_noop),
-    ("getHyphDictList", return_empty_table),
-    ("getSelectedHyphDict", return_empty_string),
-    ("setHyphDictionary", module_noop),
-    ("getTextLangStatus", return_zero),
-    ("getLatestDomVersion", return_zero),
-    ("getDomVersionWithNormalizedXPointers", return_zero),
-    ("setUserHyphenationDict", module_noop),
-    ("getHyphenationForWord", return_empty_string),
-    ("softHyphenateText", return_arg2),
-    ("renderImageData", module_noop),
-    ("getBalancedHTML", return_empty_string),
-    ("smoothScaleBlitBuffer", return_one),
-    ("setImageReplacementChar", module_noop),
+    ("setAsPreferredFontWithBias", module_set_preferred_font),
+    ("getHyphDictList", module_get_hyph_dict_list),
+    ("getSelectedHyphDict", module_get_selected_hyph_dict),
+    ("setHyphDictionary", module_set_hyph_dict),
+    ("getTextLangStatus", module_get_text_lang_status),
+    ("getLatestDomVersion", module_dom_version),
+    ("getDomVersionWithNormalizedXPointers", module_dom_version),
+    ("setUserHyphenationDict", module_set_user_hyph),
+    ("getHyphenationForWord", module_get_hyphenation),
+    ("softHyphenateText", module_soft_hyphenate),
+    ("renderImageData", module_render_image_data),
+    ("getBalancedHTML", module_get_balanced_html),
+    ("smoothScaleBlitBuffer", module_smooth_scale),
+    ("setImageReplacementChar", module_set_image_replacement_char),
     ("setSkipTearDown", module_noop),
     ("setViewMode", module_noop),
     ("setTocAlternativeToc", module_noop),
     ("getDocumentRenderingHash", return_zero),
+    ("free", module_noop),
 ];
 
 /// Opens the `libkoreader-cre` Lua module.

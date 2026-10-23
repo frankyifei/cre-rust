@@ -130,7 +130,13 @@ fn line_for_page<'a>(
 
 fn fallback_position_for_line(root: &Node, line: &LineBox) -> Result<TextPosition> {
     let text_id = text_node_for_line(root, line)?;
-    let codepoint_offset = u32::try_from(line.text_start).unwrap_or(u32::MAX);
+    let content_len = root
+        .with(text_id)
+        .text_data()
+        .map_or(0, |text| text.content.chars().count() as u32);
+    let codepoint_offset = u32::try_from(line.text_start)
+        .unwrap_or(u32::MAX)
+        .min(content_len);
     position_for_text_node(root, text_id, codepoint_offset)
 }
 
@@ -340,7 +346,7 @@ fn nearest_real_element_id(root: &Node, node_id: NodeId) -> Option<NodeId> {
     }
 }
 
-fn position_for_text_node(
+pub(crate) fn position_for_text_node(
     root: &Node,
     target_id: NodeId,
     codepoint_offset: u32,
@@ -379,6 +385,14 @@ fn position_for_text_node(
 }
 
 pub(crate) fn resolve_text_position(root: &Node, position: &TextPosition) -> Result<NodeId> {
+    let current_id = resolve_element_position(root, position)?;
+    let current = root.with(current_id);
+    first_text_node(current, false)
+        .or_else(|| first_text_node(current, true))
+        .context("XPointer target element has no text node")
+}
+
+pub(crate) fn resolve_element_position(root: &Node, position: &TextPosition) -> Result<NodeId> {
     let body_id = find_body_id(root).context("document has no body element")?;
     let section_id = find_spine_section_id(root, body_id, position.spine_index);
 
@@ -397,10 +411,7 @@ pub(crate) fn resolve_text_position(root: &Node, position: &TextPosition) -> Res
         current_id = find_element_child_id(current, &segment.tag, segment.index)?;
     }
 
-    let current = root.with(current_id);
-    first_text_node(current, false)
-        .or_else(|| first_text_node(current, true))
-        .context("XPointer target element has no text node")
+    Ok(current_id)
 }
 
 fn find_body_id(node: &Node) -> Option<NodeId> {

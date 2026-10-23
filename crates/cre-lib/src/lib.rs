@@ -196,6 +196,9 @@ pub struct Document {
     page_margin: f32,
     sources: Vec<String>,
     base_url: String,
+    resources: Arc<HashMap<String, Vec<u8>>>,
+    cover_image: Option<Vec<u8>>,
+    has_non_linear_flows: bool,
     net: Arc<dyn NetProvider>,
     font_data: Vec<u8>,
     chunks: Vec<ChunkMeta>,
@@ -233,11 +236,18 @@ impl Document {
                     ..HtmlOptions::default()
                 };
                 let htmls = book.to_html_chunks(&html_options, CHUNK_TARGET_BYTES)?;
+                let cover_image = epub_cover_image(&book);
+                let has_non_linear_flows = book.spine.iter().any(|item| !item.linear);
                 let resources = Arc::new(book.resources);
                 Self::build(
                     htmls,
                     "epub://book/",
-                    Arc::new(EpubNet { resources }),
+                    Arc::new(EpubNet {
+                        resources: resources.clone(),
+                    }),
+                    resources,
+                    cover_image,
+                    has_non_linear_flows,
                     metadata,
                     raw_toc,
                     options,
@@ -265,11 +275,17 @@ impl Document {
                         depth: item.depth,
                     })
                     .collect();
+                let cover_image = book.binary.values().next().cloned();
                 let resources = Arc::new(book.binary);
                 Self::build(
                     vec![html],
                     "fb2://book/",
-                    Arc::new(Fb2Net { resources }),
+                    Arc::new(Fb2Net {
+                        resources: resources.clone(),
+                    }),
+                    resources,
+                    cover_image,
+                    false,
                     metadata,
                     raw_toc,
                     options,
@@ -293,6 +309,9 @@ impl Document {
                     vec![html],
                     "text://book/",
                     Arc::new(EmptyNet),
+                    Arc::new(HashMap::new()),
+                    None,
+                    false,
                     metadata,
                     Vec::new(),
                     options,
@@ -301,10 +320,14 @@ impl Document {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build(
         htmls: Vec<String>,
         base_url: &str,
         net: Arc<dyn NetProvider>,
+        resources: Arc<HashMap<String, Vec<u8>>>,
+        cover_image: Option<Vec<u8>>,
+        has_non_linear_flows: bool,
         metadata: DocumentMetadata,
         raw_toc: Vec<RawTocItem>,
         options: &DocumentOptions,
@@ -403,6 +426,9 @@ impl Document {
             page_margin: options.page_margin,
             sources: htmls,
             base_url: base_url.to_string(),
+            resources,
+            cover_image,
+            has_non_linear_flows,
             net,
             font_data,
             chunks,
@@ -444,6 +470,82 @@ impl Document {
 
     pub fn toc(&self) -> &[TocEntry] {
         &self.toc
+    }
+
+    pub fn cover_image(&self) -> Option<&[u8]> {
+        self.cover_image.as_deref()
+    }
+
+    pub fn has_non_linear_flows(&self) -> bool {
+        self.has_non_linear_flows
+    }
+
+    pub fn resource(&self, path: &str) -> Option<Vec<u8>> {
+        let (key, _) = href_key(path);
+        let key = key.strip_prefix("binary/").unwrap_or(&key);
+        self.resources.get(key).cloned()
+    }
+
+    pub fn image_data_at(&self, position: PagePosition) -> Result<Option<Vec<u8>>> {
+        let Some(index) = position.page.checked_sub(1) else {
+            bail!("page numbers are 1-based");
+        };
+        let snapshot = self.pages.get(index).context("page snapshot is missing")?;
+        let chunk_index = snapshot.chunk;
+        let page_top = snapshot.local_start.top;
+
+        self.with_active_chunk(chunk_index, |active| {
+            let root = active.doc.root_element();
+            Ok(find_image_data_at(
+                &active.doc,
+                root,
+                page_top,
+                position.x,
+                position.y,
+                &self.base_url,
+                &self.resources,
+            ))
+        })
+    }
+
+    pub fn html_from_xpointer(&self, xpointer: &str) -> Result<Option<String>> {
+        let position = parse_text_position(xpointer)?;
+        let chunk_index = self.chunk_for_spine(position.spine_index)?;
+        self.with_active_chunk(chunk_index, |active| {
+            let root = active.doc.root_element();
+            let node_id = xpointer::resolve_element_position(root, &position)?;
+            Ok(Some(root.with(node_id).outer_html()))
+        })
+    }
+
+    pub fn html_between_xpointers(&self, start: &str, end: &str) -> Result<Option<String>> {
+        let start_position = parse_text_position(start)?;
+        let end_position = parse_text_position(end)?;
+        if start_position.spine_index != end_position.spine_index {
+            return Ok(None);
+        }
+        let chunk_index = self.chunk_for_spine(start_position.spine_index)?;
+        self.with_active_chunk(chunk_index, |active| {
+            let root = active.doc.root_element();
+            let start_id = xpointer::resolve_element_position(root, &start_position)?;
+            let end_id = xpointer::resolve_element_position(root, &end_position)?;
+            let ancestor = common_ancestor(root, start_id, end_id).unwrap_or(start_id);
+            Ok(Some(root.with(ancestor).outer_html()))
+        })
+    }
+
+    fn chunk_for_spine(&self, spine_index: u32) -> Result<usize> {
+        self.spine_to_chunk
+            .get(&spine_index)
+            .copied()
+            .or_else(|| {
+                sorted_spine_chunks(&self.spine_to_chunk)
+                    .into_iter()
+                    .filter(|(index, _)| *index <= spine_index)
+                    .max_by_key(|(index, _)| *index)
+                    .map(|(_, chunk)| chunk)
+            })
+            .context("XPointer spine fragment is outside the rendered document")
     }
 
     pub fn render_page(&mut self, page: usize) -> Result<PageBitmap> {
@@ -1187,6 +1289,141 @@ impl Document {
         })
     }
 
+    pub fn next_visible_char(&self, xpointer: &str) -> Result<Option<String>> {
+        self.visible_neighbor(xpointer, Direction::Forward, NeighborUnit::Char)
+    }
+
+    pub fn prev_visible_char(&self, xpointer: &str) -> Result<Option<String>> {
+        self.visible_neighbor(xpointer, Direction::Backward, NeighborUnit::Char)
+    }
+
+    pub fn next_visible_word_start(&self, xpointer: &str) -> Result<Option<String>> {
+        self.visible_neighbor(xpointer, Direction::Forward, NeighborUnit::WordStart)
+    }
+
+    pub fn next_visible_word_end(&self, xpointer: &str) -> Result<Option<String>> {
+        self.visible_neighbor(xpointer, Direction::Forward, NeighborUnit::WordEnd)
+    }
+
+    pub fn prev_visible_word_start(&self, xpointer: &str) -> Result<Option<String>> {
+        self.visible_neighbor(xpointer, Direction::Backward, NeighborUnit::WordStart)
+    }
+
+    pub fn prev_visible_word_end(&self, xpointer: &str) -> Result<Option<String>> {
+        self.visible_neighbor(xpointer, Direction::Backward, NeighborUnit::WordEnd)
+    }
+
+    fn visible_neighbor(
+        &self,
+        xpointer: &str,
+        direction: Direction,
+        unit: NeighborUnit,
+    ) -> Result<Option<String>> {
+        let position = parse_text_position(xpointer)?;
+        let chunk_index = self.chunk_for_spine(position.spine_index)?;
+        self.with_active_chunk(chunk_index, |active| {
+            let root = active.doc.root_element();
+            let current_id = xpointer::resolve_text_position(root, &position)?;
+            let flat = flat_text_characters(root);
+            let current_start = flat
+                .iter()
+                .position(|entry| entry.node == current_id)
+                .context("XPointer target node has no visible text")?;
+            let start_index = (current_start + position.codepoint_offset as usize).min(flat.len());
+            let target = match (direction, unit) {
+                (Direction::Forward, NeighborUnit::Char) => {
+                    (start_index + 1..flat.len()).find(|index| !flat[*index].ch.is_whitespace())
+                }
+                (Direction::Backward, NeighborUnit::Char) => (0..start_index)
+                    .rev()
+                    .find(|index| !flat[*index].ch.is_whitespace()),
+                (Direction::Forward, NeighborUnit::WordStart) => {
+                    next_word_start(&flat, start_index)
+                }
+                (Direction::Forward, NeighborUnit::WordEnd) => next_word_end(&flat, start_index),
+                (Direction::Backward, NeighborUnit::WordStart) => {
+                    prev_word_start(&flat, start_index)
+                }
+                (Direction::Backward, NeighborUnit::WordEnd) => prev_word_end(&flat, start_index),
+            };
+            let Some(index) = target else {
+                return Ok(None);
+            };
+            let Some(entry) = flat.get(index).or_else(|| flat.last()) else {
+                return Ok(None);
+            };
+            Ok(Some(
+                xpointer::position_for_text_node(root, entry.node, entry.offset)?.to_xpointer(),
+            ))
+        })
+    }
+
+    pub fn extend_to_sentence(
+        &self,
+        start: &str,
+        end: &str,
+    ) -> Result<Option<(String, String, String)>> {
+        let mut start_position = parse_text_position(start)?;
+        let mut end_position = parse_text_position(end)?;
+        if start_position.spine_index != end_position.spine_index {
+            return Ok(None);
+        }
+        if end_position < start_position {
+            std::mem::swap(&mut start_position, &mut end_position);
+        }
+        let chunk_index = self.chunk_for_spine(start_position.spine_index)?;
+        self.with_active_chunk(chunk_index, |active| {
+            let root = active.doc.root_element();
+            let start_id = xpointer::resolve_text_position(root, &start_position)?;
+            let end_id = xpointer::resolve_text_position(root, &end_position)?;
+            if start_id != end_id {
+                return Ok(None);
+            }
+            let Some(text) = root
+                .with(start_id)
+                .text_data()
+                .map(|data| data.content.clone())
+            else {
+                return Ok(None);
+            };
+            let chars = text.chars().collect::<Vec<_>>();
+            let mut start_offset = (start_position.codepoint_offset as usize).min(chars.len());
+            let mut end_offset = (end_position.codepoint_offset as usize).min(chars.len());
+            let sentence_break = |ch: char| matches!(ch, '.' | '!' | '?' | '。' | '！' | '？');
+
+            let mut sentence_start = 0usize;
+            for index in (0..start_offset).rev() {
+                if sentence_break(chars[index]) {
+                    sentence_start = index + 1;
+                    break;
+                }
+            }
+            while sentence_start < start_offset && chars[sentence_start].is_whitespace() {
+                sentence_start += 1;
+            }
+            start_offset = sentence_start;
+
+            let mut sentence_end = chars.len();
+            for (index, ch) in chars.iter().enumerate().skip(end_offset) {
+                if sentence_break(*ch) {
+                    sentence_end = index + 1;
+                    break;
+                }
+            }
+            end_offset = sentence_end;
+            while end_offset > start_offset && chars[end_offset - 1].is_whitespace() {
+                end_offset -= 1;
+            }
+
+            start_position.codepoint_offset = start_offset as u32;
+            end_position.codepoint_offset = end_offset as u32;
+            let start_xpointer = start_position.to_xpointer();
+            let end_xpointer = end_position.to_xpointer();
+            let text = chars[start_offset..end_offset].iter().collect::<String>();
+            Ok(Some((text, start_xpointer, end_xpointer)))
+        })
+    }
+
     pub fn text_from_xpointer(&self, xpointer: &str) -> Result<String> {
         let position = parse_text_position(xpointer)?;
         let chunk_index = *self
@@ -1540,6 +1777,217 @@ fn nearest_link(root: &Node, start_id: NodeId) -> Option<String> {
         current = node.parent;
     }
     None
+}
+
+#[derive(Clone, Copy)]
+enum Direction {
+    Forward,
+    Backward,
+}
+
+#[derive(Clone, Copy)]
+enum NeighborUnit {
+    Char,
+    WordStart,
+    WordEnd,
+}
+
+struct FlatCharacter {
+    node: NodeId,
+    offset: u32,
+    ch: char,
+}
+
+fn flat_text_characters(root: &Node) -> Vec<FlatCharacter> {
+    let mut out = Vec::new();
+    collect_flat_characters(root, &mut out);
+    out
+}
+
+fn collect_flat_characters(node: &Node, out: &mut Vec<FlatCharacter>) {
+    if let Some(text) = node.text_data() {
+        for (offset, ch) in text.content.chars().enumerate() {
+            out.push(FlatCharacter {
+                node: node.id,
+                offset: offset as u32,
+                ch,
+            });
+        }
+    }
+    for child in node.children.iter() {
+        collect_flat_characters(node.with(*child), out);
+    }
+}
+
+fn next_word_start(flat: &[FlatCharacter], start: usize) -> Option<usize> {
+    let mut index = start.min(flat.len());
+    if flat.get(index).is_some_and(|entry| is_word_char(entry.ch)) {
+        while flat.get(index).is_some_and(|entry| is_word_char(entry.ch)) {
+            index += 1;
+        }
+    }
+    while index < flat.len() {
+        if is_word_char(flat[index].ch) && (index == 0 || !is_word_char(flat[index - 1].ch)) {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn next_word_end(flat: &[FlatCharacter], start: usize) -> Option<usize> {
+    let mut index = start.min(flat.len());
+    while index < flat.len() && !is_word_char(flat[index].ch) {
+        index += 1;
+    }
+    if index >= flat.len() {
+        return None;
+    }
+    while index + 1 < flat.len() && is_word_char(flat[index + 1].ch) {
+        index += 1;
+    }
+    Some(index + 1)
+}
+
+fn prev_word_start(flat: &[FlatCharacter], start: usize) -> Option<usize> {
+    let mut index = start.min(flat.len());
+    if index > 0 && is_word_char(flat[index - 1].ch) {
+        index -= 1;
+        while index > 0 && is_word_char(flat[index - 1].ch) {
+            index -= 1;
+        }
+        return Some(index);
+    }
+    while index > 0 && !is_word_char(flat[index - 1].ch) {
+        index -= 1;
+    }
+    if index == 0 {
+        return None;
+    }
+    index -= 1;
+    while index > 0 && is_word_char(flat[index - 1].ch) {
+        index -= 1;
+    }
+    Some(index)
+}
+
+fn prev_word_end(flat: &[FlatCharacter], start: usize) -> Option<usize> {
+    let mut index = start.min(flat.len());
+    while index > 0 && !is_word_char(flat[index - 1].ch) {
+        index -= 1;
+    }
+    if index == 0 {
+        return None;
+    }
+    if index == start && index < flat.len() && is_word_char(flat[index].ch) {
+        while index < flat.len() && is_word_char(flat[index].ch) {
+            index += 1;
+        }
+        return Some(index);
+    }
+    while index > 0 && is_word_char(flat[index - 1].ch) {
+        index -= 1;
+    }
+    let mut end = index;
+    while end < flat.len() && is_word_char(flat[end].ch) {
+        end += 1;
+    }
+    Some(end)
+}
+
+fn sorted_spine_chunks(map: &HashMap<u32, usize>) -> Vec<(u32, usize)> {
+    let mut entries = map
+        .iter()
+        .map(|(spine, chunk)| (*spine, *chunk))
+        .collect::<Vec<_>>();
+    entries.sort_unstable_by_key(|(spine, _)| *spine);
+    entries
+}
+
+fn common_ancestor(root: &Node, left: NodeId, right: NodeId) -> Option<NodeId> {
+    let mut ancestors = std::collections::HashSet::new();
+    let mut current = Some(left);
+    while let Some(id) = current {
+        ancestors.insert(id);
+        current = root.with(id).parent;
+    }
+    let mut current = Some(right);
+    while let Some(id) = current {
+        if ancestors.contains(&id) {
+            return Some(id);
+        }
+        current = root.with(id).parent;
+    }
+    None
+}
+
+fn find_image_data_at(
+    doc: &HtmlDocument,
+    node: &Node,
+    page_top: f32,
+    x: f32,
+    y: f32,
+    base_url: &str,
+    resources: &HashMap<String, Vec<u8>>,
+) -> Option<Vec<u8>> {
+    if node
+        .element_data()
+        .is_some_and(|element| element.name.local.to_string() == "img")
+        && let Some(rect) = doc.get_client_bounding_rect(node.id)
+    {
+        let local_top = rect.y as f32 - page_top;
+        if x >= rect.x as f32
+            && x <= (rect.x + rect.width) as f32
+            && y >= local_top
+            && y <= local_top + rect.height as f32
+        {
+            let src = node_attr(node, "src")?;
+            let resolved = if src.contains("://") {
+                src.to_string()
+            } else if src.starts_with('/') {
+                format!("{}{}", base_url.trim_end_matches('/'), src)
+            } else {
+                format!("{}{}", base_url, src)
+            };
+            let (key, _) = href_key(&resolved);
+            let key = key.strip_prefix("binary/").unwrap_or(&key);
+            if let Some(data) = resources.get(key) {
+                return Some(data.clone());
+            }
+        }
+    }
+
+    for child in node.children.iter() {
+        if let Some(data) =
+            find_image_data_at(doc, node.with(*child), page_top, x, y, base_url, resources)
+        {
+            return Some(data);
+        }
+    }
+    None
+}
+
+fn epub_cover_image(book: &EpubBook) -> Option<Vec<u8>> {
+    let item = book
+        .manifest
+        .iter()
+        .find(|item| {
+            item.properties
+                .split_whitespace()
+                .any(|property| property == "cover-image")
+        })
+        .or_else(|| {
+            book.manifest.iter().find(|item| {
+                item.id.eq_ignore_ascii_case("cover")
+                    || item
+                        .href
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|name| name.to_ascii_lowercase().starts_with("cover"))
+            })
+        })?;
+    let key = normalize_path(&item.href);
+    book.resources.get(&key).cloned()
 }
 
 fn element_id(node: &Node) -> Option<String> {

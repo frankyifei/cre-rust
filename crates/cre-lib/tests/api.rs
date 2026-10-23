@@ -686,3 +686,45 @@ fn document_rejects_missing_navigation_target() {
             .is_err()
     );
 }
+
+#[test]
+fn document_page_xpointers_are_valid_and_round_trip() {
+    require_resources();
+
+    let doc = Document::open(fixture("juliet.epub")).unwrap();
+    for page in 1..=doc.page_count() {
+        let xpointer = doc.xpointer_from_page(page).unwrap();
+        assert!(
+            !xpointer.contains(&u32::MAX.to_string()),
+            "page {page} produced sentinel offset: {xpointer}"
+        );
+        assert!(
+            doc.page_from_xpointer(&xpointer).unwrap() == page,
+            "page {page} xpointer did not round-trip: {xpointer}"
+        );
+    }
+}
+
+#[test]
+fn document_exposes_resources_cover_and_html() {
+    require_resources();
+
+    let doc = Document::open(fixture("juliet.epub")).unwrap();
+    assert!(!doc.has_non_linear_flows());
+    let cover = doc.cover_image().expect("juliet.epub exposes a cover");
+    assert!(!cover.is_empty());
+
+    let xpointer = doc.xpointer_from_page(2).unwrap();
+    let text = doc.text_from_xpointer(&xpointer).unwrap();
+    assert!(!text.trim().is_empty());
+    let html = doc.html_from_xpointer(&xpointer).unwrap();
+    assert!(html.is_some(), "expected HTML from {xpointer}");
+
+    assert!(doc.next_visible_word_start(&xpointer).unwrap().is_some());
+    assert!(doc.prev_visible_word_start(&xpointer).unwrap().is_some());
+    assert!(doc.next_visible_char(&xpointer).unwrap().is_some());
+    assert!(doc.prev_visible_char(&xpointer).unwrap().is_some());
+
+    let segment = doc.extend_to_sentence(&xpointer, &xpointer).unwrap();
+    assert!(segment.is_some(), "expected a sentence segment");
+}
