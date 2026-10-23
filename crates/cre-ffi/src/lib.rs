@@ -158,6 +158,7 @@ pub unsafe extern "C" fn cre_open_with_options(
                     height: options.height,
                     layout_height: options.layout_height,
                     page_margin: options.page_margin,
+                    font_size: 18.0,
                     font_path,
                 },
             )

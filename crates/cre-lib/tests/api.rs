@@ -261,6 +261,62 @@ fn document_hit_tests_text_positions_and_links() {
 }
 
 #[test]
+fn document_extracts_word_at_position_and_range_boxes() {
+    require_resources();
+
+    let doc = Document::open(fixture("sample.txt")).unwrap();
+    let boxes = doc.page_text_boxes(1).unwrap();
+
+    let mut found = None;
+    for text_box in &boxes {
+        let y = text_box.y + text_box.height / 2.0;
+        let mut x = text_box.x;
+        while x <= text_box.x + text_box.width {
+            if let Some(word) = doc.word_at(PagePosition { page: 1, x, y }).unwrap()
+                && word.text == "Lorem"
+            {
+                found = Some(word);
+                break;
+            }
+            x += 2.0;
+        }
+        if found.is_some() {
+            break;
+        }
+    }
+
+    let word = found.expect("word 'Lorem' was not found by hit testing");
+    assert!(!word.rects.is_empty());
+    assert!(word.rects.iter().all(|rect| rect.page == 1));
+    assert!(
+        word.rects
+            .iter()
+            .all(|rect| rect.width > 0.0 && rect.height > 0.0)
+    );
+    assert_eq!(
+        doc.page_from_xpointer(&word.xpointer_range.start.to_xpointer())
+            .unwrap(),
+        1
+    );
+    let word_end = word.xpointer_range.end.as_ref().unwrap().to_xpointer();
+    assert_eq!(doc.page_from_xpointer(&word_end).unwrap(), 1);
+    assert_eq!(
+        doc.text_between_xpointers(&word.xpointer_range.start.to_xpointer(), &word_end)
+            .unwrap(),
+        word.text
+    );
+
+    let range_boxes = doc
+        .boxes_between_xpointers(
+            &word.xpointer_range.start.to_xpointer(),
+            &word.xpointer_range.end.as_ref().unwrap().to_xpointer(),
+        )
+        .unwrap();
+    assert!(!range_boxes.is_empty());
+    assert!(range_boxes.iter().all(|rect| rect.page == 1));
+}
+
+#[test]
 fn document_hit_tests_internal_epub_links() {
     require_resources();
 
@@ -404,6 +460,7 @@ fn document_bookmarks_survive_reflow() {
         height: 480,
         layout_height: 100_000,
         page_margin: 16.0,
+        font_size: 18.0,
         font_path: None,
     };
     let narrow = Document::with_options(fixture("sample.txt"), &narrow_options).unwrap();
@@ -452,6 +509,7 @@ fn document_selection_spans_pages() {
         height: 480,
         layout_height: 100_000,
         page_margin: 16.0,
+        font_size: 18.0,
         font_path: None,
     };
     let doc = Document::with_options(fixture("sample.txt"), &options).unwrap();
@@ -473,6 +531,15 @@ fn document_selection_spans_pages() {
     };
 
     let selection = doc.selection(start, end).unwrap().unwrap();
+    assert!(!selection.text.trim().is_empty());
+    assert_eq!(
+        doc.text_between_xpointers(
+            &selection.xpointer_range.start.to_xpointer(),
+            &selection.xpointer_range.end.as_ref().unwrap().to_xpointer(),
+        )
+        .unwrap(),
+        selection.text
+    );
     assert!(selection.rects.iter().any(|text_box| text_box.page == 1));
     assert!(selection.rects.iter().any(|text_box| text_box.page == 2));
     assert_eq!(

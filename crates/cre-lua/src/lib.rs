@@ -29,6 +29,8 @@ struct Doc {
     font_face: String,
     font_size: i32,
     path: Option<PathBuf>,
+    last_range: Option<(String, String)>,
+    last_boxes: Vec<cre_lib::TextBox>,
 }
 
 impl Doc {
@@ -42,6 +44,8 @@ impl Doc {
             font_face: "Noto Serif".to_string(),
             font_size: 22,
             path: None,
+            last_range: None,
+            last_boxes: Vec::new(),
         }
     }
 
@@ -51,6 +55,7 @@ impl Doc {
             height: self.height,
             layout_height: self.layout_height,
             page_margin: self.margins.0.max(0) as f32,
+            font_size: self.font_size.max(1) as f32,
             font_path: None,
         };
         self.inner = Some(Document::with_options(&path, &options)?);
@@ -769,10 +774,10 @@ unsafe extern "C-unwind" fn doc_word_from_position(l: *mut lua_State) -> c_int {
     unsafe {
         let x = arg_int(l, 2) as f32;
         let y = arg_int(l, 3) as f32;
-        let hit = doc_ref(l).and_then(|doc| {
+        let word = doc_ref(l).and_then(|doc| {
             let inner = doc.inner.as_ref()?;
             inner
-                .hit_test(cre_lib::PagePosition {
+                .word_at(cre_lib::PagePosition {
                     page: inner.current_page(),
                     x,
                     y,
@@ -780,20 +785,39 @@ unsafe extern "C-unwind" fn doc_word_from_position(l: *mut lua_State) -> c_int {
                 .ok()
                 .flatten()
         });
-        let Some(hit) = hit else {
-            lua::lua_newtable(l);
-            return 1;
+        let Some(word) = word else {
+            return 0;
         };
-        lua::lua_createtable(l, 0, 5);
+        let rect = word.rects.first();
+        lua::lua_createtable(l, 0, 6);
         push_str(l, "word");
-        push_str(l, &hit.text);
+        push_str(l, &word.text);
         lua::lua_rawset(l, -3);
-        for (key, value) in [
-            ("x0", hit.rect.x),
-            ("y0", hit.rect.y),
-            ("x1", hit.rect.x + hit.rect.width),
-            ("y1", hit.rect.y + hit.rect.height),
-        ] {
+        push_str(l, "text");
+        push_str(l, &word.text);
+        lua::lua_rawset(l, -3);
+        push_str(l, "pos0");
+        push_str(l, &word.xpointer_range.start.to_xpointer());
+        lua::lua_rawset(l, -3);
+        push_str(l, "pos1");
+        let end = word
+            .xpointer_range
+            .end
+            .as_ref()
+            .map_or_else(String::new, |position| position.to_xpointer());
+        push_str(l, &end);
+        lua::lua_rawset(l, -3);
+        for (key, value) in rect.map_or(
+            [("x0", 0.0), ("y0", 0.0), ("x1", 0.0), ("y1", 0.0)],
+            |rect| {
+                [
+                    ("x0", rect.x),
+                    ("y0", rect.y),
+                    ("x1", rect.x + rect.width),
+                    ("y1", rect.y + rect.height),
+                ]
+            },
+        ) {
             push_str(l, key);
             push_int(l, value.round() as i64);
             lua::lua_rawset(l, -3);
@@ -805,35 +829,132 @@ unsafe extern "C-unwind" fn doc_word_from_position(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn doc_text_from_positions(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let x = arg_int(l, 2) as f32;
-        let y = arg_int(l, 3) as f32;
-        let hit = doc_ref(l).and_then(|doc| {
-            let inner = doc.inner.as_ref()?;
-            inner
-                .hit_test(cre_lib::PagePosition {
-                    page: inner.current_page(),
-                    x,
-                    y,
-                })
-                .ok()
-                .flatten()
-        });
-        let Some(hit) = hit else {
+        let x0 = arg_int(l, 2) as f32;
+        let y0 = arg_int(l, 3) as f32;
+        let x1 = arg_int(l, 4) as f32;
+        let y1 = arg_int(l, 5) as f32;
+        let Some((text, pos0, pos1)) = doc_mut(l).and_then(|doc| {
+            doc.last_range = None;
+            doc.last_boxes.clear();
+            let result = {
+                let inner = doc.inner.as_ref()?;
+                let page = inner.current_page();
+                let start = cre_lib::PagePosition { page, x: x0, y: y0 };
+                let end = cre_lib::PagePosition { page, x: x1, y: y1 };
+                if (x0 - x1).abs() < 1.0 && (y0 - y1).abs() < 1.0 {
+                    let word = inner.word_at(start).ok().flatten()?;
+                    let start_pos = word.xpointer_range.start.to_xpointer();
+                    let end_pos = word.xpointer_range.end.as_ref()?.to_xpointer();
+                    Some((
+                        word.text,
+                        start_pos.clone(),
+                        end_pos.clone(),
+                        (start_pos, end_pos),
+                        word.rects,
+                    ))
+                } else {
+                    let selection = inner.selection(start, end).ok().flatten()?;
+                    let start_pos = selection.xpointer_range.start.to_xpointer();
+                    let end_pos = selection
+                        .xpointer_range
+                        .end
+                        .as_ref()
+                        .map_or_else(String::new, |position| position.to_xpointer());
+                    Some((
+                        selection.text,
+                        start_pos.clone(),
+                        end_pos.clone(),
+                        (start_pos, end_pos),
+                        selection.rects,
+                    ))
+                }
+            };
+            if let Some((_, _, _, range, boxes)) = &result {
+                doc.last_range = Some(range.clone());
+                doc.last_boxes = boxes.clone();
+            }
+            result.map(|(text, start_pos, end_pos, _, _)| (text, start_pos, end_pos))
+        }) else {
             return 0;
         };
+
         lua::lua_createtable(l, 0, 4);
         push_str(l, "text");
-        push_str(l, &hit.text);
+        push_str(l, &text);
         lua::lua_rawset(l, -3);
         push_str(l, "pos0");
-        push_str(l, "");
+        push_str(l, &pos0);
         lua::lua_rawset(l, -3);
         push_str(l, "pos1");
-        push_str(l, "");
+        push_str(l, &pos1);
         lua::lua_rawset(l, -3);
         push_str(l, "title");
         push_str(l, "");
         lua::lua_rawset(l, -3);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_word_boxes_from_positions(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(start) = arg_str(l, 2) else {
+            return 0;
+        };
+        let Some(end) = arg_str(l, 3) else {
+            return 0;
+        };
+        let boxes = doc_ref(l).and_then(|doc| {
+            if let Some((start_pos, end_pos)) = &doc.last_range
+                && *start_pos == start
+                && *end_pos == end
+            {
+                return Some(doc.last_boxes.clone());
+            }
+            let inner = doc.inner.as_ref()?;
+            inner.boxes_between_xpointers(&start, &end).ok()
+        });
+        let Some(boxes) = boxes else {
+            return 0;
+        };
+        if boxes.is_empty() {
+            return 0;
+        }
+
+        lua::lua_createtable(l, boxes.len() as c_int, 0);
+        for (index, text_box) in boxes.iter().enumerate() {
+            lua::lua_createtable(l, 0, 4);
+            for (key, value) in [
+                ("x0", text_box.x),
+                ("y0", text_box.y),
+                ("x1", text_box.x + text_box.width),
+                ("y1", text_box.y + text_box.height),
+            ] {
+                push_str(l, key);
+                push_int(l, value.round() as i64);
+                lua::lua_rawset(l, -3);
+            }
+            lua::lua_rawseti_(l, -2, (index + 1) as c_int);
+        }
+        push_int(l, boxes.len() as i64);
+    }
+    2
+}
+
+unsafe extern "C-unwind" fn doc_text_from_xpointers(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(start) = arg_str(l, 2) else {
+            return 0;
+        };
+        let Some(end) = arg_str(l, 3) else {
+            return 0;
+        };
+        let text = doc_ref(l).and_then(|doc| {
+            let inner = doc.inner.as_ref()?;
+            inner.text_between_xpointers(&start, &end).ok()
+        });
+        push_str(l, text.as_deref().unwrap_or_default());
     }
     1
 }
@@ -916,7 +1037,13 @@ unsafe extern "C-unwind" fn doc_set_font_size(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
         if let Some(doc) = doc_mut(l) {
-            doc.font_size = arg_int(l, 2).clamp(1, 512) as i32;
+            let font_size = arg_int(l, 2).clamp(1, 512) as i32;
+            if font_size != doc.font_size {
+                doc.font_size = font_size;
+                if doc.inner.is_some() {
+                    doc.relayout();
+                }
+            }
         }
     }
     0
@@ -1053,7 +1180,7 @@ const DOC_METHODS: &[lua::luaL_Reg] = &regs![
     ("getPrevVisibleWordEnd", return_arg2),
     ("getPrevVisibleChar", return_arg2),
     ("getNextVisibleChar", return_arg2),
-    ("getTextFromXPointers", return_empty_string),
+    ("getTextFromXPointers", doc_text_from_xpointers),
     ("compareXPointers", doc_compare_xpointers),
     ("setIntProperty", stub),
     ("setStringProperty", stub),
@@ -1100,9 +1227,9 @@ const DOC_METHODS: &[lua::luaL_Reg] = &regs![
     ("getWordFromPosition", doc_word_from_position),
     ("getTextFromPositions", doc_text_from_positions),
     ("extendXPointersToSentenceSegment", return_arg2),
-    ("getWordBoxesFromPositions", return_empty_table),
+    ("getWordBoxesFromPositions", doc_word_boxes_from_positions),
     ("getImageDataFromPosition", stub),
-    ("getNearestWordFromPosition", return_empty_table),
+    ("getNearestWordFromPosition", doc_word_from_position),
     ("getLangTagForTextFromPosition", return_empty_string),
     ("getDocumentFileContent", doc_get_document_file_content),
     ("getTextFromXPointer", doc_get_text_from_xpointer),

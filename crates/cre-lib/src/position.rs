@@ -1,12 +1,12 @@
 use anyhow::{Result, anyhow};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PathSegment {
     pub tag: String,
     pub index: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TextPosition {
     pub spine_index: u32,
     pub path: Vec<PathSegment>,

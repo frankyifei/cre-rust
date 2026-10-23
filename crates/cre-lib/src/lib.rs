@@ -44,6 +44,7 @@ pub struct DocumentOptions {
     pub height: u32,
     pub layout_height: u32,
     pub page_margin: f32,
+    pub font_size: f32,
     pub font_path: Option<PathBuf>,
 }
 
@@ -54,6 +55,7 @@ impl Default for DocumentOptions {
             height: 800,
             layout_height: 100_000,
             page_margin: 32.0,
+            font_size: 18.0,
             font_path: None,
         }
     }
@@ -106,6 +108,14 @@ pub struct HitResult {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Selection {
+    pub text: String,
+    pub xpointer_range: XPointerRange,
+    pub rects: Vec<TextBox>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WordHit {
+    pub text: String,
     pub xpointer_range: XPointerRange,
     pub rects: Vec<TextBox>,
 }
@@ -211,7 +221,11 @@ impl Document {
                     language: book.language.clone(),
                     item_count: book.spine.len(),
                 };
-                let htmls = book.to_html_chunks(&HtmlOptions::default(), CHUNK_TARGET_BYTES)?;
+                let html_options = HtmlOptions {
+                    font_size: options.font_size,
+                    ..HtmlOptions::default()
+                };
+                let htmls = book.to_html_chunks(&html_options, CHUNK_TARGET_BYTES)?;
                 let resources = Arc::new(book.resources);
                 Self::build(
                     htmls,
@@ -231,7 +245,11 @@ impl Document {
                     language: book.language.clone(),
                     item_count: book.binary.len(),
                 };
-                let (html, fb2_toc) = book.to_html_with_toc(&Fb2HtmlOptions::default())?;
+                let html_options = Fb2HtmlOptions {
+                    font_size: options.font_size.max(1.0) as u32,
+                    ..Fb2HtmlOptions::default()
+                };
+                let (html, fb2_toc) = book.to_html_with_toc(&html_options)?;
                 let raw_toc = fb2_toc
                     .into_iter()
                     .map(|item| RawTocItem {
@@ -259,7 +277,11 @@ impl Document {
                     language: None,
                     item_count: 1,
                 };
-                let html = book.to_html(&TextHtmlOptions::default());
+                let html_options = TextHtmlOptions {
+                    font_size: options.font_size.max(1.0) as u32,
+                    ..TextHtmlOptions::default()
+                };
+                let html = book.to_html(&html_options);
                 Self::build(
                     vec![html],
                     "text://book/",
@@ -486,6 +508,7 @@ impl Document {
                 height: self.height,
                 layout_height: self.layout_height,
                 page_margin: self.page_margin,
+                font_size: 18.0,
                 font_path: None,
             },
         );
@@ -613,6 +636,186 @@ impl Document {
         })
     }
 
+    pub fn word_at(&self, position: PagePosition) -> Result<Option<WordHit>> {
+        let Some(hit) = self.hit_test(position)? else {
+            return Ok(None);
+        };
+        let Some((start_byte, end_byte)) = word_byte_range(&hit.text, hit.byte_offset) else {
+            return Ok(None);
+        };
+
+        let snapshot = self
+            .pages
+            .get(hit.page.saturating_sub(1))
+            .context("page snapshot is missing")?;
+        let chunk_index = snapshot.chunk;
+        let line_base = self.chunks[chunk_index].line_base;
+        let local_line = hit
+            .line_index
+            .checked_sub(line_base)
+            .context("line index is outside its chunk")?;
+
+        let (start_position, end_position) = self.with_active_chunk(chunk_index, |active| {
+            let line = active
+                .lines
+                .get(local_line)
+                .context("line snapshot is missing")?;
+            let root = active.doc.root_element();
+            let start = xpointer::position_for_line_offset(root, line, start_byte)?;
+            let end = xpointer::position_for_line_offset(root, line, end_byte)?;
+            Ok((start, end))
+        })?;
+
+        let text = hit.text[start_byte..end_byte].to_string();
+        let char_count = hit.text.chars().count().max(1) as f32;
+        let start_chars = hit.text[..start_byte].chars().count() as f32;
+        let end_chars = hit.text[..end_byte].chars().count() as f32;
+        let x0 = hit.rect.x + hit.rect.width * (start_chars / char_count);
+        let x1 = hit.rect.x + hit.rect.width * (end_chars / char_count);
+        let rect = TextBox {
+            text: text.clone(),
+            page: hit.page,
+            x: x0,
+            y: hit.rect.y,
+            width: (x1 - x0).max(1.0),
+            height: hit.rect.height,
+        };
+
+        Ok(Some(WordHit {
+            text,
+            xpointer_range: XPointerRange {
+                start: start_position,
+                end: Some(end_position),
+                id: None,
+            },
+            rects: vec![rect],
+        }))
+    }
+
+    pub fn boxes_between_xpointers(&self, start: &str, end: &str) -> Result<Vec<TextBox>> {
+        let mut boxes = Vec::new();
+        for (mut rect, slice_start, slice_end) in
+            self.clipped_lines_between_xpointers(start, end)?
+        {
+            let total_chars = rect.text.chars().count().max(1) as f32;
+            let start_chars = rect.text[..slice_start].chars().count() as f32;
+            let end_chars = rect.text[..slice_end].chars().count() as f32;
+            let x0 = rect.x + rect.width * (start_chars / total_chars);
+            let x1 = rect.x + rect.width * (end_chars / total_chars);
+            rect.text = rect.text[slice_start..slice_end].to_string();
+            rect.x = x0;
+            rect.width = (x1 - x0).max(1.0);
+            boxes.push(rect);
+        }
+        Ok(boxes)
+    }
+
+    pub fn text_between_xpointers(&self, start: &str, end: &str) -> Result<String> {
+        let mut text = String::new();
+        for (rect, slice_start, slice_end) in self.clipped_lines_between_xpointers(start, end)? {
+            let part = &rect.text[slice_start..slice_end];
+            if !part.trim().is_empty() {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(part);
+            }
+        }
+        Ok(text.trim_end().to_string())
+    }
+
+    fn clipped_lines_between_xpointers(
+        &self,
+        start: &str,
+        end: &str,
+    ) -> Result<Vec<(TextBox, usize, usize)>> {
+        let mut start_position = parse_text_position(start)?;
+        let mut end_position = parse_text_position(end)?;
+        let mut start_page = self.page_from_xpointer(start)?;
+        let mut end_page = self.page_from_xpointer(end)?;
+        let reversed =
+            start_page > end_page || (start_page == end_page && start_position > end_position);
+        if reversed {
+            std::mem::swap(&mut start_page, &mut end_page);
+            std::mem::swap(&mut start_position, &mut end_position);
+        }
+
+        let mut lines = Vec::new();
+        for page in start_page..=end_page {
+            for (line_index, rect) in self.page_text_boxes_with_lines(page)? {
+                let Some((line_start, line_end)) = self.line_bounds(page, line_index)? else {
+                    continue;
+                };
+                if line_end <= start_position || line_start >= end_position {
+                    continue;
+                }
+
+                let mut slice_start = 0;
+                let mut slice_end = rect.text.len();
+                if page == start_page
+                    && line_start < start_position
+                    && start_position < line_end
+                    && line_start.path == start_position.path
+                {
+                    let chars =
+                        (start_position.codepoint_offset - line_start.codepoint_offset) as usize;
+                    slice_start = byte_offset_for_char(&rect.text, chars);
+                }
+                if page == end_page
+                    && line_start < end_position
+                    && end_position < line_end
+                    && line_start.path == end_position.path
+                {
+                    let chars =
+                        (end_position.codepoint_offset - line_start.codepoint_offset) as usize;
+                    slice_end = byte_offset_for_char(&rect.text, chars);
+                }
+                if slice_start >= slice_end {
+                    continue;
+                }
+                while slice_start < slice_end && !rect.text.is_char_boundary(slice_start) {
+                    slice_start += 1;
+                }
+                while slice_end > slice_start && !rect.text.is_char_boundary(slice_end) {
+                    slice_end -= 1;
+                }
+                if slice_start < slice_end {
+                    lines.push((rect, slice_start, slice_end));
+                }
+            }
+        }
+        Ok(lines)
+    }
+
+    fn line_bounds(
+        &self,
+        page: usize,
+        line_index: usize,
+    ) -> Result<Option<(TextPosition, TextPosition)>> {
+        let Some(snapshot) = self.pages.get(page.saturating_sub(1)) else {
+            return Ok(None);
+        };
+        let chunk_index = snapshot.chunk;
+        let line_base = self.chunks[chunk_index].line_base;
+        let Some(local_line) = line_index.checked_sub(line_base) else {
+            return Ok(None);
+        };
+
+        self.with_active_chunk(chunk_index, |active| {
+            let Some(line) = active.lines.get(local_line) else {
+                return Ok(None);
+            };
+            let root = active.doc.root_element();
+            let start = xpointer::position_for_line_offset(root, line, 0)?;
+            let end = xpointer::position_for_line_offset(
+                root,
+                line,
+                line.text_end.saturating_sub(line.text_start),
+            )?;
+            Ok(Some((start, end)))
+        })
+    }
+
     pub fn selection(&self, start: PagePosition, end: PagePosition) -> Result<Option<Selection>> {
         let Some(mut start_hit) = self.hit_test(start)? else {
             return Ok(None);
@@ -628,19 +831,39 @@ impl Document {
         }
 
         let mut rects = Vec::new();
+        let mut text = String::new();
         for page in start_hit.page..=end_hit.page {
             for (line_index, mut rect) in self.page_text_boxes_with_lines(page)? {
                 if line_index < start_hit.line_index || line_index > end_hit.line_index {
                     continue;
                 }
+                let mut slice_start = 0;
+                let mut slice_end = rect.text.len();
                 if page == start_hit.page && line_index == start_hit.line_index {
+                    slice_start = start_hit.byte_offset.min(slice_end);
                     let left = start_hit.point.x.clamp(rect.x, rect.x + rect.width);
                     rect.width = (rect.x + rect.width - left).max(0.0);
                     rect.x = left;
                 }
                 if page == end_hit.page && line_index == end_hit.line_index {
+                    slice_end = end_hit.byte_offset.min(slice_end);
                     let right = end_hit.point.x.clamp(rect.x, rect.x + rect.width);
                     rect.width = (right - rect.x).max(0.0);
+                }
+                while slice_start < slice_end && !rect.text.is_char_boundary(slice_start) {
+                    slice_start += 1;
+                }
+                while slice_end > slice_start && !rect.text.is_char_boundary(slice_end) {
+                    slice_end -= 1;
+                }
+                if slice_start < slice_end {
+                    let part = &rect.text[slice_start..slice_end];
+                    if !part.trim().is_empty() {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(part);
+                    }
                 }
                 if rect.width > 0.0 {
                     rects.push(rect);
@@ -649,6 +872,7 @@ impl Document {
         }
 
         Ok(Some(Selection {
+            text: text.trim_end().to_string(),
             xpointer_range: XPointerRange {
                 start: start_hit.text_position,
                 end: Some(end_hit.text_position),
@@ -920,6 +1144,9 @@ fn validate_options(options: &DocumentOptions) -> Result<()> {
     if options.width == 0 || options.height == 0 || options.layout_height == 0 {
         bail!("width, height, and layout_height must be positive");
     }
+    if !options.font_size.is_finite() || options.font_size <= 0.0 {
+        bail!("font_size must be a positive finite number");
+    }
     Ok(())
 }
 
@@ -1079,6 +1306,58 @@ fn node_attr<'a>(node: &'a Node, name: &str) -> Option<&'a str> {
         .iter()
         .find(|attr| attr.name.local.to_string() == name)
         .map(|attr| attr.value.as_str())
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '\'' | '\u{2019}' | '-' | '_')
+}
+
+fn byte_offset_for_char(text: &str, char_offset: usize) -> usize {
+    text.char_indices()
+        .nth(char_offset)
+        .map_or(text.len(), |(offset, _)| offset)
+}
+
+fn word_byte_range(text: &str, byte_offset: usize) -> Option<(usize, usize)> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    if chars.is_empty() {
+        return None;
+    }
+
+    let mut index = chars
+        .iter()
+        .position(|(offset, _)| *offset >= byte_offset)
+        .unwrap_or(chars.len() - 1);
+    if index >= chars.len() {
+        index = chars.len() - 1;
+    }
+
+    if !is_word_char(chars[index].1) {
+        if let Some(next) = chars[index + 1..]
+            .iter()
+            .position(|(_, ch)| is_word_char(*ch))
+        {
+            index += next + 1;
+        } else {
+            index = chars[..index]
+                .iter()
+                .rposition(|(_, ch)| is_word_char(*ch))?;
+        }
+    }
+
+    let mut start = index;
+    while start > 0 && is_word_char(chars[start - 1].1) {
+        start -= 1;
+    }
+
+    let mut end = index + 1;
+    while end < chars.len() && is_word_char(chars[end].1) {
+        end += 1;
+    }
+
+    let start_byte = chars[start].0;
+    let end_byte = chars.get(end).map_or(text.len(), |(offset, _)| *offset);
+    (start_byte < end_byte).then_some((start_byte, end_byte))
 }
 
 fn source_element_at_line_offset(
