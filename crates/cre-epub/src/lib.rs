@@ -382,12 +382,42 @@ fn extract_styles(html: &str, opf_dir: &str, doc_path: &str) -> (Vec<String>, Ve
             break;
         };
         let text_end = text_start + close;
-        styles.push(html[text_start..text_end].to_string());
+        let css = clean_css(&html[text_start..text_end]);
+        if !css.is_empty() {
+            styles.push(css);
+        }
         cursor = text_end + 8;
     }
 
     let _ = opf_dir;
     (css_urls, styles)
+}
+
+fn clean_css(raw: &str) -> String {
+    let mut css = raw.trim();
+    loop {
+        let mut changed = false;
+        if let Some(rest) = css.strip_prefix("<![CDATA[") {
+            css = rest.trim();
+            changed = true;
+        }
+        if let Some(rest) = css.strip_prefix("<!--") {
+            css = rest.trim();
+            changed = true;
+        }
+        if let Some(rest) = css.strip_suffix("]]>") {
+            css = rest.trim_end();
+            changed = true;
+        }
+        if let Some(rest) = css.strip_suffix("-->") {
+            css = rest.trim_end();
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+    css.to_string()
 }
 
 fn rewrite_urls(body: &str, doc_dir: &str, opf_dir: &str) -> String {
@@ -874,6 +904,87 @@ mod tests {
         assert_eq!(book.toc[1].title, "Nested");
         assert_eq!(book.toc[1].href, "sec1.xhtml#sub");
         assert_eq!(book.toc[1].depth, 2);
+    }
+
+    #[test]
+    fn strips_cdata_and_comment_wrappers_from_inline_styles() {
+        assert_eq!(
+            clean_css("<![CDATA[\n   p { color: red; }\n]]>"),
+            "p { color: red; }"
+        );
+        assert_eq!(clean_css("<!-- p { color: red; } -->"), "p { color: red; }");
+        assert_eq!(clean_css("  \n p { a: b } \n "), "p { a: b }");
+        assert_eq!(clean_css("<![CDATA[<!-- p { a: b } -->]]>"), "p { a: b }");
+        assert_eq!(clean_css(""), "");
+    }
+
+    #[test]
+    fn combined_html_has_cdata_free_inline_styles() {
+        let book = EpubBook::from_bytes(synthetic_cdata_styled_epub()).unwrap();
+        let html = book.to_html(&HtmlOptions::default()).unwrap();
+        assert!(html.contains("p.cdata-marker { color: #ff0000; }"));
+        assert!(!html.contains("<![CDATA["));
+        assert!(!html.contains("]]>"));
+    }
+
+    fn synthetic_cdata_styled_epub() -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buf);
+            let options = zip::write::SimpleFileOptions::default();
+
+            write_zip_file(&mut writer, options, "mimetype", "application/epub+zip");
+            write_zip_file(
+                &mut writer,
+                options,
+                "META-INF/container.xml",
+                r#"<?xml version="1.0"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+  <rootfiles>
+    <rootfile full-path="pkg.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#,
+            );
+            write_zip_file(
+                &mut writer,
+                options,
+                "pkg.opf",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="id">urn:uuid:cdata-test</dc:identifier>
+    <dc:title>CDATA Test</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="s1" href="sec1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="s1"/>
+  </spine>
+</package>"#,
+            );
+            write_zip_file(
+                &mut writer,
+                options,
+                "sec1.xhtml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head>
+    <title>Sec1</title>
+    <style type="text/css"><![CDATA[
+   p.cdata-marker { color: #ff0000; }
+]]></style>
+  </head>
+  <body>
+    <p class="cdata-marker">styled paragraph</p>
+  </body>
+</html>"#,
+            );
+
+            writer.finish().unwrap();
+        }
+        buf.into_inner()
     }
 
     fn synthetic_epub3_nav() -> Vec<u8> {
