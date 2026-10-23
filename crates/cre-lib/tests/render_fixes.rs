@@ -72,6 +72,23 @@ fn png_images_are_decoded_and_painted() {
 }
 
 #[test]
+fn svg_images_are_decoded_and_painted() {
+    require_font();
+
+    let mut doc = Document::open(fixture("svg-image.epub")).unwrap();
+    let bitmap = doc.render_page(1).unwrap();
+
+    assert!(
+        min_in(&bitmap, 60, 67, 4) < 64,
+        "the SVG fixture should be painted inside its layout box"
+    );
+    assert!(
+        max_in(&bitmap, 120, 67, 4) > 200,
+        "outside the SVG image box the page should stay white"
+    );
+}
+
+#[test]
 fn forced_page_breaks_create_new_pages() {
     require_font();
 

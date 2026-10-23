@@ -410,15 +410,24 @@ fn document_handles_large_epub() {
     let page_count = doc.page_count();
     assert!(page_count > 100);
 
-    let samples = [
-        1,
+    let mut first_text_page = None;
+    for page in 1..=page_count {
+        if !doc.page_text(page).unwrap().trim().is_empty() {
+            first_text_page = Some(page);
+            break;
+        }
+    }
+    let first_text_page = first_text_page.expect("large EPUB should contain a text page");
+
+    let mut last_sample = 0;
+    for page in [
+        first_text_page,
         page_count / 3,
         page_count / 2,
         (page_count * 2) / 3,
         page_count,
-    ];
-    let mut last_sample = 0;
-    for page in samples {
+    ] {
+        let page = page.max(first_text_page);
         if page == last_sample {
             continue;
         }

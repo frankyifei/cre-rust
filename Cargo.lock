@@ -39,6 +39,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyrender_svg"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39327debd1bdca190d086c107825a5dc4c665be31e99e5c0854345a050d08cad"
+dependencies = [
+ "anyrender",
+ "image",
+ "kurbo",
+ "peniko",
+ "usvg",
+]
+
+[[package]]
 name = "app_units"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -143,10 +156,12 @@ dependencies = [
  "stylo_static_prefs",
  "stylo_taffy",
  "stylo_traits",
+ "svgtypes",
  "taffy",
  "thin-vec",
  "thread_local",
  "url",
+ "usvg",
  "web-time",
  "writeable",
  "wuff",
@@ -171,6 +186,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28803328124d7b7ea5f8f41501513ccb005559e9f6baf33fa0c1fb7612654a93"
 dependencies = [
  "anyrender",
+ "anyrender_svg",
  "blitz-dom",
  "blitz-traits",
  "bytemuck",
@@ -183,6 +199,7 @@ dependencies = [
  "smallvec",
  "stylo",
  "taffy",
+ "usvg",
 ]
 
 [[package]]
@@ -704,6 +721,7 @@ checksum = "2660c5e9157bf76d2db1294e4a9feba604ef610819a3b591088d0d8392a3290f"
 dependencies = [
  "fontconfig-parser",
  "log",
+ "memmap2",
  "slotmap",
  "tinyvec",
 ]
@@ -2372,6 +2390,7 @@ checksum = "977d0a4abdef933f424a99fe09f95576e089b90aebc6f016a3bc813762493e91"
 dependencies = [
  "base64 0.23.1",
  "data-url",
+ "flate2",
  "fontdb",
  "harfrust",
  "imagesize",

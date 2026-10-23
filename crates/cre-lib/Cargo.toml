@@ -13,9 +13,10 @@ blitz-dom = { version = "=0.3.0-beta.4", default-features = false, features = [
     "complex-scripts",
     "text-transform-icu",
     "woff",
+    "svg",
 ] }
 blitz-html = "=0.3.0-beta.4"
-blitz-paint = { version = "=0.3.0-beta.4", default-features = false }
+blitz-paint = { version = "=0.3.0-beta.4", default-features = false, features = ["svg"] }
 blitz-traits = "=0.3.0-beta.4"
 cre-epub = { path = "../cre-epub" }
 cre-fb2 = { path = "../cre-fb2" }
