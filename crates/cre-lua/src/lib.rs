@@ -12,6 +12,7 @@ use mlua::ffi as lua;
 use mlua::lua_State;
 
 const CREDOC: &[u8] = b"credocument\0";
+const CREIMAGE: &[u8] = b"creimage\0";
 const INDEX: &[u8] = b"__index\0";
 
 #[repr(C)]
@@ -209,6 +210,23 @@ struct FontFace {
     name: String,
     path: PathBuf,
     index: i32,
+}
+
+struct CreImage {
+    image: Option<(Vec<u8>, u32, u32)>,
+}
+
+impl CreImage {
+    fn from_svg(data: &[u8]) -> Option<Self> {
+        let (_, width, height) = cre_lib::render_svg_image(data, None, None)?;
+        Some(Self {
+            image: Some((data.to_vec(), width, height)),
+        })
+    }
+
+    fn free(&mut self) {
+        self.image = None;
+    }
 }
 
 static FONT_CACHE: OnceLock<Vec<FontFace>> = OnceLock::new();
@@ -412,6 +430,25 @@ unsafe fn arg_int(l: *mut lua_State, index: c_int) -> i64 {
 unsafe fn arg_bool(l: *mut lua_State, index: c_int) -> bool {
     // SAFETY: `index` is a valid Lua stack index for this call.
     unsafe { lua::lua_toboolean(l, index) != 0 }
+}
+
+unsafe fn push_image(l: *mut lua_State, value: CreImage) {
+    // SAFETY: `l` is the active Lua state; the userdata is initialized below and
+    // is owned by Lua once its metatable is installed.
+    unsafe {
+        let ptr = lua::lua_newuserdata(l, std::mem::size_of::<CreImage>()).cast::<CreImage>();
+        ptr::write(ptr, value);
+        lua::luaL_getmetatable(l, CREIMAGE.as_ptr().cast());
+        lua::lua_setmetatable(l, -2);
+    }
+}
+
+unsafe fn image_mut<'a>(l: *mut lua_State, index: c_int) -> Option<&'a mut CreImage> {
+    // SAFETY: `l` is the active Lua state; the caller supplies a valid stack index.
+    unsafe {
+        let ptr = lua::lua_touserdata(l, index).cast::<CreImage>();
+        if ptr.is_null() { None } else { Some(&mut *ptr) }
+    }
 }
 
 unsafe fn push_bool(l: *mut lua_State, value: bool) {
@@ -749,6 +786,78 @@ unsafe extern "C-unwind" fn module_render_image_data(l: *mut lua_State) -> c_int
         push_int(l, i64::from(height));
     }
     3
+}
+
+unsafe extern "C-unwind" fn image_render_scaled(l: *mut lua_State) -> c_int {
+    let rendered = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: `l` is the active Lua state; index 1 is checked below.
+        unsafe {
+            let image = image_mut(l, 1)?.image.as_ref()?.clone();
+            let (data, width, height) = image;
+            if width == 0 || height == 0 {
+                return None;
+            }
+            let scale = if lua::lua_isnumber(l, 2) != 0 {
+                lua::lua_tonumber(l, 2)
+            } else {
+                1.0
+            };
+            let scale = if scale <= 0.0 {
+                let request_width = arg_int(l, 3).max(1) as f64;
+                let request_height = arg_int(l, 4).max(1) as f64;
+                (request_width / f64::from(width)).min(request_height / f64::from(height))
+            } else {
+                scale
+            };
+            if !scale.is_finite() || scale <= 0.0 {
+                return None;
+            }
+            let target_width = (f64::from(width) * scale).clamp(1.0, f64::from(u32::MAX)) as u32;
+            let target_height = (f64::from(height) * scale).clamp(1.0, f64::from(u32::MAX)) as u32;
+            let (pixels, width, height) =
+                cre_lib::render_svg_image(&data, Some(target_width), Some(target_height))?;
+            let buffer = libc::malloc(pixels.len().max(1)).cast::<u8>();
+            if buffer.is_null() {
+                return None;
+            }
+            ptr::copy_nonoverlapping(pixels.as_ptr(), buffer, pixels.len());
+            Some((buffer, width, height, scale))
+        }
+    }));
+    match rendered {
+        Ok(Some((buffer, width, height, scale))) => {
+            // SAFETY: `l` is the active Lua state and the buffer is malloc-owned.
+            unsafe {
+                lua::lua_pushlightuserdata(l, buffer.cast());
+                push_int(l, i64::from(width));
+                push_int(l, i64::from(height));
+                lua::lua_pushnumber(l, scale);
+            }
+            4
+        }
+        _ => 0,
+    }
+}
+
+unsafe extern "C-unwind" fn image_free(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state; index 1 is checked below.
+    unsafe {
+        if let Some(image) = image_mut(l, 1) {
+            image.free();
+        }
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn image_gc(l: *mut lua_State) -> c_int {
+    // SAFETY: `__gc` receives a userdata initialized by `push_image`.
+    unsafe {
+        let ptr = lua::lua_touserdata(l, 1).cast::<CreImage>();
+        if !ptr.is_null() {
+            ptr::drop_in_place(ptr);
+        }
+    }
+    0
 }
 
 unsafe extern "C-unwind" fn module_get_balanced_html(l: *mut lua_State) -> c_int {
@@ -2390,6 +2499,7 @@ unsafe extern "C-unwind" fn doc_get_image_data(l: *mut lua_State) -> c_int {
     unsafe {
         let x = arg_int(l, 2) as f32;
         let y = arg_int(l, 3) as f32;
+        let accept_cre_scalable_image = arg_bool(l, 4);
         let data = doc_ref(l).and_then(|doc| {
             let inner = doc.inner.as_ref()?;
             inner
@@ -2404,6 +2514,12 @@ unsafe extern "C-unwind" fn doc_get_image_data(l: *mut lua_State) -> c_int {
         let Some(data) = data else {
             return 0;
         };
+        if accept_cre_scalable_image && let Some(image) = CreImage::from_svg(&data) {
+            push_bool(l, false);
+            push_int(l, 0);
+            push_image(l, image);
+            return 3;
+        }
         if !push_malloc_bytes(l, &data) {
             return 0;
         }
@@ -3066,6 +3182,12 @@ macro_rules! regs {
     };
 }
 
+const IMAGE_METHODS: &[lua::luaL_Reg] = &regs![
+    ("renderScaled", image_render_scaled),
+    ("free", image_free),
+    ("__gc", image_gc),
+];
+
 const DOC_METHODS: &[lua::luaL_Reg] = &regs![
     ("loadDocument", doc_load),
     ("renderDocument", doc_render),
@@ -3256,6 +3378,12 @@ pub unsafe extern "C" fn luaopen_cre(l: *mut lua_State) -> c_int {
         lua::lua_pushvalue(l, -1);
         lua::lua_setfield(l, -2, INDEX.as_ptr().cast());
         lua::luaL_register(l, ptr::null(), DOC_METHODS.as_ptr());
+        lua::lua_pop(l, 1);
+
+        lua::luaL_newmetatable_(l, CREIMAGE.as_ptr().cast());
+        lua::lua_pushvalue(l, -1);
+        lua::lua_setfield(l, -2, INDEX.as_ptr().cast());
+        lua::luaL_register(l, ptr::null(), IMAGE_METHODS.as_ptr());
         lua::lua_pop(l, 1);
 
         lua::lua_newtable(l);
