@@ -1187,6 +1187,27 @@ impl Document {
         })
     }
 
+    pub fn text_from_xpointer(&self, xpointer: &str) -> Result<String> {
+        let position = parse_text_position(xpointer)?;
+        let chunk_index = *self
+            .spine_to_chunk
+            .get(&position.spine_index)
+            .with_context(|| {
+                format!(
+                    "XPointer DocFragment[{}] was not found in the rendered document",
+                    position.spine_index
+                )
+            })?;
+        self.with_active_chunk(chunk_index, |active| {
+            let root = active.doc.root_element();
+            let text_id = xpointer::resolve_text_position(root, &position)?;
+            root.with(text_id)
+                .text_data()
+                .map(|text| text.content.clone())
+                .context("XPointer text node has no content")
+        })
+    }
+
     pub fn current_position(&self) -> Result<TextPosition> {
         let xpointer = self.xpointer_from_page(self.current_page)?;
         parse_text_position(&xpointer)

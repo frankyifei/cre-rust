@@ -1143,7 +1143,28 @@ unsafe extern "C-unwind" fn doc_get_document_file_content(l: *mut lua_State) -> 
 
 unsafe extern "C-unwind" fn doc_get_text_from_xpointer(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
-    unsafe { push_str(l, "") };
+    unsafe {
+        let text = arg_str(l, 2).and_then(|xpointer| {
+            doc_ref(l)
+                .and_then(|doc| doc.inner.as_ref())
+                .and_then(|inner| inner.text_from_xpointer(&xpointer).ok())
+        });
+        let Some(text) = text else {
+            return 0;
+        };
+        push_str(l, &text);
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_normalized_xpointer(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let xpointer = arg_str(l, 2).unwrap_or_default();
+        let normalized = cre_lib::parse_text_position(&xpointer)
+            .map_or_else(|_| xpointer, |position| position.to_xpointer());
+        push_str(l, &normalized);
+    }
     1
 }
 
@@ -1319,7 +1340,7 @@ const DOC_METHODS: &[lua::luaL_Reg] = &regs![
     ("getPageLinks", doc_get_page_links),
     ("isLinkToFootnote", return_false),
     ("highlightXPointer", stub),
-    ("getNormalizedXPointer", return_arg2),
+    ("getNormalizedXPointer", doc_normalized_xpointer),
     ("getCoverPageImageData", stub),
     ("gotoLink", stub),
     ("goBack", stub),

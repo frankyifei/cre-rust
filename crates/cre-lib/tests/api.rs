@@ -327,6 +327,11 @@ fn document_extracts_word_at_position_and_range_boxes() {
             .unwrap(),
         word.text
     );
+    assert!(
+        doc.text_from_xpointer(&word.xpointer_range.start.to_xpointer())
+            .unwrap()
+            .contains("Lorem")
+    );
 
     let range_boxes = doc
         .boxes_between_xpointers(

@@ -378,7 +378,7 @@ fn position_for_text_node(
     })
 }
 
-fn resolve_text_position(root: &Node, position: &TextPosition) -> Result<NodeId> {
+pub(crate) fn resolve_text_position(root: &Node, position: &TextPosition) -> Result<NodeId> {
     let body_id = find_body_id(root).context("document has no body element")?;
     let section_id = find_spine_section_id(root, body_id, position.spine_index);
 
