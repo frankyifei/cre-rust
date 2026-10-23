@@ -17,6 +17,7 @@ pub use cre_paint::PageBitmap;
 use cre_text::{TextBook, TextHtmlOptions};
 use percent_encoding::percent_decode_str;
 
+mod page_breaks;
 mod position;
 mod xpointer;
 
@@ -348,8 +349,10 @@ impl Document {
             let doc = create_document(html, base_url, net.clone(), &font_data, options);
             let root = doc.root_element();
             let lines = collect_lines(root);
+            let forced_breaks = page_breaks::collect_forced_breaks(root);
             let page_starts = paginate(
                 &lines,
+                &forced_breaks,
                 options.height as f32,
                 options.page_margin,
                 options.page_margin,
@@ -622,8 +625,10 @@ impl Document {
             },
         );
         let lines = collect_lines(doc.root_element());
+        let forced_breaks = page_breaks::collect_forced_breaks(doc.root_element());
         let page_starts = paginate(
             &lines,
+            &forced_breaks,
             self.height as f32,
             self.page_margin,
             self.page_margin,
@@ -1575,15 +1580,38 @@ fn collect_lines_inner(node: &Node, out: &mut Vec<LineBox>) {
 
 fn paginate(
     lines: &[LineBox],
+    forced_breaks: &[f32],
     page_height: f32,
     margin_top: f32,
     margin_bottom: f32,
 ) -> Vec<PageStart> {
+    const BREAK_EPSILON: f32 = 0.5;
+
     let mut starts = vec![PageStart {
         top: 0.0,
         clip_top: margin_top,
     }];
+    let mut forced_index = 0usize;
     for line in lines {
+        let current = starts.last().unwrap();
+        let mut force_break_before = false;
+        while forced_index < forced_breaks.len()
+            && forced_breaks[forced_index] <= line.top + BREAK_EPSILON
+        {
+            if forced_breaks[forced_index] > current.clip_top + BREAK_EPSILON
+                && line.top > current.clip_top + BREAK_EPSILON
+            {
+                force_break_before = true;
+            }
+            forced_index += 1;
+        }
+        if force_break_before {
+            starts.push(PageStart {
+                top: line.top - margin_top,
+                clip_top: line.top,
+            });
+        }
+
         let current = starts.last().unwrap();
         let clip_bottom = current.top + page_height - margin_bottom;
         if line.bottom > clip_bottom && line.top > current.clip_top {

@@ -70,3 +70,24 @@ fn png_images_are_decoded_and_painted() {
         "outside the image box the page should stay white"
     );
 }
+
+#[test]
+fn forced_page_breaks_create_new_pages() {
+    require_font();
+
+    let doc = Document::open(fixture("pagebreak.epub")).unwrap();
+    assert!(
+        doc.page_count() >= 3,
+        "page-break-before declarations should create extra pages"
+    );
+
+    let page1 = doc.page_text(1).unwrap();
+    let page2 = doc.page_text(2).unwrap();
+    let page3 = doc.page_text(3).unwrap();
+
+    assert!(page1.contains("MARK-A"));
+    assert!(!page1.contains("MARK-B"));
+    assert!(page2.contains("MARK-B"));
+    assert!(!page2.contains("MARK-C"));
+    assert!(page3.contains("MARK-C"));
+}
