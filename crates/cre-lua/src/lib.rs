@@ -1403,7 +1403,9 @@ unsafe extern "C-unwind" fn doc_load(l: *mut lua_State) -> c_int {
             call_document_callback(l, "OnLoadFileStart");
             if doc.open(PathBuf::from(path)).is_ok() {
                 doc.record_history();
+                call_document_callback(l, "OnLoadFileFormatDetected");
                 call_document_callback(l, "OnDocumentReady");
+                call_document_callback(l, "OnFormatEnd");
                 true
             } else {
                 call_document_callback(l, "OnLoadFileError");
