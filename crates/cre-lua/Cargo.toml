@@ -15,3 +15,4 @@ anyhow = "1"
 cre-lib = { path = "../cre-lib" }
 libc = "0.2"
 mlua = { version = "0.11", features = ["luajit", "module"] }
+regex = "1.13.1"

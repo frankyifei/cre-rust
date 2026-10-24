@@ -234,6 +234,9 @@ static REGISTERED_FONTS: OnceLock<Mutex<Vec<FontFace>>> = OnceLock::new();
 static GAMMA_INDEX: AtomicI32 = AtomicI32::new(2);
 static GAMMA_LEVEL: AtomicU32 = AtomicU32::new(1.0f32.to_bits());
 static IMAGE_REPLACEMENT_CHAR: AtomicU32 = AtomicU32::new(' ' as u32);
+const REGEX_SEARCH_ERROR_NONE: i32 = 0;
+const REGEX_SEARCH_ERROR_INVALID_PATTERN: i32 = 1;
+static REGEX_SEARCH_ERROR: AtomicI32 = AtomicI32::new(REGEX_SEARCH_ERROR_NONE);
 
 fn font_dir_state() -> &'static Mutex<String> {
     static STATE: OnceLock<Mutex<String>> = OnceLock::new();
@@ -955,12 +958,6 @@ unsafe extern "C-unwind" fn return_false(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn return_zero(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe { lua::lua_pushinteger(l, 0) };
-    1
-}
-
-unsafe extern "C-unwind" fn return_empty_string(l: *mut lua_State) -> c_int {
-    // SAFETY: `l` is the active Lua state.
-    unsafe { push_str(l, "") };
     1
 }
 
@@ -3149,7 +3146,26 @@ unsafe extern "C-unwind" fn doc_set_background_color(l: *mut lua_State) -> c_int
 
 unsafe extern "C-unwind" fn doc_check_regex(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
-    unsafe { push_bool(l, true) };
+    unsafe {
+        let Some(pattern) = arg_str(l, 2) else {
+            REGEX_SEARCH_ERROR.store(REGEX_SEARCH_ERROR_INVALID_PATTERN, Ordering::Relaxed);
+            push_int(l, i64::from(REGEX_SEARCH_ERROR_INVALID_PATTERN));
+            return 1;
+        };
+        let error = match regex::Regex::new(&pattern) {
+            Ok(_) => REGEX_SEARCH_ERROR_NONE,
+            Err(_) => REGEX_SEARCH_ERROR_INVALID_PATTERN,
+        };
+        REGEX_SEARCH_ERROR.store(error, Ordering::Relaxed);
+        push_int(l, i64::from(error));
+    }
+    1
+}
+
+unsafe extern "C-unwind" fn doc_get_and_clear_regex_search_error(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    let error = REGEX_SEARCH_ERROR.swap(REGEX_SEARCH_ERROR_NONE, Ordering::Relaxed);
+    unsafe { push_int(l, i64::from(error)) };
     1
 }
 
@@ -3325,7 +3341,10 @@ const DOC_METHODS: &[lua::luaL_Reg] = &regs![
     ("hasNonLinearFlows", doc_has_non_linear_flows),
     ("hasHiddenFlows", return_false),
     ("checkRegex", doc_check_regex),
-    ("getAndClearRegexSearchError", return_empty_string),
+    (
+        "getAndClearRegexSearchError",
+        doc_get_and_clear_regex_search_error
+    ),
     ("readDefaults", doc_read_defaults),
     ("saveDefaults", doc_save_defaults),
     ("close", doc_close),
