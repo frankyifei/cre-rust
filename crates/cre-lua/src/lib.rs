@@ -1796,10 +1796,10 @@ unsafe extern "C-unwind" fn doc_toc(l: *mut lua_State) -> c_int {
         for (index, item) in inner.toc().iter().enumerate() {
             lua::lua_createtable(l, 0, 4);
             push_str(l, "page");
-            push_int(l, item.page.unwrap_or(1) as i64);
+            push_int(l, item.page.unwrap_or(0) as i64);
             lua::lua_rawset(l, -3);
             push_str(l, "xpointer");
-            push_str(l, item.xpointer.as_deref().unwrap_or(&item.href));
+            push_str(l, item.xpointer.as_deref().unwrap_or_default());
             lua::lua_rawset(l, -3);
             push_str(l, "depth");
             push_int(l, item.depth as i64);
