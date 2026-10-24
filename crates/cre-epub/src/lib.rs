@@ -229,6 +229,62 @@ impl EpubBook {
         changed
     }
 
+    pub fn normalize_full_page_images(
+        &mut self,
+        page_width: f32,
+        page_height: f32,
+        margin_x: f32,
+        margin_y: f32,
+    ) -> usize {
+        let available_width = page_width - margin_x * 2.0;
+        let available_height = page_height - margin_y * 2.0;
+        if available_width <= 1.0 || available_height <= 1.0 {
+            return 0;
+        }
+
+        let spine = self.spine.clone();
+        let mut updates: Vec<(String, String, HashMap<String, Vec<u8>>)> = Vec::new();
+        let mut generated_counter = 0usize;
+
+        for item in spine.iter().filter(|item| item.linear) {
+            if !is_html_resource(&item.media_type, &item.href) {
+                continue;
+            }
+            let doc_key = normalize_path(&item.href);
+            let Some(doc_bytes) = self.resources.get(&doc_key).cloned() else {
+                continue;
+            };
+            let text = decode_text(&doc_bytes);
+            if !text.to_ascii_lowercase().contains("<img") {
+                continue;
+            }
+
+            let mut generated = HashMap::new();
+            let normalized = rewrite_full_page_image_tags(
+                &text,
+                parent_dir(&doc_key),
+                &self.resources,
+                &mut generated,
+                &mut generated_counter,
+                available_width,
+                available_height,
+            );
+            if !generated.is_empty() {
+                updates.push((doc_key, normalized, generated));
+            }
+        }
+
+        let mut changed = 0usize;
+        for (doc_key, normalized, generated) in updates {
+            for (key, value) in generated {
+                self.resources.insert(key, value);
+                changed += 1;
+            }
+            self.resources.insert(doc_key, normalized.into_bytes());
+        }
+        changed
+    }
+
     pub fn spine_documents(&self) -> Result<Vec<SpineDocument>> {
         let mut docs = Vec::new();
         for (index, item) in self.spine.iter().enumerate() {
@@ -938,6 +994,127 @@ fn generated_image_tag(generated_key: &str, svg_attrs: &HashMap<String, String>)
     tag
 }
 
+fn rewrite_full_page_image_tags(
+    html: &str,
+    doc_dir: &str,
+    resources: &HashMap<String, Vec<u8>>,
+    generated: &mut HashMap<String, Vec<u8>>,
+    generated_counter: &mut usize,
+    available_width: f32,
+    available_height: f32,
+) -> String {
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::with_capacity(html.len());
+    let mut cursor = 0usize;
+
+    while let Some(open_start) = next_tag_start(&lower, cursor, "<img") {
+        let Some(close_end) = find_tag_end(html, open_start) else {
+            out.push_str(&html[cursor..]);
+            return out;
+        };
+        out.push_str(&html[cursor..open_start]);
+
+        if let Some(replacement) = full_page_image_replacement(
+            &html[open_start..close_end],
+            doc_dir,
+            resources,
+            generated,
+            generated_counter,
+            available_width,
+            available_height,
+        ) {
+            out.push_str(&replacement);
+        } else {
+            out.push_str(&html[open_start..close_end]);
+        }
+        cursor = close_end;
+    }
+
+    out.push_str(&html[cursor..]);
+    out
+}
+
+fn full_page_image_replacement(
+    tag: &str,
+    doc_dir: &str,
+    resources: &HashMap<String, Vec<u8>>,
+    generated: &mut HashMap<String, Vec<u8>>,
+    generated_counter: &mut usize,
+    available_width: f32,
+    available_height: f32,
+) -> Option<String> {
+    let attrs = parse_attrs(tag);
+    if !attrs
+        .get("style")
+        .is_some_and(|style| style_has_full_height(style))
+    {
+        return None;
+    }
+    let src = attrs.get("src").map(String::as_str).unwrap_or_default();
+    let src = src.trim();
+    if src.is_empty() || src.starts_with("data:") || src.contains("://") {
+        return None;
+    }
+
+    let image_key = resolve_href(doc_dir, src);
+    let image_bytes = resources.get(&image_key)?;
+    let image_mime = image_mime(image_bytes, &image_key);
+    if image_mime == "image/svg+xml" {
+        return None;
+    }
+
+    *generated_counter += 1;
+    let generated_key = generated_full_page_image_key(*generated_counter);
+    let svg =
+        full_page_image_svg_document(available_width, available_height, image_mime, image_bytes);
+    generated.insert(generated_key.clone(), svg.into_bytes());
+
+    Some(full_page_image_tag(&generated_key, &attrs))
+}
+
+fn generated_full_page_image_key(counter: usize) -> String {
+    format!("cre-page-fit-{counter}.svg")
+}
+
+fn full_page_image_svg_document(width: f32, height: f32, mime: &str, image_bytes: &[u8]) -> String {
+    let encoded = base64_encode(image_bytes);
+    format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"{width:.0}\" height=\"{height:.0}\" viewBox=\"0 0 {width:.0} {height:.0}\"><image x=\"0\" y=\"0\" width=\"{width:.0}\" height=\"{height:.0}\" preserveAspectRatio=\"xMidYMid meet\" xlink:href=\"data:{mime};base64,{encoded}\" /></svg>"
+    )
+}
+
+fn full_page_image_tag(generated_key: &str, image_attrs: &HashMap<String, String>) -> String {
+    let src = format!("epub://book/{}", encode_path(generated_key));
+    let mut tag = format!("<img src=\"{}\"", escape_attr(&src));
+    if let Some(id) = image_attrs.get("id") {
+        tag.push_str(&format!(" id=\"{}\"", escape_attr(id)));
+    }
+    if let Some(class) = image_attrs.get("class") {
+        tag.push_str(&format!(" class=\"{}\"", escape_attr(class)));
+    }
+    if let Some(alt) = image_attrs.get("alt") {
+        tag.push_str(&format!(" alt=\"{}\"", escape_attr(alt)));
+    }
+    tag.push_str(" style=\"max-width:100%;height:auto\">");
+    tag
+}
+
+fn style_has_full_height(style: &str) -> bool {
+    for declaration in style.split(';') {
+        let Some((property, value)) = declaration.split_once(':') else {
+            continue;
+        };
+        if !property.trim().eq_ignore_ascii_case("height") {
+            continue;
+        }
+        let value = value.trim().trim_end_matches('!').trim();
+        if value.eq_ignore_ascii_case("100%") {
+            return true;
+        }
+    }
+    false
+}
+
 fn svg_css_style(attrs: &HashMap<String, String>) -> String {
     let mut style = attrs.get("style").cloned().unwrap_or_default();
     if let Some(value) = attrs.get("width").and_then(|value| css_length(value)) {
@@ -1412,6 +1589,96 @@ mod tests {
         let mut book = EpubBook::from_bytes(synthetic_complex_inline_svg_epub()).unwrap();
         assert_eq!(book.normalize_inline_svg_images(), 0);
         assert!(!book.resources.contains_key("cre-inline-svg-1.svg"));
+    }
+
+    #[test]
+    fn normalizes_full_page_height_images_to_page_fit_svg() {
+        let mut book = EpubBook::from_bytes(synthetic_full_page_image_epub()).unwrap();
+        assert_eq!(book.normalize_full_page_images(600.0, 800.0, 40.0, 32.0), 1);
+
+        let generated_key = "cre-page-fit-1.svg";
+        let generated_svg = String::from_utf8(book.resources[generated_key].clone()).unwrap();
+        assert!(generated_svg.contains("viewBox=\"0 0 520 736\""));
+        assert!(generated_svg.contains("preserveAspectRatio=\"xMidYMid meet\""));
+        assert!(generated_svg.contains("xlink:href=\"data:image/jpeg;base64,"));
+
+        let html = book.to_html(&HtmlOptions::default()).unwrap();
+        assert!(html.contains(&format!("epub://book/{generated_key}")));
+        assert!(html.contains("style=\"max-width:100%;height:auto\""));
+        assert!(!html.contains("height: 100%; max-width: 100%"));
+    }
+
+    #[test]
+    fn leaves_inline_images_without_full_height_style_unchanged() {
+        let mut book = EpubBook::from_bytes(synthetic_normal_image_epub()).unwrap();
+        assert_eq!(book.normalize_full_page_images(600.0, 800.0, 40.0, 32.0), 0);
+        assert!(!book.resources.contains_key("cre-page-fit-1.svg"));
+    }
+
+    fn synthetic_full_page_image_epub() -> Vec<u8> {
+        let container = r#"<?xml version="1.0"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+  <rootfiles>
+    <rootfile full-path="pkg.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#;
+        let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="id">urn:uuid:page-image-test</dc:identifier>
+    <dc:title>Page Image Test</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="s1" href="sec1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="img" href="images/one.jpg" media-type="image/jpeg"/>
+  </manifest>
+  <spine>
+    <itemref idref="s1"/>
+  </spine>
+</package>"#;
+        let doc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head><title>Sec1</title></head>
+  <body>
+    <div style="text-align: center; page-break-after: always;">
+      <img src="images/one.jpg" alt="Cover" style="height: 100%; max-width: 100%;" />
+    </div>
+  </body>
+</html>"#;
+        synthetic_epub_fixture(container, opf, doc, &jpg_fixture_bytes())
+    }
+
+    fn synthetic_normal_image_epub() -> Vec<u8> {
+        let container = r#"<?xml version="1.0"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+  <rootfiles>
+    <rootfile full-path="pkg.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#;
+        let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="id">urn:uuid:normal-image-test</dc:identifier>
+    <dc:title>Normal Image Test</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="s1" href="sec1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="img" href="images/one.jpg" media-type="image/jpeg"/>
+  </manifest>
+  <spine>
+    <itemref idref="s1"/>
+  </spine>
+</package>"#;
+        let doc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head><title>Sec1</title></head>
+  <body>
+    <img src="images/one.jpg" alt="Inline" style="max-width: 100%; height: auto;" />
+  </body>
+</html>"#;
+        synthetic_epub_fixture(container, opf, doc, &jpg_fixture_bytes())
     }
 
     fn synthetic_cdata_styled_epub() -> Vec<u8> {

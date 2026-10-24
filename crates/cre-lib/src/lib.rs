@@ -237,6 +237,12 @@ impl Document {
                     font_size: options.font_size,
                     ..HtmlOptions::default()
                 };
+                let _ = book.normalize_full_page_images(
+                    options.width as f32,
+                    options.height as f32,
+                    html_options.margin_x,
+                    html_options.margin_y,
+                );
                 let htmls = book.to_html_chunks(&html_options, CHUNK_TARGET_BYTES)?;
                 let cover_image = epub_cover_image(&book);
                 let has_non_linear_flows = book.spine.iter().any(|item| !item.linear);
