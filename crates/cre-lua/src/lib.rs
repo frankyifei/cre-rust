@@ -2605,9 +2605,28 @@ unsafe extern "C-unwind" fn doc_set_header_progress(l: *mut lua_State) -> c_int 
     // SAFETY: `l` is the active Lua state.
     unsafe {
         if let Some(doc) = doc_mut(l) {
-            let marks = arg_str(l, 2).unwrap_or_default();
-            doc.properties
-                .insert("header.progress.marks".to_string(), marks);
+            let pages = arg_int(l, 2).max(1);
+            let mut bounds = vec![0];
+            if lua::lua_istable(l, 3) != 0 {
+                let len = lua::lua_objlen(l, 3);
+                for index in 1..=len {
+                    lua::lua_rawgeti(l, 3, i64::try_from(index).unwrap_or(i64::MAX));
+                    if lua::lua_isnumber(l, -1) != 0 {
+                        let page = arg_int(l, -1);
+                        bounds.push(10_000 * (page - 1) / pages);
+                    }
+                    lua::lua_pop(l, 1);
+                }
+            }
+            bounds.push(10_000);
+            doc.properties.insert(
+                "header.progress.marks".to_string(),
+                bounds
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
         }
     }
     0
