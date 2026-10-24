@@ -160,6 +160,7 @@ pub unsafe extern "C" fn cre_open_with_options(
                     page_margin: options.page_margin,
                     font_size: 18.0,
                     font_path,
+                    stylesheet: None,
                 },
             )
             .map_err(|error| format!("{error:#}"))?

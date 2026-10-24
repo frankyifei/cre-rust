@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use anyrender::Scene;
-use blitz_dom::{DocumentConfig, Node, NodeId, Point, StyleThreading, build_single_font_ctx};
+use blitz_dom::{
+    DocumentConfig, Node, NodeId, Point, StyleThreading, UserAgentStylesheet, build_single_font_ctx,
+};
 use blitz_html::HtmlDocument;
 use blitz_traits::net::{Bytes, NetHandler, NetProvider, Request};
 use blitz_traits::shell::{ColorScheme, Viewport};
@@ -59,6 +61,7 @@ pub struct DocumentOptions {
     pub page_margin: f32,
     pub font_size: f32,
     pub font_path: Option<PathBuf>,
+    pub stylesheet: Option<String>,
 }
 
 impl Default for DocumentOptions {
@@ -70,6 +73,7 @@ impl Default for DocumentOptions {
             page_margin: 32.0,
             font_size: 18.0,
             font_path: None,
+            stylesheet: None,
         }
     }
 }
@@ -215,6 +219,7 @@ pub struct Document {
     height: u32,
     layout_height: u32,
     page_margin: f32,
+    stylesheet: Option<String>,
     sources: Vec<String>,
     base_url: String,
     resources: Arc<HashMap<String, Vec<u8>>>,
@@ -496,6 +501,7 @@ impl Document {
             height: options.height,
             layout_height: options.layout_height,
             page_margin: options.page_margin,
+            stylesheet: options.stylesheet.clone(),
             sources: htmls,
             base_url: base_url.to_string(),
             resources,
@@ -721,6 +727,7 @@ impl Document {
                 page_margin: self.page_margin,
                 font_size: 18.0,
                 font_path: None,
+                stylesheet: self.stylesheet.clone(),
             },
         );
         let lines = collect_lines(doc.root_element());
@@ -2498,7 +2505,7 @@ fn create_document(
     font_data: &[u8],
     options: &DocumentOptions,
 ) -> HtmlDocument {
-    let config = DocumentConfig {
+    let mut config = DocumentConfig {
         viewport: Some(Viewport::new(
             options.width,
             options.layout_height,
@@ -2511,6 +2518,17 @@ fn create_document(
         style_threading: StyleThreading::Sequential,
         ..Default::default()
     };
+
+    if let Some(stylesheet) = options
+        .stylesheet
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        config.ua_stylesheets = vec![
+            UserAgentStylesheet::default_sheet(),
+            UserAgentStylesheet::parse(stylesheet),
+        ];
+    }
 
     let mut doc = HtmlDocument::from_html(html, config);
     doc.resolve(0.0);

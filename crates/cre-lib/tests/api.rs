@@ -709,6 +709,7 @@ fn document_find_text_direction_filters_by_current_page() {
         page_margin: 16.0,
         font_size: 18.0,
         font_path: None,
+        stylesheet: None,
     };
     let mut doc = Document::with_options(fixture("sample.txt"), &options).unwrap();
     assert!(doc.page_count() > 3);
@@ -786,6 +787,7 @@ fn document_bookmarks_survive_reflow() {
         page_margin: 16.0,
         font_size: 18.0,
         font_path: None,
+        stylesheet: None,
     };
     let narrow = Document::with_options(fixture("sample.txt"), &narrow_options).unwrap();
     assert!(narrow.page_count() > 3);
@@ -835,6 +837,7 @@ fn document_selection_spans_pages() {
         page_margin: 16.0,
         font_size: 18.0,
         font_path: None,
+        stylesheet: None,
     };
     let doc = Document::with_options(fixture("sample.txt"), &options).unwrap();
     assert!(doc.page_count() > 3);

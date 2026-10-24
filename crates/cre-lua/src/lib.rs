@@ -112,6 +112,7 @@ impl Doc {
             page_margin: self.margins.0.max(0) as f32,
             font_size: self.font_size.max(1) as f32,
             font_path: self.font_path.clone(),
+            stylesheet: (!self.stylesheet.is_empty()).then(|| self.stylesheet.clone()),
         };
         self.inner = Some(Document::with_options(&path, &options)?);
         self.path = Some(path);
@@ -2714,8 +2715,12 @@ unsafe extern "C-unwind" fn doc_set_stylesheet(l: *mut lua_State) -> c_int {
             }
             stylesheet.push_str(&content);
         }
+        let changed = stylesheet != doc.stylesheet;
         doc.stylesheet = stylesheet.clone();
         doc.properties.insert("stylesheet".to_string(), stylesheet);
+        if changed && doc.inner.is_some() {
+            doc.relayout();
+        }
     }
     0
 }
