@@ -23,6 +23,12 @@ mod xpointer;
 
 pub use position::{PathSegment, TextPosition, XPointerRange, parse_text_position};
 
+const SEARCH_FLAGS_CASE_INSENSITIVE: i32 = 1 << 1;
+const SEARCH_FLAGS_COMMENTS: i32 = 1 << 2;
+const SEARCH_FLAGS_MULTILINE: i32 = 1 << 3;
+const SEARCH_FLAGS_LITERAL: i32 = 1 << 4;
+const SEARCH_FLAGS_DOTALL: i32 = 1 << 5;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DocumentFormat {
     Epub,
@@ -1078,10 +1084,27 @@ impl Document {
         pattern_is_regex: bool,
         max_hits: Option<usize>,
     ) -> Result<Vec<SearchHit>> {
+        self.find_text_with_search_flags(query, case_insensitive, pattern_is_regex, 0, max_hits)
+    }
+
+    pub fn find_text_with_search_flags(
+        &self,
+        query: &str,
+        case_insensitive: bool,
+        pattern_is_regex: bool,
+        search_flags: i32,
+        max_hits: Option<usize>,
+    ) -> Result<Vec<SearchHit>> {
         if max_hits.is_some_and(|max_hits| max_hits == 0) {
             return Ok(Vec::new());
         }
-        self.find_text_matches(query, case_insensitive, pattern_is_regex, max_hits)
+        self.find_text_matches(
+            query,
+            case_insensitive,
+            pattern_is_regex,
+            search_flags,
+            max_hits,
+        )
     }
 
     pub fn find_text_with_direction(
@@ -1093,10 +1116,38 @@ impl Document {
         reverse: bool,
         max_hits: Option<usize>,
     ) -> Result<Vec<SearchHit>> {
+        self.find_text_with_direction_flags(
+            query,
+            case_insensitive,
+            pattern_is_regex,
+            origin,
+            reverse,
+            0,
+            max_hits,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_text_with_direction_flags(
+        &self,
+        query: &str,
+        case_insensitive: bool,
+        pattern_is_regex: bool,
+        origin: i32,
+        reverse: bool,
+        search_flags: i32,
+        max_hits: Option<usize>,
+    ) -> Result<Vec<SearchHit>> {
         if max_hits.is_some_and(|max_hits| max_hits == 0) {
             return Ok(Vec::new());
         }
-        let mut hits = self.find_text_matches(query, case_insensitive, pattern_is_regex, None)?;
+        let mut hits = self.find_text_matches(
+            query,
+            case_insensitive,
+            pattern_is_regex,
+            search_flags,
+            None,
+        )?;
         self.apply_search_direction(&mut hits, origin, reverse);
         if let Some(max_hits) = max_hits {
             hits.truncate(max_hits);
@@ -1109,20 +1160,32 @@ impl Document {
         query: &str,
         case_insensitive: bool,
         pattern_is_regex: bool,
+        search_flags: i32,
         max_hits: Option<usize>,
     ) -> Result<Vec<SearchHit>> {
         if query.is_empty() {
             bail!("search query must not be empty");
         }
 
-        let pattern = if pattern_is_regex {
-            query.to_string()
-        } else {
+        let literal = !pattern_is_regex || (search_flags & SEARCH_FLAGS_LITERAL) != 0;
+        let pattern = if literal {
             regex::escape(query)
+        } else if (search_flags & SEARCH_FLAGS_COMMENTS) != 0 {
+            format!("(?x){query}")
+        } else {
+            query.to_string()
         };
-        let re = regex::RegexBuilder::new(&pattern)
-            .case_insensitive(case_insensitive)
-            .build()?;
+        let mut builder = regex::RegexBuilder::new(&pattern);
+        builder.case_insensitive(
+            case_insensitive || (search_flags & SEARCH_FLAGS_CASE_INSENSITIVE) != 0,
+        );
+        if (search_flags & SEARCH_FLAGS_DOTALL) != 0 {
+            builder.dot_matches_new_line(true);
+        }
+        if (search_flags & SEARCH_FLAGS_MULTILINE) != 0 {
+            builder.multi_line(true);
+        }
+        let re = builder.build()?;
 
         let mut hits = Vec::new();
         for page in 1..=self.page_count() {

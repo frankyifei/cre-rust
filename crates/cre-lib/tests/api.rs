@@ -535,6 +535,72 @@ fn document_finds_text_with_regex_and_case_insensitive_options() {
 }
 
 #[test]
+fn document_finds_text_with_search_flags() {
+    require_resources();
+
+    let doc = Document::open(fixture("sample.txt")).unwrap();
+
+    assert!(
+        doc.find_text_with("99..September", false, true, None)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !doc.find_text_with_search_flags("99..September", false, true, 32, None)
+            .unwrap()
+            .is_empty()
+    );
+
+    assert!(
+        doc.find_text_with("^September", false, true, None)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !doc.find_text_with_search_flags("^September", false, true, 8, None)
+            .unwrap()
+            .is_empty()
+    );
+
+    assert!(
+        doc.find_text_with(r"foo @bar .com", false, true, None)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !doc.find_text_with_search_flags("foo @bar .com", false, true, 4, None)
+            .unwrap()
+            .is_empty()
+    );
+
+    assert!(
+        doc.find_text_with("FOO@BAR\\.COM", false, true, None)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !doc.find_text_with_search_flags("FOO@BAR\\.COM", false, true, 2, None)
+            .unwrap()
+            .is_empty()
+    );
+
+    assert!(
+        !doc.find_text_with("foo.bar", false, true, None)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        doc.find_text_with_search_flags("foo.bar", false, true, 16, None)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        doc.find_text_with_search_flags("(", false, true, 16, None)
+            .is_ok()
+    );
+}
+
+#[test]
 fn document_find_text_direction_filters_by_current_page() {
     require_resources();
 

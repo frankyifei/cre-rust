@@ -1488,6 +1488,7 @@ unsafe extern "C-unwind" fn doc_find_text(l: *mut lua_State) -> c_int {
         let case_insensitive = arg_bool(l, 5);
         let pattern_is_regex = arg_bool(l, 6);
         let requested = arg_int(l, 7);
+        let search_flags = arg_int(l, 8) as i32;
         let Some(inner) = doc_ref(l).and_then(|doc| doc.inner.as_ref()) else {
             return 0;
         };
@@ -1498,6 +1499,7 @@ unsafe extern "C-unwind" fn doc_find_text(l: *mut lua_State) -> c_int {
             pattern_is_regex,
             origin,
             reverse,
+            search_flags,
             requested,
         ) else {
             return 0;
@@ -1520,6 +1522,7 @@ unsafe extern "C-unwind" fn doc_find_text(l: *mut lua_State) -> c_int {
     2
 }
 
+#[allow(clippy::too_many_arguments)]
 fn find_text_document_hits(
     inner: &cre_lib::Document,
     query: &str,
@@ -1527,18 +1530,20 @@ fn find_text_document_hits(
     pattern_is_regex: bool,
     origin: i32,
     reverse: bool,
+    search_flags: i32,
     requested: i64,
 ) -> Option<Vec<cre_lib::SearchHit>> {
     if query.is_empty() {
         return Some(Vec::new());
     }
     let max_hits = (requested > 0).then_some(requested as usize);
-    match inner.find_text_with_direction(
+    match inner.find_text_with_direction_flags(
         query,
         case_insensitive,
         pattern_is_regex,
         origin,
         reverse,
+        search_flags,
         max_hits,
     ) {
         Ok(hits) => Some(hits),
@@ -1556,13 +1561,20 @@ fn find_all_document_hits(
     query: &str,
     case_insensitive: bool,
     pattern_is_regex: bool,
+    search_flags: i32,
     requested: i64,
 ) -> Option<Vec<cre_lib::SearchHit>> {
     if query.is_empty() {
         return Some(Vec::new());
     }
     let max_hits = (requested > 0).then_some(requested as usize);
-    match inner.find_text_with(query, case_insensitive, pattern_is_regex, max_hits) {
+    match inner.find_text_with_search_flags(
+        query,
+        case_insensitive,
+        pattern_is_regex,
+        search_flags,
+        max_hits,
+    ) {
         Ok(hits) => Some(hits),
         Err(_) => {
             if pattern_is_regex {
@@ -1614,12 +1626,18 @@ unsafe extern "C-unwind" fn doc_find_all_text(l: *mut lua_State) -> c_int {
         let pattern_is_regex = arg_bool(l, 4);
         let requested = arg_int(l, 5);
         let get_matched_text = arg_bool(l, 6);
+        let search_flags = arg_int(l, 8) as i32;
         let Some(inner) = doc_ref(l).and_then(|doc| doc.inner.as_ref()) else {
             return 0;
         };
-        let Some(hits) =
-            find_all_document_hits(inner, &query, case_insensitive, pattern_is_regex, requested)
-        else {
+        let Some(hits) = find_all_document_hits(
+            inner,
+            &query,
+            case_insensitive,
+            pattern_is_regex,
+            search_flags,
+            requested,
+        ) else {
             return 0;
         };
         if hits.is_empty() {
