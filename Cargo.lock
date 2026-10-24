@@ -413,6 +413,7 @@ dependencies = [
  "cre-text",
  "image",
  "percent-encoding",
+ "regex",
  "resvg",
  "url",
 ]

@@ -1068,9 +1068,31 @@ impl Document {
     }
 
     pub fn find_text(&self, query: &str) -> Result<Vec<SearchHit>> {
+        self.find_text_with(query, false, false, None)
+    }
+
+    pub fn find_text_with(
+        &self,
+        query: &str,
+        case_insensitive: bool,
+        pattern_is_regex: bool,
+        max_hits: Option<usize>,
+    ) -> Result<Vec<SearchHit>> {
         if query.is_empty() {
             bail!("search query must not be empty");
         }
+        if max_hits.is_some_and(|max_hits| max_hits == 0) {
+            return Ok(Vec::new());
+        }
+
+        let pattern = if pattern_is_regex {
+            query.to_string()
+        } else {
+            regex::escape(query)
+        };
+        let re = regex::RegexBuilder::new(&pattern)
+            .case_insensitive(case_insensitive)
+            .build()?;
 
         let mut hits = Vec::new();
         for page in 1..=self.page_count() {
@@ -1100,11 +1122,12 @@ impl Document {
                 ));
             }
 
-            let mut search_start = 0;
-            while let Some(relative) = page_text[search_start..].find(query) {
-                let start = search_start + relative;
-                let end = start + query.len();
-                search_start = end;
+            for mat in re.find_iter(&page_text) {
+                let start = mat.start();
+                let end = mat.end();
+                if start == end {
+                    continue;
+                }
 
                 let Some(start_index) = spans.iter().position(|(_, span_start, span_end, _)| {
                     start >= *span_start && start < *span_end
@@ -1161,6 +1184,9 @@ impl Document {
                         .map(|(_, _, _, text_box)| text_box.clone())
                         .collect(),
                 });
+                if max_hits.is_some_and(|max_hits| hits.len() >= max_hits) {
+                    return Ok(hits);
+                }
             }
         }
         Ok(hits)

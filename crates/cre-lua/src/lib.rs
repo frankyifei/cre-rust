@@ -1483,11 +1483,15 @@ unsafe extern "C-unwind" fn doc_find_text(l: *mut lua_State) -> c_int {
         let Some(query) = arg_str(l, 2) else {
             return 0;
         };
+        let case_insensitive = arg_bool(l, 5);
+        let pattern_is_regex = arg_bool(l, 6);
         let requested = arg_int(l, 7);
         let Some(inner) = doc_ref(l).and_then(|doc| doc.inner.as_ref()) else {
             return 0;
         };
-        let Ok(hits) = inner.find_text(&query) else {
+        let Some(hits) =
+            find_document_hits(inner, &query, case_insensitive, pattern_is_regex, requested)
+        else {
             return 0;
         };
         if hits.is_empty() {
@@ -1506,6 +1510,28 @@ unsafe extern "C-unwind" fn doc_find_text(l: *mut lua_State) -> c_int {
         push_int(l, limit as i64);
     }
     2
+}
+
+fn find_document_hits(
+    inner: &cre_lib::Document,
+    query: &str,
+    case_insensitive: bool,
+    pattern_is_regex: bool,
+    requested: i64,
+) -> Option<Vec<cre_lib::SearchHit>> {
+    if query.is_empty() {
+        return Some(Vec::new());
+    }
+    let max_hits = (requested > 0).then_some(requested as usize);
+    match inner.find_text_with(query, case_insensitive, pattern_is_regex, max_hits) {
+        Ok(hits) => Some(hits),
+        Err(_) => {
+            if pattern_is_regex {
+                REGEX_SEARCH_ERROR.store(REGEX_SEARCH_ERROR_INVALID_PATTERN, Ordering::Relaxed);
+            }
+            None
+        }
+    }
 }
 
 unsafe fn push_match(l: *mut lua_State, hit: &cre_lib::SearchHit, matched_text: Option<&str>) {
@@ -1545,12 +1571,16 @@ unsafe extern "C-unwind" fn doc_find_all_text(l: *mut lua_State) -> c_int {
         let Some(query) = arg_str(l, 2) else {
             return 0;
         };
+        let case_insensitive = arg_bool(l, 3);
+        let pattern_is_regex = arg_bool(l, 4);
         let requested = arg_int(l, 5);
         let get_matched_text = arg_bool(l, 6);
         let Some(inner) = doc_ref(l).and_then(|doc| doc.inner.as_ref()) else {
             return 0;
         };
-        let Ok(hits) = inner.find_text(&query) else {
+        let Some(hits) =
+            find_document_hits(inner, &query, case_insensitive, pattern_is_regex, requested)
+        else {
             return 0;
         };
         if hits.is_empty() {

@@ -30,6 +30,7 @@ image = { version = "0.25", default-features = false, features = [
     "bmp",
 ] }
 percent-encoding = "2"
+regex = "1.13.1"
 resvg = { version = "0.48.1", default-features = false, features = [
     "text",
     "system-fonts",

@@ -504,6 +504,37 @@ fn document_finds_text_with_xpointer_ranges_and_rects() {
 }
 
 #[test]
+fn document_finds_text_with_regex_and_case_insensitive_options() {
+    require_resources();
+
+    let doc = Document::open(fixture("sample.txt")).unwrap();
+    let literal_hits = doc.find_text("foo@bar.com").unwrap();
+    assert!(!literal_hits.is_empty());
+
+    let regex_hits = doc
+        .find_text_with(r"foo@\w+\.com", false, true, Some(1))
+        .unwrap();
+    assert_eq!(regex_hits.len(), 1);
+    assert_eq!(regex_hits[0].page, literal_hits[0].page);
+    assert_eq!(
+        regex_hits[0].xpointer_range.start,
+        literal_hits[0].xpointer_range.start
+    );
+
+    let case_hits = doc
+        .find_text_with("FOO@BAR.COM", true, false, Some(1))
+        .unwrap();
+    assert_eq!(case_hits.len(), 1);
+    assert_eq!(case_hits[0].page, literal_hits[0].page);
+    assert_eq!(
+        case_hits[0].xpointer_range.start,
+        literal_hits[0].xpointer_range.start
+    );
+
+    assert!(doc.find_text_with("(", false, true, None).is_err());
+}
+
+#[test]
 fn document_bookmarks_survive_reflow() {
     require_resources();
 
