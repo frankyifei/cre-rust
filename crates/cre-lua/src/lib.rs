@@ -1728,11 +1728,23 @@ unsafe extern "C-unwind" fn doc_pos_from_xpointer(l: *mut lua_State) -> c_int {
     2
 }
 
+fn current_document_pos(inner: &Document) -> i64 {
+    let page = inner.current_page();
+    let page_y = inner.page_start_y(page);
+    if let Some(xpointer) = inner.xpointer_from_page(page).ok()
+        && let Some((_, y)) = inner.point_from_xpointer(&xpointer).ok().flatten()
+    {
+        return page_y + y.round() as i64;
+    }
+    page_y
+}
+
 unsafe extern "C-unwind" fn doc_current_pos(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
         let pos = doc_ref(l)
-            .and_then(|doc| doc.inner.as_ref().map(Document::current_pos))
+            .and_then(|doc| doc.inner.as_ref())
+            .map(current_document_pos)
             .unwrap_or(0);
         push_int(l, pos);
     }
@@ -1749,7 +1761,7 @@ unsafe extern "C-unwind" fn doc_current_percent(l: *mut lua_State) -> c_int {
                 if full_height == 0 {
                     0
                 } else {
-                    (inner.current_pos() * 10_000 / full_height).clamp(0, 9_999)
+                    (current_document_pos(inner) * 10_000 / full_height).clamp(0, 9_999)
                 }
             });
         push_int(l, percent);
