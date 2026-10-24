@@ -2263,10 +2263,23 @@ unsafe extern "C-unwind" fn doc_text_from_xpointers(l: *mut lua_State) -> c_int 
         let Some(end) = arg_str(l, 3) else {
             return 0;
         };
+        let draw_selection = lua::lua_isboolean(l, 4) != 0 && arg_bool(l, 4);
+        let draw_segmented = if lua::lua_isboolean(l, 5) != 0 {
+            arg_bool(l, 5)
+        } else {
+            draw_selection
+        };
+        let include_images = lua::lua_isboolean(l, 6) != 0 && arg_bool(l, 6);
         let text = doc_ref(l).and_then(|doc| {
             let inner = doc.inner.as_ref()?;
             inner.text_between_xpointers(&start, &end).ok()
         });
+        if draw_selection && let Some(doc) = doc_mut(l) {
+            doc.highlight = Some((start.clone(), end.clone()));
+            doc.last_range = Some((start.clone(), end.clone()));
+            let _ = draw_segmented;
+            let _ = include_images;
+        }
         push_str(l, text.as_deref().unwrap_or_default());
     }
     1
