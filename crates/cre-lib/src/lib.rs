@@ -42,6 +42,10 @@ pub struct DocumentMetadata {
     pub title: Option<String>,
     pub creator: Option<String>,
     pub language: Option<String>,
+    pub series: Option<String>,
+    pub description: Option<String>,
+    pub keywords: Option<String>,
+    pub identifiers: Option<String>,
     pub item_count: usize,
 }
 
@@ -237,6 +241,10 @@ impl Document {
                     title: book.title.clone(),
                     creator: book.creator.clone(),
                     language: book.language.clone(),
+                    series: book.series.clone(),
+                    description: book.description.clone(),
+                    keywords: book.keywords.clone(),
+                    identifiers: book.identifiers.clone(),
                     item_count: book.spine.len(),
                 };
                 let html_options = HtmlOptions {
@@ -274,6 +282,10 @@ impl Document {
                     title: book.title.clone(),
                     creator: book.creator.clone(),
                     language: book.language.clone(),
+                    series: None,
+                    description: book.description.clone(),
+                    keywords: None,
+                    identifiers: book.isbn.clone().map(|isbn| format!("ISBN: {isbn}")),
                     item_count: book.binary.len(),
                 };
                 let html_options = Fb2HtmlOptions {
@@ -312,6 +324,10 @@ impl Document {
                     title: book.title.clone(),
                     creator: None,
                     language: None,
+                    series: None,
+                    description: None,
+                    keywords: None,
+                    identifiers: None,
                     item_count: 1,
                 };
                 let html_options = TextHtmlOptions {

@@ -65,6 +65,10 @@ pub struct EpubBook {
     pub title: Option<String>,
     pub creator: Option<String>,
     pub language: Option<String>,
+    pub series: Option<String>,
+    pub description: Option<String>,
+    pub keywords: Option<String>,
+    pub identifiers: Option<String>,
     pub opf_path: String,
     pub opf_dir: String,
     pub manifest: Vec<ManifestItem>,
@@ -111,6 +115,10 @@ impl EpubBook {
         let title = first_child_text(root, "title");
         let creator = first_child_text(root, "creator");
         let language = first_child_text(root, "language");
+        let series = meta_content(root, "calibre:series");
+        let description = first_child_text(root, "description");
+        let keywords = element_texts(root, "subject");
+        let identifiers = element_texts(root, "identifier");
 
         let manifest_node = root
             .children()
@@ -168,6 +176,10 @@ impl EpubBook {
             title,
             creator,
             language,
+            series,
+            description,
+            keywords,
+            identifiers,
             opf_path,
             opf_dir,
             manifest,
@@ -421,6 +433,38 @@ fn first_child_text(root: roxmltree::Node<'_, '_>, name: &str) -> Option<String>
     root.descendants()
         .find(|n| n.is_element() && n.tag_name().name() == name)
         .and_then(|n| n.text())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn element_texts(root: roxmltree::Node<'_, '_>, name: &str) -> Option<String> {
+    let mut values = Vec::new();
+    for node in root
+        .descendants()
+        .filter(|n| n.is_element() && n.tag_name().name() == name)
+    {
+        let Some(text) = node
+            .text()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        if !values.contains(&text) {
+            values.push(text);
+        }
+    }
+    (!values.is_empty()).then(|| values.join(", "))
+}
+
+fn meta_content(root: roxmltree::Node<'_, '_>, name: &str) -> Option<String> {
+    root.descendants()
+        .filter(|n| n.is_element() && n.tag_name().name() == "meta")
+        .find(|n| {
+            n.attribute("name")
+                .is_some_and(|value| value.eq_ignore_ascii_case(name))
+        })
+        .and_then(|n| n.attribute("content"))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
@@ -1615,6 +1659,21 @@ mod tests {
         assert!(!book.resources.contains_key("cre-page-fit-1.svg"));
     }
 
+    #[test]
+    fn parses_extended_metadata() {
+        let book = EpubBook::from_bytes(synthetic_metadata_epub()).unwrap();
+        assert_eq!(book.title.as_deref(), Some("Metadata Test"));
+        assert_eq!(book.creator.as_deref(), Some("Test Author"));
+        assert_eq!(book.language.as_deref(), Some("zh"));
+        assert_eq!(book.series.as_deref(), Some("Test Series"));
+        assert_eq!(book.description.as_deref(), Some("Description text"));
+        assert_eq!(book.keywords.as_deref(), Some("alpha, beta"));
+        assert_eq!(
+            book.identifiers.as_deref(),
+            Some("urn:uuid:metadata-test, urn:isbn:123")
+        );
+    }
+
     fn synthetic_full_page_image_epub() -> Vec<u8> {
         let container = r#"<?xml version="1.0"?>
 <container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
@@ -1679,6 +1738,41 @@ mod tests {
   </body>
 </html>"#;
         synthetic_epub_fixture(container, opf, doc, &jpg_fixture_bytes())
+    }
+
+    fn synthetic_metadata_epub() -> Vec<u8> {
+        let container = r#"<?xml version="1.0"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+  <rootfiles>
+    <rootfile full-path="pkg.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#;
+        let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="uid">urn:uuid:metadata-test</dc:identifier>
+    <dc:title>Metadata Test</dc:title>
+    <dc:creator>Test Author</dc:creator>
+    <dc:language>zh</dc:language>
+    <dc:subject>alpha</dc:subject>
+    <dc:subject>beta</dc:subject>
+    <dc:identifier>urn:isbn:123</dc:identifier>
+    <dc:description>Description text</dc:description>
+    <meta name="calibre:series" content="Test Series"/>
+  </metadata>
+  <manifest>
+    <item id="s1" href="sec1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="s1"/>
+  </spine>
+</package>"#;
+        let doc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head><title>Sec1</title></head>
+  <body><p>metadata test</p></body>
+</html>"#;
+        synthetic_epub_fixture(container, opf, doc, b"")
     }
 
     fn synthetic_cdata_styled_epub() -> Vec<u8> {

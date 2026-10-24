@@ -1081,6 +1081,10 @@ unsafe extern "C-unwind" fn doc_props(l: *mut lua_State) -> c_int {
             props[0].1 = meta.title.as_deref().unwrap_or("");
             props[1].1 = meta.creator.as_deref().unwrap_or("");
             props[2].1 = meta.language.as_deref().unwrap_or("");
+            props[3].1 = meta.series.as_deref().unwrap_or("");
+            props[4].1 = meta.description.as_deref().unwrap_or("");
+            props[5].1 = meta.keywords.as_deref().unwrap_or("");
+            props[6].1 = meta.identifiers.as_deref().unwrap_or("");
         }
         for (key, value) in props {
             push_str(l, key);

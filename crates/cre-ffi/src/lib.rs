@@ -318,6 +318,10 @@ pub extern "C" fn cre_metadata(
             1 => metadata.title.as_deref(),
             2 => metadata.creator.as_deref(),
             3 => metadata.language.as_deref(),
+            4 => metadata.series.as_deref(),
+            5 => metadata.description.as_deref(),
+            6 => metadata.keywords.as_deref(),
+            7 => metadata.identifiers.as_deref(),
             _ => return Err("unknown metadata field".to_string()),
         };
         Ok(value.map_or(0, |value| write_string(value, out, out_len)))
