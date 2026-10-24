@@ -2146,6 +2146,22 @@ unsafe extern "C-unwind" fn doc_text_from_positions(l: *mut lua_State) -> c_int 
         let y0 = arg_int(l, 3) as f32;
         let x1 = arg_int(l, 4) as f32;
         let y1 = arg_int(l, 5) as f32;
+        let draw_selection = if lua::lua_isboolean(l, 6) != 0 {
+            arg_bool(l, 6)
+        } else {
+            true
+        };
+        let draw_segmented = if lua::lua_isboolean(l, 7) != 0 {
+            arg_bool(l, 7)
+        } else {
+            true
+        };
+        let include_images = lua::lua_isboolean(l, 8) != 0 && arg_bool(l, 8);
+        let grab_words = if lua::lua_isboolean(l, 9) != 0 {
+            arg_bool(l, 9)
+        } else {
+            true
+        };
         let Some((text, pos0, pos1)) = doc_mut(l).and_then(|doc| {
             doc.last_range = None;
             doc.last_boxes.clear();
@@ -2185,13 +2201,19 @@ unsafe extern "C-unwind" fn doc_text_from_positions(l: *mut lua_State) -> c_int 
             if let Some((_, _, _, range, boxes)) = &result {
                 doc.last_range = Some(range.clone());
                 doc.last_boxes = boxes.clone();
+                if draw_selection {
+                    doc.highlight = Some(range.clone());
+                }
             }
+            let _ = draw_segmented;
+            let _ = include_images;
+            let _ = grab_words;
             result.map(|(text, start_pos, end_pos, _, _)| (text, start_pos, end_pos))
         }) else {
             return 0;
         };
 
-        lua::lua_createtable(l, 0, 4);
+        lua::lua_createtable(l, 0, 3);
         push_str(l, "text");
         push_str(l, &text);
         lua::lua_rawset(l, -3);
@@ -2200,9 +2222,6 @@ unsafe extern "C-unwind" fn doc_text_from_positions(l: *mut lua_State) -> c_int 
         lua::lua_rawset(l, -3);
         push_str(l, "pos1");
         push_str(l, &pos1);
-        lua::lua_rawset(l, -3);
-        push_str(l, "title");
-        push_str(l, "");
         lua::lua_rawset(l, -3);
     }
     1
