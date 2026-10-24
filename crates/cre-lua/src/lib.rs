@@ -15,7 +15,6 @@ use read_fonts::TableProvider;
 const CREDOC: &[u8] = b"credocument\0";
 const CREIMAGE: &[u8] = b"creimage\0";
 const INDEX: &[u8] = b"__index\0";
-const NO_REF: c_int = -2;
 
 #[repr(C)]
 struct BlitBuffer {
@@ -66,7 +65,7 @@ struct Doc {
     page_map_source: String,
     page_map_chars: usize,
     highlight: Option<(String, String)>,
-    callback_ref: c_int,
+    callbacks: HashMap<String, c_int>,
 }
 
 impl Doc {
@@ -102,7 +101,7 @@ impl Doc {
             page_map_source: String::new(),
             page_map_chars: 0,
             highlight: None,
-            callback_ref: NO_REF,
+            callbacks: HashMap::new(),
         }
     }
 
@@ -1368,9 +1367,10 @@ unsafe extern "C-unwind" fn doc_gc(l: *mut lua_State) -> c_int {
     unsafe {
         let ptr = lua::lua_touserdata(l, 1).cast::<Doc>();
         if !ptr.is_null() {
-            if (*ptr).callback_ref != NO_REF {
-                lua::luaL_unref(l, lua::LUA_REGISTRYINDEX, (*ptr).callback_ref);
+            for reference in (*ptr).callbacks.values() {
+                lua::luaL_unref(l, lua::LUA_REGISTRYINDEX, *reference);
             }
+            (*ptr).callbacks.clear();
             ptr::drop_in_place(ptr);
         }
     }
@@ -1405,6 +1405,10 @@ unsafe extern "C-unwind" fn doc_close(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
         if let Some(doc) = doc_mut(l) {
+            for reference in doc.callbacks.values() {
+                lua::luaL_unref(l, lua::LUA_REGISTRYINDEX, *reference);
+            }
+            doc.callbacks.clear();
             doc.inner = None;
         }
     }
@@ -2844,18 +2848,39 @@ unsafe extern "C-unwind" fn doc_set_battery_state(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn doc_set_callback(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let is_function = lua::lua_isfunction(l, 2) != 0;
+        let has_name = lua::lua_isstring(l, 2) != 0;
+        let name = if has_name {
+            arg_str(l, 2).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let function_index = match (
+            lua::lua_isfunction(l, 3) != 0,
+            lua::lua_isfunction(l, 2) != 0,
+        ) {
+            (true, _) => 3,
+            (false, true) => 2,
+            (false, false) => 0,
+        };
         if let Some(doc) = doc_mut(l) {
-            if is_function {
-                if doc.callback_ref != NO_REF {
-                    lua::luaL_unref(l, lua::LUA_REGISTRYINDEX, doc.callback_ref);
+            if function_index != 0 {
+                let previous = doc.callbacks.remove(&name);
+                if let Some(previous) = previous {
+                    lua::luaL_unref(l, lua::LUA_REGISTRYINDEX, previous);
                 }
-                doc.callback_ref = lua::luaL_ref(l, lua::LUA_REGISTRYINDEX);
-            } else if doc.callback_ref != NO_REF {
-                lua::luaL_unref(l, lua::LUA_REGISTRYINDEX, doc.callback_ref);
-                doc.callback_ref = NO_REF;
+                doc.callbacks
+                    .insert(name, lua::luaL_ref(l, lua::LUA_REGISTRYINDEX));
+            } else if has_name {
+                if let Some(previous) = doc.callbacks.remove(&name) {
+                    lua::luaL_unref(l, lua::LUA_REGISTRYINDEX, previous);
+                }
+            } else {
+                for reference in doc.callbacks.values() {
+                    lua::luaL_unref(l, lua::LUA_REGISTRYINDEX, *reference);
+                }
+                doc.callbacks.clear();
             }
-        } else if is_function {
+        } else if function_index != 0 {
             let reference = lua::luaL_ref(l, lua::LUA_REGISTRYINDEX);
             lua::luaL_unref(l, lua::LUA_REGISTRYINDEX, reference);
         }
