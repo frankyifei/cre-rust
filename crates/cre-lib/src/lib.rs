@@ -62,6 +62,7 @@ pub struct DocumentOptions {
     pub font_size: f32,
     pub font_path: Option<PathBuf>,
     pub stylesheet: Option<String>,
+    pub embedded_styles_enabled: bool,
 }
 
 impl Default for DocumentOptions {
@@ -74,6 +75,7 @@ impl Default for DocumentOptions {
             font_size: 18.0,
             font_path: None,
             stylesheet: None,
+            embedded_styles_enabled: true,
         }
     }
 }
@@ -220,6 +222,7 @@ pub struct Document {
     layout_height: u32,
     page_margin: f32,
     stylesheet: Option<String>,
+    embedded_styles_enabled: bool,
     sources: Vec<String>,
     base_url: String,
     resources: Arc<HashMap<String, Vec<u8>>>,
@@ -502,6 +505,7 @@ impl Document {
             layout_height: options.layout_height,
             page_margin: options.page_margin,
             stylesheet: options.stylesheet.clone(),
+            embedded_styles_enabled: options.embedded_styles_enabled,
             sources: htmls,
             base_url: base_url.to_string(),
             resources,
@@ -728,6 +732,7 @@ impl Document {
                 font_size: 18.0,
                 font_path: None,
                 stylesheet: self.stylesheet.clone(),
+                embedded_styles_enabled: self.embedded_styles_enabled,
             },
         );
         let lines = collect_lines(doc.root_element());
@@ -2530,13 +2535,105 @@ fn create_document(
         ];
     }
 
-    let mut doc = HtmlDocument::from_html(html, config);
+    let stripped = if options.embedded_styles_enabled {
+        String::new()
+    } else {
+        strip_author_styles(html)
+    };
+    let html_source = if options.embedded_styles_enabled {
+        html
+    } else {
+        stripped.as_str()
+    };
+    let mut doc = HtmlDocument::from_html(html_source, config);
     doc.resolve(0.0);
     for _ in 0..4 {
         doc.handle_messages();
         doc.resolve(0.0);
     }
     doc
+}
+
+fn strip_author_styles(html: &str) -> String {
+    let bytes = remove_style_blocks(html.as_bytes().to_vec());
+    let bytes = remove_link_stylesheets(bytes);
+    String::from_utf8(bytes).unwrap_or_else(|_| html.to_string())
+}
+
+fn lower_ascii(bytes: &[u8]) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    for value in out.iter_mut() {
+        if *value >= b'A' && *value <= b'Z' {
+            *value += 32;
+        }
+    }
+    out
+}
+
+fn find_case_insensitive(haystack: &[u8], needle_lower: &[u8], from: usize) -> Option<usize> {
+    if needle_lower.is_empty() {
+        return Some(from);
+    }
+    if from > haystack.len() || from + needle_lower.len() > haystack.len() {
+        return None;
+    }
+    let upper = haystack.len() - needle_lower.len();
+    (from..=upper).find(|start| {
+        needle_lower
+            .iter()
+            .enumerate()
+            .all(|(offset, needle)| haystack[start + offset].to_ascii_lowercase() == *needle)
+    })
+}
+
+fn contains_in_range(haystack: &[u8], needle_lower: &[u8], start: usize, end: usize) -> bool {
+    find_case_insensitive(haystack, needle_lower, start).is_some_and(|position| position <= end)
+}
+
+fn remove_range(bytes: &[u8], start: usize, end: usize) -> Vec<u8> {
+    let end = end.min(bytes.len());
+    let start = start.min(end);
+    let mut out = Vec::with_capacity(bytes.len().saturating_sub(end - start));
+    out.extend(bytes[..start].iter());
+    out.extend(bytes[end..].iter());
+    out
+}
+
+fn remove_style_blocks(bytes: Vec<u8>) -> Vec<u8> {
+    let mut current = bytes;
+    loop {
+        let lower = lower_ascii(&current);
+        let Some(start) = find_case_insensitive(&lower, b"<style", 0) else {
+            break;
+        };
+        let close = find_case_insensitive(&lower, b"</style>", start + b"<style".len())
+            .map(|end| end + b"</style>".len())
+            .unwrap_or(current.len());
+        current = remove_range(&current, start, close);
+    }
+    current
+}
+
+fn remove_link_stylesheets(bytes: Vec<u8>) -> Vec<u8> {
+    let mut current = bytes;
+    let mut start = 0usize;
+    loop {
+        let lower = lower_ascii(&current);
+        let Some(tag_start) = find_case_insensitive(&lower, b"<link", start) else {
+            break;
+        };
+        let Some(tag_end) = find_case_insensitive(&lower, b">", tag_start) else {
+            break;
+        };
+        let is_stylesheet_link = contains_in_range(&lower, b"stylesheet", tag_start, tag_end)
+            || contains_in_range(&lower, b"text/css", tag_start, tag_end);
+        if is_stylesheet_link {
+            current = remove_range(&current, tag_start, tag_end + 1);
+            continue;
+        }
+        start = tag_end + 1;
+    }
+    current
 }
 
 fn snapshot_page_boxes(
@@ -2688,4 +2785,22 @@ impl NetProvider for EmptyNet {
     fn fetch(&self, _doc_id: usize, request: Request, handler: Box<dyn NetHandler>) {
         handler.bytes(request.url.to_string(), Bytes::from(Vec::new()));
     }
+}
+
+#[test]
+fn strip_author_styles_removes_embedded_style_and_stylesheet_link() {
+    let html = r#"
+<html>
+<head>
+<link rel="stylesheet" href="cover.css"></link>
+<style>.hidden { visibility: hidden; }</style>
+</head>
+<body><p class="hidden">visible</p></body>
+</html>
+"#;
+    let stripped = strip_author_styles(html);
+    let bytes = stripped.as_bytes();
+    assert!(find_case_insensitive(bytes, b"<style", 0).is_none());
+    assert!(find_case_insensitive(bytes, b"<link", 0).is_none());
+    assert!(find_case_insensitive(bytes, b"visible", 0).is_some());
 }

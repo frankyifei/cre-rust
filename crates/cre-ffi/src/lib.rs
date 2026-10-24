@@ -161,6 +161,7 @@ pub unsafe extern "C" fn cre_open_with_options(
                     font_size: 18.0,
                     font_path,
                     stylesheet: None,
+                    embedded_styles_enabled: true,
                 },
             )
             .map_err(|error| format!("{error:#}"))?

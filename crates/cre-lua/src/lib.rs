@@ -54,6 +54,7 @@ struct Doc {
     header_height: i32,
     interline: i32,
     stylesheet: String,
+    embedded_stylesheet_enabled: bool,
     background_color: String,
     background_image: String,
     battery: i32,
@@ -89,6 +90,7 @@ impl Doc {
             header_height: 0,
             interline: 100,
             stylesheet: String::new(),
+            embedded_stylesheet_enabled: true,
             background_color: String::new(),
             background_image: String::new(),
             battery: 0,
@@ -113,6 +115,7 @@ impl Doc {
             font_size: self.font_size.max(1) as f32,
             font_path: self.font_path.clone(),
             stylesheet: (!self.stylesheet.is_empty()).then(|| self.stylesheet.clone()),
+            embedded_styles_enabled: self.embedded_stylesheet_enabled,
         };
         self.inner = Some(Document::with_options(&path, &options)?);
         self.path = Some(path);
@@ -2753,12 +2756,20 @@ unsafe extern "C-unwind" fn doc_set_stylesheet(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn doc_set_embedded_stylesheet(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let enabled = arg_int(l, 2);
+        let enabled = arg_int(l, 2) != 0;
+        let value = if enabled {
+            "1".to_string()
+        } else {
+            "0".to_string()
+        };
         if let Some(doc) = doc_mut(l) {
-            doc.properties.insert(
-                "crengine.doc.embedded.styles.enabled".to_string(),
-                enabled.to_string(),
-            );
+            let changed = doc.embedded_stylesheet_enabled != enabled;
+            doc.embedded_stylesheet_enabled = enabled;
+            doc.properties
+                .insert("crengine.doc.embedded.styles.enabled".to_string(), value);
+            if changed {
+                doc.relayout();
+            }
         }
     }
     0
@@ -3846,6 +3857,8 @@ unsafe extern "C-unwind" fn doc_render_hash(l: *mut lua_State) -> c_int {
             doc.font_face.hash(&mut hasher);
             doc.margins.hash(&mut hasher);
             doc.view_mode.hash(&mut hasher);
+            doc.embedded_stylesheet_enabled.hash(&mut hasher);
+            doc.stylesheet.hash(&mut hasher);
             doc.path.hash(&mut hasher);
         }
         push_int(l, hasher.finish() as i64);
