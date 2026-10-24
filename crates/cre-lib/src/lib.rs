@@ -534,6 +534,10 @@ impl Document {
         self.height
     }
 
+    pub fn page_margin_y(&self) -> i64 {
+        self.page_margin.round() as i64
+    }
+
     pub fn page_count_1based(&self) -> usize {
         self.page_count()
     }

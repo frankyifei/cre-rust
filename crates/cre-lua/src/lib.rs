@@ -216,9 +216,9 @@ impl Doc {
         }
         let index = self
             .page_map
-            .binary_search_by_key(&y, |entry| entry.doc_y)
-            .unwrap_or_else(|index| index);
-        Some(index.saturating_sub(1))
+            .partition_point(|entry| entry.doc_y < y)
+            .saturating_sub(1);
+        Some(index)
     }
 
     fn page_map_index_for_doc_y_at_or_below(&self, y: i64) -> Option<usize> {
@@ -236,11 +236,7 @@ impl Doc {
         if self.page_map.is_empty() {
             return None;
         }
-        Some(
-            self.page_map
-                .binary_search_by_key(&y, |entry| entry.doc_y)
-                .unwrap_or_else(|index| index),
-        )
+        Some(self.page_map.partition_point(|entry| entry.doc_y < y))
     }
 
     fn current_page(&self) -> usize {
@@ -2866,7 +2862,19 @@ unsafe extern "C-unwind" fn doc_get_page_flow(l: *mut lua_State) -> c_int {
 
 unsafe extern "C-unwind" fn doc_get_page_offset_x(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
-    unsafe { push_int(l, 0) };
+    unsafe {
+        let page = arg_int(l, 2);
+        let offset = doc_ref(l).and_then(|doc| {
+            let inner = doc.inner.as_ref()?;
+            if page < 1 || usize::try_from(page).ok()? > inner.page_count() {
+                return Some(0);
+            }
+            let count = i64::from(doc.visible_page_count.max(1));
+            let width = i64::from(inner.page_width());
+            Some((page - 1).rem_euclid(count) * width)
+        });
+        push_int(l, offset.unwrap_or(0));
+    }
     1
 }
 
@@ -3567,6 +3575,11 @@ unsafe extern "C-unwind" fn doc_get_page_map_visible(l: *mut lua_State) -> c_int
         let end_page = (start_page + visible_count).min(page_count + 1);
         let min_y = inner.current_pos();
         let max_y = min_y + i64::from(inner.page_height()) * i64::from(visible_count as u32);
+        let offset_y = if doc.view_mode == 1 {
+            i64::from(doc.header_height.max(0)) + inner.page_margin_y()
+        } else {
+            0
+        };
         let start_index = doc
             .page_map_first_index_at_or_above(min_y)
             .unwrap_or(doc.page_map.len());
@@ -3584,7 +3597,7 @@ unsafe extern "C-unwind" fn doc_get_page_map_visible(l: *mut lua_State) -> c_int
             push_int(l, (entry.page - start_page + 1) as i64);
             lua::lua_rawset(l, -3);
             push_str(l, "screen_y");
-            push_int(l, entry.doc_y - inner.page_start_y(entry.page));
+            push_int(l, entry.doc_y - inner.page_start_y(entry.page) + offset_y);
             lua::lua_rawset(l, -3);
             push_str(l, "page");
             push_int(l, entry.page as i64);
