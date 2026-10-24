@@ -210,8 +210,37 @@ impl Doc {
         self.page_map_source = "synthetic".to_string();
     }
 
-    fn page_map_index_for_page(&self, page: usize) -> Option<usize> {
-        self.page_map.iter().rposition(|entry| entry.page <= page)
+    fn page_map_index_for_doc_y_below(&self, y: i64) -> Option<usize> {
+        if self.page_map.is_empty() {
+            return None;
+        }
+        let index = self
+            .page_map
+            .binary_search_by_key(&y, |entry| entry.doc_y)
+            .unwrap_or_else(|index| index);
+        Some(index.saturating_sub(1))
+    }
+
+    fn page_map_index_for_doc_y_at_or_below(&self, y: i64) -> Option<usize> {
+        if self.page_map.is_empty() {
+            return None;
+        }
+        let index = self
+            .page_map
+            .partition_point(|entry| entry.doc_y <= y)
+            .saturating_sub(1);
+        Some(index)
+    }
+
+    fn page_map_first_index_at_or_above(&self, y: i64) -> Option<usize> {
+        if self.page_map.is_empty() {
+            return None;
+        }
+        Some(
+            self.page_map
+                .binary_search_by_key(&y, |entry| entry.doc_y)
+                .unwrap_or_else(|index| index),
+        )
     }
 
     fn current_page(&self) -> usize {
@@ -1438,16 +1467,16 @@ unsafe extern "C-unwind" fn doc_goto_percent(l: *mut lua_State) -> c_int {
             let Some(doc) = doc_mut(l) else {
                 return;
             };
-            let count = doc.page_count();
             let Some(inner) = doc.inner.as_mut() else {
                 return;
             };
-            if count == 0 {
+            if inner.page_count() == 0 {
                 return;
             }
-            let percent = arg_int(l, 2).clamp(0, 10_000) as usize;
-            let page = (percent * count / 10_000).max(1).min(count);
-            let _ = inner.go_to_page(page);
+            let percent = arg_int(l, 2).clamp(0, 10_000);
+            let full_height = i64::try_from(inner.full_height()).unwrap_or(i64::MAX);
+            let pos = percent.saturating_mul(full_height) / 10_000;
+            let _ = inner.set_pos(pos);
         }
     }));
     // SAFETY: `l` is the active Lua state.
@@ -1466,17 +1495,14 @@ unsafe extern "C-unwind" fn doc_goto_pos(l: *mut lua_State) -> c_int {
             let Some(doc) = doc_mut(l) else {
                 return;
             };
-            let count = doc.page_count();
-            let height = doc.height.max(1) as i64;
             let Some(inner) = doc.inner.as_mut() else {
                 return;
             };
-            if count == 0 {
+            if inner.page_count() == 0 {
                 return;
             }
             let pos = arg_int(l, 2).max(0);
-            let page = ((pos / height) as usize + 1).min(count);
-            let _ = inner.go_to_page(page);
+            let _ = inner.set_pos(pos);
         }
     }));
     // SAFETY: `l` is the active Lua state.
@@ -3370,8 +3396,12 @@ unsafe extern "C-unwind" fn doc_get_page_map_current(l: *mut lua_State) -> c_int
         let Some(doc) = doc_ref(l) else {
             return 0;
         };
-        let page = doc.current_page();
-        let Some(index) = doc.page_map_index_for_page(page) else {
+        let Some(inner) = doc.inner.as_ref() else {
+            return 0;
+        };
+        let max_y = inner.current_pos()
+            + i64::from(inner.page_height()) * i64::from(doc.visible_page_count.max(1) as u32);
+        let Some(index) = doc.page_map_index_for_doc_y_below(max_y) else {
             return 0;
         };
         push_str(l, &doc.page_map[index].label);
@@ -3390,14 +3420,18 @@ unsafe extern "C-unwind" fn doc_get_page_map_xpointer(l: *mut lua_State) -> c_in
         let Some(doc) = doc_ref(l) else {
             return 0;
         };
-        let Some(page) = doc
-            .inner
-            .as_ref()
-            .and_then(|inner| inner.page_from_xpointer(&xpointer).ok())
-        else {
+        let Some(inner) = doc.inner.as_ref() else {
             return 0;
         };
-        let Some(index) = doc.page_map_index_for_page(page) else {
+        let page = match inner.page_from_xpointer(&xpointer) {
+            Ok(page) => page,
+            Err(_) => return 0,
+        };
+        let point = inner.point_from_xpointer(&xpointer).ok().flatten();
+        let (x, y) = point.unwrap_or((0.0, 0.0));
+        let _ = x;
+        let xp_y = (inner.page_start_y(page) + y.round() as i64).max(0);
+        let Some(index) = doc.page_map_index_for_doc_y_at_or_below(xp_y) else {
             return 0;
         };
         push_str(l, &doc.page_map[index].label);
@@ -3414,11 +3448,23 @@ unsafe extern "C-unwind" fn doc_get_page_map_visible(l: *mut lua_State) -> c_int
         if doc.page_map.is_empty() {
             return 0;
         }
-        let start_page = doc.current_page();
-        let end_page = start_page + doc.visible_page_count.max(1) as usize;
+        let Some(inner) = doc.inner.as_ref() else {
+            return 0;
+        };
+        let page_count = inner.page_count();
+        let start_page = inner.current_page();
+        let visible_count = doc.visible_page_count.max(1) as usize;
+        let end_page = (start_page + visible_count).min(page_count + 1);
+        let min_y = inner.current_pos();
+        let max_y = min_y + i64::from(inner.page_height()) * i64::from(visible_count as u32);
+        let start_index = doc
+            .page_map_first_index_at_or_above(min_y)
+            .unwrap_or(doc.page_map.len());
         let entries = doc
             .page_map
             .iter()
+            .skip(start_index)
+            .take_while(|entry| entry.doc_y < max_y)
             .filter(|entry| entry.page >= start_page && entry.page < end_page)
             .collect::<Vec<_>>();
         lua::lua_createtable(l, entries.len() as c_int, 0);
@@ -3428,7 +3474,7 @@ unsafe extern "C-unwind" fn doc_get_page_map_visible(l: *mut lua_State) -> c_int
             push_int(l, (entry.page - start_page + 1) as i64);
             lua::lua_rawset(l, -3);
             push_str(l, "screen_y");
-            push_int(l, 0);
+            push_int(l, entry.doc_y - inner.page_start_y(entry.page));
             lua::lua_rawset(l, -3);
             push_str(l, "page");
             push_int(l, entry.page as i64);

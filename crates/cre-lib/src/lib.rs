@@ -472,7 +472,7 @@ impl Document {
             })
             .collect();
 
-        let page_map = page_map_items
+        let mut page_map: Vec<PageMapEntry> = page_map_items
             .into_iter()
             .filter_map(|item| {
                 let page = page_for_href(&href_pages, &item.href).ok()?;
@@ -488,6 +488,7 @@ impl Document {
                 })
             })
             .collect();
+        page_map.sort_by_key(|entry| (entry.doc_y, entry.page));
 
         let document = Self {
             metadata,
@@ -1510,6 +1511,19 @@ impl Document {
         }
         self.current_page = page;
         Ok(page)
+    }
+
+    pub fn set_pos(&mut self, pos: i64) -> Result<usize> {
+        let page_count = self.page_count();
+        if page_count == 0 {
+            bail!("document has no pages");
+        }
+        let page = if pos <= 0 {
+            1
+        } else {
+            (pos / i64::from(self.height) + 1).min(page_count as i64) as usize
+        };
+        self.go_to_page(page)
     }
 
     pub fn go_to_first_page(&mut self) -> usize {
