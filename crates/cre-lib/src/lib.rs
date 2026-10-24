@@ -1024,6 +1024,11 @@ impl Document {
                 rect.y,
             )));
         }
+        if let Some(next) = self.next_visible_char(xpointer)?
+            && next != xpointer
+        {
+            return self.point_from_xpointer(&next);
+        }
         Ok(None)
     }
 

@@ -1645,7 +1645,7 @@ unsafe extern "C-unwind" fn doc_pos_from_xpointer(l: *mut lua_State) -> c_int {
                     let inner = doc.inner.as_ref()?;
                     let page = inner.page_from_xpointer(&xp).ok()?;
                     let point = inner.point_from_xpointer(&xp).ok().flatten();
-                    let (x, y) = point.unwrap_or((0.0, inner.page_height() as f32));
+                    let (x, y) = point.unwrap_or((0.0, 0.0));
                     let y = inner.page_start_y(page) + y.round() as i64;
                     Some((y, x.round() as i64))
                 })
