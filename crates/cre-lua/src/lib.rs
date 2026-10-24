@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{c_char, c_int};
 use std::hash::{Hash, Hasher};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -10,6 +10,7 @@ use std::sync::{Mutex, OnceLock};
 use cre_lib::{Document, DocumentFormat, DocumentOptions};
 use mlua::ffi as lua;
 use mlua::lua_State;
+use read_fonts::TableProvider;
 
 const CREDOC: &[u8] = b"credocument\0";
 const CREIMAGE: &[u8] = b"creimage\0";
@@ -111,9 +112,7 @@ impl Doc {
         };
         self.inner = Some(Document::with_options(&path, &options)?);
         self.path = Some(path);
-        self.page_map.clear();
-        self.page_map_source.clear();
-        self.page_map_chars = 0;
+        self.load_document_page_map();
         Ok(())
     }
 
@@ -135,9 +134,7 @@ impl Doc {
         if let (Some(xpointer), Some(inner)) = (xpointer, self.inner.as_mut()) {
             let _ = inner.go_to_xpointer(&xpointer);
         }
-        self.page_map.clear();
-        self.page_map_source.clear();
-        self.page_map_chars = 0;
+        self.load_document_page_map();
     }
 
     fn current_xpointer(&self) -> Option<String> {
@@ -147,6 +144,26 @@ impl Doc {
                 .ok()
                 .filter(|xpointer| !xpointer.is_empty())
         })
+    }
+
+    fn load_document_page_map(&mut self) {
+        self.page_map.clear();
+        self.page_map_source.clear();
+        self.page_map_chars = 0;
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        self.page_map_source = inner.document_page_map_source().to_string();
+        self.page_map = inner
+            .document_page_map()
+            .iter()
+            .map(|entry| PageMapEntry {
+                page: entry.page,
+                xpointer: entry.xpointer.clone().unwrap_or_default(),
+                doc_y: entry.doc_y,
+                label: entry.label.clone(),
+            })
+            .collect();
     }
 
     fn record_history(&mut self) {
@@ -206,10 +223,19 @@ impl Doc {
     }
 }
 
+#[derive(Clone)]
 struct FontFace {
-    name: String,
+    family: String,
+    full_name: String,
+    postscript_name: String,
     path: PathBuf,
     index: i32,
+    weight: i32,
+    italic: bool,
+    monospace: bool,
+    math: bool,
+    color: bool,
+    bitmap: bool,
 }
 
 struct CreImage {
@@ -231,6 +257,7 @@ impl CreImage {
 
 static FONT_CACHE: OnceLock<Vec<FontFace>> = OnceLock::new();
 static REGISTERED_FONTS: OnceLock<Mutex<Vec<FontFace>>> = OnceLock::new();
+static FONT_BIAS: OnceLock<Mutex<HashMap<String, i32>>> = OnceLock::new();
 static GAMMA_INDEX: AtomicI32 = AtomicI32::new(2);
 static GAMMA_LEVEL: AtomicU32 = AtomicU32::new(1.0f32.to_bits());
 static IMAGE_REPLACEMENT_CHAR: AtomicU32 = AtomicU32::new(' ' as u32);
@@ -253,7 +280,7 @@ fn user_hyph_state() -> &'static Mutex<HashSet<String>> {
     STATE.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-fn font_faces() -> &'static Vec<FontFace> {
+fn all_font_faces() -> &'static Vec<FontFace> {
     FONT_CACHE.get_or_init(|| {
         let mut roots = vec![
             PathBuf::from("/usr/share/fonts"),
@@ -274,16 +301,44 @@ fn font_faces() -> &'static Vec<FontFace> {
         for root in roots {
             collect_font_faces(&root, 0, &mut faces, &mut seen);
         }
-        faces.sort_by(|left, right| left.name.cmp(&right.name));
+        faces.extend(registered_font_faces());
+        sort_font_faces(&mut faces);
         faces
     })
+}
+
+fn registered_font_faces() -> Vec<FontFace> {
+    let registered = REGISTERED_FONTS.get_or_init(|| Mutex::new(Vec::new()));
+    match registered.lock() {
+        Ok(fonts) => fonts.clone(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn all_font_faces_with_registration() -> Vec<FontFace> {
+    let mut faces = all_font_faces().clone();
+    faces.extend(registered_font_faces());
+    sort_font_faces(&mut faces);
+    faces
+}
+
+fn sort_font_faces(faces: &mut [FontFace]) {
+    faces.sort_by(|left, right| {
+        left.family
+            .to_lowercase()
+            .cmp(&right.family.to_lowercase())
+            .then_with(|| left.weight.cmp(&right.weight))
+            .then_with(|| left.italic.cmp(&right.italic))
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.index.cmp(&right.index))
+    });
 }
 
 fn collect_font_faces(
     directory: &Path,
     depth: usize,
     faces: &mut Vec<FontFace>,
-    seen: &mut HashSet<String>,
+    seen: &mut HashSet<(PathBuf, i32)>,
 ) {
     if depth > 6 {
         return;
@@ -305,32 +360,203 @@ fn collect_font_faces(
         if !matches!(extension.as_str(), "ttf" | "otf" | "ttc") {
             continue;
         }
-        let Some(name) = font_name_from_path(&path) else {
-            continue;
-        };
-        let key = name.to_ascii_lowercase();
-        if !seen.insert(key) {
-            continue;
+        for face in parse_font_metadata(&path) {
+            if seen.insert((face.path.clone(), face.index)) {
+                faces.push(face);
+            }
         }
-        faces.push(FontFace {
-            name,
-            path,
-            index: 0,
-        });
     }
 }
 
-fn font_name_from_path(path: &Path) -> Option<String> {
-    let stem = path.file_stem()?.to_str()?;
-    let family = stem.split(['-', '_']).next().unwrap_or(stem);
-    let mut name = String::new();
-    for ch in family.chars() {
-        if ch.is_uppercase() && !name.is_empty() && !name.ends_with(' ') {
-            name.push(' ');
-        }
-        name.push(ch);
+fn parse_font_metadata(path: &Path) -> Vec<FontFace> {
+    let Ok(data) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    read_fonts::FontRef::fonts(&data)
+        .enumerate()
+        .filter_map(|(index, font)| {
+            font.ok()
+                .and_then(|font| parse_font_face(path, &font, index))
+        })
+        .collect()
+}
+
+fn parse_font_face(path: &Path, font: &read_fonts::FontRef<'_>, index: usize) -> Option<FontFace> {
+    let subfamily = font_name(font, read_fonts::types::NameId::TYPOGRAPHIC_SUBFAMILY_NAME)
+        .or_else(|| font_name(font, read_fonts::types::NameId::SUBFAMILY_NAME))
+        .unwrap_or_default();
+    let full_name = font_name(font, read_fonts::types::NameId::FULL_NAME).unwrap_or_default();
+    let postscript_name =
+        font_name(font, read_fonts::types::NameId::POSTSCRIPT_NAME).unwrap_or_default();
+    let stem = path.file_stem()?.to_string_lossy().into_owned();
+    let family = font_name(font, read_fonts::types::NameId::FAMILY_NAME)
+        .or_else(|| font_name(font, read_fonts::types::NameId::TYPOGRAPHIC_FAMILY_NAME))
+        .or_else(|| font_name(font, read_fonts::types::NameId::WWS_FAMILY_NAME))
+        .filter(|value| !value.is_empty())
+        .or_else(|| infer_family(&full_name, &postscript_name))
+        .filter(|value| !value.is_empty())
+        .unwrap_or(stem);
+    if family.is_empty() {
+        return None;
     }
-    (!name.is_empty()).then_some(name)
+
+    let mut weight = infer_weight(&format!("{family} {subfamily} {postscript_name}"));
+    let mut italic = contains_style_word(&subfamily, "italic")
+        || contains_style_word(&subfamily, "oblique")
+        || contains_style_word(&postscript_name, "italic")
+        || contains_style_word(&postscript_name, "oblique");
+    if let Ok(os2) = font.os2() {
+        weight = i32::from(os2.us_weight_class());
+        italic |= os2
+            .fs_selection()
+            .intersects(read_fonts::tables::os2::SelectionFlags::ITALIC);
+    }
+    let mut monospace = false;
+    if let Ok(post) = font.post() {
+        italic |= post.italic_angle().to_f64() != 0.0;
+        monospace |= post.is_fixed_pitch() != 0;
+    }
+    if let Ok(os2) = font.os2() {
+        monospace |= os2.panose_10().first().is_some_and(|family| *family == 5);
+    }
+    let math = font
+        .data_for_tag(read_fonts::types::Tag::new(b"MATH"))
+        .is_some();
+    let color = font
+        .data_for_tag(read_fonts::types::Tag::new(b"COLR"))
+        .is_some();
+    let bitmap = font
+        .data_for_tag(read_fonts::types::Tag::new(b"CBDT"))
+        .is_some()
+        || font
+            .data_for_tag(read_fonts::types::Tag::new(b"sbix"))
+            .is_some();
+
+    Some(FontFace {
+        family,
+        full_name,
+        postscript_name,
+        path: path.to_path_buf(),
+        index: index as i32,
+        weight,
+        italic,
+        monospace,
+        math,
+        color,
+        bitmap,
+    })
+}
+
+fn font_name(font: &read_fonts::FontRef<'_>, name_id: read_fonts::types::NameId) -> Option<String> {
+    let name_table = font.name().ok()?;
+    let string_data = name_table.string_data();
+    let mut best: Option<(u32, String)> = None;
+    for record in name_table.name_record() {
+        if record.name_id() != name_id || !record.is_unicode() {
+            continue;
+        }
+        let score = match record.platform_id() {
+            3 => 2,
+            0 | 1 => 1,
+            _ => 0,
+        } + if record.language_id() == 0x0409 || record.language_id() == 0 {
+            4
+        } else {
+            0
+        };
+        if score == 0 {
+            continue;
+        }
+        let Ok(value) = record.string(string_data) else {
+            continue;
+        };
+        let decoded = value.to_string();
+        if decoded.is_empty() {
+            continue;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|(best_score, _)| score > *best_score)
+        {
+            best = Some((score, decoded));
+        }
+    }
+    best.map(|(_, value)| value)
+}
+
+fn infer_family(full_name: &str, postscript_name: &str) -> Option<String> {
+    let source = if !full_name.is_empty() {
+        full_name
+    } else if !postscript_name.is_empty() {
+        postscript_name
+    } else {
+        return None;
+    };
+    let mut value = source.to_string();
+    for style in [
+        " Bold Italic",
+        " Italic",
+        " Bold",
+        " Oblique",
+        "-Bold Italic",
+        "-Italic",
+        "-Bold",
+        "-Oblique",
+        " BoldItalic",
+        "-BoldItalic",
+    ] {
+        if let Some((family, _)) = value.rsplit_once(style) {
+            value = family.to_string();
+            break;
+        }
+    }
+    (!value.is_empty()).then_some(value)
+}
+
+fn infer_weight(text: &str) -> i32 {
+    let text = text.to_lowercase();
+    for (word, weight) in [
+        ("extrablack", 950),
+        ("ultrablack", 950),
+        ("black", 900),
+        ("extrabold", 800),
+        ("ultrabold", 800),
+        ("demibold", 600),
+        ("semibold", 600),
+        ("bold", 700),
+        ("extralight", 200),
+        ("ultralight", 200),
+        ("semilight", 350),
+        ("demilight", 350),
+        ("light", 300),
+        ("medium", 500),
+        ("thin", 100),
+    ] {
+        if text.contains(word) {
+            return weight;
+        }
+    }
+    if text.contains("regular") || text.contains("roman") || text.contains("book") {
+        return 400;
+    }
+    400
+}
+
+fn contains_style_word(text: &str, word: &str) -> bool {
+    let text = text.to_lowercase();
+    let mut start = 0;
+    while let Some(offset) = text[start..].find(word) {
+        let end = start + offset + word.len();
+        let before_ok =
+            start == 0 || !text[start - 1..].starts_with(|ch: char| ch.is_alphanumeric());
+        let after_ok =
+            end >= text.len() || !text[end..].starts_with(|ch: char| ch.is_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+        start = end;
+    }
+    false
 }
 
 fn normalize_face_name(name: &str) -> String {
@@ -340,28 +566,86 @@ fn normalize_face_name(name: &str) -> String {
         .collect()
 }
 
-fn find_font_face(name: &str) -> Option<FontFace> {
+fn font_matches(face: &FontFace, normalized: &str) -> bool {
+    [
+        face.family.as_str(),
+        face.full_name.as_str(),
+        face.postscript_name.as_str(),
+    ]
+    .iter()
+    .any(|value| normalize_face_name(value) == normalized)
+}
+
+fn find_font_face(name: &str, bold: bool, italic: bool) -> Option<FontFace> {
+    let faces = all_font_faces_with_registration();
+    select_font_face(&faces, name, bold, italic)
+}
+
+fn select_font_face(faces: &[FontFace], name: &str, bold: bool, italic: bool) -> Option<FontFace> {
     let normalized = normalize_face_name(name);
-    let registered = REGISTERED_FONTS.get_or_init(|| Mutex::new(Vec::new()));
-    if let Ok(registered) = registered.lock()
-        && let Some(face) = registered
-            .iter()
-            .find(|face| normalize_face_name(&face.name) == normalized)
-    {
-        return Some(FontFace {
-            name: face.name.clone(),
-            path: face.path.clone(),
-            index: face.index,
-        });
-    }
-    font_faces()
+    let matches: Vec<&FontFace> = faces
         .iter()
-        .find(|face| normalize_face_name(&face.name) == normalized)
-        .map(|face| FontFace {
-            name: face.name.clone(),
-            path: face.path.clone(),
-            index: face.index,
+        .filter(|face| font_matches(face, &normalized))
+        .collect();
+    let exact_family = matches
+        .iter()
+        .filter(|face| normalize_face_name(&face.family) == normalized)
+        .copied()
+        .collect::<Vec<_>>();
+    let candidates: &[&FontFace] = if exact_family.is_empty() {
+        &matches
+    } else {
+        &exact_family
+    };
+    candidates
+        .iter()
+        .copied()
+        .min_by_key(|face| {
+            let italic_penalty = usize::from(face.italic != italic);
+            let weight_penalty = if bold {
+                (face.weight - 700).abs()
+            } else {
+                (face.weight - 400).abs()
+            };
+            (
+                face.family.to_lowercase(),
+                italic_penalty,
+                weight_penalty,
+                face.path.clone(),
+                face.index,
+            )
         })
+        .cloned()
+}
+
+fn font_families() -> Vec<String> {
+    let mut families = BTreeMap::new();
+    for face in all_font_faces_with_registration() {
+        if face.family.is_empty() {
+            continue;
+        }
+        families
+            .entry(normalize_face_name(&face.family))
+            .or_insert_with(|| face.family.clone());
+    }
+    let bias = font_bias();
+    let mut families = families
+        .into_iter()
+        .map(|(normalized, family)| {
+            let bias = bias.get(&normalized).copied().unwrap_or(0);
+            (bias, family)
+        })
+        .collect::<Vec<_>>();
+    families.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    families.into_iter().map(|(_, family)| family).collect()
+}
+
+fn font_bias() -> HashMap<String, i32> {
+    let state = FONT_BIAS.get_or_init(|| Mutex::new(HashMap::new()));
+    match state.lock() {
+        Ok(bias) => bias.clone(),
+        Err(_) => HashMap::new(),
+    }
 }
 
 unsafe fn doc_ref<'a>(l: *mut lua_State) -> Option<&'a Doc> {
@@ -520,10 +804,10 @@ unsafe extern "C-unwind" fn module_init_hyph_dict(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn module_get_font_faces(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let faces = font_faces();
-        lua::lua_createtable(l, faces.len() as c_int, 0);
-        for (index, face) in faces.iter().enumerate() {
-            push_str(l, &face.name);
+        let families = font_families();
+        lua::lua_createtable(l, families.len() as c_int, 0);
+        for (index, family) in families.iter().enumerate() {
+            push_str(l, family);
             lua::lua_rawseti_(l, -2, (index + 1) as c_int);
         }
     }
@@ -536,14 +820,16 @@ unsafe extern "C-unwind" fn module_font_face_filename(l: *mut lua_State) -> c_in
         let Some(name) = arg_str(l, 1) else {
             return 0;
         };
-        let Some(face) = find_font_face(&name) else {
+        let bold = lua::lua_isboolean(l, 2) != 0 && arg_bool(l, 2);
+        let italic = lua::lua_isboolean(l, 3) != 0 && arg_bool(l, 3);
+        let Some(face) = find_font_face(&name, bold, italic) else {
             return 0;
         };
         push_str(l, &face.path.to_string_lossy());
         push_int(l, i64::from(face.index));
-        push_bool(l, false);
-        push_bool(l, false);
-        push_bool(l, false);
+        push_bool(l, face.monospace);
+        push_bool(l, face.math);
+        push_bool(l, face.color || face.bitmap);
     }
     5
 }
@@ -554,15 +840,24 @@ unsafe extern "C-unwind" fn module_font_face_weights(l: *mut lua_State) -> c_int
         let Some(name) = arg_str(l, 1) else {
             return 0;
         };
-        if find_font_face(&name).is_none() {
+        let faces = all_font_faces_with_registration();
+        let Some(anchor) = select_font_face(&faces, &name, false, false) else {
             lua::lua_newtable(l);
             return 1;
+        };
+        let family = normalize_face_name(&anchor.family);
+        let mut weights = faces
+            .iter()
+            .filter(|face| normalize_face_name(&face.family) == family)
+            .map(|face| face.weight)
+            .collect::<Vec<_>>();
+        weights.sort_unstable();
+        weights.dedup();
+        lua::lua_createtable(l, weights.len() as c_int, 0);
+        for (index, weight) in weights.into_iter().enumerate() {
+            push_int(l, i64::from(weight));
+            lua::lua_rawseti_(l, -2, (index + 1) as c_int);
         }
-        lua::lua_createtable(l, 2, 0);
-        push_int(l, 400);
-        lua::lua_rawseti_(l, -2, 1);
-        push_int(l, 700);
-        lua::lua_rawseti_(l, -2, 2);
     }
     1
 }
@@ -602,25 +897,20 @@ unsafe extern "C-unwind" fn module_register_font(l: *mut lua_State) -> c_int {
             return 0;
         };
         let path = PathBuf::from(&path);
-        if !path.exists() {
+        let faces = parse_font_metadata(&path);
+        if faces.is_empty() {
             return 0;
         }
-        let name = font_name_from_path(&path).unwrap_or_else(|| {
-            path.file_stem().map_or_else(
-                || "Registered Font".to_string(),
-                |stem| stem.to_string_lossy().into_owned(),
-            )
-        });
         let registered = REGISTERED_FONTS.get_or_init(|| Mutex::new(Vec::new()));
         if let Ok(mut fonts) = registered.lock() {
-            if fonts.iter().any(|font| font.path == path) {
-                return 0;
+            for face in faces {
+                if !fonts
+                    .iter()
+                    .any(|font| font.path == face.path && font.index == face.index)
+                {
+                    fonts.push(face);
+                }
             }
-            fonts.push(FontFace {
-                name,
-                path,
-                index: 0,
-            });
         }
     }
     0
@@ -629,9 +919,26 @@ unsafe extern "C-unwind" fn module_register_font(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn module_set_preferred_font(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let face = arg_str(l, 1).unwrap_or_default();
-        if let Ok(mut state) = hyph_state().lock() {
-            *state = face;
+        let Some(face) = arg_str(l, 1) else {
+            return 0;
+        };
+        let bias = arg_int(l, 2).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        let clear_other_bias = if lua::lua_isboolean(l, 3) != 0 {
+            arg_bool(l, 3)
+        } else {
+            true
+        };
+        let normalized = normalize_face_name(&face);
+        let state = FONT_BIAS.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(mut biases) = state.lock() {
+            if clear_other_bias {
+                biases.clear();
+            }
+            if bias == 0 {
+                biases.remove(&normalized);
+            } else {
+                biases.insert(normalized, bias);
+            }
         }
     }
     0
@@ -947,18 +1254,6 @@ unsafe extern "C-unwind" fn module_set_image_replacement_char(l: *mut lua_State)
         IMAGE_REPLACEMENT_CHAR.store(value, Ordering::Relaxed);
     }
     0
-}
-
-unsafe extern "C-unwind" fn return_false(l: *mut lua_State) -> c_int {
-    // SAFETY: `l` is the active Lua state.
-    unsafe { lua::lua_pushboolean(l, 0) };
-    1
-}
-
-unsafe extern "C-unwind" fn return_zero(l: *mut lua_State) -> c_int {
-    // SAFETY: `l` is the active Lua state.
-    unsafe { lua::lua_pushinteger(l, 0) };
-    1
 }
 
 unsafe extern "C-unwind" fn return_empty_table(l: *mut lua_State) -> c_int {
@@ -1295,8 +1590,12 @@ unsafe extern "C-unwind" fn doc_pos_from_xpointer(l: *mut lua_State) -> c_int {
         let (y, x) = arg_str(l, 2)
             .and_then(|xp| {
                 doc_ref(l).and_then(|doc| {
-                    let page = doc.inner.as_ref()?.page_from_xpointer(&xp).ok()?;
-                    Some(((page.saturating_sub(1) * doc.height as usize) as i64, 0))
+                    let inner = doc.inner.as_ref()?;
+                    let page = inner.page_from_xpointer(&xp).ok()?;
+                    let point = inner.point_from_xpointer(&xp).ok().flatten();
+                    let (x, y) = point.unwrap_or((0.0, inner.page_height() as f32));
+                    let y = inner.page_start_y(page) + y.round() as i64;
+                    Some((y, x.round() as i64))
                 })
             })
             .unwrap_or((0, 0));
@@ -1309,9 +1608,9 @@ unsafe extern "C-unwind" fn doc_pos_from_xpointer(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn doc_current_pos(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let pos = doc_ref(l).map_or(0, |doc| {
-            doc.current_page().saturating_sub(1) as i64 * i64::from(doc.height)
-        });
+        let pos = doc_ref(l)
+            .and_then(|doc| doc.inner.as_ref().map(Document::current_pos))
+            .unwrap_or(0);
         push_int(l, pos);
     }
     1
@@ -1320,14 +1619,16 @@ unsafe extern "C-unwind" fn doc_current_pos(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn doc_current_percent(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let percent = doc_ref(l).map_or(0, |doc| {
-            let count = doc.page_count();
-            if count == 0 {
-                0
-            } else {
-                doc.current_page() as i64 * 10_000 / count as i64
-            }
-        });
+        let percent = doc_ref(l)
+            .and_then(|doc| doc.inner.as_ref())
+            .map_or(0, |inner| {
+                let full_height = i64::try_from(inner.full_height()).unwrap_or(i64::MAX);
+                if full_height == 0 {
+                    0
+                } else {
+                    (inner.current_pos() * 10_000 / full_height).clamp(0, 9_999)
+                }
+            });
         push_int(l, percent);
     }
     1
@@ -1336,7 +1637,9 @@ unsafe extern "C-unwind" fn doc_current_percent(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn doc_full_height(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let height = doc_ref(l).map_or(0, |doc| doc.page_count() as i64 * i64::from(doc.height));
+        let height = doc_ref(l)
+            .and_then(|doc| doc.inner.as_ref().map(|inner| inner.full_height() as i64))
+            .unwrap_or(0);
         push_int(l, height);
     }
     1
@@ -1346,9 +1649,13 @@ unsafe extern "C-unwind" fn doc_page_start_y(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
         let page = arg_int(l, 2).max(1) as usize;
-        let y = doc_ref(l).map_or(0, |doc| {
-            page.saturating_sub(1) as i64 * i64::from(doc.height)
-        });
+        let y = doc_ref(l)
+            .and_then(|doc| {
+                doc.inner
+                    .as_ref()
+                    .map(|inner| inner.page_start_y(page.min(inner.page_count())))
+            })
+            .unwrap_or(0);
         push_int(l, y);
     }
     1
@@ -1357,7 +1664,13 @@ unsafe extern "C-unwind" fn doc_page_start_y(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn doc_page_height(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let height = doc_ref(l).map_or(0, |doc| i64::from(doc.height));
+        let height = doc_ref(l)
+            .and_then(|doc| {
+                doc.inner
+                    .as_ref()
+                    .map(|inner| i64::from(inner.page_height()))
+            })
+            .unwrap_or(0);
         push_int(l, height);
     }
     1
@@ -1719,6 +2032,54 @@ unsafe extern "C-unwind" fn doc_word_from_position(l: *mut lua_State) -> c_int {
     1
 }
 
+unsafe extern "C-unwind" fn doc_nearest_word_from_position(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let x = arg_int(l, 2) as f32;
+        let y = arg_int(l, 3) as f32;
+        let direction = if lua::lua_isnoneornil(l, 4) != 0 {
+            4
+        } else {
+            arg_int(l, 4).clamp(0, 4) as u32
+        };
+        let word = doc_ref(l).and_then(|doc| {
+            let inner = doc.inner.as_ref()?;
+            let page_count = inner.page_count();
+            let start = inner.current_page();
+            let pages = (start..=(start + doc.visible_page_count.max(1) as usize - 1))
+                .filter(|page| *page >= 1 && *page <= page_count)
+                .collect::<Vec<_>>();
+            inner
+                .nearest_word_at(
+                    cre_lib::PagePosition { page: start, x, y },
+                    &pages,
+                    direction,
+                )
+                .ok()
+                .flatten()
+        });
+        let Some(word) = word else {
+            return 0;
+        };
+        lua::lua_createtable(l, 0, 3);
+        push_str(l, "text");
+        push_str(l, &word.text);
+        lua::lua_rawset(l, -3);
+        push_str(l, "pos0");
+        push_str(l, &word.xpointer_range.start.to_xpointer());
+        lua::lua_rawset(l, -3);
+        push_str(l, "pos1");
+        let end = word
+            .xpointer_range
+            .end
+            .as_ref()
+            .map_or_else(String::new, |position| position.to_xpointer());
+        push_str(l, &end);
+        lua::lua_rawset(l, -3);
+    }
+    1
+}
+
 unsafe extern "C-unwind" fn doc_text_from_positions(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
@@ -1921,7 +2282,7 @@ unsafe extern "C-unwind" fn doc_set_font_face(l: *mut lua_State) -> c_int {
     unsafe {
         if let Some(doc) = doc_mut(l) {
             let face = arg_str(l, 2).unwrap_or_default();
-            let font_path = find_font_face(&face).map(|font| font.path.clone());
+            let font_path = find_font_face(&face, false, false).map(|font| font.path.clone());
             let changed = doc.font_face != face || doc.font_path != font_path;
             doc.font_face = face;
             doc.font_path = font_path;
@@ -2065,7 +2426,7 @@ unsafe extern "C-unwind" fn doc_set_string_property(l: *mut lua_State) -> c_int 
         doc.properties.insert(name.clone(), value.clone());
         match name.as_str() {
             "font.face.default" | "font.face" => {
-                let font_path = find_font_face(&value).map(|font| font.path.clone());
+                let font_path = find_font_face(&value, false, false).map(|font| font.path.clone());
                 let changed = doc.font_face != value || doc.font_path != font_path;
                 doc.font_face = value;
                 doc.font_path = font_path;
@@ -2843,13 +3204,28 @@ unsafe extern "C-unwind" fn doc_epub_cfi_range(l: *mut lua_State) -> c_int {
 
 unsafe extern "C-unwind" fn doc_has_page_map_document_provided(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
-    unsafe { push_bool(l, false) };
+    unsafe {
+        let value = doc_ref(l)
+            .and_then(|doc| doc.inner.as_ref())
+            .is_some_and(Document::has_document_page_map);
+        push_bool(l, value);
+    }
     1
 }
 
 unsafe extern "C-unwind" fn doc_is_page_map_document_provided(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
-    unsafe { push_bool(l, false) };
+    unsafe {
+        let value = doc_ref(l).is_some_and(|doc| {
+            !doc.page_map.is_empty()
+                && doc
+                    .inner
+                    .as_ref()
+                    .is_some_and(Document::has_document_page_map)
+                && doc.page_map_source != "synthetic"
+        });
+        push_bool(l, value);
+    }
     1
 }
 
@@ -3390,7 +3766,7 @@ const DOC_METHODS: &[lua::luaL_Reg] = &regs![
     ("extendXPointersToSentenceSegment", doc_extend_sentence),
     ("getWordBoxesFromPositions", doc_word_boxes_from_positions),
     ("getImageDataFromPosition", doc_get_image_data),
-    ("getNearestWordFromPosition", doc_word_from_position),
+    ("getNearestWordFromPosition", doc_nearest_word_from_position),
     ("getLangTagForTextFromPosition", doc_get_lang_tag),
     ("getDocumentFileContent", doc_get_document_file_content),
     ("getTextFromXPointer", doc_get_text_from_xpointer),
@@ -3430,7 +3806,6 @@ const DOC_METHODS: &[lua::luaL_Reg] = &regs![
         doc_is_page_map_document_provided
     ),
     ("hasNonLinearFlows", doc_has_non_linear_flows),
-    ("hasHiddenFlows", return_false),
     ("checkRegex", doc_check_regex),
     (
         "getAndClearRegexSearchError",
@@ -3469,10 +3844,6 @@ const MODULE_FUNCS: &[lua::luaL_Reg] = &regs![
     ("smoothScaleBlitBuffer", module_smooth_scale),
     ("setImageReplacementChar", module_set_image_replacement_char),
     ("setSkipTearDown", module_noop),
-    ("setViewMode", module_noop),
-    ("setTocAlternativeToc", module_noop),
-    ("getDocumentRenderingHash", return_zero),
-    ("free", module_noop),
 ];
 
 /// Opens the `libkoreader-cre` Lua module.

@@ -344,6 +344,104 @@ fn document_extracts_word_at_position_and_range_boxes() {
 }
 
 #[test]
+fn document_finds_nearest_word_in_requested_directions() {
+    require_resources();
+
+    let doc = Document::open(fixture("sample.txt")).unwrap();
+    let boxes = doc.page_text_boxes(1).unwrap();
+
+    let mut target = None;
+    for text_box in &boxes {
+        let y = text_box.y + text_box.height / 2.0;
+        let mut x = text_box.x;
+        while x <= text_box.x + text_box.width {
+            if let Some(word) = doc.word_at(PagePosition { page: 1, x, y }).unwrap() {
+                target = Some(word);
+                break;
+            }
+            x += 2.0;
+        }
+        if target.is_some() {
+            break;
+        }
+    }
+
+    let word = target.expect("page 1 has no word hit target");
+    let rect = word.rects.first().expect("word has no rect");
+    let center_y = rect.y + rect.height / 2.0;
+    let target_x = rect.x + rect.width / 2.0;
+
+    let left_point_x = rect.x.max(5.0) - 5.0;
+    let right_of_target = doc
+        .nearest_word_at(
+            PagePosition {
+                page: 1,
+                x: left_point_x,
+                y: center_y,
+            },
+            &[1],
+            2,
+        )
+        .unwrap()
+        .expect("no word to the right");
+    let right_rect = right_of_target.rects.first().expect("word has no rect");
+    assert!(right_rect.x + 1.0 >= left_point_x);
+    assert!(
+        (right_rect.x + right_rect.width / 2.0 - left_point_x) <= (target_x - left_point_x) + 1.0
+    );
+
+    let right_point_x = rect.x + rect.width + 5.0;
+    let left_of_target = doc
+        .nearest_word_at(
+            PagePosition {
+                page: 1,
+                x: right_point_x,
+                y: center_y,
+            },
+            &[1],
+            0,
+        )
+        .unwrap()
+        .expect("no word to the left");
+    let left_rect = left_of_target.rects.first().expect("word has no rect");
+    assert!(left_rect.x + left_rect.width <= right_point_x + 1.0);
+    assert!(
+        (right_point_x - (left_rect.x + left_rect.width / 2.0)) <= (right_point_x - target_x) + 1.0
+    );
+
+    assert!(
+        doc.nearest_word_at(
+            PagePosition {
+                page: 1,
+                x: 0.0,
+                y: 0.0,
+            },
+            &[],
+            4,
+        )
+        .unwrap()
+        .is_none()
+    );
+}
+
+#[test]
+fn document_maps_xpointer_to_page_coordinates() {
+    require_resources();
+
+    let doc = Document::open(fixture("sample.txt")).unwrap();
+    let xpointer = doc.xpointer_from_page(1).unwrap();
+    let (x, y) = doc
+        .point_from_xpointer(&xpointer)
+        .unwrap()
+        .expect("page xpointer should map to a page coordinate");
+
+    let boxes = doc.page_text_boxes(1).unwrap();
+    let first = boxes.first().expect("page 1 has no text boxes");
+    assert!(y >= first.y && y < first.y + first.height);
+    assert!(x >= first.x && x <= first.x + first.width);
+}
+
+#[test]
 fn document_hit_tests_internal_epub_links() {
     require_resources();
 

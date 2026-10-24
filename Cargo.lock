@@ -426,6 +426,7 @@ dependencies = [
  "cre-lib",
  "libc",
  "mlua",
+ "read-fonts",
  "regex",
 ]
 

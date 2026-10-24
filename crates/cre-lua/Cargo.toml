@@ -15,4 +15,5 @@ anyhow = "1"
 cre-lib = { path = "../cre-lib" }
 libc = "0.2"
 mlua = { version = "0.11", features = ["luajit", "module"] }
+read-fonts = "0.41.0"
 regex = "1.13.1"

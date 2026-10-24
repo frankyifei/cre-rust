@@ -43,6 +43,13 @@ pub struct TocItem {
 }
 
 #[derive(Clone, Debug)]
+pub struct PageMapItem {
+    pub label: String,
+    /// Resolved resource path with optional `#fragment`.
+    pub href: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct HtmlOptions {
     pub font_size: f32,
     pub line_height: f32,
@@ -74,6 +81,8 @@ pub struct EpubBook {
     pub manifest: Vec<ManifestItem>,
     pub spine: Vec<SpineItem>,
     pub toc: Vec<TocItem>,
+    pub page_map_source: String,
+    pub page_map: Vec<PageMapItem>,
     pub resources: HashMap<String, Vec<u8>>,
 }
 
@@ -171,6 +180,8 @@ impl EpubBook {
         }
 
         let toc = parse_toc(opf, spine_node, &manifest, &opf_dir, &resources);
+        let (page_map_source, page_map) =
+            parse_page_map(spine_node, &manifest, &opf_dir, &resources);
 
         Ok(Self {
             title,
@@ -185,6 +196,8 @@ impl EpubBook {
             manifest,
             spine,
             toc,
+            page_map_source,
+            page_map,
             resources,
         })
     }
@@ -1460,6 +1473,146 @@ fn parse_nav_ol(ol: roxmltree::Node<'_, '_>, depth: usize, base_dir: &str, out: 
     }
 }
 
+fn parse_page_map(
+    spine_node: roxmltree::Node<'_, '_>,
+    manifest: &[ManifestItem],
+    opf_dir: &str,
+    resources: &HashMap<String, Vec<u8>>,
+) -> (String, Vec<PageMapItem>) {
+    let _ = opf_dir;
+    if let Some(item) = manifest.iter().find(|item| {
+        item.properties
+            .split_whitespace()
+            .any(|property| property == "page-list")
+    }) && let Some(bytes) = resources.get(&item.href)
+    {
+        let mut out = Vec::new();
+        parse_epub3_page_list(bytes, parent_dir(&item.href), &mut out);
+        if !out.is_empty() {
+            return ("page-list".to_string(), out);
+        }
+    }
+
+    if let Some(toc_id) = spine_node.attribute("toc")
+        && let Some(item) = manifest.iter().find(|item| item.id == toc_id)
+        && let Some(bytes) = resources.get(&item.href)
+    {
+        let mut out = Vec::new();
+        parse_ncx_page_map(bytes, parent_dir(&item.href), &mut out);
+        if !out.is_empty() {
+            return ("ncx".to_string(), out);
+        }
+    }
+
+    for item in manifest
+        .iter()
+        .filter(|item| item.media_type == "application/x-dtbncx+xml")
+    {
+        if let Some(bytes) = resources.get(&item.href) {
+            let mut out = Vec::new();
+            parse_ncx_page_map(bytes, parent_dir(&item.href), &mut out);
+            if !out.is_empty() {
+                return ("ncx".to_string(), out);
+            }
+        }
+    }
+
+    ("page-list".to_string(), Vec::new())
+}
+
+fn parse_epub3_page_list(bytes: &[u8], base_dir: &str, out: &mut Vec<PageMapItem>) {
+    let text = decode_text(bytes);
+    let options = roxmltree::ParsingOptions {
+        allow_dtd: true,
+        ..Default::default()
+    };
+    let Ok(doc) = roxmltree::Document::parse_with_options(&text, options) else {
+        return;
+    };
+    let Some(nav) = doc
+        .root_element()
+        .descendants()
+        .find(|n| n.is_element() && n.tag_name().name() == "nav" && has_epub_type(*n, "page-list"))
+    else {
+        return;
+    };
+    let Some(ol) = nav
+        .children()
+        .find(|n| n.is_element() && n.tag_name().name() == "ol")
+    else {
+        return;
+    };
+    parse_page_list_ol(ol, base_dir, out);
+}
+
+fn parse_page_list_ol(ol: roxmltree::Node<'_, '_>, base_dir: &str, out: &mut Vec<PageMapItem>) {
+    for li in ol
+        .children()
+        .filter(|n| n.is_element() && n.tag_name().name() == "li")
+    {
+        if let Some(anchor) = li
+            .children()
+            .find(|n| n.is_element() && n.tag_name().name() == "a")
+        {
+            let label = descendant_text(anchor).unwrap_or_default();
+            let href = resolve_toc_href(base_dir, anchor.attribute("href").unwrap_or_default());
+            if !label.is_empty() && !href.is_empty() {
+                out.push(PageMapItem { label, href });
+            }
+        }
+        for child in li
+            .children()
+            .filter(|n| n.is_element() && n.tag_name().name() == "ol")
+        {
+            parse_page_list_ol(child, base_dir, out);
+        }
+    }
+}
+
+fn parse_ncx_page_map(bytes: &[u8], base_dir: &str, out: &mut Vec<PageMapItem>) {
+    let text = decode_text(bytes);
+    let options = roxmltree::ParsingOptions {
+        allow_dtd: true,
+        ..Default::default()
+    };
+    let Ok(doc) = roxmltree::Document::parse_with_options(&text, options) else {
+        return;
+    };
+    let Some(page_map) = doc
+        .root_element()
+        .children()
+        .find(|n| n.is_element() && n.tag_name().name() == "pageMap")
+    else {
+        return;
+    };
+    parse_ncx_page_map_node(page_map, base_dir, out);
+}
+
+fn parse_ncx_page_map_node(
+    node: roxmltree::Node<'_, '_>,
+    base_dir: &str,
+    out: &mut Vec<PageMapItem>,
+) {
+    for target in node
+        .children()
+        .filter(|n| n.is_element() && n.tag_name().name() == "pageTarget")
+    {
+        let label = child_text(target, "navLabel")
+            .or_else(|| target.attribute("playLevel").map(|value| value.to_string()))
+            .unwrap_or_default();
+        let href = target
+            .children()
+            .find(|n| n.is_element() && n.tag_name().name() == "content")
+            .and_then(|n| n.attribute("src"))
+            .unwrap_or_default();
+        let href = resolve_toc_href(base_dir, href);
+        if !label.is_empty() && !href.is_empty() {
+            out.push(PageMapItem { label, href });
+        }
+        parse_ncx_page_map_node(target, base_dir, out);
+    }
+}
+
 fn child_text(node: roxmltree::Node<'_, '_>, name: &str) -> Option<String> {
     node.children()
         .find(|n| n.is_element() && n.tag_name().name() == name)
@@ -1590,6 +1743,28 @@ mod tests {
         assert_eq!(book.toc[1].title, "Nested");
         assert_eq!(book.toc[1].href, "sec1.xhtml#sub");
         assert_eq!(book.toc[1].depth, 2);
+    }
+
+    #[test]
+    fn parses_epub3_page_list_from_synthetic_epub() {
+        let book = EpubBook::from_bytes(synthetic_epub3_page_list()).unwrap();
+        assert_eq!(book.page_map_source, "page-list");
+        assert_eq!(book.page_map.len(), 2);
+        assert_eq!(book.page_map[0].label, "page 1");
+        assert_eq!(book.page_map[0].href, "sec1.xhtml#p1");
+        assert_eq!(book.page_map[1].label, "page 2");
+        assert_eq!(book.page_map[1].href, "sec1.xhtml#p2");
+    }
+
+    #[test]
+    fn parses_ncx_page_map_from_synthetic_epub() {
+        let book = EpubBook::from_bytes(synthetic_ncx_page_map_epub()).unwrap();
+        assert_eq!(book.page_map_source, "ncx");
+        assert_eq!(book.page_map.len(), 2);
+        assert_eq!(book.page_map[0].label, "Page 1");
+        assert_eq!(book.page_map[0].href, "sec1.xhtml#p1");
+        assert_eq!(book.page_map[1].label, "Page 2");
+        assert_eq!(book.page_map[1].href, "sec1.xhtml#p2");
     }
 
     #[test]
@@ -1904,6 +2079,163 @@ mod tests {
   <body>
     <h1 id="sec1">Chapter One</h1>
     <h2 id="sub">Nested</h2>
+  </body>
+</html>"#,
+            );
+
+            writer.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    fn synthetic_epub3_page_list() -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buf);
+            let options = zip::write::SimpleFileOptions::default();
+
+            write_zip_file(&mut writer, options, "mimetype", "application/epub+zip");
+            write_zip_file(
+                &mut writer,
+                options,
+                "META-INF/container.xml",
+                r#"<?xml version="1.0"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+  <rootfiles>
+    <rootfile full-path="pkg.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#,
+            );
+            write_zip_file(
+                &mut writer,
+                options,
+                "pkg.opf",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="id">urn:uuid:page-list-test</dc:identifier>
+    <dc:title>Page List Test</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="pagelist" href="pagelist.xhtml" media-type="application/xhtml+xml" properties="page-list"/>
+    <item id="s1" href="sec1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="s1"/>
+  </spine>
+</package>"#,
+            );
+            write_zip_file(
+                &mut writer,
+                options,
+                "pagelist.xhtml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+  <head><title>Page List</title></head>
+  <body>
+    <nav epub:type="page-list">
+      <ol>
+        <li>
+          <a href="sec1.xhtml#p1">page 1</a>
+          <ol>
+            <li><a href="sec1.xhtml#p2">page 2</a></li>
+          </ol>
+        </li>
+      </ol>
+    </nav>
+  </body>
+</html>"#,
+            );
+            write_zip_file(
+                &mut writer,
+                options,
+                "sec1.xhtml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head><title>Sec1</title></head>
+  <body>
+    <h1 id="p1">Page 1</h1>
+    <p id="p2">Page 2</p>
+  </body>
+</html>"#,
+            );
+
+            writer.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    fn synthetic_ncx_page_map_epub() -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buf);
+            let options = zip::write::SimpleFileOptions::default();
+
+            write_zip_file(&mut writer, options, "mimetype", "application/epub+zip");
+            write_zip_file(
+                &mut writer,
+                options,
+                "META-INF/container.xml",
+                r#"<?xml version="1.0"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+  <rootfiles>
+    <rootfile full-path="pkg.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#,
+            );
+            write_zip_file(
+                &mut writer,
+                options,
+                "pkg.opf",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="id">urn:uuid:ncx-page-map-test</dc:identifier>
+    <dc:title>NCX Page Map Test</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+    <item id="s1" href="sec1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine toc="ncx">
+    <itemref idref="s1"/>
+  </spine>
+</package>"#,
+            );
+            write_zip_file(
+                &mut writer,
+                options,
+                "toc.ncx",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <head>
+    <meta name="dtb:uid" content="urn:uuid:ncx-page-map-test"/>
+  </head>
+  <docTitle><text>NCX Page Map Test</text></docTitle>
+  <pageMap>
+    <pageTarget playLevel="1">
+      <navLabel><text>Page 1</text></navLabel>
+      <content src="sec1.xhtml#p1"/>
+    </pageTarget>
+    <pageTarget playLevel="1">
+      <navLabel><text>Page 2</text></navLabel>
+      <content src="sec1.xhtml#p2"/>
+    </pageTarget>
+  </pageMap>
+</ncx>"#,
+            );
+            write_zip_file(
+                &mut writer,
+                options,
+                "sec1.xhtml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head><title>Sec1</title></head>
+  <body>
+    <h1 id="p1">Page 1</h1>
+    <p id="p2">Page 2</p>
   </body>
 </html>"#,
             );

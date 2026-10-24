@@ -9,7 +9,9 @@ use blitz_dom::{DocumentConfig, Node, NodeId, Point, StyleThreading, build_singl
 use blitz_html::HtmlDocument;
 use blitz_traits::net::{Bytes, NetHandler, NetProvider, Request};
 use blitz_traits::shell::{ColorScheme, Viewport};
-use cre_epub::{EpubBook, HtmlOptions, TocItem as RawTocItem, normalize_path};
+use cre_epub::{
+    EpubBook, HtmlOptions, PageMapItem as RawPageMapItem, TocItem as RawTocItem, normalize_path,
+};
 use cre_fb2::{Fb2Book, Fb2HtmlOptions};
 use cre_paint::render_page as paint_page;
 
@@ -138,6 +140,14 @@ pub struct PageLink {
     pub rects: Vec<TextBox>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PageMapEntry {
+    pub page: usize,
+    pub xpointer: Option<String>,
+    pub doc_y: i64,
+    pub label: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bookmark {
     pub page: usize,
@@ -218,6 +228,8 @@ pub struct Document {
     href_pages: HashMap<(String, Option<String>), usize>,
     spine_to_chunk: HashMap<u32, usize>,
     toc: Vec<TocEntry>,
+    page_map_source: String,
+    page_map: Vec<PageMapEntry>,
     active: RefCell<Option<ActiveChunk>>,
     current_page: usize,
 }
@@ -236,6 +248,8 @@ impl Document {
                 let mut book = EpubBook::open(path)?;
                 let _ = book.normalize_inline_svg_images();
                 let raw_toc = std::mem::take(&mut book.toc);
+                let raw_page_map_source = std::mem::take(&mut book.page_map_source);
+                let raw_page_map = std::mem::take(&mut book.page_map);
                 let metadata = DocumentMetadata {
                     format,
                     title: book.title.clone(),
@@ -272,6 +286,8 @@ impl Document {
                     has_non_linear_flows,
                     metadata,
                     raw_toc,
+                    raw_page_map_source,
+                    raw_page_map,
                     options,
                 )
             }
@@ -314,6 +330,8 @@ impl Document {
                     false,
                     metadata,
                     raw_toc,
+                    String::new(),
+                    Vec::new(),
                     options,
                 )
             }
@@ -344,6 +362,8 @@ impl Document {
                     false,
                     metadata,
                     Vec::new(),
+                    String::new(),
+                    Vec::new(),
                     options,
                 )
             }
@@ -360,6 +380,8 @@ impl Document {
         has_non_linear_flows: bool,
         metadata: DocumentMetadata,
         raw_toc: Vec<RawTocItem>,
+        page_map_source: String,
+        page_map_items: Vec<RawPageMapItem>,
         options: &DocumentOptions,
     ) -> Result<Self> {
         let font_path = resolve_font_path(options)?;
@@ -450,6 +472,23 @@ impl Document {
             })
             .collect();
 
+        let page_map = page_map_items
+            .into_iter()
+            .filter_map(|item| {
+                let page = page_for_href(&href_pages, &item.href).ok()?;
+                let xpointer = page_xpointers
+                    .get(page.saturating_sub(1))
+                    .cloned()
+                    .flatten();
+                Some(PageMapEntry {
+                    page,
+                    xpointer,
+                    doc_y: page.saturating_sub(1) as i64 * i64::from(options.height),
+                    label: item.label,
+                })
+            })
+            .collect();
+
         let document = Self {
             metadata,
             width: options.width,
@@ -469,6 +508,8 @@ impl Document {
             href_pages,
             spine_to_chunk,
             toc,
+            page_map_source,
+            page_map,
             active: RefCell::new(None),
             current_page: 1,
         };
@@ -494,6 +535,30 @@ impl Document {
 
     pub fn page_count_1based(&self) -> usize {
         self.page_count()
+    }
+
+    pub fn has_document_page_map(&self) -> bool {
+        !self.page_map.is_empty()
+    }
+
+    pub fn document_page_map_source(&self) -> &str {
+        &self.page_map_source
+    }
+
+    pub fn document_page_map(&self) -> &[PageMapEntry] {
+        &self.page_map
+    }
+
+    pub fn full_height(&self) -> u64 {
+        self.page_count() as u64 * u64::from(self.height)
+    }
+
+    pub fn page_start_y(&self, page: usize) -> i64 {
+        page.saturating_sub(1) as i64 * i64::from(self.height)
+    }
+
+    pub fn current_pos(&self) -> i64 {
+        self.page_start_y(self.current_page)
     }
 
     pub fn current_page(&self) -> usize {
@@ -835,6 +900,86 @@ impl Document {
         }))
     }
 
+    pub fn nearest_word_at(
+        &self,
+        position: PagePosition,
+        pages: &[usize],
+        direction: u32,
+    ) -> Result<Option<WordHit>> {
+        let mut candidates = Vec::new();
+        for page in pages.iter().copied() {
+            if page == 0 || page > self.page_count() {
+                continue;
+            }
+            let Some(snapshot) = self.pages.get(page - 1) else {
+                continue;
+            };
+            let chunk_index = snapshot.chunk;
+            let line_base = self.chunks[chunk_index].line_base;
+            for (global_line, rect) in self.page_text_boxes_with_lines(page)? {
+                let Some(local_line) = global_line.checked_sub(line_base) else {
+                    continue;
+                };
+                let ranges = word_ranges(&rect.text);
+                self.with_active_chunk(chunk_index, |active| {
+                    let Some(line) = active.lines.get(local_line) else {
+                        return Ok(());
+                    };
+                    let root = active.doc.root_element();
+                    let char_count = rect.text.chars().count().max(1) as f32;
+                    for (start_byte, end_byte) in ranges {
+                        let Ok(start_position) =
+                            xpointer::position_for_line_offset(root, line, start_byte)
+                        else {
+                            continue;
+                        };
+                        let Ok(end_position) =
+                            xpointer::position_for_line_offset(root, line, end_byte)
+                        else {
+                            continue;
+                        };
+                        let start_chars = rect.text[..start_byte].chars().count() as f32;
+                        let end_chars = rect.text[..end_byte].chars().count() as f32;
+                        let x0 = rect.x + rect.width * (start_chars / char_count);
+                        let x1 = rect.x + rect.width * (end_chars / char_count);
+                        candidates.push(WordHit {
+                            text: rect.text[start_byte..end_byte].to_string(),
+                            xpointer_range: XPointerRange {
+                                start: start_position,
+                                end: Some(end_position),
+                                id: None,
+                            },
+                            rects: vec![TextBox {
+                                text: rect.text[start_byte..end_byte].to_string(),
+                                page,
+                                x: x0,
+                                y: rect.y,
+                                width: (x1 - x0).max(1.0),
+                                height: rect.height,
+                            }],
+                        });
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+
+        let word = candidates
+            .into_iter()
+            .filter(|word| {
+                word.rects
+                    .first()
+                    .is_some_and(|rect| direction_matches(position, rect, direction))
+            })
+            .min_by(|left, right| {
+                let left = word_sort_key(left, position, direction);
+                let right = word_sort_key(right, position, direction);
+                left.partial_cmp(&right)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        Ok(word)
+    }
+
     pub fn boxes_between_xpointers(&self, start: &str, end: &str) -> Result<Vec<TextBox>> {
         let mut boxes = Vec::new();
         for (mut rect, slice_start, slice_end) in
@@ -851,6 +996,34 @@ impl Document {
             boxes.push(rect);
         }
         Ok(boxes)
+    }
+
+    pub fn point_from_xpointer(&self, xpointer: &str) -> Result<Option<(f32, f32)>> {
+        let target = parse_text_position(xpointer)?;
+        let page = self.page_from_xpointer(xpointer)?;
+        for (line_index, rect) in self.page_text_boxes_with_lines(page)? {
+            let Some((start, end)) = self.line_bounds(page, line_index)? else {
+                continue;
+            };
+            if target < start || target > end {
+                continue;
+            }
+            let chars = if target == end {
+                rect.text.chars().count().saturating_sub(1)
+            } else {
+                (target
+                    .codepoint_offset
+                    .saturating_sub(start.codepoint_offset)) as usize
+            };
+            let byte = byte_offset_for_char(&rect.text, chars);
+            let char_count = rect.text.chars().count().max(1) as f32;
+            let start_chars = rect.text[..byte].chars().count() as f32;
+            return Ok(Some((
+                rect.x + rect.width * (start_chars / char_count),
+                rect.y,
+            )));
+        }
+        Ok(None)
     }
 
     pub fn page_links(&self, page: usize, internal_only: bool) -> Result<Vec<PageLink>> {
@@ -1933,6 +2106,56 @@ fn word_byte_range(text: &str, byte_offset: usize) -> Option<(usize, usize)> {
     let start_byte = chars[start].0;
     let end_byte = chars.get(end).map_or(text.len(), |(offset, _)| *offset);
     (start_byte < end_byte).then_some((start_byte, end_byte))
+}
+
+fn word_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start: Option<usize> = None;
+    for (offset, ch) in text.char_indices() {
+        if is_word_char(ch) {
+            start.get_or_insert(offset);
+        } else if let Some(start) = start.take()
+            && start < offset
+        {
+            ranges.push((start, offset));
+        }
+    }
+    if let Some(start) = start
+        && start < text.len()
+    {
+        ranges.push((start, text.len()));
+    }
+    ranges
+}
+
+fn direction_matches(point: PagePosition, rect: &TextBox, direction: u32) -> bool {
+    let right = rect.x + rect.width;
+    let bottom = rect.y + rect.height;
+    match direction {
+        0 => point.x >= right - 1.0,
+        1 => point.y >= bottom - 1.0,
+        2 => point.x <= rect.x + 1.0,
+        3 => point.y <= rect.y + 1.0,
+        _ => true,
+    }
+}
+
+fn word_sort_key(
+    word: &WordHit,
+    point: PagePosition,
+    direction: u32,
+) -> (f32, f32, f32, f32, String) {
+    let Some(rect) = word.rects.first() else {
+        return (f32::INFINITY, f32::INFINITY, 0.0, 0.0, String::new());
+    };
+    let center_x = rect.x + rect.width * 0.5;
+    let center_y = rect.y + rect.height * 0.5;
+    let (primary, secondary) = match direction {
+        0 | 2 => ((center_x - point.x).abs(), (center_y - point.y).abs()),
+        1 | 3 => ((center_y - point.y).abs(), (center_x - point.x).abs()),
+        _ => ((center_x - point.x).hypot(center_y - point.y), 0.0),
+    };
+    (primary, secondary, rect.x, rect.y, word.text.clone())
 }
 
 fn source_element_at_line_offset(
