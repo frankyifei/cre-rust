@@ -224,6 +224,7 @@ impl Document {
         match format {
             DocumentFormat::Epub => {
                 let mut book = EpubBook::open(path)?;
+                let _ = book.normalize_inline_svg_images();
                 let raw_toc = std::mem::take(&mut book.toc);
                 let metadata = DocumentMetadata {
                     format,

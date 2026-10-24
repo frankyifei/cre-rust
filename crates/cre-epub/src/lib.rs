@@ -187,6 +187,48 @@ impl EpubBook {
         format!("epub://book/{}", encode_path(&normalize_path(path)))
     }
 
+    pub fn normalize_inline_svg_images(&mut self) -> usize {
+        let spine = self.spine.clone();
+        let mut updates: Vec<(String, String, HashMap<String, Vec<u8>>)> = Vec::new();
+        let mut generated_counter = 0usize;
+
+        for item in spine.iter().filter(|item| item.linear) {
+            if !is_html_resource(&item.media_type, &item.href) {
+                continue;
+            }
+            let doc_key = normalize_path(&item.href);
+            let Some(doc_bytes) = self.resources.get(&doc_key).cloned() else {
+                continue;
+            };
+            let text = decode_text(&doc_bytes);
+            if !text.to_ascii_lowercase().contains("<svg") {
+                continue;
+            }
+
+            let mut generated = HashMap::new();
+            let normalized = rewrite_inline_svg_image_blocks(
+                &text,
+                parent_dir(&doc_key),
+                &self.resources,
+                &mut generated,
+                &mut generated_counter,
+            );
+            if !generated.is_empty() {
+                updates.push((doc_key, normalized, generated));
+            }
+        }
+
+        let mut changed = 0usize;
+        for (doc_key, normalized, generated) in updates {
+            for (key, value) in generated {
+                self.resources.insert(key, value);
+                changed += 1;
+            }
+            self.resources.insert(doc_key, normalized.into_bytes());
+        }
+        changed
+    }
+
     pub fn spine_documents(&self) -> Result<Vec<SpineDocument>> {
         let mut docs = Vec::new();
         for (index, item) in self.spine.iter().enumerate() {
@@ -600,6 +642,429 @@ fn parse_attrs(tag: &str) -> HashMap<String, String> {
     attrs
 }
 
+fn is_html_resource(media_type: &str, href: &str) -> bool {
+    if media_type.to_ascii_lowercase().contains("html") {
+        return true;
+    }
+    matches!(file_extension(href).as_str(), "xhtml" | "html" | "htm")
+}
+
+fn file_extension(path: &str) -> String {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+fn rewrite_inline_svg_image_blocks(
+    html: &str,
+    doc_dir: &str,
+    resources: &HashMap<String, Vec<u8>>,
+    generated: &mut HashMap<String, Vec<u8>>,
+    generated_counter: &mut usize,
+) -> String {
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::with_capacity(html.len());
+    let mut cursor = 0usize;
+
+    while cursor < html.len() {
+        let Some(open_start) = next_tag_start(&lower, cursor, "<svg") else {
+            out.push_str(&html[cursor..]);
+            break;
+        };
+        out.push_str(&html[cursor..open_start]);
+
+        let Some((close_start, close_end)) =
+            find_matching_close_tag(&lower, open_start, "<svg", "</svg")
+        else {
+            out.push_str(&html[open_start..]);
+            break;
+        };
+
+        if let Some(replacement) = replace_image_only_svg_block(
+            html,
+            open_start,
+            close_start,
+            doc_dir,
+            resources,
+            generated,
+            generated_counter,
+        ) {
+            out.push_str(&replacement);
+        } else {
+            out.push_str(&html[open_start..close_end]);
+        }
+        cursor = close_end;
+    }
+
+    out
+}
+
+fn replace_image_only_svg_block(
+    html: &str,
+    open_start: usize,
+    close_start: usize,
+    doc_dir: &str,
+    resources: &HashMap<String, Vec<u8>>,
+    generated: &mut HashMap<String, Vec<u8>>,
+    generated_counter: &mut usize,
+) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let svg_open_end = find_tag_end(html, open_start)?;
+    if svg_open_end >= close_start {
+        return None;
+    }
+
+    let image_start = next_tag_start(&lower, svg_open_end, "<image")?;
+    if next_tag_start(&lower, image_start + "<image".len(), "<image").is_some() {
+        return None;
+    }
+    let image_end = find_tag_end(html, image_start)?;
+    if image_end >= close_start {
+        return None;
+    }
+    if has_element_tag(html, svg_open_end, image_start)
+        || has_element_tag(html, image_end, close_start)
+        || has_meaningful_text(&html[svg_open_end..image_start])
+        || has_meaningful_text(&html[image_end..close_start])
+    {
+        return None;
+    }
+
+    let svg_tag = &html[open_start..svg_open_end];
+    let image_tag = &html[image_start..image_end];
+    let svg_attrs = parse_attrs(svg_tag);
+    let image_attrs = parse_attrs(image_tag);
+
+    let href = image_attrs
+        .get("xlink:href")
+        .or_else(|| image_attrs.get("href"))?;
+    let href = href.trim();
+    if href.is_empty() || is_external(href) {
+        return None;
+    }
+
+    let image_key = resolve_href(doc_dir, &value_without_fragment(href));
+    let image_bytes = resources.get(&image_key)?;
+    let image_mime = image_mime(image_bytes, &image_key);
+
+    let view_size = svg_attrs
+        .get("viewbox")
+        .and_then(|value| parse_view_box(value))
+        .or_else(|| numeric_size(&svg_attrs))
+        .or_else(|| numeric_size(&image_attrs))?;
+    let image_size = numeric_size(&image_attrs).unwrap_or(view_size);
+
+    *generated_counter += 1;
+    let generated_key = normalize_path(&generated_svg_key(doc_dir, *generated_counter));
+    let svg = generated_svg_document(view_size, image_size, image_mime, image_bytes);
+    generated.insert(generated_key.clone(), svg.into_bytes());
+
+    Some(generated_image_tag(&generated_key, &svg_attrs))
+}
+
+fn next_tag_start(text: &str, from: usize, tag_lower: &str) -> Option<usize> {
+    if from > text.len() {
+        return None;
+    }
+    let mut from = from;
+    while let Some(rel) = text[from..].find(tag_lower) {
+        let pos = from + rel;
+        if is_tag_boundary(text, pos + tag_lower.len()) {
+            return Some(pos);
+        }
+        from = pos + tag_lower.len();
+    }
+    None
+}
+
+fn is_tag_boundary(text: &str, pos: usize) -> bool {
+    if pos >= text.len() {
+        return true;
+    }
+    match text[pos..].chars().next() {
+        Some(c) => c.is_whitespace() || c == '>' || c == '/',
+        None => true,
+    }
+}
+
+fn find_matching_close_tag(
+    text: &str,
+    open_start: usize,
+    open_tag: &str,
+    close_tag: &str,
+) -> Option<(usize, usize)> {
+    let mut depth = 1usize;
+    let mut scan = open_start + open_tag.len();
+
+    while scan < text.len() {
+        let next_open = next_tag_start(text, scan, open_tag);
+        let next_close = next_tag_start(text, scan, close_tag);
+        match (next_open, next_close) {
+            (None, None) => return None,
+            (Some(open_pos), None) => {
+                depth += 1;
+                scan = find_tag_end(text, open_pos)?;
+            }
+            (None, Some(close_pos)) => {
+                depth -= 1;
+                let close_end = find_tag_end(text, close_pos)?;
+                if depth == 0 {
+                    return Some((close_pos, close_end));
+                }
+                scan = close_end;
+            }
+            (Some(open_pos), Some(close_pos)) => {
+                if close_pos < open_pos {
+                    depth -= 1;
+                    let close_end = find_tag_end(text, close_pos)?;
+                    if depth == 0 {
+                        return Some((close_pos, close_end));
+                    }
+                    scan = close_end;
+                } else {
+                    depth += 1;
+                    scan = find_tag_end(text, open_pos)?;
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn find_tag_end(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if start >= bytes.len() || bytes[start] != b'<' {
+        return None;
+    }
+    let mut i = start + 1;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if let Some(quote_byte) = quote {
+            if byte == quote_byte {
+                quote = None;
+            }
+        } else if byte == b'"' || byte == b'\'' {
+            quote = Some(byte);
+        } else if byte == b'>' {
+            return Some(i + 1);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn has_element_tag(text: &str, start: usize, end: usize) -> bool {
+    let Some(segment) = text.get(start..end) else {
+        return true;
+    };
+    let mut i = 0;
+    while let Some(rel) = segment[i..].find('<') {
+        let tag_pos = i + rel + 1;
+        if tag_pos < segment.len() {
+            let first = segment[tag_pos..].chars().next().unwrap();
+            if first.is_ascii_alphabetic() {
+                return true;
+            }
+            if first == '/' {
+                let after = segment[tag_pos + 1..].chars().next();
+                if after.is_some_and(|c| c.is_ascii_alphabetic()) {
+                    return true;
+                }
+            }
+        }
+        i += rel + 1;
+    }
+    false
+}
+
+fn has_meaningful_text(text: &str) -> bool {
+    let mut i = 0;
+    while i < text.len() {
+        match text[i..].find('<') {
+            Some(rel) if text[i + rel..].starts_with("<!--") => {
+                let comment_start = i + rel;
+                if let Some(comment_end) = text[comment_start..].find("-->") {
+                    i = comment_start + comment_end + 3;
+                } else {
+                    i = text.len();
+                }
+            }
+            Some(_) => return true,
+            None => return text[i..].chars().any(|c| !c.is_whitespace()),
+        }
+    }
+    false
+}
+
+fn generated_svg_key(doc_dir: &str, counter: usize) -> String {
+    if doc_dir.is_empty() {
+        format!("cre-inline-svg-{counter}.svg")
+    } else {
+        format!("{doc_dir}/cre-inline-svg-{counter}.svg")
+    }
+}
+
+fn generated_svg_document(
+    view_size: (f32, f32),
+    image_size: (f32, f32),
+    mime: &str,
+    image_bytes: &[u8],
+) -> String {
+    let (view_width, view_height) = view_size;
+    let (image_width, image_height) = image_size;
+    let encoded = base64_encode(image_bytes);
+    format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"{view_width}\" height=\"{view_height}\" viewBox=\"0 0 {view_width} {view_height}\"><image width=\"{image_width}\" height=\"{image_height}\" xlink:href=\"data:{mime};base64,{encoded}\" /></svg>"
+    )
+}
+
+fn generated_image_tag(generated_key: &str, svg_attrs: &HashMap<String, String>) -> String {
+    let src = format!("epub://book/{}", encode_path(generated_key));
+    let mut tag = format!("<img src=\"{}\"", escape_attr(&src));
+    if let Some(id) = svg_attrs.get("id") {
+        tag.push_str(&format!(" id=\"{}\"", escape_attr(id)));
+    }
+    if let Some(class) = svg_attrs.get("class") {
+        tag.push_str(&format!(" class=\"{}\"", escape_attr(class)));
+    }
+    let style = svg_css_style(svg_attrs);
+    if !style.is_empty() {
+        tag.push_str(&format!(" style=\"{}\"", escape_attr(&style)));
+    }
+    tag.push('>');
+    tag
+}
+
+fn svg_css_style(attrs: &HashMap<String, String>) -> String {
+    let mut style = attrs.get("style").cloned().unwrap_or_default();
+    if let Some(value) = attrs.get("width").and_then(|value| css_length(value)) {
+        append_style_declaration(&mut style, "width", &value);
+    }
+    if let Some(value) = attrs.get("height").and_then(|value| css_length(value)) {
+        append_style_declaration(&mut style, "height", &value);
+    }
+    style
+}
+
+fn append_style_declaration(style: &mut String, property: &str, value: &str) {
+    if value.is_empty() {
+        return;
+    }
+    if !style.is_empty() && !style.ends_with(';') {
+        style.push(';');
+    }
+    style.push_str(property);
+    style.push(':');
+    style.push_str(value);
+    style.push(';');
+}
+
+fn css_length(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(number) = parse_number(value) {
+        return Some(format!("{number}px"));
+    }
+    if value.len() <= 64
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '%' | '-' | '_' | '|'))
+    {
+        return Some(value.to_string());
+    }
+    None
+}
+
+fn numeric_size(attrs: &HashMap<String, String>) -> Option<(f32, f32)> {
+    let width = attrs.get("width").and_then(|value| parse_number(value))?;
+    let height = attrs.get("height").and_then(|value| parse_number(value))?;
+    if width > 0.0 && height > 0.0 {
+        Some((width, height))
+    } else {
+        None
+    }
+}
+
+fn parse_view_box(value: &str) -> Option<(f32, f32)> {
+    let normalized = value.replace(',', " ");
+    let numbers: Vec<f32> = normalized
+        .split_whitespace()
+        .filter_map(parse_number)
+        .collect();
+    if numbers.len() != 4 {
+        return None;
+    }
+    let width = numbers[2];
+    let height = numbers[3];
+    if width > 0.0 && height > 0.0 {
+        Some((width, height))
+    } else {
+        None
+    }
+}
+
+fn parse_number(value: &str) -> Option<f32> {
+    let lower = value.trim().to_ascii_lowercase();
+    let number = lower.strip_suffix("px").unwrap_or(&lower).trim();
+    number.parse::<f32>().ok().filter(|value| value.is_finite())
+}
+
+fn image_mime(data: &[u8], path: &str) -> &'static str {
+    if data.starts_with(&[0x89, 0x50, 0x4e, 0x47]) {
+        return "image/png";
+    }
+    if data.starts_with(&[0xff, 0xd8, 0xff]) {
+        return "image/jpeg";
+    }
+    if data.starts_with(b"GIF8") {
+        return "image/gif";
+    }
+    if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
+        return "image/webp";
+    }
+    if data.starts_with(b"BM") {
+        return "image/bmp";
+    }
+    match file_extension(path).as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" | "svgz" => "image/svg+xml",
+        _ => "application/octet-stream",
+    }
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let value = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((value >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((value >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[((value >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(value & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
 fn is_external(value: &str) -> bool {
     let value = value.trim();
     value.is_empty()
@@ -927,6 +1392,28 @@ mod tests {
         assert!(!html.contains("]]>"));
     }
 
+    #[test]
+    fn normalizes_inline_svg_image_wrappers_to_raster_svg_resources() {
+        let mut book = EpubBook::from_bytes(synthetic_inline_svg_epub()).unwrap();
+        assert_eq!(book.normalize_inline_svg_images(), 1);
+
+        let generated_key = "cre-inline-svg-1.svg";
+        let generated_svg = String::from_utf8(book.resources[generated_key].clone()).unwrap();
+        assert!(generated_svg.contains("viewBox=\"0 0 100 200\""));
+        assert!(generated_svg.contains("xlink:href=\"data:image/jpeg;base64,"));
+
+        let html = book.to_html(&HtmlOptions::default()).unwrap();
+        assert!(html.contains(&format!("epub://book/{generated_key}")));
+        assert!(html.contains("width:100%;height:100%"));
+    }
+
+    #[test]
+    fn ignores_complex_inline_svg_blocks() {
+        let mut book = EpubBook::from_bytes(synthetic_complex_inline_svg_epub()).unwrap();
+        assert_eq!(book.normalize_inline_svg_images(), 0);
+        assert!(!book.resources.contains_key("cre-inline-svg-1.svg"));
+    }
+
     fn synthetic_cdata_styled_epub() -> Vec<u8> {
         let mut buf = Cursor::new(Vec::new());
         {
@@ -1065,14 +1552,124 @@ mod tests {
         buf.into_inner()
     }
 
+    fn synthetic_inline_svg_epub() -> Vec<u8> {
+        let container = r#"<?xml version="1.0"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+  <rootfiles>
+    <rootfile full-path="pkg.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#;
+        let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="id">urn:uuid:svg-test</dc:identifier>
+    <dc:title>Inline SVG Test</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="s1" href="sec1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="img" href="images/one.jpg" media-type="image/jpeg"/>
+  </manifest>
+  <spine>
+    <itemref idref="s1"/>
+  </spine>
+</package>"#;
+        let doc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <head><title>Sec1</title></head>
+  <body>
+    <svg width="100%" height="100%" viewBox="0 0 100 200">
+      <image width="100" height="200" xlink:href="images/one.jpg" />
+    </svg>
+  </body>
+</html>"#;
+        synthetic_epub_fixture(container, opf, doc, &jpg_fixture_bytes())
+    }
+
+    fn synthetic_complex_inline_svg_epub() -> Vec<u8> {
+        let container = r#"<?xml version="1.0"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+  <rootfiles>
+    <rootfile full-path="pkg.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#;
+        let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="id">urn:uuid:svg-complex-test</dc:identifier>
+    <dc:title>Complex Inline SVG Test</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="s1" href="sec1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="img" href="images/one.jpg" media-type="image/jpeg"/>
+  </manifest>
+  <spine>
+    <itemref idref="s1"/>
+  </spine>
+</package>"#;
+        let doc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <head><title>Sec1</title></head>
+  <body>
+    <svg width="100%" height="100%" viewBox="0 0 100 200">
+      <rect width="100" height="200" fill="blue" />
+      <image width="100" height="200" xlink:href="images/one.jpg" />
+      <text x="10" y="50">caption</text>
+    </svg>
+  </body>
+</html>"#;
+        synthetic_epub_fixture(container, opf, doc, &jpg_fixture_bytes())
+    }
+
+    fn synthetic_epub_fixture(
+        container: &str,
+        opf: &str,
+        doc: &str,
+        image_bytes: &[u8],
+    ) -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buf);
+            let options = zip::write::SimpleFileOptions::default();
+
+            write_zip_bytes(&mut writer, options, "mimetype", b"application/epub+zip");
+            write_zip_bytes(
+                &mut writer,
+                options,
+                "META-INF/container.xml",
+                container.as_bytes(),
+            );
+            write_zip_bytes(&mut writer, options, "pkg.opf", opf.as_bytes());
+            write_zip_bytes(&mut writer, options, "sec1.xhtml", doc.as_bytes());
+            write_zip_bytes(&mut writer, options, "images/one.jpg", image_bytes);
+
+            writer.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    fn jpg_fixture_bytes() -> Vec<u8> {
+        vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]
+    }
+
     fn write_zip_file(
         writer: &mut zip::ZipWriter<&mut Cursor<Vec<u8>>>,
         options: zip::write::SimpleFileOptions,
         name: &str,
         contents: &str,
     ) {
+        write_zip_bytes(writer, options, name, contents.as_bytes());
+    }
+
+    fn write_zip_bytes(
+        writer: &mut zip::ZipWriter<&mut Cursor<Vec<u8>>>,
+        options: zip::write::SimpleFileOptions,
+        name: &str,
+        contents: &[u8],
+    ) {
         use std::io::Write;
         writer.start_file(name, options).unwrap();
-        writer.write_all(contents.as_bytes()).unwrap();
+        writer.write_all(contents).unwrap();
     }
 }
