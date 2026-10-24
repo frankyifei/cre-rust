@@ -119,6 +119,24 @@ impl Doc {
         Ok(())
     }
 
+    fn two_visible_pages_count_as_one(&self) -> bool {
+        match self
+            .properties
+            .get("window.pages.two.visible.as.one.page.number")
+        {
+            Some(value) => value == "1",
+            None => self.visible_page_count.max(1) > 1,
+        }
+    }
+
+    fn visible_page_number_count(&self) -> i64 {
+        if self.two_visible_pages_count_as_one() {
+            1
+        } else {
+            i64::from(self.visible_page_count.max(1))
+        }
+    }
+
     fn relayout(&mut self) {
         let Some(path) = self.path.clone() else {
             return;
@@ -2422,7 +2440,9 @@ unsafe extern "C-unwind" fn doc_get_int_property(l: *mut lua_State) -> c_int {
             "crengine.page.margin.bottom" => i64::from(bottom),
             "crengine.interline.space" => i64::from(doc.interline),
             "crengine.page.header.height" => i64::from(doc.header_height),
-            "window.pages.two.visible.as.one.page.number" => i64::from(doc.visible_page_count > 1),
+            "window.pages.two.visible.as.one.page.number" => {
+                i64::from(doc.two_visible_pages_count_as_one())
+            }
             "window.status.battery.percent" => i64::from(doc.battery),
             _ => doc
                 .properties
@@ -3776,6 +3796,15 @@ unsafe extern "C-unwind" fn doc_visible_page_count(l: *mut lua_State) -> c_int {
     1
 }
 
+unsafe extern "C-unwind" fn doc_get_visible_page_number_count(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let count = doc_ref(l).map_or(1, |doc| doc.visible_page_number_count());
+        push_int(l, count);
+    }
+    1
+}
+
 unsafe extern "C-unwind" fn doc_render_hash(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
@@ -3903,7 +3932,10 @@ const DOC_METHODS: &[lua::luaL_Reg] = &regs![
     ("getHeaderHeight", doc_get_header_height),
     ("getToc", doc_toc),
     ("getVisiblePageCount", doc_visible_page_count),
-    ("getVisiblePageNumberCount", doc_visible_page_count),
+    (
+        "getVisiblePageNumberCount",
+        doc_get_visible_page_number_count
+    ),
     ("getNextVisibleWordStart", doc_next_visible_word_start),
     ("getNextVisibleWordEnd", doc_next_visible_word_end),
     ("getPrevVisibleWordStart", doc_prev_visible_word_start),
