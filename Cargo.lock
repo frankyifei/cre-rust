@@ -391,13 +391,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cre-ffi"
-version = "0.1.0"
-dependencies = [
- "cre-lib",
-]
-
-[[package]]
 name = "cre-lib"
 version = "0.1.0"
 dependencies = [

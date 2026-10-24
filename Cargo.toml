@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/cre-blitz-spike",
     "crates/cre-epub", "crates/cre-fb2",
-    "crates/cre-ffi",
     "crates/cre-lib",
     "crates/cre-lua",
     "crates/cre-paint",
