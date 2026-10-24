@@ -535,6 +535,83 @@ fn document_finds_text_with_regex_and_case_insensitive_options() {
 }
 
 #[test]
+fn document_find_text_direction_filters_by_current_page() {
+    require_resources();
+
+    let options = DocumentOptions {
+        width: 320,
+        height: 480,
+        layout_height: 100_000,
+        page_margin: 16.0,
+        font_size: 18.0,
+        font_path: None,
+    };
+    let mut doc = Document::with_options(fixture("sample.txt"), &options).unwrap();
+    assert!(doc.page_count() > 3);
+
+    let mut selected = None;
+    for query in ["et", "at", "ex", "consetetur", "iusto"] {
+        let hits = doc.find_text(query).unwrap();
+        let mut pages: Vec<usize> = hits.iter().map(|hit| hit.page).collect();
+        pages.sort_unstable();
+        pages.dedup();
+        if pages.len() >= 2 {
+            selected = Some((query, hits));
+            break;
+        }
+    }
+    let (query, all) = selected.expect("fixture should repeat text on multiple pages");
+
+    let mut pages: Vec<usize> = all.iter().map(|hit| hit.page).collect();
+    pages.sort_unstable();
+    pages.dedup();
+    let boundary = pages[1];
+
+    doc.go_to_page(boundary).unwrap();
+    let forward = doc
+        .find_text_with_direction(query, false, false, 0, false, None)
+        .unwrap();
+    assert!(!forward.is_empty());
+    assert!(forward.iter().all(|hit| hit.page >= boundary));
+    assert!(forward.windows(2).all(|pair| pair[0].page <= pair[1].page));
+
+    let backward = doc
+        .find_text_with_direction(query, false, false, 0, true, None)
+        .unwrap();
+    assert!(!backward.is_empty());
+    assert!(backward.iter().all(|hit| hit.page <= boundary));
+    assert!(backward.windows(2).all(|pair| pair[0].page >= pair[1].page));
+
+    let before = doc
+        .find_text_with_direction(query, false, false, -1, false, None)
+        .unwrap();
+    assert!(!before.is_empty());
+    assert!(before.iter().all(|hit| hit.page <= boundary));
+
+    let after_reverse = doc
+        .find_text_with_direction(query, false, false, -1, true, None)
+        .unwrap();
+    assert!(!after_reverse.is_empty());
+    assert!(after_reverse.iter().all(|hit| hit.page >= boundary));
+    assert!(
+        after_reverse
+            .windows(2)
+            .all(|pair| pair[0].page >= pair[1].page)
+    );
+
+    assert!(
+        doc.find_text_with_direction("", false, false, 0, false, None)
+            .is_err()
+    );
+    assert_eq!(
+        doc.find_text_with_direction("zzzz-not-in-sample", false, false, 0, false, Some(1))
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[test]
 fn document_bookmarks_survive_reflow() {
     require_resources();
 

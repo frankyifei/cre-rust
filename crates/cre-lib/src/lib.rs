@@ -1078,11 +1078,41 @@ impl Document {
         pattern_is_regex: bool,
         max_hits: Option<usize>,
     ) -> Result<Vec<SearchHit>> {
-        if query.is_empty() {
-            bail!("search query must not be empty");
-        }
         if max_hits.is_some_and(|max_hits| max_hits == 0) {
             return Ok(Vec::new());
+        }
+        self.find_text_matches(query, case_insensitive, pattern_is_regex, max_hits)
+    }
+
+    pub fn find_text_with_direction(
+        &self,
+        query: &str,
+        case_insensitive: bool,
+        pattern_is_regex: bool,
+        origin: i32,
+        reverse: bool,
+        max_hits: Option<usize>,
+    ) -> Result<Vec<SearchHit>> {
+        if max_hits.is_some_and(|max_hits| max_hits == 0) {
+            return Ok(Vec::new());
+        }
+        let mut hits = self.find_text_matches(query, case_insensitive, pattern_is_regex, None)?;
+        self.apply_search_direction(&mut hits, origin, reverse);
+        if let Some(max_hits) = max_hits {
+            hits.truncate(max_hits);
+        }
+        Ok(hits)
+    }
+
+    fn find_text_matches(
+        &self,
+        query: &str,
+        case_insensitive: bool,
+        pattern_is_regex: bool,
+        max_hits: Option<usize>,
+    ) -> Result<Vec<SearchHit>> {
+        if query.is_empty() {
+            bail!("search query must not be empty");
         }
 
         let pattern = if pattern_is_regex {
@@ -1190,6 +1220,36 @@ impl Document {
             }
         }
         Ok(hits)
+    }
+
+    fn apply_search_direction(&self, hits: &mut Vec<SearchHit>, origin: i32, reverse: bool) {
+        let current_page = self.current_page();
+        if reverse {
+            if origin == -1 {
+                hits.retain(|hit| hit.page >= current_page);
+            } else {
+                hits.retain(|hit| hit.page <= current_page);
+            }
+            hits.sort_by(|left, right| {
+                right
+                    .xpointer_range
+                    .start
+                    .cmp(&left.xpointer_range.start)
+                    .then_with(|| right.page.cmp(&left.page))
+            });
+        } else {
+            if origin == -1 {
+                hits.retain(|hit| hit.page <= current_page);
+            } else {
+                hits.retain(|hit| hit.page >= current_page);
+            }
+            hits.sort_by(|left, right| {
+                left.xpointer_range
+                    .start
+                    .cmp(&right.xpointer_range.start)
+                    .then_with(|| left.page.cmp(&right.page))
+            });
+        }
     }
 
     pub fn go_to_page(&mut self, page: usize) -> Result<usize> {

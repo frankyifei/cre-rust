@@ -1483,15 +1483,23 @@ unsafe extern "C-unwind" fn doc_find_text(l: *mut lua_State) -> c_int {
         let Some(query) = arg_str(l, 2) else {
             return 0;
         };
+        let origin = arg_int(l, 3) as i32;
+        let reverse = arg_bool(l, 4);
         let case_insensitive = arg_bool(l, 5);
         let pattern_is_regex = arg_bool(l, 6);
         let requested = arg_int(l, 7);
         let Some(inner) = doc_ref(l).and_then(|doc| doc.inner.as_ref()) else {
             return 0;
         };
-        let Some(hits) =
-            find_document_hits(inner, &query, case_insensitive, pattern_is_regex, requested)
-        else {
+        let Some(hits) = find_text_document_hits(
+            inner,
+            &query,
+            case_insensitive,
+            pattern_is_regex,
+            origin,
+            reverse,
+            requested,
+        ) else {
             return 0;
         };
         if hits.is_empty() {
@@ -1512,7 +1520,38 @@ unsafe extern "C-unwind" fn doc_find_text(l: *mut lua_State) -> c_int {
     2
 }
 
-fn find_document_hits(
+fn find_text_document_hits(
+    inner: &cre_lib::Document,
+    query: &str,
+    case_insensitive: bool,
+    pattern_is_regex: bool,
+    origin: i32,
+    reverse: bool,
+    requested: i64,
+) -> Option<Vec<cre_lib::SearchHit>> {
+    if query.is_empty() {
+        return Some(Vec::new());
+    }
+    let max_hits = (requested > 0).then_some(requested as usize);
+    match inner.find_text_with_direction(
+        query,
+        case_insensitive,
+        pattern_is_regex,
+        origin,
+        reverse,
+        max_hits,
+    ) {
+        Ok(hits) => Some(hits),
+        Err(_) => {
+            if pattern_is_regex {
+                REGEX_SEARCH_ERROR.store(REGEX_SEARCH_ERROR_INVALID_PATTERN, Ordering::Relaxed);
+            }
+            None
+        }
+    }
+}
+
+fn find_all_document_hits(
     inner: &cre_lib::Document,
     query: &str,
     case_insensitive: bool,
@@ -1579,7 +1618,7 @@ unsafe extern "C-unwind" fn doc_find_all_text(l: *mut lua_State) -> c_int {
             return 0;
         };
         let Some(hits) =
-            find_document_hits(inner, &query, case_insensitive, pattern_is_regex, requested)
+            find_all_document_hits(inner, &query, case_insensitive, pattern_is_regex, requested)
         else {
             return 0;
         };
