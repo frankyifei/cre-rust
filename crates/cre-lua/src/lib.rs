@@ -777,6 +777,32 @@ unsafe fn push_int(l: *mut lua_State, value: i64) {
     unsafe { lua::lua_pushinteger(l, value) };
 }
 
+fn apply_text_highlight(
+    bitmap: &mut cre_lib::PageBitmap,
+    boxes: &[cre_lib::TextBox],
+    current_page: usize,
+) {
+    for text_box in boxes {
+        if text_box.page != current_page {
+            continue;
+        }
+        let left = text_box.x.floor().max(0.0) as u32;
+        let top = text_box.y.floor().max(0.0) as u32;
+        let right = (text_box.x + text_box.width).ceil().max(0.0) as u32;
+        let bottom = (text_box.y + text_box.height).ceil().max(0.0) as u32;
+        let right = right.min(bitmap.width);
+        let bottom = bottom.min(bitmap.height);
+        for y in top..bottom {
+            for x in left..right {
+                let index = (y * bitmap.width + x) as usize;
+                if let Some(pixel) = bitmap.data.get_mut(index) {
+                    *pixel = 255 - *pixel;
+                }
+            }
+        }
+    }
+}
+
 fn cfi_for_position(position: &cre_lib::TextPosition) -> String {
     let mut path = String::new();
     for segment in &position.path {
@@ -1783,9 +1809,16 @@ unsafe extern "C-unwind" fn doc_draw_current_page(l: *mut lua_State) -> c_int {
                 return;
             }
             let color = arg_bool(l, 3);
-            let Ok(bitmap) = inner.render_current_page() else {
+            let highlight = doc.highlight.clone();
+            let current_page = inner.current_page();
+            let Ok(mut bitmap) = inner.render_current_page() else {
                 return;
             };
+            if let Some((start, end)) = highlight
+                && let Ok(boxes) = inner.boxes_between_xpointers(&start, &end)
+            {
+                apply_text_highlight(&mut bitmap, &boxes, current_page);
+            }
             let bb = &*bb;
             let rows = bitmap.height.min(bb.h) as usize;
             let cols = bitmap.width.min(bb.w) as usize;
@@ -2656,7 +2689,16 @@ unsafe extern "C-unwind" fn doc_set_visible_page_count(l: *mut lua_State) -> c_i
     // SAFETY: `l` is the active Lua state.
     unsafe {
         if let Some(doc) = doc_mut(l) {
-            doc.visible_page_count = arg_int(l, 2).clamp(1, 4) as i32;
+            let count = arg_int(l, 2);
+            let only_if_sane = if lua::lua_isboolean(l, 3) != 0 {
+                arg_bool(l, 3)
+            } else {
+                true
+            };
+            let next = count.clamp(1, 4) as i32;
+            if count == i64::from(next) || !only_if_sane {
+                doc.visible_page_count = next;
+            }
         }
     }
     0
