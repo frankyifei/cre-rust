@@ -3003,11 +3003,28 @@ unsafe extern "C-unwind" fn doc_highlight(l: *mut lua_State) -> c_int {
         let Some(doc) = doc_mut(l) else {
             return 0;
         };
-        if let Some(xpointer) = arg_str(l, 2) {
-            doc.highlight = Some((xpointer.clone(), xpointer));
-        } else {
-            doc.highlight = None;
-        }
+        let xpointer = arg_str(l, 2);
+        let highlight = match xpointer {
+            None => None,
+            Some(xpointer) => {
+                let range = doc.inner.as_ref().and_then(|inner| {
+                    let page = inner.page_from_xpointer(&xpointer).ok()?;
+                    let (x, y) = inner.point_from_xpointer(&xpointer).ok()??;
+                    let word = inner
+                        .word_at(cre_lib::PagePosition { page, x, y })
+                        .ok()
+                        .flatten()?;
+                    let end = word
+                        .xpointer_range
+                        .end
+                        .as_ref()
+                        .map_or_else(String::new, |position| position.to_xpointer());
+                    (!end.is_empty()).then(|| (word.xpointer_range.start.to_xpointer(), end))
+                });
+                Some(range.unwrap_or_else(|| (xpointer.clone(), xpointer)))
+            }
+        };
+        doc.highlight = highlight;
         push_bool(l, true);
     }
     1
