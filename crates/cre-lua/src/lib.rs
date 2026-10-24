@@ -1377,6 +1377,19 @@ unsafe extern "C-unwind" fn doc_gc(l: *mut lua_State) -> c_int {
     0
 }
 
+unsafe fn call_document_callback(l: *mut lua_State, name: &str) {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(reference) = doc_ref(l).and_then(|doc| doc.callbacks.get(name)) else {
+            return;
+        };
+        lua::lua_rawgeti(l, lua::LUA_REGISTRYINDEX, *reference as lua::lua_Integer);
+        if lua::lua_pcall(l, 0, 0, 0) != 0 {
+            lua::lua_pop(l, 1);
+        }
+    }
+}
+
 unsafe extern "C-unwind" fn doc_load(l: *mut lua_State) -> c_int {
     let loaded = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: `l` is the active Lua state.
@@ -1387,10 +1400,13 @@ unsafe extern "C-unwind" fn doc_load(l: *mut lua_State) -> c_int {
             let Some(path) = arg_str(l, 2) else {
                 return false;
             };
+            call_document_callback(l, "OnLoadFileStart");
             if doc.open(PathBuf::from(path)).is_ok() {
                 doc.record_history();
+                call_document_callback(l, "OnDocumentReady");
                 true
             } else {
+                call_document_callback(l, "OnLoadFileError");
                 false
             }
         }
