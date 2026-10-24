@@ -15,6 +15,7 @@ use read_fonts::TableProvider;
 const CREDOC: &[u8] = b"credocument\0";
 const CREIMAGE: &[u8] = b"creimage\0";
 const INDEX: &[u8] = b"__index\0";
+const NO_REF: c_int = -2;
 
 #[repr(C)]
 struct BlitBuffer {
@@ -64,6 +65,7 @@ struct Doc {
     page_map_source: String,
     page_map_chars: usize,
     highlight: Option<(String, String)>,
+    callback_ref: c_int,
 }
 
 impl Doc {
@@ -98,6 +100,7 @@ impl Doc {
             page_map_source: String::new(),
             page_map_chars: 0,
             highlight: None,
+            callback_ref: NO_REF,
         }
     }
 
@@ -1343,6 +1346,9 @@ unsafe extern "C-unwind" fn doc_gc(l: *mut lua_State) -> c_int {
     unsafe {
         let ptr = lua::lua_touserdata(l, 1).cast::<Doc>();
         if !ptr.is_null() {
+            if (*ptr).callback_ref != NO_REF {
+                lua::luaL_unref(l, lua::LUA_REGISTRYINDEX, (*ptr).callback_ref);
+            }
             ptr::drop_in_place(ptr);
         }
     }
@@ -2774,7 +2780,25 @@ unsafe extern "C-unwind" fn doc_set_battery_state(l: *mut lua_State) -> c_int {
     0
 }
 
-unsafe extern "C-unwind" fn doc_set_callback(_l: *mut lua_State) -> c_int {
+unsafe extern "C-unwind" fn doc_set_callback(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let is_function = lua::lua_isfunction(l, 2) != 0;
+        if let Some(doc) = doc_mut(l) {
+            if is_function {
+                if doc.callback_ref != NO_REF {
+                    lua::luaL_unref(l, lua::LUA_REGISTRYINDEX, doc.callback_ref);
+                }
+                doc.callback_ref = lua::luaL_ref(l, lua::LUA_REGISTRYINDEX);
+            } else if doc.callback_ref != NO_REF {
+                lua::luaL_unref(l, lua::LUA_REGISTRYINDEX, doc.callback_ref);
+                doc.callback_ref = NO_REF;
+            }
+        } else if is_function {
+            let reference = lua::luaL_ref(l, lua::LUA_REGISTRYINDEX);
+            lua::luaL_unref(l, lua::LUA_REGISTRYINDEX, reference);
+        }
+    }
     0
 }
 
