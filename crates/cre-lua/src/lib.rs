@@ -1660,20 +1660,45 @@ unsafe extern "C-unwind" fn doc_xpointer_in_current_page(l: *mut lua_State) -> c
 unsafe extern "C-unwind" fn doc_pos_from_xpointer(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let (y, x) = arg_str(l, 2)
-            .and_then(|xp| {
-                doc_ref(l).and_then(|doc| {
-                    let inner = doc.inner.as_ref()?;
-                    let page = inner.page_from_xpointer(&xp).ok()?;
-                    let point = inner.point_from_xpointer(&xp).ok().flatten();
-                    let (x, y) = point.unwrap_or((0.0, 0.0));
-                    let y = inner.page_start_y(page) + y.round() as i64;
-                    Some((y, x.round() as i64))
-                })
-            })
-            .unwrap_or((0, 0));
-        push_int(l, y);
-        push_int(l, x);
+        let Some(xp) = arg_str(l, 2) else {
+            push_int(l, 0);
+            push_int(l, 0);
+            return 2;
+        };
+        let Some(inner) = doc_ref(l).and_then(|doc| doc.inner.as_ref()) else {
+            push_int(l, 0);
+            push_int(l, 0);
+            return 2;
+        };
+        let mut page = inner.page_from_xpointer(&xp).ok();
+        let mut point = inner.point_from_xpointer(&xp).ok().flatten();
+        if page.is_none() || point.is_none() {
+            let next = inner
+                .next_visible_char(&xp)
+                .ok()
+                .flatten()
+                .filter(|next| *next != xp);
+            if let Some(next) = next {
+                if page.is_none() {
+                    page = inner.page_from_xpointer(&next).ok();
+                }
+                if point.is_none() {
+                    point = inner.point_from_xpointer(&next).ok().flatten();
+                }
+            }
+        }
+        let Some(page) = page else {
+            push_int(l, 0);
+            push_int(l, 0);
+            return 2;
+        };
+        let Some((x, y)) = point else {
+            push_int(l, 0);
+            push_int(l, 0);
+            return 2;
+        };
+        push_int(l, inner.page_start_y(page) + y.round() as i64);
+        push_int(l, x.round() as i64);
     }
     2
 }
