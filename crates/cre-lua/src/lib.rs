@@ -2855,7 +2855,11 @@ unsafe extern "C-unwind" fn doc_set_int_property(l: *mut lua_State) -> c_int {
                     relayout = true;
                 }
             }
-            "view.mode" => doc.view_mode = value as i32,
+            "view.mode" => {
+                if value == 0 || value == 1 {
+                    doc.view_mode = value as i32;
+                }
+            }
             "crengine.page.margin.left" => {
                 doc.margins.0 = value as i32;
                 relayout = true;
