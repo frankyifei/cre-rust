@@ -144,7 +144,7 @@ impl Doc {
             width: self.width,
             height: self.height,
             layout_height: self.layout_height,
-            page_margin: self.margins.0.max(0) as f32,
+            page_margin: self.margins.1.max(0) as f32,
             font_size: self.render_font_css_size(),
             font_path: self.font_path.clone(),
             stylesheet: (!self.stylesheet.is_empty()).then(|| self.stylesheet.clone()),
