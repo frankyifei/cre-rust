@@ -68,7 +68,8 @@ struct Doc {
     render_dpi: u32,
     scale_font_with_dpi: bool,
     highlight: Option<(String, String)>,
-    callbacks: HashMap<String, c_int>,
+    callback: Option<c_int>,
+    render_requested: bool,
 }
 
 impl Doc {
@@ -107,7 +108,8 @@ impl Doc {
             render_dpi: 96,
             scale_font_with_dpi: false,
             highlight: None,
-            callbacks: HashMap::new(),
+            callback: None,
+            render_requested: false,
         }
     }
 
@@ -1501,24 +1503,55 @@ unsafe extern "C-unwind" fn doc_gc(l: *mut lua_State) -> c_int {
     unsafe {
         let ptr = lua::lua_touserdata(l, 1).cast::<Doc>();
         if !ptr.is_null() {
-            for reference in (*ptr).callbacks.values() {
-                lua::luaL_unref(l, lua::LUA_REGISTRYINDEX, *reference);
+            if let Some(reference) = (*ptr).callback {
+                lua::luaL_unref(l, lua::LUA_REGISTRYINDEX, reference);
             }
-            (*ptr).callbacks.clear();
+            (*ptr).callback = None;
             ptr::drop_in_place(ptr);
         }
     }
     0
 }
 
-unsafe fn call_document_callback(l: *mut lua_State, name: &str) {
+unsafe fn call_document_callback(l: *mut lua_State, event: &str) {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let Some(reference) = doc_ref(l).and_then(|doc| doc.callbacks.get(name)) else {
+        let Some(reference) = doc_ref(l).and_then(|doc| doc.callback) else {
             return;
         };
-        lua::lua_rawgeti(l, lua::LUA_REGISTRYINDEX, *reference as lua::lua_Integer);
-        if lua::lua_pcall(l, 0, 0, 0) != 0 {
+        lua::lua_rawgeti(l, lua::LUA_REGISTRYINDEX, lua::lua_Integer::from(reference));
+        push_str(l, event);
+        if lua::lua_pcall(l, 1, 0, 0) != 0 {
+            lua::lua_pop(l, 1);
+        }
+    }
+}
+
+unsafe fn call_document_callback_str(l: *mut lua_State, event: &str, value: &str) {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(reference) = doc_ref(l).and_then(|doc| doc.callback) else {
+            return;
+        };
+        lua::lua_rawgeti(l, lua::LUA_REGISTRYINDEX, lua::lua_Integer::from(reference));
+        push_str(l, event);
+        push_str(l, value);
+        if lua::lua_pcall(l, 2, 0, 0) != 0 {
+            lua::lua_pop(l, 1);
+        }
+    }
+}
+
+unsafe fn call_document_callback_int(l: *mut lua_State, event: &str, value: i64) {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(reference) = doc_ref(l).and_then(|doc| doc.callback) else {
+            return;
+        };
+        lua::lua_rawgeti(l, lua::LUA_REGISTRYINDEX, lua::lua_Integer::from(reference));
+        push_str(l, event);
+        push_int(l, value);
+        if lua::lua_pcall(l, 2, 0, 0) != 0 {
             lua::lua_pop(l, 1);
         }
     }
@@ -1534,15 +1567,27 @@ unsafe extern "C-unwind" fn doc_load(l: *mut lua_State) -> c_int {
             let Some(path) = arg_str(l, 2) else {
                 return false;
             };
-            call_document_callback(l, "OnLoadFileStart");
-            if doc.open(PathBuf::from(path)).is_ok() {
+            call_document_callback_str(l, "OnLoadFileStart", &path);
+            let opened = doc.open(PathBuf::from(path));
+            if opened.is_ok() {
                 doc.record_history();
-                call_document_callback(l, "OnLoadFileFormatDetected");
-                call_document_callback(l, "OnDocumentReady");
+                let format = doc_ref(l)
+                    .and_then(|doc| doc.inner.as_ref())
+                    .map(|inner| format_name(inner.metadata().format))
+                    .unwrap_or("TXT");
+                call_document_callback_str(l, "OnLoadFileFormatDetected", format);
+                call_document_callback_int(l, "OnLoadFileProgress", 100);
+                call_document_callback(l, "OnLoadFileEnd");
+                call_document_callback(l, "OnFormatStart");
                 call_document_callback(l, "OnFormatEnd");
+                call_document_callback(l, "OnDocumentReady");
                 true
             } else {
-                call_document_callback(l, "OnLoadFileError");
+                let message = opened
+                    .err()
+                    .map(|err| err.to_string())
+                    .unwrap_or_else(|| "document load failed".to_string());
+                call_document_callback_str(l, "OnLoadFileError", &message);
                 false
             }
         }
@@ -1557,10 +1602,10 @@ unsafe extern "C-unwind" fn doc_close(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
         if let Some(doc) = doc_mut(l) {
-            for reference in doc.callbacks.values() {
-                lua::luaL_unref(l, lua::LUA_REGISTRYINDEX, *reference);
+            if let Some(reference) = doc.callback {
+                lua::luaL_unref(l, lua::LUA_REGISTRYINDEX, reference);
             }
-            doc.callbacks.clear();
+            doc.callback = None;
             doc.inner = None;
         }
     }
@@ -2937,7 +2982,13 @@ unsafe extern "C-unwind" fn doc_set_string_property(l: *mut lua_State) -> c_int 
     0
 }
 
-unsafe extern "C-unwind" fn doc_request_render(_l: *mut lua_State) -> c_int {
+unsafe extern "C-unwind" fn doc_request_render(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        if let Some(doc) = doc_mut(l) {
+            doc.render_requested = true;
+        }
+    }
     0
 }
 
@@ -3194,43 +3245,27 @@ unsafe extern "C-unwind" fn doc_set_battery_state(l: *mut lua_State) -> c_int {
 }
 
 unsafe extern "C-unwind" fn doc_set_callback(l: *mut lua_State) -> c_int {
-    // SAFETY: `l` is the active Lua state.
+    // SAFETY: `l` is the active Lua state. The Lua callback is stored in the
+    // registry, matching `cre.cpp`'s `setCallback` behavior.
     unsafe {
-        let has_name = lua::lua_isstring(l, 2) != 0;
-        let name = if has_name {
-            arg_str(l, 2).unwrap_or_default()
-        } else {
-            String::new()
-        };
-        let function_index = match (
-            lua::lua_isfunction(l, 3) != 0,
-            lua::lua_isfunction(l, 2) != 0,
-        ) {
-            (true, _) => 3,
-            (false, true) => 2,
-            (false, false) => 0,
-        };
-        if let Some(doc) = doc_mut(l) {
-            if function_index != 0 {
-                let previous = doc.callbacks.remove(&name);
-                if let Some(previous) = previous {
+        if lua::lua_isfunction(l, 2) != 0 {
+            if let Some(doc) = doc_mut(l) {
+                if let Some(previous) = doc.callback {
                     lua::luaL_unref(l, lua::LUA_REGISTRYINDEX, previous);
                 }
-                doc.callbacks
-                    .insert(name, lua::luaL_ref(l, lua::LUA_REGISTRYINDEX));
-            } else if has_name {
-                if let Some(previous) = doc.callbacks.remove(&name) {
-                    lua::luaL_unref(l, lua::LUA_REGISTRYINDEX, previous);
-                }
+                lua::lua_pushvalue(l, 2);
+                doc.callback = Some(lua::luaL_ref(l, lua::LUA_REGISTRYINDEX));
             } else {
-                for reference in doc.callbacks.values() {
-                    lua::luaL_unref(l, lua::LUA_REGISTRYINDEX, *reference);
-                }
-                doc.callbacks.clear();
+                let reference = lua::luaL_ref(l, lua::LUA_REGISTRYINDEX);
+                lua::luaL_unref(l, lua::LUA_REGISTRYINDEX, reference);
             }
-        } else if function_index != 0 {
-            let reference = lua::luaL_ref(l, lua::LUA_REGISTRYINDEX);
-            lua::luaL_unref(l, lua::LUA_REGISTRYINDEX, reference);
+        } else {
+            if let Some(doc) = doc_mut(l) {
+                if let Some(previous) = doc.callback {
+                    lua::luaL_unref(l, lua::LUA_REGISTRYINDEX, previous);
+                }
+                doc.callback = None;
+            }
         }
     }
     0
