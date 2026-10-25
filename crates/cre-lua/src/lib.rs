@@ -2357,15 +2357,21 @@ unsafe extern "C-unwind" fn doc_text_from_positions(l: *mut lua_State) -> c_int 
         } else {
             true
         };
+        let is_single_point = (x0 - x1).abs() < 1.0 && (y0 - y1).abs() < 1.0;
+        let (sx, sy, ex, ey) = if y1 < y0 || (y1 == y0 && x1 < x0) {
+            (x1, y1, x0, y0)
+        } else {
+            (x0, y0, x1, y1)
+        };
         let Some((text, pos0, pos1)) = doc_mut(l).and_then(|doc| {
             doc.last_range = None;
             doc.last_boxes.clear();
-            let result = {
+            let mut result = {
                 let inner = doc.inner.as_ref()?;
                 let page = inner.current_page();
-                let start = cre_lib::PagePosition { page, x: x0, y: y0 };
-                let end = cre_lib::PagePosition { page, x: x1, y: y1 };
-                if (x0 - x1).abs() < 1.0 && (y0 - y1).abs() < 1.0 {
+                let start = cre_lib::PagePosition { page, x: sx, y: sy };
+                let end = cre_lib::PagePosition { page, x: ex, y: ey };
+                if is_single_point {
                     let word = inner.word_at(start).ok().flatten()?;
                     let start_pos = word.xpointer_range.start.to_xpointer();
                     let end_pos = word.xpointer_range.end.as_ref()?.to_xpointer();
@@ -2400,9 +2406,86 @@ unsafe extern "C-unwind" fn doc_text_from_positions(l: *mut lua_State) -> c_int 
                     doc.highlight = Some(range.clone());
                 }
             }
+            if grab_words && !is_single_point {
+                let extension = if let Some(inner) = doc.inner.as_ref() {
+                    if let Some(start_word) = inner
+                        .word_at(cre_lib::PagePosition {
+                            page: inner.current_page(),
+                            x: sx,
+                            y: sy,
+                        })
+                        .ok()
+                        .flatten()
+                    {
+                        if let Some(start_word_end) = start_word.xpointer_range.end.as_ref() {
+                            let use_start = start_word.xpointer_range.start.to_xpointer();
+                            let use_start_end = start_word_end.to_xpointer();
+                            if use_start != use_start_end {
+                                if let Some(end_word) = inner
+                                    .word_at(cre_lib::PagePosition {
+                                        page: inner.current_page(),
+                                        x: ex,
+                                        y: ey,
+                                    })
+                                    .ok()
+                                    .flatten()
+                                {
+                                    if let Some(end_pos_ref) = end_word.xpointer_range.end.as_ref()
+                                    {
+                                        let use_end = end_pos_ref.to_xpointer();
+                                        let new_text = inner
+                                            .text_between_xpointers(&use_start, &use_end)
+                                            .ok()
+                                            .unwrap_or_default();
+                                        if !new_text.trim().is_empty() {
+                                            let new_boxes = inner
+                                                .boxes_between_xpointers(&use_start, &use_end)
+                                                .ok()
+                                                .unwrap_or_default();
+                                            if !new_boxes.is_empty() {
+                                                let new_range =
+                                                    (use_start.clone(), use_end.clone());
+                                                Some((
+                                                    new_text, use_start, use_end, new_range,
+                                                    new_boxes,
+                                                ))
+                                            } else {
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some((new_text, use_start, use_end, range, boxes)) = extension {
+                    let range_for_highlight = range.clone();
+                    let boxes_for_cache = boxes.clone();
+                    result = Some((new_text, use_start, use_end, range, boxes));
+                    doc.last_range = Some(range_for_highlight.clone());
+                    doc.last_boxes = boxes_for_cache;
+                    if draw_selection {
+                        doc.highlight = Some(range_for_highlight.clone());
+                    }
+                }
+            }
             let _ = draw_segmented;
             let _ = include_images;
-            let _ = grab_words;
             result.map(|(text, start_pos, end_pos, _, _)| (text, start_pos, end_pos))
         }) else {
             return 0;
