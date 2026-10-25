@@ -443,12 +443,18 @@ impl Document {
             let mut line_flows = lines.iter().map(|_| 0i64).collect::<Vec<i64>>();
             collect_line_flows(root, 0, &mut max_flow, &line_indices, &mut line_flows);
             let forced_breaks = page_breaks::collect_forced_breaks(root);
+            let (page_height_css_u32, page_height_css, page_margin_css) = css_page_geometry(
+                options.width,
+                options.height,
+                options.viewport_scale,
+                options.page_margin,
+            );
             let page_starts = paginate(
                 &lines,
                 &forced_breaks,
-                options.height as f32,
-                options.page_margin,
-                options.page_margin,
+                page_height_css,
+                page_margin_css,
+                page_margin_css,
             );
             let first_page = pages.len() + 1;
             let mut local_xpointer_pages = HashMap::new();
@@ -456,8 +462,8 @@ impl Document {
                 root,
                 &lines,
                 &page_starts,
-                options.height,
-                options.page_margin,
+                page_height_css_u32,
+                page_margin_css,
                 &mut local_xpointer_pages,
             );
             let anchors = collect_anchor_maps(root);
@@ -482,7 +488,8 @@ impl Document {
                     previous_page_flow
                 };
                 previous_page_flow = page_flow;
-                let render_height = (clip_bottom - start.top).max(0.0);
+                let render_height =
+                    ((clip_bottom - start.top).max(0.0) * options.viewport_scale).max(0.0);
                 let doc_top = running_doc_top;
                 running_doc_top += render_height;
                 let xpointer = local_page_xpointers
@@ -846,12 +853,18 @@ impl Document {
         );
         let lines = collect_lines(doc.root_element());
         let forced_breaks = page_breaks::collect_forced_breaks(doc.root_element());
+        let (_page_height_css_u32, page_height_css, page_margin_css) = css_page_geometry(
+            self.width,
+            self.height,
+            self.viewport_scale,
+            self.page_margin,
+        );
         let page_starts = paginate(
             &lines,
             &forced_breaks,
-            self.height as f32,
-            self.page_margin,
-            self.page_margin,
+            page_height_css,
+            page_margin_css,
+            page_margin_css,
         );
         *self.active.borrow_mut() = Some(ActiveChunk {
             index,
@@ -2827,12 +2840,33 @@ fn line_text_from_root(root: &Node, line: &LineBox) -> Option<String> {
         .map(str::to_string)
 }
 
+fn css_page_geometry(
+    width: u32,
+    height: u32,
+    viewport_scale: f32,
+    page_margin: f32,
+) -> (u32, f32, f32) {
+    let viewport = Viewport::new(width, height, viewport_scale, ColorScheme::Light);
+    let (_css_width, css_height) = viewport.logical_size();
+    let css_height = css_height.max(1.0);
+    let css_margin = page_margin / viewport_scale;
+    let css_height_u32 = css_height as u32;
+    (css_height_u32, css_height, css_margin)
+}
+
 fn page_clip_bottom(page_starts: &[PageStart], index: usize, options: &DocumentOptions) -> f32 {
     let start = page_starts[index];
-    page_starts.get(index + 1).map_or(
-        start.top + options.height as f32 - options.page_margin,
-        |next| next.clip_top,
-    )
+    let (_page_height_css_u32, page_height_css, page_margin_css) = css_page_geometry(
+        options.width,
+        options.height,
+        options.viewport_scale,
+        options.page_margin,
+    );
+    page_starts
+        .get(index + 1)
+        .map_or(start.top + page_height_css - page_margin_css, |next| {
+            next.clip_top
+        })
 }
 
 fn collect_spine_chunks(node: &Node, chunk_index: usize, out: &mut HashMap<u32, usize>) {
