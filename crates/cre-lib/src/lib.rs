@@ -146,6 +146,22 @@ pub struct PageLink {
     pub rects: Vec<TextBox>,
 }
 
+fn render_length_to_i64(value: f32) -> i64 {
+    if !value.is_finite() {
+        return 0;
+    }
+    let bounded = value.max(0.0).round();
+    bounded as i64
+}
+
+fn render_length_to_u64(value: f32) -> u64 {
+    if !value.is_finite() {
+        return 0;
+    }
+    let bounded = value.max(0.0).round();
+    bounded as u64
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PageMapEntry {
     pub page: usize,
@@ -202,6 +218,8 @@ struct PageSnapshot {
     chunk: usize,
     local_start: PageStart,
     local_clip_bottom: f32,
+    doc_top: f32,
+    render_height: f32,
     boxes: Vec<SnapshotLine>,
     xpointer: Option<String>,
     page_flow: i64,
@@ -405,6 +423,7 @@ impl Document {
         let mut spine_to_chunk = HashMap::new();
         let mut line_base = 0usize;
         let mut max_flow = 0i64;
+        let mut running_doc_top = 0.0;
 
         for (chunk_index, html) in htmls.iter().enumerate() {
             let doc = create_document(html, base_url, net.clone(), &font_data, options);
@@ -459,6 +478,9 @@ impl Document {
                     previous_page_flow
                 };
                 previous_page_flow = page_flow;
+                let render_height = (clip_bottom - start.top).max(0.0);
+                let doc_top = running_doc_top;
+                running_doc_top += render_height;
                 let xpointer = local_page_xpointers
                     .get(local_index)
                     .and_then(|xpointer| xpointer.clone());
@@ -470,6 +492,8 @@ impl Document {
                     chunk: chunk_index,
                     local_start: *start,
                     local_clip_bottom: clip_bottom,
+                    doc_top,
+                    render_height,
                     boxes,
                     xpointer,
                     page_flow,
@@ -511,10 +535,14 @@ impl Document {
                     .get(page.saturating_sub(1))
                     .cloned()
                     .flatten();
+                let doc_y = pages
+                    .get(page.saturating_sub(1))
+                    .map(|snapshot| snapshot.doc_top.max(0.0).round() as i64)
+                    .unwrap_or(page.saturating_sub(1) as i64 * options.height as i64);
                 Some(PageMapEntry {
                     page,
                     xpointer,
-                    doc_y: page.saturating_sub(1) as i64 * i64::from(options.height),
+                    doc_y,
                     label: item.label,
                 })
             })
@@ -588,11 +616,43 @@ impl Document {
     }
 
     pub fn full_height(&self) -> u64 {
-        self.page_count() as u64 * u64::from(self.height)
+        let mut max_bottom: f32 = 0.0;
+        for snapshot in &self.pages {
+            max_bottom = max_bottom.max(snapshot.doc_top + snapshot.render_height);
+        }
+        let calculated = render_length_to_u64(max_bottom);
+        let fallback = u64::from(self.height);
+        if calculated > fallback {
+            calculated
+        } else {
+            fallback
+        }
     }
 
     pub fn page_start_y(&self, page: usize) -> i64 {
-        page.saturating_sub(1) as i64 * i64::from(self.height)
+        let index = page.saturating_sub(1);
+        self.pages
+            .get(index)
+            .map(|snapshot| render_length_to_i64(snapshot.doc_top))
+            .unwrap_or(0)
+    }
+
+    pub fn page_start_y_or_invalid(&self, page: usize) -> i64 {
+        let Some(index) = page.checked_sub(1) else {
+            return -1;
+        };
+        self.pages
+            .get(index)
+            .map(|snapshot| render_length_to_i64(snapshot.doc_top))
+            .unwrap_or(-1)
+    }
+
+    pub fn page_render_height(&self, page: usize) -> i64 {
+        let index = page.saturating_sub(1);
+        self.pages
+            .get(index)
+            .map(|snapshot| render_length_to_i64(snapshot.render_height))
+            .unwrap_or(i64::from(self.height))
     }
 
     pub fn current_pos(&self) -> i64 {

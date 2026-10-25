@@ -1783,14 +1783,11 @@ unsafe extern "C-unwind" fn doc_full_height(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn doc_page_start_y(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let page = arg_int(l, 2).max(1) as usize;
+        let page = arg_int(l, 2);
         let y = doc_ref(l)
-            .and_then(|doc| {
-                doc.inner
-                    .as_ref()
-                    .map(|inner| inner.page_start_y(page.min(inner.page_count())))
-            })
-            .unwrap_or(0);
+            .and_then(|doc| doc.inner.as_ref())
+            .map(|inner| inner.page_start_y_or_invalid(usize::try_from(page).unwrap_or(0)))
+            .unwrap_or(-1);
         push_int(l, y);
     }
     1
@@ -1799,13 +1796,18 @@ unsafe extern "C-unwind" fn doc_page_start_y(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn doc_page_height(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
+        let page = arg_int(l, 2);
         let height = doc_ref(l)
-            .and_then(|doc| {
-                doc.inner
-                    .as_ref()
-                    .map(|inner| i64::from(inner.page_height()))
+            .and_then(|doc| doc.inner.as_ref())
+            .map(|inner| {
+                let page_idx = usize::try_from(page).unwrap_or(0);
+                if page_idx < 1 {
+                    -1
+                } else {
+                    inner.page_render_height(page_idx)
+                }
             })
-            .unwrap_or(0);
+            .unwrap_or(-1);
         push_int(l, height);
     }
     1
