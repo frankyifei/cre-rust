@@ -55,6 +55,7 @@ struct Doc {
     stylesheet: String,
     embedded_stylesheet_enabled: bool,
     background_color: String,
+    background_color_value: u32,
     background_image: String,
     battery: i32,
     partial_rerendering: bool,
@@ -93,6 +94,7 @@ impl Doc {
             stylesheet: String::new(),
             embedded_stylesheet_enabled: true,
             background_color: String::new(),
+            background_color_value: 0xFF_FFFF,
             background_image: String::new(),
             battery: 0,
             partial_rerendering: false,
@@ -151,7 +153,9 @@ impl Doc {
             embedded_styles_enabled: self.embedded_stylesheet_enabled,
             viewport_scale: self.render_viewport_scale(),
         };
-        self.inner = Some(Document::with_options(&path, &options)?);
+        let mut opened = Document::with_options(&path, &options)?;
+        opened.set_background_color(self.background_color_value);
+        self.inner = Some(opened);
         self.path = Some(path);
         self.load_document_page_map();
         Ok(())
@@ -4265,6 +4269,7 @@ unsafe extern "C-unwind" fn doc_render_hash(l: *mut lua_State) -> c_int {
             doc.header_height.hash(&mut hasher);
             doc.interline.hash(&mut hasher);
             doc.background_color.hash(&mut hasher);
+            doc.background_color_value.hash(&mut hasher);
             doc.background_image.hash(&mut hasher);
             doc.render_dpi.hash(&mut hasher);
             doc.scale_font_with_dpi.hash(&mut hasher);
@@ -4291,11 +4296,67 @@ unsafe extern "C-unwind" fn doc_render_hash(l: *mut lua_State) -> c_int {
     1
 }
 
+fn hex_digit(value: u8) -> u32 {
+    match value {
+        b'0'..=b'9' => (value - b'0') as u32,
+        b'a'..=b'f' => (value - b'a') as u32 + 10,
+        b'A'..=b'F' => (value - b'A') as u32 + 10,
+        _ => 0,
+    }
+}
+
+fn parse_lua_color(text: String) -> u32 {
+    let raw = text.trim();
+    let digits = if let Some(stripped) = raw.strip_prefix("#") {
+        stripped.to_string()
+    } else if let Some(stripped) = raw.strip_prefix("0x") {
+        stripped.to_string()
+    } else if let Some(stripped) = raw.strip_prefix("0X") {
+        stripped.to_string()
+    } else {
+        raw.to_string()
+    };
+    let digits = if let Some(stripped) = digits.strip_prefix("#") {
+        stripped.to_string()
+    } else {
+        digits
+    };
+    let bytes = digits.as_bytes();
+    if bytes.len() == 3 && bytes.iter().all(|byte| byte.is_ascii_hexdigit()) {
+        let r = hex_digit(bytes[0]);
+        let g = hex_digit(bytes[1]);
+        let b = hex_digit(bytes[2]);
+        return (((r * 0x11) << 16) | ((g * 0x11) << 8) | (b * 0x11)) & 0xFF_FFFF;
+    }
+    if bytes.len() == 6 && bytes.iter().all(|byte| byte.is_ascii_hexdigit()) {
+        return bytes
+            .iter()
+            .fold(0_u32, |acc, byte| (acc << 4) | hex_digit(*byte))
+            & 0xFF_FFFF;
+    }
+    0xFF_FFFF
+}
+
+fn arg_color(l: *mut lua_State, index: c_int) -> u32 {
+    unsafe {
+        if lua::lua_isnoneornil(l, index) != 0 {
+            return 0xFF_FFFF;
+        }
+        if lua::lua_isstring(l, index) != 0 {
+            return parse_lua_color(arg_str(l, index).unwrap_or_default());
+        }
+        (arg_int(l, index) & 0xFF_FFFFi64) as u32
+    }
+}
+
 unsafe extern "C-unwind" fn doc_set_background_color(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
         if let Some(doc) = doc_mut(l) {
-            doc.background_color = arg_str(l, 2).unwrap_or_default();
+            doc.background_color_value = arg_color(l, 2);
+            if let Some(inner) = doc.inner.as_mut() {
+                inner.set_background_color(doc.background_color_value);
+            }
         }
     }
     0

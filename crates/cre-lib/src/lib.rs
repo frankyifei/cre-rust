@@ -263,6 +263,7 @@ pub struct Document {
     page_map: Vec<PageMapEntry>,
     active: RefCell<Option<ActiveChunk>>,
     current_page: usize,
+    background_color: u32,
 }
 
 impl Document {
@@ -587,6 +588,7 @@ impl Document {
             page_map,
             active: RefCell::new(None),
             current_page: 1,
+            background_color: 0xFF_FFFF,
         };
         document.ensure_chunk(0)?;
         Ok(document)
@@ -602,6 +604,10 @@ impl Document {
 
     pub fn page_width(&self) -> u32 {
         self.width
+    }
+
+    pub fn set_background_color(&mut self, background_color: u32) {
+        self.background_color = background_color & 0xFF_FFFF;
     }
 
     pub fn page_height(&self) -> u32 {
@@ -806,6 +812,7 @@ impl Document {
             0.0,
             clip_top * viewport_scale,
             clip_bottom * viewport_scale,
+            self.background_color,
         ))
     }
 

@@ -40,9 +40,16 @@ pub fn render_page(
     page_top: f32,
     clip_top: f32,
     clip_bottom: f32,
+    background: u32,
 ) -> (PageBitmap, usize, usize) {
     let mut pixmap = Pixmap::new(width, height).expect("non-zero page bitmap");
-    pixmap.fill(tiny_skia::Color::WHITE);
+    let background_color = tiny_skia::Color::from_rgba8(
+        ((background >> 16) & 0xff) as u8,
+        ((background >> 8) & 0xff) as u8,
+        (background & 0xff) as u8,
+        0xff,
+    );
+    pixmap.fill(background_color);
 
     let page_transform = Affine::translate((0.0, -page_top as f64));
     let local_top = (clip_top - page_top).clamp(0.0, height as f32);
