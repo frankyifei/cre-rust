@@ -372,7 +372,11 @@ fn user_hyph_state() -> &'static Mutex<HashSet<String>> {
 fn registered_font_faces() -> Vec<FontFace> {
     let registered = REGISTERED_FONTS.get_or_init(|| Mutex::new(Vec::new()));
     match registered.lock() {
-        Ok(fonts) => fonts.clone(),
+        Ok(fonts) => {
+            let mut sorted = fonts.clone();
+            sort_font_faces(&mut sorted);
+            sorted
+        }
         Err(_) => Vec::new(),
     }
 }
@@ -410,9 +414,9 @@ fn parse_font_face(path: &Path, font: &read_fonts::FontRef<'_>, index: usize) ->
     let postscript_name =
         font_name(font, read_fonts::types::NameId::POSTSCRIPT_NAME).unwrap_or_default();
     let stem = path.file_stem()?.to_string_lossy().into_owned();
-    let family = font_name(font, read_fonts::types::NameId::FAMILY_NAME)
+    let family = font_name(font, read_fonts::types::NameId::WWS_FAMILY_NAME)
         .or_else(|| font_name(font, read_fonts::types::NameId::TYPOGRAPHIC_FAMILY_NAME))
-        .or_else(|| font_name(font, read_fonts::types::NameId::WWS_FAMILY_NAME))
+        .or_else(|| font_name(font, read_fonts::types::NameId::FAMILY_NAME))
         .filter(|value| !value.is_empty())
         .or_else(|| infer_family(&full_name, &postscript_name))
         .filter(|value| !value.is_empty())
