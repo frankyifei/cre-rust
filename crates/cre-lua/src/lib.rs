@@ -3029,14 +3029,7 @@ unsafe extern "C-unwind" fn doc_set_page_info_override(_l: *mut lua_State) -> c_
     0
 }
 
-unsafe extern "C-unwind" fn doc_set_header_font(l: *mut lua_State) -> c_int {
-    // SAFETY: `l` is the active Lua state.
-    unsafe {
-        if let Some(doc) = doc_mut(l) {
-            let face = arg_str(l, 2).unwrap_or_default();
-            doc.properties.insert("header.font.face".to_string(), face);
-        }
-    }
+unsafe extern "C-unwind" fn doc_set_header_font(_l: *mut lua_State) -> c_int {
     0
 }
 
@@ -3145,13 +3138,7 @@ unsafe extern "C-unwind" fn doc_set_embedded_fonts(l: *mut lua_State) -> c_int {
     0
 }
 
-unsafe extern "C-unwind" fn doc_set_background_image(l: *mut lua_State) -> c_int {
-    // SAFETY: `l` is the active Lua state.
-    unsafe {
-        if let Some(doc) = doc_mut(l) {
-            doc.background_image = arg_str(l, 2).unwrap_or_default();
-        }
-    }
+unsafe extern "C-unwind" fn doc_set_background_image(_l: *mut lua_State) -> c_int {
     0
 }
 
@@ -3366,12 +3353,8 @@ unsafe extern "C-unwind" fn doc_get_page_offset_x(l: *mut lua_State) -> c_int {
     1
 }
 
-unsafe extern "C-unwind" fn doc_get_header_height(l: *mut lua_State) -> c_int {
-    // SAFETY: `l` is the active Lua state.
-    unsafe {
-        let height = doc_ref(l).map_or(0, |doc| i64::from(doc.header_height));
-        push_int(l, height);
-    }
+unsafe extern "C-unwind" fn doc_get_header_height(_l: *mut lua_State) -> c_int {
+    unsafe { push_int(_l, 0) };
     1
 }
 
