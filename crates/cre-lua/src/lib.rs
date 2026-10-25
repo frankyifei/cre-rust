@@ -2716,7 +2716,7 @@ unsafe extern "C-unwind" fn doc_link_from_position(l: *mut lua_State) -> c_int {
     unsafe {
         let x = arg_int(l, 2) as f32;
         let y = arg_int(l, 3) as f32;
-        let link = doc_ref(l).and_then(|doc| {
+        let hit = doc_ref(l).and_then(|doc| {
             let inner = doc.inner.as_ref()?;
             inner
                 .hit_test(cre_lib::PagePosition {
@@ -2726,12 +2726,29 @@ unsafe extern "C-unwind" fn doc_link_from_position(l: *mut lua_State) -> c_int {
                 })
                 .ok()
                 .flatten()
-                .and_then(|hit| hit.link)
         });
-        let Some(link) = link else {
-            return 0;
-        };
-        push_str(l, &link);
+        if let Some(hit) = hit {
+            let Some(inner) = doc_ref(l).and_then(|doc| doc.inner.as_ref()) else {
+                push_str(l, "");
+                return 1;
+            };
+            let link = hit.link.unwrap_or_default();
+            if !link.is_empty() {
+                let target_xp = inner
+                    .page_from_href(&link)
+                    .ok()
+                    .and_then(|page| inner.xpointer_from_page(page).ok());
+                push_str(l, target_xp.unwrap_or(link).as_ref());
+                let source_xp = inner.xpointer_from_position(&hit.text_position).ok();
+                if let Some(source_xp) = source_xp {
+                    push_str(l, source_xp.as_ref());
+                } else {
+                    push_str(l, "");
+                }
+                return 2;
+            }
+        }
+        push_str(l, "");
     }
     1
 }
