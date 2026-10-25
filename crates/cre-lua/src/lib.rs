@@ -4540,7 +4540,6 @@ const DOC_METHODS: &[lua::luaL_Reg] = &regs![
     ("getTextFromPositions", doc_text_from_positions),
     ("extendXPointersToSentenceSegment", doc_extend_sentence),
     ("getWordBoxesFromPositions", doc_word_boxes_from_positions),
-    ("getScreenBoxesFromPositions", doc_word_boxes_from_positions),
     ("getImageDataFromPosition", doc_get_image_data),
     ("getNearestWordFromPosition", doc_nearest_word_from_position),
     ("getLangTagForTextFromPosition", doc_get_lang_tag),
