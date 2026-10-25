@@ -64,6 +64,8 @@ struct Doc {
     page_map: Vec<PageMapEntry>,
     page_map_source: String,
     page_map_chars: usize,
+    render_dpi: u32,
+    scale_font_with_dpi: bool,
     highlight: Option<(String, String)>,
     callbacks: HashMap<String, c_int>,
 }
@@ -100,9 +102,41 @@ impl Doc {
             page_map: Vec::new(),
             page_map_source: String::new(),
             page_map_chars: 0,
+            render_dpi: 96,
+            scale_font_with_dpi: false,
             highlight: None,
             callbacks: HashMap::new(),
         }
+    }
+
+    fn render_viewport_scale(&self) -> f32 {
+        if self.render_dpi == 0 || self.render_dpi == 96 {
+            1.0
+        } else {
+            (self.render_dpi as f32) / 96.0
+        }
+    }
+
+    fn effective_font_size(&self) -> i32 {
+        let requested = self.font_size.max(1);
+        if !self.scale_font_with_dpi {
+            return requested;
+        }
+        let scale = self.render_viewport_scale();
+        if scale == 1.0 {
+            return requested;
+        }
+        let scaled = ((requested as f32) * scale).round() as i32;
+        scaled.clamp(1, 512)
+    }
+
+    fn render_font_css_size(&self) -> f32 {
+        let requested = self.font_size.max(1) as f32;
+        let scale = self.render_viewport_scale();
+        if self.scale_font_with_dpi || scale == 1.0 {
+            return requested;
+        }
+        requested / scale
     }
 
     fn open(&mut self, path: PathBuf) -> anyhow::Result<()> {
@@ -111,10 +145,11 @@ impl Doc {
             height: self.height,
             layout_height: self.layout_height,
             page_margin: self.margins.0.max(0) as f32,
-            font_size: self.font_size.max(1) as f32,
+            font_size: self.render_font_css_size(),
             font_path: self.font_path.clone(),
             stylesheet: (!self.stylesheet.is_empty()).then(|| self.stylesheet.clone()),
             embedded_styles_enabled: self.embedded_stylesheet_enabled,
+            viewport_scale: self.render_viewport_scale(),
         };
         self.inner = Some(Document::with_options(&path, &options)?);
         self.path = Some(path);
@@ -1917,7 +1952,7 @@ unsafe extern "C-unwind" fn doc_page_height(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn doc_font_size(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let size = doc_ref(l).map_or(22, |doc| doc.font_size);
+        let size = doc_ref(l).map_or(22, |doc| doc.effective_font_size());
         push_int(l, i64::from(size));
     }
     1
@@ -2753,6 +2788,14 @@ unsafe extern "C-unwind" fn doc_get_int_property(l: *mut lua_State) -> c_int {
                 i64::from(doc.two_visible_pages_count_as_one())
             }
             "window.status.battery.percent" => i64::from(doc.battery),
+            "crengine.render.dpi" => i64::from(doc.render_dpi),
+            "crengine.render.scale.font.with.dpi" => {
+                if doc.scale_font_with_dpi {
+                    1_i64
+                } else {
+                    0_i64
+                }
+            }
             _ => doc
                 .properties
                 .get(&name)
@@ -2837,6 +2880,20 @@ unsafe extern "C-unwind" fn doc_set_int_property(l: *mut lua_State) -> c_int {
                 let enabled = value != 0;
                 if doc.embedded_stylesheet_enabled != enabled {
                     doc.embedded_stylesheet_enabled = enabled;
+                    relayout = true;
+                }
+            }
+            "crengine.render.dpi" => {
+                let dpi = value.clamp(0, i64::from(u32::MAX)) as u32;
+                if dpi != doc.render_dpi {
+                    doc.render_dpi = dpi;
+                    relayout = true;
+                }
+            }
+            "crengine.render.scale.font.with.dpi" => {
+                let enabled = value != 0;
+                if enabled != doc.scale_font_with_dpi {
+                    doc.scale_font_with_dpi = enabled;
                     relayout = true;
                 }
             }
@@ -3116,10 +3173,17 @@ unsafe extern "C-unwind" fn doc_set_visible_page_count(l: *mut lua_State) -> c_i
 unsafe extern "C-unwind" fn doc_adjust_font_sizes(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let dpi = arg_int(l, 2);
+        let dpi_value = arg_int(l, 2);
         if let Some(doc) = doc_mut(l) {
             doc.properties
-                .insert("crengine.render.dpi".to_string(), dpi.to_string());
+                .insert("crengine.render.dpi".to_string(), dpi_value.to_string());
+            let dpi = dpi_value.clamp(0, i64::from(u32::MAX)) as u32;
+            if dpi != doc.render_dpi {
+                doc.render_dpi = dpi;
+                if doc.inner.is_some() {
+                    doc.relayout();
+                }
+            }
         }
     }
     0
@@ -4194,6 +4258,9 @@ unsafe extern "C-unwind" fn doc_render_hash(l: *mut lua_State) -> c_int {
             doc.interline.hash(&mut hasher);
             doc.background_color.hash(&mut hasher);
             doc.background_image.hash(&mut hasher);
+            doc.render_dpi.hash(&mut hasher);
+            doc.scale_font_with_dpi.hash(&mut hasher);
+            doc.effective_font_size().hash(&mut hasher);
             let mut selected_property_keys = doc
                 .properties
                 .keys()

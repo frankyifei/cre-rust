@@ -63,6 +63,7 @@ pub struct DocumentOptions {
     pub font_path: Option<PathBuf>,
     pub stylesheet: Option<String>,
     pub embedded_styles_enabled: bool,
+    pub viewport_scale: f32,
 }
 
 impl Default for DocumentOptions {
@@ -76,6 +77,7 @@ impl Default for DocumentOptions {
             font_path: None,
             stylesheet: None,
             embedded_styles_enabled: true,
+            viewport_scale: 1.0,
         }
     }
 }
@@ -240,6 +242,8 @@ pub struct Document {
     height: u32,
     layout_height: u32,
     page_margin: f32,
+    font_css_size: f32,
+    viewport_scale: f32,
     stylesheet: Option<String>,
     embedded_styles_enabled: bool,
     sources: Vec<String>,
@@ -557,6 +561,8 @@ impl Document {
             page_margin: options.page_margin,
             stylesheet: options.stylesheet.clone(),
             embedded_styles_enabled: options.embedded_styles_enabled,
+            font_css_size: options.font_size,
+            viewport_scale: options.viewport_scale,
             sources: htmls,
             base_url: base_url.to_string(),
             resources,
@@ -770,6 +776,7 @@ impl Document {
         let active = active
             .as_mut()
             .context("active document chunk is missing")?;
+        let viewport_scale = self.viewport_scale;
         active.doc.set_viewport_scroll(Point {
             x: 0.0,
             y: f64::from(start.top),
@@ -778,7 +785,7 @@ impl Document {
         blitz_paint::paint_scene(
             &mut scene,
             &mut active.doc,
-            1.0,
+            viewport_scale as f64,
             self.width,
             self.height,
             0,
@@ -790,8 +797,8 @@ impl Document {
             self.width,
             self.height,
             0.0,
-            clip_top,
-            clip_bottom,
+            clip_top * viewport_scale,
+            clip_bottom * viewport_scale,
         ))
     }
 
@@ -830,10 +837,11 @@ impl Document {
                 height: self.height,
                 layout_height: self.layout_height,
                 page_margin: self.page_margin,
-                font_size: 18.0,
+                font_size: self.font_css_size,
                 font_path: None,
                 stylesheet: self.stylesheet.clone(),
                 embedded_styles_enabled: self.embedded_styles_enabled,
+                viewport_scale: self.viewport_scale,
             },
         );
         let lines = collect_lines(doc.root_element());
@@ -1975,6 +1983,9 @@ fn validate_options(options: &DocumentOptions) -> Result<()> {
     if !options.font_size.is_finite() || options.font_size <= 0.0 {
         bail!("font_size must be a positive finite number");
     }
+    if !options.viewport_scale.is_finite() || options.viewport_scale <= 0.0 {
+        bail!("viewport_scale must be a positive finite number");
+    }
     Ok(())
 }
 
@@ -2646,7 +2657,7 @@ fn create_document(
         viewport: Some(Viewport::new(
             options.width,
             options.layout_height,
-            1.0,
+            options.viewport_scale,
             ColorScheme::Light,
         )),
         base_url: Some(base_url.to_string()),

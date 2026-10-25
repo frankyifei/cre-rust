@@ -711,6 +711,7 @@ fn document_find_text_direction_filters_by_current_page() {
         font_path: None,
         stylesheet: None,
         embedded_styles_enabled: true,
+        viewport_scale: 1.0,
     };
     let mut doc = Document::with_options(fixture("sample.txt"), &options).unwrap();
     assert!(doc.page_count() > 3);
@@ -790,6 +791,7 @@ fn document_bookmarks_survive_reflow() {
         font_path: None,
         stylesheet: None,
         embedded_styles_enabled: true,
+        viewport_scale: 1.0,
     };
     let narrow = Document::with_options(fixture("sample.txt"), &narrow_options).unwrap();
     assert!(narrow.page_count() > 3);
@@ -841,6 +843,7 @@ fn document_selection_spans_pages() {
         font_path: None,
         stylesheet: None,
         embedded_styles_enabled: true,
+        viewport_scale: 1.0,
     };
     let doc = Document::with_options(fixture("sample.txt"), &options).unwrap();
     assert!(doc.page_count() > 3);
