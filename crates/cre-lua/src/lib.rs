@@ -3257,7 +3257,15 @@ unsafe extern "C-unwind" fn doc_invalidate_cache(_l: *mut lua_State) -> c_int {
     0
 }
 
-unsafe extern "C-unwind" fn doc_update_toc(_l: *mut lua_State) -> c_int {
+unsafe extern "C-unwind" fn doc_update_toc(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        if let Some(doc) = doc_mut(l)
+            && doc.inner.is_some()
+        {
+            doc.relayout();
+        }
+    }
     0
 }
 
