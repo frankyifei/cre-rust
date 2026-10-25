@@ -379,6 +379,7 @@ fn all_font_faces() -> &'static Vec<FontFace> {
             PathBuf::from("/mnt/us/fonts"),
         ];
         if let Ok(home) = std::env::var("HOME") {
+            roots.push(Path::new(&home).join("fonts"));
             roots.push(Path::new(&home).join(".fonts"));
             roots.push(Path::new(&home).join(".local/share/fonts"));
         }
@@ -447,7 +448,10 @@ fn collect_font_faces(
             .and_then(|extension| extension.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
-        if !matches!(extension.as_str(), "ttf" | "otf" | "ttc") {
+        if !matches!(
+            extension.as_str(),
+            "ttf" | "otf" | "otc" | "ttc" | "woff" | "woff2",
+        ) {
             continue;
         }
         for face in parse_font_metadata(&path) {
