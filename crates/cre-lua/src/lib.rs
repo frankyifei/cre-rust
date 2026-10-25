@@ -4187,6 +4187,29 @@ unsafe extern "C-unwind" fn doc_render_hash(l: *mut lua_State) -> c_int {
             doc.embedded_stylesheet_enabled.hash(&mut hasher);
             doc.stylesheet.hash(&mut hasher);
             doc.path.hash(&mut hasher);
+            doc.layout_height.hash(&mut hasher);
+            doc.font_path.hash(&mut hasher);
+            doc.visible_page_count.hash(&mut hasher);
+            doc.header_height.hash(&mut hasher);
+            doc.interline.hash(&mut hasher);
+            doc.background_color.hash(&mut hasher);
+            doc.background_image.hash(&mut hasher);
+            let mut selected_property_keys = doc
+                .properties
+                .keys()
+                .filter(|name| {
+                    name.starts_with("crengine.")
+                        || name.starts_with("font.")
+                        || name.starts_with("header.")
+                        || name.starts_with("window.pages.")
+                })
+                .cloned()
+                .collect::<Vec<String>>();
+            selected_property_keys.sort();
+            for key in selected_property_keys {
+                let value = doc.properties.get(&key).cloned().unwrap_or_default();
+                (key, value).hash(&mut hasher);
+            }
         }
         push_int(l, hasher.finish() as i64);
     }
