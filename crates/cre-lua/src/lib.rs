@@ -1879,25 +1879,27 @@ unsafe extern "C-unwind" fn doc_toc(l: *mut lua_State) -> c_int {
 }
 
 unsafe extern "C-unwind" fn doc_draw_current_page(l: *mut lua_State) -> c_int {
-    let _ = catch_unwind(AssertUnwindSafe(|| {
+    let image_stats = catch_unwind(AssertUnwindSafe(|| -> (usize, f64) {
         // SAFETY: `l` is the active Lua state. The BlitBuffer pointer is supplied by KOReader
         // through `lua_topointer`, matching cre.cpp.
         unsafe {
             let Some(doc) = doc_mut(l) else {
-                return;
+                return (0, 0.0);
             };
             let Some(inner) = doc.inner.as_mut() else {
-                return;
+                return (0, 0.0);
             };
             let bb = lua::lua_topointer(l, 2).cast::<BlitBuffer>();
             if bb.is_null() || (*bb).data.is_null() {
-                return;
+                return (0, 0.0);
             }
             let color = arg_bool(l, 3);
             let highlight = doc.highlight.clone();
             let current_page = inner.current_page();
-            let Ok(mut bitmap) = inner.render_current_page() else {
-                return;
+            let Ok((mut bitmap, image_count, image_surface)) =
+                inner.render_current_page_with_stats()
+            else {
+                return (0, 0.0);
             };
             if let Some((start, end)) = highlight
                 && let Ok(boxes) = inner.boxes_between_xpointers(&start, &end)
@@ -1928,12 +1930,19 @@ unsafe extern "C-unwind" fn doc_draw_current_page(l: *mut lua_State) -> c_int {
                     dst_row[..cols].copy_from_slice(&src[..cols]);
                 }
             }
+            let total_pixels = bitmap
+                .width
+                .saturating_mul(bitmap.height)
+                .saturating_mul(1)
+                .max(1);
+            (image_count, image_surface as f64 / total_pixels as f64)
         }
     }));
+    let (image_count, image_fraction) = image_stats.unwrap_or((0, 0.0));
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        push_int(l, 0);
-        lua::lua_pushnumber(l, 0.0);
+        push_int(l, i64::min(i64::MAX, image_count as i64));
+        lua::lua_pushnumber(l, image_fraction);
     }
     2
 }

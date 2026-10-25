@@ -753,7 +753,7 @@ impl Document {
             .context("XPointer spine fragment is outside the rendered document")
     }
 
-    pub fn render_page(&mut self, page: usize) -> Result<PageBitmap> {
+    pub fn render_page_with_stats(&mut self, page: usize) -> Result<(PageBitmap, usize, usize)> {
         let Some(index) = page.checked_sub(1) else {
             bail!("page numbers are 1-based");
         };
@@ -795,8 +795,16 @@ impl Document {
         ))
     }
 
+    pub fn render_page(&mut self, page: usize) -> Result<PageBitmap> {
+        Ok(self.render_page_with_stats(page)?.0)
+    }
+
     pub fn render_current_page(&mut self) -> Result<PageBitmap> {
         self.render_page(self.current_page)
+    }
+
+    pub fn render_current_page_with_stats(&mut self) -> Result<(PageBitmap, usize, usize)> {
+        self.render_page_with_stats(self.current_page)
     }
 
     fn ensure_chunk(&self, index: usize) -> Result<()> {

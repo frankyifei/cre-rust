@@ -40,7 +40,7 @@ pub fn render_page(
     page_top: f32,
     clip_top: f32,
     clip_bottom: f32,
-) -> PageBitmap {
+) -> (PageBitmap, usize, usize) {
     let mut pixmap = Pixmap::new(width, height).expect("non-zero page bitmap");
     pixmap.fill(tiny_skia::Color::WHITE);
 
@@ -48,6 +48,14 @@ pub fn render_page(
     let local_top = (clip_top - page_top).clamp(0.0, height as f32);
     let local_bottom = (clip_bottom - page_top).clamp(0.0, height as f32);
     let clip_mask = page_clip_mask(width, height, local_top, local_bottom);
+    let (image_count, image_surface) = image_draw_stats(
+        scene,
+        width,
+        height,
+        page_transform,
+        local_top,
+        local_bottom,
+    );
     let mut fonts = HashMap::new();
 
     for command in &scene.commands {
@@ -125,10 +133,91 @@ pub fn render_page(
         data.push(value);
     }
 
-    PageBitmap {
-        width,
-        height,
-        data,
+    (
+        PageBitmap {
+            width,
+            height,
+            data,
+        },
+        image_count,
+        image_surface,
+    )
+}
+
+fn image_draw_stats(
+    scene: &Scene,
+    width: u32,
+    height: u32,
+    page_transform: Affine,
+    local_top: f32,
+    local_bottom: f32,
+) -> (usize, usize) {
+    let viewport_width = width as f32;
+    let viewport_top = local_top.max(0.0);
+    let viewport_bottom = local_bottom.min(height as f32);
+    let mut count = 0usize;
+    let mut surface = 0usize;
+    for command in &scene.commands {
+        if let RenderCommand::Fill(cmd) = command
+            && matches!(cmd.brush, Paint::Image(_))
+            && let Some((left, top, right, bottom)) =
+                path_bounds(&cmd.shape, page_transform * cmd.transform)
+        {
+            let visible_left = left.clamp(0.0, viewport_width);
+            let visible_right = right.clamp(0.0, viewport_width);
+            let visible_top = top.clamp(viewport_top, viewport_bottom);
+            let visible_bottom = bottom.clamp(viewport_top, viewport_bottom);
+            if visible_right <= visible_left || visible_bottom <= visible_top {
+                continue;
+            }
+            count += 1;
+            let area =
+                (visible_right - visible_left) as f64 * (visible_bottom - visible_top) as f64;
+            surface += area.clamp(0.0, f64::MAX).ceil() as usize;
+        }
+    }
+    (count, surface)
+}
+
+fn path_bounds(shape: &BezPath, transform: Affine) -> Option<(f32, f32, f32, f32)> {
+    let max_float = f32::MAX;
+    let mut min_x = max_float;
+    let mut min_y = max_float;
+    let mut max_x = -max_float;
+    let mut max_y = -max_float;
+    let mut found = false;
+    let mut add_point = |p: Point| {
+        let p = transform * p;
+        let px = p.x as f32;
+        let py = p.y as f32;
+        if px.is_nan() || py.is_nan() {
+            return;
+        }
+        found = true;
+        min_x = min_x.min(px);
+        max_x = max_x.max(px);
+        min_y = min_y.min(py);
+        max_y = max_y.max(py);
+    };
+    for element in shape.iter() {
+        match element {
+            PathEl::MoveTo(p) | PathEl::LineTo(p) => add_point(p),
+            PathEl::QuadTo(p1, p2) => {
+                add_point(p1);
+                add_point(p2);
+            }
+            PathEl::CurveTo(p1, p2, p3) => {
+                add_point(p1);
+                add_point(p2);
+                add_point(p3);
+            }
+            PathEl::ClosePath => {}
+        }
+    }
+    if found {
+        Some((min_x, min_y, max_x, max_y))
+    } else {
+        None
     }
 }
 
