@@ -2505,6 +2505,50 @@ unsafe extern "C-unwind" fn doc_text_from_positions(l: *mut lua_State) -> c_int 
     1
 }
 
+fn expand_to_visible_word_start(inner: &Document, xpointer: &str) -> String {
+    let page = match inner.page_from_xpointer(xpointer).ok() {
+        None => return xpointer.to_string(),
+        Some(page) => page,
+    };
+    let (x, y) = match inner.point_from_xpointer(xpointer).ok().unwrap_or(None) {
+        None => return xpointer.to_string(),
+        Some((x, y)) => (x + 1.0, y),
+    };
+    let word = match inner
+        .word_at(cre_lib::PagePosition { page, x, y })
+        .ok()
+        .unwrap_or(None)
+    {
+        None => return xpointer.to_string(),
+        Some(word) => word,
+    };
+    word.xpointer_range.start.to_xpointer()
+}
+
+fn expand_to_visible_word_end(inner: &Document, xpointer: &str) -> String {
+    let page = match inner.page_from_xpointer(xpointer).ok() {
+        None => return xpointer.to_string(),
+        Some(page) => page,
+    };
+    let (x, y) = match inner.point_from_xpointer(xpointer).ok().unwrap_or(None) {
+        None => return xpointer.to_string(),
+        Some((x, y)) => (x - 1.0, y),
+    };
+    let word = match inner
+        .word_at(cre_lib::PagePosition { page, x, y })
+        .ok()
+        .unwrap_or(None)
+    {
+        None => return xpointer.to_string(),
+        Some(word) => word,
+    };
+    word.xpointer_range
+        .end
+        .as_ref()
+        .map(|position| position.to_xpointer())
+        .unwrap_or(xpointer.to_string())
+}
+
 unsafe extern "C-unwind" fn doc_word_boxes_from_positions(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
@@ -2516,10 +2560,20 @@ unsafe extern "C-unwind" fn doc_word_boxes_from_positions(l: *mut lua_State) -> 
         };
         let get_segments = lua::lua_isboolean(l, 4) != 0 && arg_bool(l, 4);
         let include_images = lua::lua_isboolean(l, 5) != 0 && arg_bool(l, 5);
-        let _ = (get_segments, include_images);
+        let _ = include_images;
         let boxes = doc_ref(l).and_then(|doc| {
             let inner = doc.inner.as_ref()?;
-            inner.boxes_between_xpointers(&start, &end).ok()
+            let use_start = if get_segments {
+                start.clone()
+            } else {
+                expand_to_visible_word_start(inner, &start)
+            };
+            let use_end = if get_segments {
+                end.clone()
+            } else {
+                expand_to_visible_word_end(inner, &end)
+            };
+            inner.boxes_between_xpointers(&use_start, &use_end).ok()
         });
         let Some(boxes) = boxes else {
             return 0;
