@@ -204,6 +204,7 @@ struct PageSnapshot {
     local_clip_bottom: f32,
     boxes: Vec<SnapshotLine>,
     xpointer: Option<String>,
+    page_flow: i64,
 }
 
 struct SnapshotLine {
@@ -403,11 +404,21 @@ impl Document {
         let mut href_pages = HashMap::new();
         let mut spine_to_chunk = HashMap::new();
         let mut line_base = 0usize;
+        let mut max_flow = 0i64;
 
         for (chunk_index, html) in htmls.iter().enumerate() {
             let doc = create_document(html, base_url, net.clone(), &font_data, options);
             let root = doc.root_element();
             let lines = collect_lines(root);
+            let mut line_indices: HashMap<NodeId, Vec<usize>> = HashMap::new();
+            for (local_line, line) in lines.iter().enumerate() {
+                line_indices
+                    .entry(line.node_id)
+                    .or_default()
+                    .push(local_line);
+            }
+            let mut line_flows = lines.iter().map(|_| 0i64).collect::<Vec<i64>>();
+            collect_line_flows(root, 0, &mut max_flow, &line_indices, &mut line_flows);
             let forced_breaks = page_breaks::collect_forced_breaks(root);
             let page_starts = paginate(
                 &lines,
@@ -434,9 +445,20 @@ impl Document {
             }
             collect_spine_chunks(root, chunk_index, &mut spine_to_chunk);
 
+            let mut previous_page_flow = 0;
             for (local_index, start) in page_starts.iter().enumerate() {
                 let clip_bottom = page_clip_bottom(&page_starts, local_index, options);
                 let boxes = snapshot_page_boxes(root, &lines, *start, clip_bottom, line_base);
+                let page_flow = if let Some(first) = boxes.first() {
+                    let local_line = first.global_line.saturating_sub(line_base);
+                    line_flows
+                        .get(local_line)
+                        .copied()
+                        .unwrap_or(previous_page_flow)
+                } else {
+                    previous_page_flow
+                };
+                previous_page_flow = page_flow;
                 let xpointer = local_page_xpointers
                     .get(local_index)
                     .and_then(|xpointer| xpointer.clone());
@@ -450,6 +472,7 @@ impl Document {
                     local_clip_bottom: clip_bottom,
                     boxes,
                     xpointer,
+                    page_flow,
                 });
             }
 
@@ -510,7 +533,7 @@ impl Document {
             base_url: base_url.to_string(),
             resources,
             cover_image,
-            has_non_linear_flows,
+            has_non_linear_flows: has_non_linear_flows || max_flow > 0,
             net,
             font_data,
             chunks,
@@ -590,6 +613,16 @@ impl Document {
 
     pub fn has_non_linear_flows(&self) -> bool {
         self.has_non_linear_flows
+    }
+
+    pub fn page_flow(&self, page: usize) -> i64 {
+        let Some(index) = page.checked_sub(1) else {
+            return 0;
+        };
+        self.pages
+            .get(index)
+            .map(|snapshot| snapshot.page_flow)
+            .unwrap_or(0)
     }
 
     pub fn resource(&self, path: &str) -> Option<Vec<u8>> {
@@ -2056,6 +2089,37 @@ fn node_attr<'a>(node: &'a Node, name: &str) -> Option<&'a str> {
         .iter()
         .find(|attr| attr.name.local.to_string() == name)
         .map(|attr| attr.value.as_str())
+}
+
+fn collect_line_flows(
+    node: &Node,
+    current_flow: i64,
+    max_flow: &mut i64,
+    line_indices: &HashMap<NodeId, Vec<usize>>,
+    line_flows: &mut Vec<i64>,
+) {
+    let local_flow = if node_attr(node, "data-spine-nonlinear").is_some_and(|value| value == "1") {
+        *max_flow += 1;
+        *max_flow
+    } else {
+        current_flow
+    };
+    if let Some(indices) = line_indices.get(&node.id) {
+        for index in indices {
+            if *index < line_flows.len() {
+                line_flows[*index] = local_flow;
+            }
+        }
+    }
+    for child in &node.children {
+        collect_line_flows(
+            node.with(*child),
+            local_flow,
+            max_flow,
+            line_indices,
+            line_flows,
+        );
+    }
 }
 
 fn is_word_char(ch: char) -> bool {

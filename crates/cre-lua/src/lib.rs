@@ -2996,7 +2996,18 @@ unsafe extern "C-unwind" fn doc_is_alternative_toc(l: *mut lua_State) -> c_int {
 
 unsafe extern "C-unwind" fn doc_get_page_flow(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
-    unsafe { push_int(l, 0) };
+    unsafe {
+        let page = arg_int(l, 2);
+        let value = doc_ref(l).and_then(|doc| {
+            let inner = doc.inner.as_ref()?;
+            let page_idx = usize::try_from(page).ok()?;
+            if page < 1 || page_idx > inner.page_count() {
+                return Some(-1);
+            }
+            Some(inner.page_flow(page_idx))
+        });
+        push_int(l, value.unwrap_or(-1));
+    }
     1
 }
 

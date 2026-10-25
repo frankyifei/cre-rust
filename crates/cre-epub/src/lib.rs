@@ -32,6 +32,7 @@ pub struct SpineDocument {
     pub body_html: String,
     pub css_urls: Vec<String>,
     pub inline_styles: Vec<String>,
+    pub nonlinear: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -313,15 +314,21 @@ impl EpubBook {
     pub fn spine_documents(&self) -> Result<Vec<SpineDocument>> {
         let mut docs = Vec::new();
         for (index, item) in self.spine.iter().enumerate() {
-            if !item.linear {
+            let nonlinear = !item.linear;
+            let include = item.linear || item.media_type.to_ascii_lowercase().contains("html");
+            if !include {
                 continue;
             }
             let bytes = self
                 .resource(&item.href)
                 .with_context(|| format!("spine document missing: {}", item.href))?;
             let text = decode_text(bytes);
-            let body = extract_body(&text)
-                .with_context(|| format!("spine document has no <body>: {}", item.href))?;
+            let body_opt = extract_body(&text);
+            if body_opt.is_none() && nonlinear {
+                continue;
+            }
+            let body =
+                body_opt.with_context(|| format!("spine document has no <body>: {}", item.href))?;
             let (css_urls, inline_styles) = extract_styles(&text, &self.opf_dir, &item.href);
             docs.push(SpineDocument {
                 index,
@@ -331,6 +338,7 @@ impl EpubBook {
                 body_html: rewrite_urls(&body, parent_dir(&item.href), &self.opf_dir),
                 css_urls,
                 inline_styles,
+                nonlinear,
             });
         }
         Ok(docs)
@@ -419,11 +427,17 @@ impl EpubBook {
 }
 
 fn push_section_html(out: &mut String, doc: &SpineDocument) {
+    let nonlinear_attr = if doc.nonlinear {
+        " data-spine-nonlinear=\"1\""
+    } else {
+        ""
+    };
     out.push_str(&format!(
-        "<section class=\"cre-spine\" data-spine-index=\"{}\" data-spine-id=\"{}\" data-spine-href=\"{}\">",
+        "<section class=\"cre-spine\" data-spine-index=\"{}\" data-spine-id=\"{}\" data-spine-href=\"{}\"{}>",
         doc.index,
         escape_attr(&doc.id),
-        escape_attr(&normalize_path(&doc.href))
+        escape_attr(&normalize_path(&doc.href)),
+        nonlinear_attr
     ));
     out.push_str(&doc.body_html);
     out.push_str("</section>");
