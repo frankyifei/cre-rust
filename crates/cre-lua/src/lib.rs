@@ -991,6 +991,107 @@ unsafe extern "C-unwind" fn module_register_font(l: *mut lua_State) -> c_int {
     0
 }
 
+fn regularize_registered_font_weights(print_updates: bool) {
+    let registered = REGISTERED_FONTS.get_or_init(|| Mutex::new(Vec::new()));
+    let mut fonts = match registered.lock() {
+        Ok(fonts) => fonts,
+        Err(_) => return,
+    };
+    if fonts.is_empty() {
+        return;
+    }
+    let snapshot = fonts.clone();
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, face) in snapshot.iter().enumerate() {
+        let key = normalize_face_name(&face.family);
+        if key.is_empty() {
+            continue;
+        }
+        groups.entry(key).or_default().push(index);
+    }
+    let mut updates: Vec<(usize, i32, i32, String, String)> = Vec::new();
+    for (family, indexes_ref) in groups.iter() {
+        let indexes: Vec<usize> = indexes_ref.to_vec();
+        for italic in [false, true] {
+            let regular_index: Option<usize> = {
+                let mut found: Option<usize> = None;
+                let mut best_cost = i32::MAX;
+                for index_ref in &indexes {
+                    let index = *index_ref;
+                    let face = &snapshot[index];
+                    if face.italic != italic || face.weight >= 700 {
+                        continue;
+                    }
+                    let cost = (face.weight - 401).abs();
+                    if cost < best_cost {
+                        found = Some(index);
+                        best_cost = cost;
+                    }
+                }
+                found
+            };
+            if let Some(index) = regular_index {
+                let face = &snapshot[index];
+                if face.weight != 400 {
+                    updates.push((
+                        index,
+                        face.weight,
+                        400,
+                        family.clone(),
+                        "regular".to_string(),
+                    ));
+                }
+            }
+            let bold_index: Option<usize> = {
+                let mut found: Option<usize> = None;
+                let mut best_weight = i32::MAX;
+                for index_ref in &indexes {
+                    let index = *index_ref;
+                    let face = &snapshot[index];
+                    if face.italic != italic || face.weight < 700 {
+                        continue;
+                    }
+                    if face.weight < best_weight {
+                        found = Some(index);
+                        best_weight = face.weight;
+                    }
+                }
+                found
+            };
+            if let Some(index) = bold_index {
+                let face = &snapshot[index];
+                if face.weight != 700 {
+                    updates.push((index, face.weight, 700, family.clone(), "bold".to_string()));
+                }
+            }
+        }
+    }
+    if updates.is_empty() {
+        return;
+    }
+    if print_updates {
+        for (_, old_weight, new_weight, family, label) in updates.iter() {
+            println!(
+                "CRE: font {} {}: updated weight from {} to {}",
+                family, label, old_weight, new_weight,
+            );
+        }
+    }
+    for (index, _, new_weight, _, _) in updates {
+        fonts[index].weight = new_weight;
+    }
+    sort_font_faces(fonts.as_mut());
+}
+
+unsafe extern "C-unwind" fn module_regularize_registered_font_weights(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let print_updates = lua::lua_isboolean(l, 1) != 0 && arg_bool(l, 1);
+        regularize_registered_font_weights(print_updates);
+    }
+    0
+}
+
 unsafe extern "C-unwind" fn module_set_preferred_font(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
@@ -4173,7 +4274,10 @@ const MODULE_FUNCS: &[lua::luaL_Reg] = &regs![
     ("getGammaIndex", module_get_gamma_index),
     ("setGammaIndex", module_set_gamma_index),
     ("registerFont", module_register_font),
-    ("regularizeRegisteredFontsWeights", module_noop),
+    (
+        "regularizeRegisteredFontsWeights",
+        module_regularize_registered_font_weights
+    ),
     ("setAsPreferredFontWithBias", module_set_preferred_font),
     ("getHyphDictList", module_get_hyph_dict_list),
     ("getSelectedHyphDict", module_get_selected_hyph_dict),
