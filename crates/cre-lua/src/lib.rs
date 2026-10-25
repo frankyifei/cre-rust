@@ -2999,14 +2999,15 @@ unsafe extern "C-unwind" fn doc_rerender_delayed(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn doc_set_view_mode(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let mode = arg_int(l, 2) as i32;
-        if let Some(doc) = doc_mut(l) {
-            doc.view_mode = mode;
+        let mode = arg_int(l, 2);
+        if let Some(doc) = doc_mut(l)
+            && (mode == 0 || mode == 1)
+        {
+            doc.view_mode = mode as i32;
         }
     }
     0
 }
-
 unsafe extern "C-unwind" fn doc_set_header_info(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
