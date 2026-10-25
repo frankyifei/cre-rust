@@ -1471,12 +1471,6 @@ unsafe extern "C-unwind" fn module_set_image_replacement_char(l: *mut lua_State)
     0
 }
 
-unsafe extern "C-unwind" fn return_empty_table(l: *mut lua_State) -> c_int {
-    // SAFETY: `l` is the active Lua state.
-    unsafe { lua::lua_newtable(l) };
-    1
-}
-
 unsafe extern "C-unwind" fn module_noop(_l: *mut lua_State) -> c_int {
     0
 }
@@ -3068,7 +3062,10 @@ unsafe extern "C-unwind" fn doc_set_default_interline(l: *mut lua_State) -> c_in
     // SAFETY: `l` is the active Lua state.
     unsafe {
         if let Some(doc) = doc_mut(l) {
-            doc.interline = arg_int(l, 2).clamp(0, 1000) as i32;
+            let value = arg_int(l, 2).clamp(0, 1000);
+            doc.interline = value as i32;
+            doc.properties
+                .insert("crengine.interline.space".to_string(), value.to_string());
         }
     }
     0
@@ -3367,10 +3364,24 @@ unsafe extern "C-unwind" fn doc_get_embedded_font_list(l: *mut lua_State) -> c_i
 unsafe extern "C-unwind" fn doc_get_lang_tag(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let language = doc_ref(l)
-            .and_then(|doc| doc.inner.as_ref())
-            .and_then(|inner| inner.metadata().language.clone())
-            .unwrap_or_else(|| "en".to_string());
+        let x = arg_int(l, 2) as f32;
+        let y = arg_int(l, 3) as f32;
+        let Some(inner) = doc_ref(l).and_then(|doc| doc.inner.as_ref()) else {
+            return 0;
+        };
+        let position = cre_lib::PagePosition {
+            page: inner.current_page(),
+            x,
+            y,
+        };
+        let has_text =
+            inner.text_at(position).ok().is_some() || inner.word_at(position).ok().is_some();
+        let Some(language) = inner.metadata().language.clone() else {
+            return 0;
+        };
+        if !has_text {
+            return 0;
+        }
         push_str(l, &language);
     }
     1
@@ -3435,6 +3446,28 @@ unsafe extern "C-unwind" fn doc_get_html_from_xpointers(l: *mut lua_State) -> c_
         push_str(l, "");
     }
     3
+}
+
+unsafe extern "C-unwind" fn doc_get_stylesheets_matching_rulesets(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state.
+    unsafe {
+        let Some(doc) = doc_ref(l) else {
+            lua::lua_newtable(l);
+            return 1;
+        };
+        let with_user_stylesheet = if lua::lua_isboolean(l, 3) != 0 {
+            arg_bool(l, 3)
+        } else {
+            true
+        };
+        lua::lua_newtable(l);
+        if with_user_stylesheet && !doc.stylesheet.is_empty() {
+            push_str(l, "1");
+            push_str(l, &doc.stylesheet);
+            lua::lua_rawseti_(l, -2, 1);
+        }
+    }
+    1
 }
 
 unsafe extern "C-unwind" fn doc_extend_sentence(l: *mut lua_State) -> c_int {
@@ -4509,7 +4542,10 @@ const DOC_METHODS: &[lua::luaL_Reg] = &regs![
     ("getTextFromXPointer", doc_get_text_from_xpointer),
     ("getHTMLFromXPointer", doc_get_html_from_xpointer),
     ("getHTMLFromXPointers", doc_get_html_from_xpointers),
-    ("getStylesheetsMatchingRulesets", return_empty_table),
+    (
+        "getStylesheetsMatchingRulesets",
+        doc_get_stylesheets_matching_rulesets
+    ),
     ("getPageLinks", doc_get_page_links),
     ("isLinkToFootnote", doc_is_link_to_footnote),
     ("highlightXPointer", doc_highlight),
