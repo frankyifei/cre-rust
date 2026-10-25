@@ -405,6 +405,7 @@ dependencies = [
  "cre-paint",
  "cre-text",
  "image",
+ "parley",
  "percent-encoding",
  "regex",
  "resvg",

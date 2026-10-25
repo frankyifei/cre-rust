@@ -5,9 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use anyrender::Scene;
-use blitz_dom::{
-    DocumentConfig, Node, NodeId, Point, StyleThreading, UserAgentStylesheet, build_single_font_ctx,
-};
+use blitz_dom::{DocumentConfig, Node, NodeId, Point, StyleThreading, UserAgentStylesheet};
 use blitz_html::HtmlDocument;
 use blitz_traits::net::{Bytes, NetHandler, NetProvider, Request};
 use blitz_traits::shell::{ColorScheme, Viewport};
@@ -19,6 +17,8 @@ use cre_paint::render_page as paint_page;
 
 pub use cre_paint::PageBitmap;
 use cre_text::{TextBook, TextHtmlOptions};
+use parley::FontContext;
+use parley::fontique::{Blob, Collection, CollectionOptions, FamilyId, GenericFamily, SourceCache};
 use percent_encoding::percent_decode_str;
 
 mod page_breaks;
@@ -61,6 +61,7 @@ pub struct DocumentOptions {
     pub page_margin: f32,
     pub font_size: f32,
     pub font_path: Option<PathBuf>,
+    pub fallback_font_paths: Vec<PathBuf>,
     pub stylesheet: Option<String>,
     pub embedded_styles_enabled: bool,
     pub viewport_scale: f32,
@@ -75,6 +76,7 @@ impl Default for DocumentOptions {
             page_margin: 32.0,
             font_size: 18.0,
             font_path: None,
+            fallback_font_paths: Vec::new(),
             stylesheet: None,
             embedded_styles_enabled: true,
             viewport_scale: 1.0,
@@ -252,7 +254,7 @@ pub struct Document {
     cover_image: Option<Vec<u8>>,
     has_non_linear_flows: bool,
     net: Arc<dyn NetProvider>,
-    font_data: Vec<u8>,
+    font_datas: Vec<Vec<u8>>,
     chunks: Vec<ChunkMeta>,
     pages: Vec<PageSnapshot>,
     xpointer_pages: HashMap<String, usize>,
@@ -416,9 +418,7 @@ impl Document {
         page_map_items: Vec<RawPageMapItem>,
         options: &DocumentOptions,
     ) -> Result<Self> {
-        let font_path = resolve_font_path(options)?;
-        let font_data = std::fs::read(&font_path)
-            .with_context(|| format!("read font {}", font_path.display()))?;
+        let font_datas = collect_font_datas(options)?;
 
         let mut chunks = Vec::with_capacity(htmls.len());
         let mut pages = Vec::new();
@@ -431,7 +431,7 @@ impl Document {
         let mut running_doc_top = 0.0;
 
         for (chunk_index, html) in htmls.iter().enumerate() {
-            let doc = create_document(html, base_url, net.clone(), &font_data, options);
+            let doc = create_document(html, base_url, net.clone(), &font_datas, options);
             let root = doc.root_element();
             let lines = collect_lines(root);
             let mut line_indices: HashMap<NodeId, Vec<usize>> = HashMap::new();
@@ -577,7 +577,7 @@ impl Document {
             cover_image,
             has_non_linear_flows: has_non_linear_flows || max_flow > 0,
             net,
-            font_data,
+            font_datas,
             chunks,
             pages,
             xpointer_pages,
@@ -845,7 +845,7 @@ impl Document {
             html,
             &self.base_url,
             self.net.clone(),
-            &self.font_data,
+            &self.font_datas,
             &DocumentOptions {
                 width: self.width,
                 height: self.height,
@@ -853,6 +853,7 @@ impl Document {
                 page_margin: self.page_margin,
                 font_size: self.font_css_size,
                 font_path: None,
+                fallback_font_paths: Vec::new(),
                 stylesheet: self.stylesheet.clone(),
                 embedded_styles_enabled: self.embedded_styles_enabled,
                 viewport_scale: self.viewport_scale,
@@ -2666,11 +2667,57 @@ fn split_toc_href(href: &str) -> (&str, Option<&str>) {
     }
 }
 
+fn collect_font_datas(options: &DocumentOptions) -> Result<Vec<Vec<u8>>> {
+    let font_path = resolve_font_path(options)?;
+    let main_font =
+        std::fs::read(&font_path).with_context(|| format!("read font {}", font_path.display()))?;
+    let mut out: Vec<Vec<u8>> = vec![main_font];
+    for fallback_path in &options.fallback_font_paths {
+        if let Ok(data) = std::fs::read(fallback_path) {
+            out.push(data);
+        }
+    }
+    Ok(out)
+}
+
+fn build_font_ctx_with_fallbacks(font_datas: &[Vec<u8>]) -> FontContext {
+    let mut ctx = FontContext {
+        source_cache: SourceCache::new_shared(),
+        collection: Collection::new(CollectionOptions {
+            shared: false,
+            system_fonts: false,
+        }),
+    };
+    let family_ids: Vec<FamilyId> = font_datas
+        .iter()
+        .flat_map(|data| {
+            let decoded = data.to_vec();
+            let registered = ctx
+                .collection
+                .register_fonts(Blob::new(Arc::new(decoded) as _), None);
+            registered
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<FamilyId>>()
+        })
+        .collect();
+    for generic in [
+        GenericFamily::SansSerif,
+        GenericFamily::Serif,
+        GenericFamily::Monospace,
+        GenericFamily::SystemUi,
+    ] {
+        ctx.collection
+            .append_generic_families(generic, family_ids.iter().copied());
+    }
+    ctx
+}
+
 fn create_document(
     html: &str,
     base_url: &str,
     net: Arc<dyn NetProvider>,
-    font_data: &[u8],
+    font_datas: &[Vec<u8>],
     options: &DocumentOptions,
 ) -> HtmlDocument {
     let mut config = DocumentConfig {
@@ -2682,7 +2729,7 @@ fn create_document(
         )),
         base_url: Some(base_url.to_string()),
         net_provider: Some(net),
-        font_ctx: Some(build_single_font_ctx(font_data)),
+        font_ctx: Some(build_font_ctx_with_fallbacks(font_datas)),
         style_threading: StyleThreading::Sequential,
         ..Default::default()
     };

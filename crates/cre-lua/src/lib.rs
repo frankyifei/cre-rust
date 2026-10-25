@@ -151,6 +151,7 @@ impl Doc {
             page_margin: self.margins.1.max(0) as f32,
             font_size: self.render_font_css_size(),
             font_path: self.font_path.clone(),
+            fallback_font_paths: self.fallback_font_paths(),
             stylesheet: (!self.stylesheet.is_empty()).then(|| self.stylesheet.clone()),
             embedded_styles_enabled: self.embedded_stylesheet_enabled,
             viewport_scale: self.render_viewport_scale(),
@@ -161,6 +162,21 @@ impl Doc {
         self.path = Some(path);
         self.load_document_page_map();
         Ok(())
+    }
+
+    fn fallback_font_paths(&self) -> Vec<PathBuf> {
+        let value = self
+            .properties
+            .get("crengine.font.fallback.faces")
+            .cloned()
+            .unwrap_or(String::new());
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for name in value.split('|') {
+            if let Some(face) = find_font_face(name, false, false) {
+                paths.push(face.path.clone());
+            }
+        }
+        paths
     }
 
     fn two_visible_pages_count_as_one(&self) -> bool {
@@ -2916,6 +2932,7 @@ unsafe extern "C-unwind" fn doc_set_string_property(l: *mut lua_State) -> c_int 
         let Some(doc) = doc_mut(l) else {
             return 0;
         };
+        let previous = doc.properties.get(&name).cloned().unwrap_or(String::new());
         doc.properties.insert(name.clone(), value.clone());
         match name.as_str() {
             "font.face.default" | "font.face" => {
@@ -2928,6 +2945,9 @@ unsafe extern "C-unwind" fn doc_set_string_property(l: *mut lua_State) -> c_int 
                 }
             }
             "crengine.highlight.selection.color" => {}
+            "crengine.font.fallback.faces" if previous != value && doc.inner.is_some() => {
+                doc.relayout();
+            }
             _ => {}
         }
     }
