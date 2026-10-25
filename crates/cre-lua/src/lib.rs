@@ -2775,11 +2775,18 @@ unsafe extern "C-unwind" fn doc_get_string_property(l: *mut lua_State) -> c_int 
         };
         let value = match name.as_str() {
             "font.face.default" | "font.face" => doc.font_face.clone(),
-            "crengine.textlang.main.lang" => doc
-                .inner
-                .as_ref()
-                .and_then(|inner| inner.metadata().language.clone())
-                .unwrap_or_default(),
+            "crengine.textlang.main.lang" => {
+                let fallback = doc
+                    .inner
+                    .as_ref()
+                    .and_then(|inner| inner.metadata().language.clone())
+                    .unwrap_or_default();
+                doc.properties
+                    .get(&name)
+                    .filter(|value| !value.is_empty())
+                    .cloned()
+                    .unwrap_or(fallback)
+            }
             _ => doc.properties.get(&name).cloned().unwrap_or_default(),
         };
         push_str(l, &value);
