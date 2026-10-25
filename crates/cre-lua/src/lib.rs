@@ -2514,13 +2514,10 @@ unsafe extern "C-unwind" fn doc_word_boxes_from_positions(l: *mut lua_State) -> 
         let Some(end) = arg_str(l, 3) else {
             return 0;
         };
+        let get_segments = lua::lua_isboolean(l, 4) != 0 && arg_bool(l, 4);
+        let include_images = lua::lua_isboolean(l, 5) != 0 && arg_bool(l, 5);
+        let _ = (get_segments, include_images);
         let boxes = doc_ref(l).and_then(|doc| {
-            if let Some((start_pos, end_pos)) = &doc.last_range
-                && *start_pos == start
-                && *end_pos == end
-            {
-                return Some(doc.last_boxes.clone());
-            }
             let inner = doc.inner.as_ref()?;
             inner.boxes_between_xpointers(&start, &end).ok()
         });
