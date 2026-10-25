@@ -345,7 +345,6 @@ impl CreImage {
     }
 }
 
-static FONT_CACHE: OnceLock<Vec<FontFace>> = OnceLock::new();
 static REGISTERED_FONTS: OnceLock<Mutex<Vec<FontFace>>> = OnceLock::new();
 static FONT_BIAS: OnceLock<Mutex<HashMap<String, i32>>> = OnceLock::new();
 static GAMMA_INDEX: AtomicI32 = AtomicI32::new(2);
@@ -370,46 +369,12 @@ fn user_hyph_state() -> &'static Mutex<HashSet<String>> {
     STATE.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-fn all_font_faces() -> &'static Vec<FontFace> {
-    FONT_CACHE.get_or_init(|| {
-        let mut roots = vec![
-            PathBuf::from("/usr/share/fonts"),
-            PathBuf::from("/usr/local/share/fonts"),
-            PathBuf::from("/system/fonts"),
-            PathBuf::from("/mnt/us/fonts"),
-        ];
-        if let Ok(home) = std::env::var("HOME") {
-            roots.push(Path::new(&home).join(".fonts"));
-            roots.push(Path::new(&home).join(".local/share/fonts"));
-        }
-        if let Ok(extra) = std::env::var("CRE_FONT_DIR") {
-            roots.push(PathBuf::from(extra));
-        }
-
-        let mut faces = Vec::new();
-        let mut seen = HashSet::new();
-        for root in roots {
-            collect_font_faces(&root, 0, &mut faces, &mut seen);
-        }
-        faces.extend(registered_font_faces());
-        sort_font_faces(&mut faces);
-        faces
-    })
-}
-
 fn registered_font_faces() -> Vec<FontFace> {
     let registered = REGISTERED_FONTS.get_or_init(|| Mutex::new(Vec::new()));
     match registered.lock() {
         Ok(fonts) => fonts.clone(),
         Err(_) => Vec::new(),
     }
-}
-
-fn all_font_faces_with_registration() -> Vec<FontFace> {
-    let mut faces = all_font_faces().clone();
-    faces.extend(registered_font_faces());
-    sort_font_faces(&mut faces);
-    faces
 }
 
 fn sort_font_faces(faces: &mut [FontFace]) {
@@ -422,40 +387,6 @@ fn sort_font_faces(faces: &mut [FontFace]) {
             .then_with(|| left.path.cmp(&right.path))
             .then_with(|| left.index.cmp(&right.index))
     });
-}
-
-fn collect_font_faces(
-    directory: &Path,
-    depth: usize,
-    faces: &mut Vec<FontFace>,
-    seen: &mut HashSet<(PathBuf, i32)>,
-) {
-    if depth > 6 {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_font_faces(&path, depth + 1, faces, seen);
-            continue;
-        }
-        let extension = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if !matches!(extension.as_str(), "ttf" | "otf" | "ttc") {
-            continue;
-        }
-        for face in parse_font_metadata(&path) {
-            if seen.insert((face.path.clone(), face.index)) {
-                faces.push(face);
-            }
-        }
-    }
 }
 
 fn parse_font_metadata(path: &Path) -> Vec<FontFace> {
@@ -667,7 +598,7 @@ fn font_matches(face: &FontFace, normalized: &str) -> bool {
 }
 
 fn find_font_face(name: &str, bold: bool, italic: bool) -> Option<FontFace> {
-    let faces = all_font_faces_with_registration();
+    let faces = registered_font_faces();
     select_font_face(&faces, name, bold, italic)
 }
 
@@ -710,7 +641,7 @@ fn select_font_face(faces: &[FontFace], name: &str, bold: bool, italic: bool) ->
 
 fn font_families() -> Vec<String> {
     let mut families = BTreeMap::new();
-    for face in all_font_faces_with_registration() {
+    for face in registered_font_faces() {
         if face.family.is_empty() {
             continue;
         }
@@ -956,7 +887,7 @@ unsafe extern "C-unwind" fn module_font_face_weights(l: *mut lua_State) -> c_int
         let Some(name) = arg_str(l, 1) else {
             return 0;
         };
-        let faces = all_font_faces_with_registration();
+        let faces = registered_font_faces();
         let Some(anchor) = select_font_face(&faces, &name, false, false) else {
             lua::lua_newtable(l);
             return 1;
