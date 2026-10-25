@@ -3657,7 +3657,7 @@ unsafe extern "C-unwind" fn doc_get_page_map_current(l: *mut lua_State) -> c_int
         let Some(inner) = doc.inner.as_ref() else {
             return 0;
         };
-        let max_y = inner.current_pos()
+        let max_y = current_document_pos(inner)
             + i64::from(inner.page_height()) * i64::from(doc.visible_page_count.max(1) as u32);
         let Some(index) = doc.page_map_index_for_doc_y_below(max_y) else {
             return 0;
@@ -3713,7 +3713,7 @@ unsafe extern "C-unwind" fn doc_get_page_map_visible(l: *mut lua_State) -> c_int
         let start_page = inner.current_page();
         let visible_count = doc.visible_page_count.max(1) as usize;
         let end_page = (start_page + visible_count).min(page_count + 1);
-        let min_y = inner.current_pos();
+        let min_y = current_document_pos(inner);
         let max_y = min_y + i64::from(inner.page_height()) * i64::from(visible_count as u32);
         let offset_y = if doc.view_mode == 1 {
             i64::from(doc.header_height.max(0)) + inner.page_margin_y()
