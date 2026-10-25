@@ -2826,6 +2826,14 @@ unsafe extern "C-unwind" fn doc_set_int_property(l: *mut lua_State) -> c_int {
             }
             "crengine.interline.space" => doc.interline = value as i32,
             "window.status.battery.percent" => doc.battery = value as i32,
+            "crengine.doc.embedded.styles.enabled" => {
+                let enabled = value != 0;
+                if doc.embedded_stylesheet_enabled != enabled {
+                    doc.embedded_stylesheet_enabled = enabled;
+                    relayout = true;
+                }
+            }
+            "crengine.doc.embedded.fonts.enabled" => {}
             _ => {}
         }
         if relayout && doc.inner.is_some() {
