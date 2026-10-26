@@ -19,7 +19,11 @@ use cre_paint::render_page as paint_page;
 pub use cre_paint::PageBitmap;
 use cre_text::{TextBook, TextHtmlOptions};
 use parley::FontContext;
+use parley::editing::{Cursor, Selection as ParleySelection};
 use parley::fontique::{Blob, Collection, CollectionOptions, FamilyId, GenericFamily, SourceCache};
+type ClippedLine = (usize, usize, TextBox, usize, usize);
+
+use parley::layout::Affinity;
 use percent_encoding::percent_decode_str;
 
 mod page_breaks;
@@ -1220,20 +1224,104 @@ impl Document {
 
     pub fn boxes_between_xpointers(&self, start: &str, end: &str) -> Result<Vec<TextBox>> {
         let mut boxes = Vec::new();
-        for (mut rect, slice_start, slice_end) in
+        for (page, line_index, mut rect, slice_start, slice_end) in
             self.clipped_lines_between_xpointers(start, end)?
         {
+            let text_slice = rect.text[slice_start..slice_end].to_string();
+            if let Some((x0, x1)) = self
+                .parley_segment_x_bounds(page, line_index, slice_start, slice_end)
+                .unwrap_or(None)
+            {
+                rect.text = text_slice;
+                rect.x = x0;
+                rect.width = (x1 - x0).max(1.0);
+                boxes.push(rect);
+                continue;
+            }
+
             let total_chars = rect.text.chars().count().max(1) as f32;
             let start_chars = rect.text[..slice_start].chars().count() as f32;
             let end_chars = rect.text[..slice_end].chars().count() as f32;
             let x0 = rect.x + rect.width * (start_chars / total_chars);
             let x1 = rect.x + rect.width * (end_chars / total_chars);
-            rect.text = rect.text[slice_start..slice_end].to_string();
+            rect.text = text_slice;
             rect.x = x0;
             rect.width = (x1 - x0).max(1.0);
             boxes.push(rect);
         }
         Ok(boxes)
+    }
+
+    fn parley_segment_x_bounds(
+        &self,
+        page: usize,
+        line_index: usize,
+        slice_start: usize,
+        slice_end: usize,
+    ) -> Result<Option<(f32, f32)>> {
+        let Some(snapshot) = self.pages.get(page.saturating_sub(1)) else {
+            return Ok(None);
+        };
+        let chunk_index = snapshot.chunk;
+        let line_base = self.chunks[chunk_index].line_base;
+        let Some(local_line) = line_index.checked_sub(line_base) else {
+            return Ok(None);
+        };
+
+        self.with_active_chunk(chunk_index, |active| {
+            let Some(line_box) = active.lines.get(local_line) else {
+                return Ok(None);
+            };
+            let root = active.doc.root_element();
+            let node = root.with(line_box.node_id);
+            let Some(inline_layout) = node
+                .element_data()
+                .and_then(|element| element.inline_layout_data.as_ref())
+            else {
+                return Ok(None);
+            };
+            let layout = &inline_layout.layout;
+
+            let Some((target_index, target_line)) = (0..layout.len())
+                .map(|line_number| (line_number, layout.get(line_number)))
+                .filter_map(|(line_number, line)| line.map(|value| (line_number, value)))
+                .find(|(_, line)| {
+                    let text_range = line.text_range();
+                    text_range.start <= line_box.text_start && text_range.end >= line_box.text_end
+                })
+            else {
+                return Ok(None);
+            };
+            let line_metrics = target_line.metrics();
+
+            let start_byte = line_box.text_start.saturating_add(slice_start);
+            let end_byte = line_box.text_start.saturating_add(slice_end);
+            if start_byte >= end_byte {
+                return Ok(None);
+            }
+
+            let start_cursor = Cursor::from_byte_index(layout, start_byte, Affinity::Upstream);
+            let end_cursor = Cursor::from_byte_index(layout, end_byte, Affinity::Downstream);
+            let selection = ParleySelection::new(start_cursor, end_cursor);
+
+            let mut left = f32::INFINITY;
+            let mut right = f32::NEG_INFINITY;
+            for (bbox, line_idx) in selection.geometry(layout) {
+                if line_idx != target_index {
+                    continue;
+                }
+                let x0 = line_box.left + ((bbox.x0 as f32) - line_metrics.offset);
+                let x1 = line_box.left + ((bbox.x1 as f32) - line_metrics.offset);
+                left = left.min(x0);
+                left = left.min(x1);
+                right = right.max(x0);
+                right = right.max(x1);
+            }
+            if left.is_finite() && right.is_finite() && right > left {
+                return Ok(Some((left, right)));
+            }
+            Ok(None)
+        })
     }
 
     pub fn point_from_xpointer(&self, xpointer: &str) -> Result<Option<(f32, f32)>> {
@@ -1335,7 +1423,9 @@ impl Document {
 
     pub fn text_between_xpointers(&self, start: &str, end: &str) -> Result<String> {
         let mut text = String::new();
-        for (rect, slice_start, slice_end) in self.clipped_lines_between_xpointers(start, end)? {
+        for (_, _, rect, slice_start, slice_end) in
+            self.clipped_lines_between_xpointers(start, end)?
+        {
             let part = &rect.text[slice_start..slice_end];
             if !part.trim().is_empty() {
                 if !text.is_empty() {
@@ -1347,11 +1437,7 @@ impl Document {
         Ok(text.trim_end().to_string())
     }
 
-    fn clipped_lines_between_xpointers(
-        &self,
-        start: &str,
-        end: &str,
-    ) -> Result<Vec<(TextBox, usize, usize)>> {
+    fn clipped_lines_between_xpointers(&self, start: &str, end: &str) -> Result<Vec<ClippedLine>> {
         let mut start_position = parse_text_position(start)?;
         let mut end_position = parse_text_position(end)?;
         let mut start_page = self.page_from_xpointer(start)?;
@@ -1403,7 +1489,7 @@ impl Document {
                     slice_end -= 1;
                 }
                 if slice_start < slice_end {
-                    lines.push((rect, slice_start, slice_end));
+                    lines.push((page, line_index, rect, slice_start, slice_end));
                 }
             }
         }
