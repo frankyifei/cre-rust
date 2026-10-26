@@ -206,6 +206,7 @@ struct TocAnchorId {
 }
 
 const CHUNK_TARGET_BYTES: usize = 256 * 1024;
+const PAGE_IMAGE_CACHE_CAPACITY: usize = 2usize;
 
 struct ChunkMeta {
     first_page: usize,
@@ -217,6 +218,13 @@ struct ActiveChunk {
     doc: HtmlDocument,
     lines: Vec<LineBox>,
     page_starts: Vec<PageStart>,
+}
+
+#[derive(Clone)]
+struct PageImage {
+    bitmap: PageBitmap,
+    image_count: usize,
+    image_surface: usize,
 }
 
 struct PageSnapshot {
@@ -273,6 +281,8 @@ pub struct Document {
     active: RefCell<Option<ActiveChunk>>,
     current_page: usize,
     background_color: u32,
+    page_image_cache: HashMap<usize, PageImage>,
+    page_cache_order: Vec<usize>,
 }
 
 impl Document {
@@ -607,6 +617,8 @@ impl Document {
             active: RefCell::new(None),
             current_page: 1,
             background_color: 0xFF_FFFF,
+            page_image_cache: HashMap::new(),
+            page_cache_order: Vec::new(),
         };
         document.ensure_chunk(0)?;
         Ok(document)
@@ -625,7 +637,11 @@ impl Document {
     }
 
     pub fn set_background_color(&mut self, background_color: u32) {
-        self.background_color = background_color & 0xFF_FFFF;
+        let color = background_color & 0xFF_FFFF;
+        if self.background_color != color {
+            self.clear_page_image_cache();
+        }
+        self.background_color = color;
     }
 
     pub fn page_height(&self) -> u32 {
@@ -802,36 +818,55 @@ impl Document {
         let clip_top = start.clip_top - start.top;
         let clip_bottom = snapshot.local_clip_bottom - start.top;
 
-        self.ensure_chunk(chunk_index)?;
-        let mut active = self.active.borrow_mut();
-        let active = active
-            .as_mut()
-            .context("active document chunk is missing")?;
-        let viewport_scale = self.viewport_scale;
-        active.doc.set_viewport_scroll(Point {
-            x: 0.0,
-            y: f64::from(start.top),
-        });
-        let mut scene = Scene::default();
-        blitz_paint::paint_scene(
-            &mut scene,
-            &mut active.doc,
-            viewport_scale as f64,
-            self.width,
-            self.height,
-            0,
-            0,
-        );
+        if let Some(cached) = self.cached_page_image(page) {
+            self.ensure_chunk(chunk_index)?;
+            return Ok((
+                cached.bitmap.clone(),
+                cached.image_count,
+                cached.image_surface,
+            ));
+        }
 
-        Ok(paint_page(
-            &scene,
-            self.width,
-            self.height,
-            0.0,
-            clip_top * viewport_scale,
-            clip_bottom * viewport_scale,
-            self.background_color,
-        ))
+        let (bitmap, image_count, image_surface) = {
+            self.ensure_chunk(chunk_index)?;
+            let mut active = self.active.borrow_mut();
+            let active = active
+                .as_mut()
+                .context("active document chunk is missing")?;
+            let viewport_scale = self.viewport_scale;
+            active.doc.set_viewport_scroll(Point {
+                x: 0.0,
+                y: f64::from(start.top),
+            });
+            let mut scene = Scene::default();
+            blitz_paint::paint_scene(
+                &mut scene,
+                &mut active.doc,
+                viewport_scale as f64,
+                self.width,
+                self.height,
+                0,
+                0,
+            );
+
+            paint_page(
+                &scene,
+                self.width,
+                self.height,
+                0.0,
+                clip_top * viewport_scale,
+                clip_bottom * viewport_scale,
+                self.background_color,
+            )
+        };
+        let image = PageImage {
+            bitmap,
+            image_count,
+            image_surface,
+        };
+        let out = (image.bitmap.clone(), image_count, image_surface);
+        self.cache_page_image(page, image);
+        Ok(out)
     }
 
     pub fn render_page(&mut self, page: usize) -> Result<PageBitmap> {
@@ -844,6 +879,39 @@ impl Document {
 
     pub fn render_current_page_with_stats(&mut self) -> Result<(PageBitmap, usize, usize)> {
         self.render_page_with_stats(self.current_page)
+    }
+
+    fn cached_page_image(&mut self, page: usize) -> Option<PageImage> {
+        if let Some(image) = self.page_image_cache.get(&page) {
+            let image = image.clone();
+            self.touch_page_image_cache(page);
+            return Some(image);
+        }
+        None
+    }
+
+    fn touch_page_image_cache(&mut self, page: usize) {
+        self.page_cache_order = self
+            .page_cache_order
+            .iter()
+            .filter(|cached| **cached != page)
+            .copied()
+            .collect::<Vec<usize>>();
+        self.page_cache_order.push(page);
+    }
+
+    fn cache_page_image(&mut self, page: usize, image: PageImage) {
+        self.touch_page_image_cache(page);
+        while self.page_cache_order.len() > PAGE_IMAGE_CACHE_CAPACITY {
+            let evicted = self.page_cache_order.remove(0);
+            self.page_image_cache.remove(&evicted);
+        }
+        self.page_image_cache.insert(page, image);
+    }
+
+    fn clear_page_image_cache(&mut self) {
+        self.page_image_cache.clear();
+        self.page_cache_order.clear();
     }
 
     fn ensure_chunk(&self, index: usize) -> Result<()> {

@@ -11,6 +11,7 @@ use tiny_skia::{
     Stroke as SkStroke, Transform,
 };
 
+#[derive(Clone)]
 pub struct PageBitmap {
     pub width: u32,
     pub height: u32,
