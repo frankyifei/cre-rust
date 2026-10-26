@@ -1959,10 +1959,47 @@ impl Document {
                     position.spine_index
                 )
             })?;
+        let line_page = self
+            .page_from_text_position_by_line_ranges(&position, chunk_index)
+            .unwrap_or(None);
+        if let Some(page) = line_page {
+            return Ok(page);
+        }
+
         let local_page = self.with_active_chunk(chunk_index, |active| {
             xpointer::page_from_xpointer(&active.doc, &active.page_starts, trimmed)
         })?;
         Ok(self.chunks[chunk_index].first_page + local_page - 1)
+    }
+
+    fn page_from_text_position_by_line_ranges(
+        &self,
+        position: &TextPosition,
+        chunk_index: usize,
+    ) -> Result<Option<usize>> {
+        if self.chunks.get(chunk_index).is_none() {
+            return Ok(None);
+        }
+        let pages = self
+            .pages
+            .iter()
+            .enumerate()
+            .filter(|(_, snapshot)| snapshot.chunk == chunk_index)
+            .map(|(index, _)| index + 1)
+            .collect::<Vec<usize>>();
+        for page in pages.iter() {
+            for (line_index, _) in self.page_text_boxes_with_lines(*page)? {
+                let Some((line_start, line_end)) = self.line_bounds(*page, line_index)? else {
+                    continue;
+                };
+                if line_start.cmp(position) != std::cmp::Ordering::Greater
+                    && line_end.cmp(position) != std::cmp::Ordering::Less
+                {
+                    return Ok(Some(*page));
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub fn go_to_xpointer(&mut self, xpointer: &str) -> Result<usize> {
