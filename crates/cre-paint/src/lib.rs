@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyrender::recording::RenderCommand;
 use anyrender::{Paint, Scene};
@@ -42,7 +43,7 @@ pub fn render_page(
     clip_top: f32,
     clip_bottom: f32,
     background: u32,
-) -> (PageBitmap, usize, usize) {
+) -> (Arc<PageBitmap>, usize, usize) {
     let mut pixmap = Pixmap::new(width, height).expect("non-zero page bitmap");
     let background_color = tiny_skia::Color::from_rgba8(
         ((background >> 16) & 0xff) as u8,
@@ -142,11 +143,11 @@ pub fn render_page(
     }
 
     (
-        PageBitmap {
+        Arc::new(PageBitmap {
             width,
             height,
             data,
-        },
+        }),
         image_count,
         image_surface,
     )

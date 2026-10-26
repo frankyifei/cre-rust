@@ -222,7 +222,7 @@ struct ActiveChunk {
 
 #[derive(Clone)]
 struct PageImage {
-    bitmap: PageBitmap,
+    bitmap: Arc<PageBitmap>,
     image_count: usize,
     image_surface: usize,
 }
@@ -269,7 +269,7 @@ pub struct Document {
     cover_image: Option<Vec<u8>>,
     has_non_linear_flows: bool,
     net: Arc<dyn NetProvider>,
-    font_datas: Vec<Vec<u8>>,
+    font_context: Arc<FontContext>,
     chunks: Vec<ChunkMeta>,
     pages: Vec<PageSnapshot>,
     xpointer_pages: HashMap<String, usize>,
@@ -448,6 +448,7 @@ impl Document {
         options: &DocumentOptions,
         font_datas: &[Vec<u8>],
     ) -> Result<Self> {
+        let font_context = Arc::new(build_font_ctx_with_fallbacks(font_datas));
         let mut chunks = Vec::with_capacity(htmls.len());
         let mut pages = Vec::new();
         let mut page_xpointers = Vec::new();
@@ -459,7 +460,7 @@ impl Document {
         let mut running_doc_top = 0.0;
 
         for (chunk_index, html) in htmls.iter().enumerate() {
-            let doc = create_document(html, base_url, net.clone(), font_datas, options);
+            let doc = create_document(html, base_url, net.clone(), font_context.clone(), options);
             let root = doc.root_element();
             let lines = collect_lines(root);
             let mut line_indices: HashMap<NodeId, Vec<usize>> = HashMap::new();
@@ -605,7 +606,7 @@ impl Document {
             cover_image,
             has_non_linear_flows: has_non_linear_flows || max_flow > 0,
             net,
-            font_datas: font_datas.to_vec(),
+            font_context,
             chunks,
             pages,
             xpointer_pages,
@@ -806,7 +807,10 @@ impl Document {
             .context("XPointer spine fragment is outside the rendered document")
     }
 
-    pub fn render_page_with_stats(&mut self, page: usize) -> Result<(PageBitmap, usize, usize)> {
+    pub fn render_page_with_stats(
+        &mut self,
+        page: usize,
+    ) -> Result<(Arc<PageBitmap>, usize, usize)> {
         let Some(index) = page.checked_sub(1) else {
             bail!("page numbers are 1-based");
         };
@@ -860,24 +864,25 @@ impl Document {
             )
         };
         let image = PageImage {
-            bitmap,
+            bitmap: bitmap.clone(),
             image_count,
             image_surface,
         };
-        let out = (image.bitmap.clone(), image_count, image_surface);
+        let out = (bitmap.clone(), image_count, image_surface);
         self.cache_page_image(page, image);
         Ok(out)
     }
 
     pub fn render_page(&mut self, page: usize) -> Result<PageBitmap> {
-        Ok(self.render_page_with_stats(page)?.0)
+        let (bitmap, _, _) = self.render_page_with_stats(page)?;
+        Ok(bitmap.as_ref().clone())
     }
 
     pub fn render_current_page(&mut self) -> Result<PageBitmap> {
         self.render_page(self.current_page)
     }
 
-    pub fn render_current_page_with_stats(&mut self) -> Result<(PageBitmap, usize, usize)> {
+    pub fn render_current_page_with_stats(&mut self) -> Result<(Arc<PageBitmap>, usize, usize)> {
         self.render_page_with_stats(self.current_page)
     }
 
@@ -931,7 +936,7 @@ impl Document {
             html,
             &self.base_url,
             self.net.clone(),
-            &self.font_datas,
+            self.font_context.clone(),
             &DocumentOptions {
                 width: self.width,
                 height: self.height,
@@ -2838,7 +2843,7 @@ fn create_document(
     html: &str,
     base_url: &str,
     net: Arc<dyn NetProvider>,
-    font_datas: &[Vec<u8>],
+    font_context: Arc<FontContext>,
     options: &DocumentOptions,
 ) -> HtmlDocument {
     let mut config = DocumentConfig {
@@ -2850,7 +2855,7 @@ fn create_document(
         )),
         base_url: Some(base_url.to_string()),
         net_provider: Some(net),
-        font_ctx: Some(build_font_ctx_with_fallbacks(font_datas)),
+        font_ctx: Some(font_context.as_ref().clone()),
         style_threading: StyleThreading::Sequential,
         ..Default::default()
     };

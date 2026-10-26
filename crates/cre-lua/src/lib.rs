@@ -72,6 +72,7 @@ struct Doc {
     render_requested: bool,
     font_data_cache: Vec<Vec<u8>>,
     font_cache_paths: Vec<PathBuf>,
+    render_state_snapshot: String,
 }
 
 impl Doc {
@@ -114,6 +115,7 @@ impl Doc {
             render_requested: false,
             font_data_cache: Vec::new(),
             font_cache_paths: Vec::new(),
+            render_state_snapshot: String::new(),
         }
     }
 
@@ -147,7 +149,43 @@ impl Doc {
         requested / scale
     }
 
+    fn render_state_snapshot(&self, path: PathBuf) -> String {
+        let mut properties = self.properties.iter().collect::<Vec<(&String, &String)>>();
+        properties.sort_by(|left, right| left.0.cmp(right.0));
+        let mut alt_properties = self
+            .alt_properties
+            .iter()
+            .collect::<Vec<(&String, &String)>>();
+        alt_properties.sort_by(|left, right| left.0.cmp(right.0));
+        format!(
+            "{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
+            path,
+            self.width,
+            self.height,
+            self.layout_height,
+            self.margins,
+            self.font_face,
+            self.font_path,
+            self.font_size,
+            self.view_mode,
+            self.visible_page_count,
+            self.header_height,
+            self.interline,
+            self.stylesheet,
+            self.embedded_stylesheet_enabled,
+            self.render_dpi,
+            self.scale_font_with_dpi,
+            properties,
+            alt_properties,
+        )
+    }
+
     fn open(&mut self, path: PathBuf) -> anyhow::Result<()> {
+        let snapshot = self.render_state_snapshot(path.clone());
+        if self.inner.is_some() && self.render_state_snapshot == snapshot {
+            return Ok(());
+        }
+        self.render_state_snapshot = snapshot;
         let options = DocumentOptions {
             width: self.width,
             height: self.height,
@@ -797,6 +835,32 @@ unsafe fn push_bool(l: *mut lua_State, value: bool) {
 unsafe fn push_int(l: *mut lua_State, value: i64) {
     // SAFETY: Lua takes the integer by value.
     unsafe { lua::lua_pushinteger(l, value) };
+}
+
+unsafe fn copy_page_bitmap_to_blit(bitmap: &cre_lib::PageBitmap, color: bool, bb: &BlitBuffer) {
+    let rows = bitmap.height.min(bb.h) as usize;
+    let cols = bitmap.width.min(bb.w) as usize;
+    let dst =
+        unsafe { std::slice::from_raw_parts_mut(bb.data, bb.stride.saturating_mul(bb.h as usize)) };
+    if color {
+        for y in 0..rows {
+            let src = &bitmap.data[y * bitmap.width as usize..];
+            let dst_row = &mut dst[y * bb.stride..];
+            for (x, &value) in src.iter().take(cols).enumerate() {
+                let offset = x * 4;
+                dst_row[offset] = value;
+                dst_row[offset + 1] = value;
+                dst_row[offset + 2] = value;
+                dst_row[offset + 3] = 0xFF;
+            }
+        }
+    } else {
+        for y in 0..rows {
+            let src = &bitmap.data[y * bitmap.width as usize..];
+            let dst_row = &mut dst[y * bb.stride..];
+            dst_row[..cols].copy_from_slice(&src[..cols]);
+        }
+    }
 }
 
 fn apply_text_highlight(
@@ -2036,46 +2100,28 @@ unsafe extern "C-unwind" fn doc_draw_current_page(l: *mut lua_State) -> c_int {
             let color = arg_bool(l, 3);
             let highlight = doc.highlight.clone();
             let current_page = inner.current_page();
-            let Ok((mut bitmap, image_count, image_surface)) =
+            let Ok((bitmap_arc, image_count, image_surface)) =
                 inner.render_current_page_with_stats()
             else {
                 return (0, 0.0);
             };
+            let total_pixels = bitmap_arc
+                .width
+                .saturating_mul(bitmap_arc.height)
+                .saturating_mul(1)
+                .max(1);
+            let stats = (image_count, image_surface as f64 / total_pixels as f64);
+            let bb = &*bb;
             if let Some((start, end)) = highlight
                 && let Ok(boxes) = inner.boxes_between_xpointers(&start, &end)
             {
+                let mut bitmap = bitmap_arc.as_ref().clone();
                 apply_text_highlight(&mut bitmap, &boxes, current_page);
-            }
-            let bb = &*bb;
-            let rows = bitmap.height.min(bb.h) as usize;
-            let cols = bitmap.width.min(bb.w) as usize;
-            let dst =
-                std::slice::from_raw_parts_mut(bb.data, bb.stride.saturating_mul(bb.h as usize));
-            if color {
-                for y in 0..rows {
-                    let src = &bitmap.data[y * bitmap.width as usize..];
-                    let dst_row = &mut dst[y * bb.stride..];
-                    for (x, &value) in src.iter().take(cols).enumerate() {
-                        let offset = x * 4;
-                        dst_row[offset] = value;
-                        dst_row[offset + 1] = value;
-                        dst_row[offset + 2] = value;
-                        dst_row[offset + 3] = 0xFF;
-                    }
-                }
+                copy_page_bitmap_to_blit(&bitmap, color, bb);
             } else {
-                for y in 0..rows {
-                    let src = &bitmap.data[y * bitmap.width as usize..];
-                    let dst_row = &mut dst[y * bb.stride..];
-                    dst_row[..cols].copy_from_slice(&src[..cols]);
-                }
+                copy_page_bitmap_to_blit(bitmap_arc.as_ref(), color, bb);
             }
-            let total_pixels = bitmap
-                .width
-                .saturating_mul(bitmap.height)
-                .saturating_mul(1)
-                .max(1);
-            (image_count, image_surface as f64 / total_pixels as f64)
+            stats
         }
     }));
     let (image_count, image_fraction) = image_stats.unwrap_or((0, 0.0));

@@ -70,17 +70,27 @@ impl Default for HtmlOptions {
     }
 }
 
-#[derive(Debug)]
+type LazyResourceZipArchive = zip::ZipArchive<std::fs::File>;
+
+fn open_zip_archive(path: PathBuf) -> Option<LazyResourceZipArchive> {
+    let file = std::fs::File::open(path).ok()?;
+    zip::ZipArchive::new(file).ok()
+}
+
 pub struct LazyResource {
     pub epub_path: Option<PathBuf>,
     cache: Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>,
+    zip_archive: Arc<Mutex<Option<LazyResourceZipArchive>>>,
 }
 
 impl LazyResource {
     pub fn new(path: impl AsRef<Path>) -> Self {
+        let path = PathBuf::from(path.as_ref());
+        let zip_archive = open_zip_archive(path.clone());
         LazyResource {
-            epub_path: Some(PathBuf::from(path.as_ref())),
+            epub_path: Some(path),
             cache: Arc::new(Mutex::new(HashMap::new())),
+            zip_archive: Arc::new(Mutex::new(zip_archive)),
         }
     }
 
@@ -92,6 +102,7 @@ impl LazyResource {
         LazyResource {
             epub_path: None,
             cache: Arc::new(Mutex::new(cached)),
+            zip_archive: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -115,9 +126,8 @@ impl LazyResource {
     }
 
     fn read_zip_entry(&self, key: &str) -> Option<Vec<u8>> {
-        let zip_path = self.epub_path.clone()?;
-        let data = std::fs::read(&zip_path).ok()?;
-        let mut archive = zip::ZipArchive::new(Cursor::new(data)).ok()?;
+        let mut maybe_archive = self.zip_archive.lock().unwrap();
+        let archive = maybe_archive.as_mut()?;
         let index = (match archive.index_for_name(key) {
             Some(index) => Some(index),
             None => {
