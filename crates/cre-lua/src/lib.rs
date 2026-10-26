@@ -12,6 +12,9 @@ use mlua::ffi as lua;
 use mlua::lua_State;
 use read_fonts::TableProvider;
 
+mod bridge_helpers;
+use bridge_helpers::*;
+
 const CREDOC: &[u8] = b"credocument\0";
 const CREIMAGE: &[u8] = b"creimage\0";
 const INDEX: &[u8] = b"__index\0";
@@ -861,58 +864,6 @@ unsafe fn copy_page_bitmap_to_blit(bitmap: &cre_lib::PageBitmap, color: bool, bb
             dst_row[..cols].copy_from_slice(&src[..cols]);
         }
     }
-}
-
-fn apply_text_highlight(
-    bitmap: &mut cre_lib::PageBitmap,
-    boxes: &[cre_lib::TextBox],
-    current_page: usize,
-) {
-    for text_box in boxes {
-        if text_box.page != current_page {
-            continue;
-        }
-        let left = text_box.x.floor().max(0.0) as u32;
-        let top = text_box.y.floor().max(0.0) as u32;
-        let right = (text_box.x + text_box.width).ceil().max(0.0) as u32;
-        let bottom = (text_box.y + text_box.height).ceil().max(0.0) as u32;
-        let right = right.min(bitmap.width);
-        let bottom = bottom.min(bitmap.height);
-        for y in top..bottom {
-            for x in left..right {
-                let index = (y * bitmap.width + x) as usize;
-                if let Some(pixel) = bitmap.data.get_mut(index) {
-                    *pixel = 255 - *pixel;
-                }
-            }
-        }
-    }
-}
-
-fn cfi_for_position(position: &cre_lib::TextPosition) -> String {
-    let mut path = String::new();
-    for segment in &position.path {
-        path.push('/');
-        path.push_str(&(segment.index.saturating_mul(2)).to_string());
-    }
-    format!(
-        "epubcfi(/6/{}!/4{}:{})",
-        position.spine_index.saturating_mul(2),
-        path,
-        position.codepoint_offset
-    )
-}
-
-fn cfi_range_for_positions(start: &cre_lib::TextPosition, end: &cre_lib::TextPosition) -> String {
-    let base = cfi_for_position(start);
-    let base = base
-        .strip_prefix("epubcfi(")
-        .and_then(|value| value.strip_suffix(')'))
-        .unwrap_or(base.as_str());
-    format!(
-        "epubcfi({},/1:{},/1:{})",
-        base, start.codepoint_offset, end.codepoint_offset
-    )
 }
 
 unsafe fn format_name(format: DocumentFormat) -> &'static str {
@@ -1932,17 +1883,6 @@ unsafe extern "C-unwind" fn doc_pos_from_xpointer(l: *mut lua_State) -> c_int {
     2
 }
 
-fn current_document_pos(inner: &Document) -> i64 {
-    let page = inner.current_page();
-    let page_y = inner.page_start_y(page);
-    if let Some(xpointer) = inner.xpointer_from_page(page).ok()
-        && let Some((_, y)) = inner.point_from_xpointer(&xpointer).ok().flatten()
-    {
-        return page_y + y.round() as i64;
-    }
-    page_y
-}
-
 unsafe extern "C-unwind" fn doc_current_pos(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
@@ -2590,99 +2530,6 @@ unsafe extern "C-unwind" fn doc_text_from_positions(l: *mut lua_State) -> c_int 
     1
 }
 
-fn expand_to_visible_word_start(inner: &Document, xpointer: &str) -> String {
-    let page = match inner.page_from_xpointer(xpointer).ok() {
-        None => return xpointer.to_string(),
-        Some(page) => page,
-    };
-    let (x, y) = match inner.point_from_xpointer(xpointer).ok().unwrap_or(None) {
-        None => return xpointer.to_string(),
-        Some((x, y)) => (x + 1.0, y),
-    };
-    let word = match inner
-        .word_at(cre_lib::PagePosition { page, x, y })
-        .ok()
-        .unwrap_or(None)
-    {
-        None => return xpointer.to_string(),
-        Some(word) => word,
-    };
-    word.xpointer_range.start.to_xpointer()
-}
-
-fn expand_to_visible_word_end(inner: &Document, xpointer: &str) -> String {
-    let page = match inner.page_from_xpointer(xpointer).ok() {
-        None => return xpointer.to_string(),
-        Some(page) => page,
-    };
-    let (x, y) = match inner.point_from_xpointer(xpointer).ok().unwrap_or(None) {
-        None => return xpointer.to_string(),
-        Some((x, y)) => (x - 1.0, y),
-    };
-    let word = match inner
-        .word_at(cre_lib::PagePosition { page, x, y })
-        .ok()
-        .unwrap_or(None)
-    {
-        None => return xpointer.to_string(),
-        Some(word) => word,
-    };
-    word.xpointer_range
-        .end
-        .as_ref()
-        .map(|position| position.to_xpointer())
-        .unwrap_or(xpointer.to_string())
-}
-
-fn window_rect_for_page_box(
-    doc: &Doc,
-    inner: &Document,
-    text_box: &cre_lib::TextBox,
-) -> Option<(f32, f32, f32, f32)> {
-    if !text_box.x.is_finite()
-        || !text_box.y.is_finite()
-        || !text_box.width.is_finite()
-        || !text_box.height.is_finite()
-    {
-        return None;
-    }
-    if text_box.width <= 0.0 || text_box.height <= 0.0 {
-        return None;
-    }
-
-    if doc.view_mode == 1 {
-        let current = inner.current_page();
-        let visible_count = doc.visible_page_count.max(1) as usize;
-        if text_box.page < current || text_box.page >= current + visible_count {
-            return None;
-        }
-        let x_offset = if text_box.page == current {
-            0.0
-        } else {
-            inner.page_width() as f32
-        };
-        Some((
-            text_box.x + x_offset,
-            text_box.y,
-            text_box.x + text_box.width + x_offset,
-            text_box.y + text_box.height,
-        ))
-    } else {
-        let page_top = inner.page_start_y_or_invalid(text_box.page);
-        if page_top < 0 {
-            return None;
-        }
-        let current_pos = current_document_pos(inner);
-        let y0 = page_top as f32 + text_box.y - current_pos as f32;
-        let y1 = y0 + text_box.height;
-        let view_height = doc.height.max(1) as f32;
-        if y1 <= 0.0 || y0 >= view_height {
-            return None;
-        }
-        Some((text_box.x, y0, text_box.x + text_box.width, y1))
-    }
-}
-
 unsafe extern "C-unwind" fn doc_word_boxes_from_positions(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
@@ -2712,7 +2559,13 @@ unsafe extern "C-unwind" fn doc_word_boxes_from_positions(l: *mut lua_State) -> 
             lua::lua_newtable(l);
             let mut cached_index = 0;
             for text_box in cached_boxes.iter() {
-                if let Some((x0, y0, x1, y1)) = window_rect_for_page_box(doc, inner, text_box) {
+                if let Some((x0, y0, x1, y1)) = window_rect_for_page_box(
+                    doc.view_mode,
+                    doc.visible_page_count,
+                    doc.height,
+                    inner,
+                    text_box,
+                ) {
                     cached_index += 1;
                     lua::lua_createtable(l, 0, 4);
                     for (key, value) in [("x0", x0), ("y0", y0), ("x1", x1), ("y1", y1)] {
@@ -2741,7 +2594,13 @@ unsafe extern "C-unwind" fn doc_word_boxes_from_positions(l: *mut lua_State) -> 
         lua::lua_newtable(l);
         let mut index = 0;
         for text_box in raw_boxes.iter() {
-            if let Some((x0, y0, x1, y1)) = window_rect_for_page_box(doc, inner, text_box) {
+            if let Some((x0, y0, x1, y1)) = window_rect_for_page_box(
+                doc.view_mode,
+                doc.visible_page_count,
+                doc.height,
+                inner,
+                text_box,
+            ) {
                 index += 1;
                 lua::lua_createtable(l, 0, 4);
                 for (key, value) in [("x0", x0), ("y0", y0), ("x1", x1), ("y1", y1)] {
