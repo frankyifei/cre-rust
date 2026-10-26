@@ -2634,57 +2634,105 @@ fn expand_to_visible_word_end(inner: &Document, xpointer: &str) -> String {
         .unwrap_or(xpointer.to_string())
 }
 
+fn window_rect_for_page_box(
+    doc: &Doc,
+    inner: &Document,
+    text_box: &cre_lib::TextBox,
+) -> Option<(f32, f32, f32, f32)> {
+    if !text_box.x.is_finite()
+        || !text_box.y.is_finite()
+        || !text_box.width.is_finite()
+        || !text_box.height.is_finite()
+    {
+        return None;
+    }
+    if text_box.width <= 0.0 || text_box.height <= 0.0 {
+        return None;
+    }
+
+    if doc.view_mode == 1 {
+        let current = inner.current_page();
+        let visible_count = doc.visible_page_count.max(1) as usize;
+        if text_box.page < current || text_box.page >= current + visible_count {
+            return None;
+        }
+        let x_offset = if text_box.page == current {
+            0.0
+        } else {
+            inner.page_width() as f32
+        };
+        Some((
+            text_box.x + x_offset,
+            text_box.y,
+            text_box.x + text_box.width + x_offset,
+            text_box.y + text_box.height,
+        ))
+    } else {
+        let page_top = inner.page_start_y_or_invalid(text_box.page);
+        if page_top < 0 {
+            return None;
+        }
+        let current_pos = current_document_pos(inner);
+        let y0 = page_top as f32 + text_box.y - current_pos as f32;
+        let y1 = y0 + text_box.height;
+        let view_height = doc.height.max(1) as f32;
+        if y1 <= 0.0 || y0 >= view_height {
+            return None;
+        }
+        Some((text_box.x, y0, text_box.x + text_box.width, y1))
+    }
+}
+
 unsafe extern "C-unwind" fn doc_word_boxes_from_positions(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
         let Some(start) = arg_str(l, 2) else {
-            return 0;
+            lua::lua_newtable(l);
+            return 1;
         };
         let Some(end) = arg_str(l, 3) else {
-            return 0;
+            lua::lua_newtable(l);
+            return 1;
         };
         let get_segments = lua::lua_isboolean(l, 4) != 0 && arg_bool(l, 4);
-        let include_images = lua::lua_isboolean(l, 5) != 0 && arg_bool(l, 5);
-        let _ = include_images;
-        let boxes = doc_ref(l).and_then(|doc| {
-            let inner = doc.inner.as_ref()?;
-            let use_start = if get_segments {
-                start.clone()
-            } else {
-                expand_to_visible_word_start(inner, &start)
-            };
-            let use_end = if get_segments {
-                end.clone()
-            } else {
-                expand_to_visible_word_end(inner, &end)
-            };
-            inner.boxes_between_xpointers(&use_start, &use_end).ok()
-        });
-        let Some(boxes) = boxes else {
+        let _include_images = lua::lua_isboolean(l, 5) != 0 && arg_bool(l, 5);
+        let Some(doc) = doc_ref(l) else {
+            lua::lua_newtable(l);
+            return 1;
+        };
+        let Some(inner) = doc.inner.as_ref() else {
+            lua::lua_newtable(l);
+            return 1;
+        };
+        let use_start = if get_segments {
+            start.clone()
+        } else {
+            expand_to_visible_word_start(inner, &start)
+        };
+        let use_end = if get_segments {
+            end.clone()
+        } else {
+            expand_to_visible_word_end(inner, &end)
+        };
+        let Some(raw_boxes) = inner.boxes_between_xpointers(&use_start, &use_end).ok() else {
             return 0;
         };
-        if boxes.is_empty() {
-            return 0;
-        }
-
-        lua::lua_createtable(l, boxes.len() as c_int, 0);
-        for (index, text_box) in boxes.iter().enumerate() {
-            lua::lua_createtable(l, 0, 4);
-            for (key, value) in [
-                ("x0", text_box.x),
-                ("y0", text_box.y),
-                ("x1", text_box.x + text_box.width),
-                ("y1", text_box.y + text_box.height),
-            ] {
-                push_str(l, key);
-                push_int(l, value.round() as i64);
-                lua::lua_rawset(l, -3);
+        lua::lua_newtable(l);
+        let mut index = 0;
+        for text_box in raw_boxes.iter() {
+            if let Some((x0, y0, x1, y1)) = window_rect_for_page_box(doc, inner, text_box) {
+                index += 1;
+                lua::lua_createtable(l, 0, 4);
+                for (key, value) in [("x0", x0), ("y0", y0), ("x1", x1), ("y1", y1)] {
+                    push_str(l, key);
+                    push_int(l, value.round() as i64);
+                    lua::lua_rawset(l, -3);
+                }
+                lua::lua_rawseti_(l, -2, index as c_int);
             }
-            lua::lua_rawseti_(l, -2, (index + 1) as c_int);
         }
-        push_int(l, boxes.len() as i64);
     }
-    2
+    1
 }
 
 unsafe extern "C-unwind" fn doc_text_from_xpointers(l: *mut lua_State) -> c_int {

@@ -819,7 +819,7 @@ impl Document {
         };
         let chunk_index = snapshot.chunk;
         let start = snapshot.local_start;
-        let clip_top = start.clip_top - start.top;
+        let clip_top = 0.0;
         let clip_bottom = snapshot.local_clip_bottom - start.top;
 
         if let Some(cached) = self.cached_page_image(page) {
