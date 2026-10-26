@@ -713,15 +713,6 @@ impl Document {
             .unwrap_or(i64::from(self.height))
     }
 
-    pub fn page_render_clip_top_offset(&self, page: usize) -> f32 {
-        let index = page.saturating_sub(1);
-        let Some(snapshot) = self.pages.get(index) else {
-            return 0.0;
-        };
-        let start = snapshot.local_start;
-        (start.clip_top - start.top).max(0.0)
-    }
-
     pub fn current_pos(&self) -> i64 {
         self.page_start_y(self.current_page)
     }
