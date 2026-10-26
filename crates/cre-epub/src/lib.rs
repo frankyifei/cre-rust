@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use percent_encoding::percent_decode_str;
@@ -69,6 +70,82 @@ impl Default for HtmlOptions {
     }
 }
 
+#[derive(Debug)]
+pub struct LazyResource {
+    pub epub_path: Option<PathBuf>,
+    cache: Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>,
+}
+
+impl LazyResource {
+    pub fn new(path: impl AsRef<Path>) -> Self {
+        LazyResource {
+            epub_path: Some(PathBuf::from(path.as_ref())),
+            cache: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn from_map(resources: HashMap<String, Vec<u8>>) -> Self {
+        let mut cached: HashMap<String, Arc<Vec<u8>>> = HashMap::new();
+        for (key, value) in resources.into_iter() {
+            cached.insert(normalize_path(&key), Arc::new(value));
+        }
+        LazyResource {
+            epub_path: None,
+            cache: Arc::new(Mutex::new(cached)),
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<Arc<Vec<u8>>> {
+        let key = normalize_path(key);
+        let cached = self.cache.lock().unwrap().get(&key).cloned();
+        if let Some(hit) = cached {
+            return Some(hit);
+        }
+        let bytes = self.read_zip_entry(&key)?;
+        let shared = Arc::new(bytes);
+        self.cache.lock().unwrap().insert(key, shared.clone());
+        Some(shared)
+    }
+
+    pub fn put(&self, key: &str, value: Arc<Vec<u8>>) {
+        self.cache
+            .lock()
+            .unwrap()
+            .insert(normalize_path(key), value);
+    }
+
+    fn read_zip_entry(&self, key: &str) -> Option<Vec<u8>> {
+        let zip_path = self.epub_path.clone()?;
+        let data = std::fs::read(&zip_path).ok()?;
+        let mut archive = zip::ZipArchive::new(Cursor::new(data)).ok()?;
+        let index = (match archive.index_for_name(key) {
+            Some(index) => Some(index),
+            None => {
+                let mut found: Option<usize> = None;
+                for i in 0..archive.len() {
+                    let Some(name) = archive.name_for_index(i) else {
+                        continue;
+                    };
+                    if normalize_path(name) == key {
+                        found = Some(i);
+                        break;
+                    }
+                }
+                found
+            }
+        })?;
+        let mut entry = archive.by_index(index).ok()?;
+        if entry.is_dir() {
+            return None;
+        }
+        let mut bytes = Vec::with_capacity(entry.size() as usize);
+        if std::io::copy(&mut entry, &mut bytes).is_err() {
+            return None;
+        }
+        Some(bytes)
+    }
+}
+
 pub struct EpubBook {
     pub title: Option<String>,
     pub creator: Option<String>,
@@ -84,14 +161,16 @@ pub struct EpubBook {
     pub toc: Vec<TocItem>,
     pub page_map_source: String,
     pub page_map: Vec<PageMapItem>,
-    pub resources: HashMap<String, Vec<u8>>,
+    pub resource_provider: LazyResource,
 }
 
 impl EpubBook {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let data = std::fs::read(path.as_ref())
-            .with_context(|| format!("read epub {}", path.as_ref().display()))?;
-        Self::from_bytes(data)
+        let path_ref = path.as_ref();
+        let data =
+            std::fs::read(path_ref).with_context(|| format!("read epub {}", path_ref.display()))?;
+        zip::ZipArchive::new(Cursor::new(data)).context("open epub zip")?;
+        Self::from_provider(LazyResource::new(path_ref))
     }
 
     pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
@@ -109,14 +188,18 @@ impl EpubBook {
             resources.insert(name, bytes);
         }
 
-        let container = resources
+        Self::from_provider(LazyResource::from_map(resources))
+    }
+
+    fn from_provider(provider: LazyResource) -> Result<Self> {
+        let container = provider
             .get(CONTAINER_PATH)
             .context("epub has no META-INF/container.xml")?;
-        let opf_path = parse_container(container)?;
-        let opf = resources
+        let opf_path = parse_container(&container)?;
+        let opf = provider
             .get(&opf_path)
             .with_context(|| format!("epub package document missing: {opf_path}"))?;
-        let opf_text = decode_text(opf);
+        let opf_text = decode_text(&opf);
         let opf_dir = parent_dir(&opf_path).to_string();
 
         let package = roxmltree::Document::parse(&opf_text).context("parse epub package")?;
@@ -180,9 +263,9 @@ impl EpubBook {
             bail!("epub spine is empty");
         }
 
-        let toc = parse_toc(opf, spine_node, &manifest, &opf_dir, &resources);
+        let toc = parse_toc(&opf, spine_node, &manifest, &opf_dir, &provider);
         let (page_map_source, page_map) =
-            parse_page_map(spine_node, &manifest, &opf_dir, &resources);
+            parse_page_map(spine_node, &manifest, &opf_dir, &provider);
 
         Ok(Self {
             title,
@@ -199,14 +282,13 @@ impl EpubBook {
             toc,
             page_map_source,
             page_map,
-            resources,
+            resource_provider: provider,
         })
     }
 
-    pub fn resource(&self, path: &str) -> Option<&[u8]> {
-        self.resources
-            .get(&normalize_path(path))
-            .map(|v| v.as_slice())
+    pub fn resource(&self, path: &str) -> Option<Vec<u8>> {
+        let shared = self.resource_provider.get(path)?;
+        Some((*shared).clone())
     }
 
     pub fn resource_url(&self, path: &str) -> String {
@@ -215,7 +297,7 @@ impl EpubBook {
 
     pub fn normalize_inline_svg_images(&mut self) -> usize {
         let spine = self.spine.clone();
-        let mut updates: Vec<(String, String, HashMap<String, Vec<u8>>)> = Vec::new();
+        let mut updates = Vec::new();
         let mut generated_counter = 0usize;
 
         for item in spine.iter().filter(|item| item.linear) {
@@ -223,7 +305,7 @@ impl EpubBook {
                 continue;
             }
             let doc_key = normalize_path(&item.href);
-            let Some(doc_bytes) = self.resources.get(&doc_key).cloned() else {
+            let Some(doc_bytes) = self.resource_provider.get(&doc_key) else {
                 continue;
             };
             let text = decode_text(&doc_bytes);
@@ -235,7 +317,7 @@ impl EpubBook {
             let normalized = rewrite_inline_svg_image_blocks(
                 &text,
                 parent_dir(&doc_key),
-                &self.resources,
+                &self.resource_provider,
                 &mut generated,
                 &mut generated_counter,
             );
@@ -247,10 +329,11 @@ impl EpubBook {
         let mut changed = 0usize;
         for (doc_key, normalized, generated) in updates {
             for (key, value) in generated {
-                self.resources.insert(key, value);
+                self.resource_provider.put(&key, value);
                 changed += 1;
             }
-            self.resources.insert(doc_key, normalized.into_bytes());
+            self.resource_provider
+                .put(&doc_key, Arc::new(normalized.into_bytes()));
         }
         changed
     }
@@ -269,7 +352,7 @@ impl EpubBook {
         }
 
         let spine = self.spine.clone();
-        let mut updates: Vec<(String, String, HashMap<String, Vec<u8>>)> = Vec::new();
+        let mut updates = Vec::new();
         let mut generated_counter = 0usize;
 
         for item in spine.iter().filter(|item| item.linear) {
@@ -277,7 +360,7 @@ impl EpubBook {
                 continue;
             }
             let doc_key = normalize_path(&item.href);
-            let Some(doc_bytes) = self.resources.get(&doc_key).cloned() else {
+            let Some(doc_bytes) = self.resource_provider.get(&doc_key) else {
                 continue;
             };
             let text = decode_text(&doc_bytes);
@@ -289,7 +372,7 @@ impl EpubBook {
             let normalized = rewrite_full_page_image_tags(
                 &text,
                 parent_dir(&doc_key),
-                &self.resources,
+                &self.resource_provider,
                 &mut generated,
                 &mut generated_counter,
                 available_width,
@@ -303,10 +386,11 @@ impl EpubBook {
         let mut changed = 0usize;
         for (doc_key, normalized, generated) in updates {
             for (key, value) in generated {
-                self.resources.insert(key, value);
+                self.resource_provider.put(&key, value);
                 changed += 1;
             }
-            self.resources.insert(doc_key, normalized.into_bytes());
+            self.resource_provider
+                .put(&doc_key, Arc::new(normalized.into_bytes()));
         }
         changed
     }
@@ -320,9 +404,10 @@ impl EpubBook {
                 continue;
             }
             let bytes = self
-                .resource(&item.href)
+                .resource_provider
+                .get(&item.href)
                 .with_context(|| format!("spine document missing: {}", item.href))?;
-            let text = decode_text(bytes);
+            let text = decode_text(&bytes);
             let body_opt = extract_body(&text);
             if body_opt.is_none() && nonlinear {
                 continue;
@@ -786,8 +871,8 @@ fn file_extension(path: &str) -> String {
 fn rewrite_inline_svg_image_blocks(
     html: &str,
     doc_dir: &str,
-    resources: &HashMap<String, Vec<u8>>,
-    generated: &mut HashMap<String, Vec<u8>>,
+    provider: &LazyResource,
+    generated: &mut HashMap<String, Arc<Vec<u8>>>,
     generated_counter: &mut usize,
 ) -> String {
     let lower = html.to_ascii_lowercase();
@@ -813,7 +898,7 @@ fn rewrite_inline_svg_image_blocks(
             open_start,
             close_start,
             doc_dir,
-            resources,
+            provider,
             generated,
             generated_counter,
         ) {
@@ -832,8 +917,8 @@ fn replace_image_only_svg_block(
     open_start: usize,
     close_start: usize,
     doc_dir: &str,
-    resources: &HashMap<String, Vec<u8>>,
-    generated: &mut HashMap<String, Vec<u8>>,
+    provider: &LazyResource,
+    generated: &mut HashMap<String, Arc<Vec<u8>>>,
     generated_counter: &mut usize,
 ) -> Option<String> {
     let lower = html.to_ascii_lowercase();
@@ -872,8 +957,8 @@ fn replace_image_only_svg_block(
     }
 
     let image_key = resolve_href(doc_dir, &value_without_fragment(href));
-    let image_bytes = resources.get(&image_key)?;
-    let image_mime = image_mime(image_bytes, &image_key);
+    let image_bytes = provider.get(&image_key)?;
+    let image_mime = image_mime(&image_bytes, &image_key);
 
     let view_size = svg_attrs
         .get("viewbox")
@@ -884,8 +969,8 @@ fn replace_image_only_svg_block(
 
     *generated_counter += 1;
     let generated_key = normalize_path(&generated_svg_key(doc_dir, *generated_counter));
-    let svg = generated_svg_document(view_size, image_size, image_mime, image_bytes);
-    generated.insert(generated_key.clone(), svg.into_bytes());
+    let svg = generated_svg_document(view_size, image_size, image_mime, &image_bytes);
+    generated.insert(generated_key.clone(), Arc::new(svg.into_bytes()));
 
     Some(generated_image_tag(&generated_key, &svg_attrs))
 }
@@ -1068,8 +1153,8 @@ fn generated_image_tag(generated_key: &str, svg_attrs: &HashMap<String, String>)
 fn rewrite_full_page_image_tags(
     html: &str,
     doc_dir: &str,
-    resources: &HashMap<String, Vec<u8>>,
-    generated: &mut HashMap<String, Vec<u8>>,
+    provider: &LazyResource,
+    generated: &mut HashMap<String, Arc<Vec<u8>>>,
     generated_counter: &mut usize,
     available_width: f32,
     available_height: f32,
@@ -1088,7 +1173,7 @@ fn rewrite_full_page_image_tags(
         if let Some(replacement) = full_page_image_replacement(
             &html[open_start..close_end],
             doc_dir,
-            resources,
+            provider,
             generated,
             generated_counter,
             available_width,
@@ -1108,8 +1193,8 @@ fn rewrite_full_page_image_tags(
 fn full_page_image_replacement(
     tag: &str,
     doc_dir: &str,
-    resources: &HashMap<String, Vec<u8>>,
-    generated: &mut HashMap<String, Vec<u8>>,
+    provider: &LazyResource,
+    generated: &mut HashMap<String, Arc<Vec<u8>>>,
     generated_counter: &mut usize,
     available_width: f32,
     available_height: f32,
@@ -1128,8 +1213,8 @@ fn full_page_image_replacement(
     }
 
     let image_key = resolve_href(doc_dir, src);
-    let image_bytes = resources.get(&image_key)?;
-    let image_mime = image_mime(image_bytes, &image_key);
+    let image_bytes = provider.get(&image_key)?;
+    let image_mime = image_mime(&image_bytes, &image_key);
     if image_mime == "image/svg+xml" {
         return None;
     }
@@ -1137,8 +1222,8 @@ fn full_page_image_replacement(
     *generated_counter += 1;
     let generated_key = generated_full_page_image_key(*generated_counter);
     let svg =
-        full_page_image_svg_document(available_width, available_height, image_mime, image_bytes);
-    generated.insert(generated_key.clone(), svg.into_bytes());
+        full_page_image_svg_document(available_width, available_height, image_mime, &image_bytes);
+    generated.insert(generated_key.clone(), Arc::new(svg.into_bytes()));
 
     Some(full_page_image_tag(&generated_key, &attrs))
 }
@@ -1359,7 +1444,7 @@ fn parse_toc(
     spine_node: roxmltree::Node<'_, '_>,
     manifest: &[ManifestItem],
     opf_dir: &str,
-    resources: &HashMap<String, Vec<u8>>,
+    provider: &LazyResource,
 ) -> Vec<TocItem> {
     let _ = ncx_bytes_hint;
     let _ = opf_dir;
@@ -1367,9 +1452,9 @@ fn parse_toc(
 
     if let Some(toc_id) = spine_node.attribute("toc")
         && let Some(item) = manifest.iter().find(|item| item.id == toc_id)
-        && let Some(bytes) = resources.get(&item.href)
+        && let Some(bytes) = provider.get(&item.href)
     {
-        parse_ncx(bytes, parent_dir(&item.href), &mut out);
+        parse_ncx(&bytes, parent_dir(&item.href), &mut out);
     }
 
     if out.is_empty() {
@@ -1377,9 +1462,9 @@ fn parse_toc(
             .iter()
             .find(|item| item.properties.split_whitespace().any(|prop| prop == "nav"));
         if let Some(item) = nav_item
-            && let Some(bytes) = resources.get(&item.href)
+            && let Some(bytes) = provider.get(&item.href)
         {
-            parse_epub3_nav(bytes, parent_dir(&item.href), &mut out);
+            parse_epub3_nav(&bytes, parent_dir(&item.href), &mut out);
         }
     }
 
@@ -1491,17 +1576,17 @@ fn parse_page_map(
     spine_node: roxmltree::Node<'_, '_>,
     manifest: &[ManifestItem],
     opf_dir: &str,
-    resources: &HashMap<String, Vec<u8>>,
+    provider: &LazyResource,
 ) -> (String, Vec<PageMapItem>) {
     let _ = opf_dir;
     if let Some(item) = manifest.iter().find(|item| {
         item.properties
             .split_whitespace()
             .any(|property| property == "page-list")
-    }) && let Some(bytes) = resources.get(&item.href)
+    }) && let Some(bytes) = provider.get(&item.href)
     {
         let mut out = Vec::new();
-        parse_epub3_page_list(bytes, parent_dir(&item.href), &mut out);
+        parse_epub3_page_list(&bytes, parent_dir(&item.href), &mut out);
         if !out.is_empty() {
             return ("page-list".to_string(), out);
         }
@@ -1509,10 +1594,10 @@ fn parse_page_map(
 
     if let Some(toc_id) = spine_node.attribute("toc")
         && let Some(item) = manifest.iter().find(|item| item.id == toc_id)
-        && let Some(bytes) = resources.get(&item.href)
+        && let Some(bytes) = provider.get(&item.href)
     {
         let mut out = Vec::new();
-        parse_ncx_page_map(bytes, parent_dir(&item.href), &mut out);
+        parse_ncx_page_map(&bytes, parent_dir(&item.href), &mut out);
         if !out.is_empty() {
             return ("ncx".to_string(), out);
         }
@@ -1522,9 +1607,9 @@ fn parse_page_map(
         .iter()
         .filter(|item| item.media_type == "application/x-dtbncx+xml")
     {
-        if let Some(bytes) = resources.get(&item.href) {
+        if let Some(bytes) = provider.get(&item.href) {
             let mut out = Vec::new();
-            parse_ncx_page_map(bytes, parent_dir(&item.href), &mut out);
+            parse_ncx_page_map(&bytes, parent_dir(&item.href), &mut out);
             if !out.is_empty() {
                 return ("ncx".to_string(), out);
             }
@@ -1808,7 +1893,7 @@ mod tests {
         assert_eq!(book.normalize_inline_svg_images(), 1);
 
         let generated_key = "cre-inline-svg-1.svg";
-        let generated_svg = String::from_utf8(book.resources[generated_key].clone()).unwrap();
+        let generated_svg = String::from_utf8(book.resource(generated_key).unwrap()).unwrap();
         assert!(generated_svg.contains("viewBox=\"0 0 100 200\""));
         assert!(generated_svg.contains("xlink:href=\"data:image/jpeg;base64,"));
 
@@ -1821,7 +1906,7 @@ mod tests {
     fn ignores_complex_inline_svg_blocks() {
         let mut book = EpubBook::from_bytes(synthetic_complex_inline_svg_epub()).unwrap();
         assert_eq!(book.normalize_inline_svg_images(), 0);
-        assert!(!book.resources.contains_key("cre-inline-svg-1.svg"));
+        assert!(book.resource("cre-inline-svg-1.svg").is_none());
     }
 
     #[test]
@@ -1830,7 +1915,7 @@ mod tests {
         assert_eq!(book.normalize_full_page_images(600.0, 800.0, 40.0, 32.0), 1);
 
         let generated_key = "cre-page-fit-1.svg";
-        let generated_svg = String::from_utf8(book.resources[generated_key].clone()).unwrap();
+        let generated_svg = String::from_utf8(book.resource(generated_key).unwrap()).unwrap();
         assert!(generated_svg.contains("viewBox=\"0 0 520 736\""));
         assert!(generated_svg.contains("preserveAspectRatio=\"xMidYMid meet\""));
         assert!(generated_svg.contains("xlink:href=\"data:image/jpeg;base64,"));
@@ -1845,7 +1930,7 @@ mod tests {
     fn leaves_inline_images_without_full_height_style_unchanged() {
         let mut book = EpubBook::from_bytes(synthetic_normal_image_epub()).unwrap();
         assert_eq!(book.normalize_full_page_images(600.0, 800.0, 40.0, 32.0), 0);
-        assert!(!book.resources.contains_key("cre-page-fit-1.svg"));
+        assert!(book.resource("cre-page-fit-1.svg").is_none());
     }
 
     #[test]

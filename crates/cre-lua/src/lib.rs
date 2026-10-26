@@ -70,6 +70,8 @@ struct Doc {
     highlight: Option<(String, String)>,
     callback: Option<c_int>,
     render_requested: bool,
+    font_data_cache: Vec<Vec<u8>>,
+    font_cache_paths: Vec<PathBuf>,
 }
 
 impl Doc {
@@ -110,6 +112,8 @@ impl Doc {
             highlight: None,
             callback: None,
             render_requested: false,
+            font_data_cache: Vec::new(),
+            font_cache_paths: Vec::new(),
         }
     }
 
@@ -156,7 +160,13 @@ impl Doc {
             embedded_styles_enabled: self.embedded_stylesheet_enabled,
             viewport_scale: self.render_viewport_scale(),
         };
-        let mut opened = Document::with_options(&path, &options)?;
+        let font_paths = cre_lib::resolve_font_paths(&options)?;
+        if self.font_cache_paths != font_paths {
+            self.font_data_cache = cre_lib::load_font_datas(&font_paths);
+            self.font_cache_paths = font_paths.clone();
+        }
+        let mut opened =
+            Document::with_options_with_font_data(&path, &options, &self.font_data_cache)?;
         opened.set_background_color(self.background_color_value);
         self.inner = Some(opened);
         self.path = Some(path);

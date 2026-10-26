@@ -10,7 +10,8 @@ use blitz_html::HtmlDocument;
 use blitz_traits::net::{Bytes, NetHandler, NetProvider, Request};
 use blitz_traits::shell::{ColorScheme, Viewport};
 use cre_epub::{
-    EpubBook, HtmlOptions, PageMapItem as RawPageMapItem, TocItem as RawTocItem, normalize_path,
+    EpubBook, HtmlOptions, LazyResource, PageMapItem as RawPageMapItem, TocItem as RawTocItem,
+    normalize_path,
 };
 use cre_fb2::{Fb2Book, Fb2HtmlOptions};
 use cre_paint::render_page as paint_page;
@@ -238,6 +239,12 @@ struct SnapshotLine {
     global_line: usize,
 }
 
+pub enum ResourceSource {
+    Empty,
+    Fb2(Arc<HashMap<String, Vec<u8>>>),
+    Epub(Arc<LazyResource>),
+}
+
 pub struct Document {
     metadata: DocumentMetadata,
     width: u32,
@@ -250,7 +257,7 @@ pub struct Document {
     embedded_styles_enabled: bool,
     sources: Vec<String>,
     base_url: String,
-    resources: Arc<HashMap<String, Vec<u8>>>,
+    resources: ResourceSource,
     cover_image: Option<Vec<u8>>,
     has_non_linear_flows: bool,
     net: Arc<dyn NetProvider>,
@@ -274,6 +281,15 @@ impl Document {
     }
 
     pub fn with_options(path: impl AsRef<Path>, options: &DocumentOptions) -> Result<Self> {
+        let font_datas = collect_font_datas(options)?;
+        Self::with_options_with_font_data(path, options, &font_datas)
+    }
+
+    pub fn with_options_with_font_data(
+        path: impl AsRef<Path>,
+        options: &DocumentOptions,
+        font_datas: &[Vec<u8>],
+    ) -> Result<Self> {
         validate_options(options)?;
         let path = path.as_ref();
         let format = detect_format(path);
@@ -308,14 +324,14 @@ impl Document {
                 let htmls = book.to_html_chunks(&html_options, CHUNK_TARGET_BYTES)?;
                 let cover_image = epub_cover_image(&book);
                 let has_non_linear_flows = book.spine.iter().any(|item| !item.linear);
-                let resources = Arc::new(book.resources);
+                let resource_provider = Arc::new(book.resource_provider);
                 Self::build(
                     htmls,
                     "epub://book/",
                     Arc::new(EpubNet {
-                        resources: resources.clone(),
+                        resource_provider: resource_provider.clone(),
                     }),
-                    resources,
+                    ResourceSource::Epub(resource_provider),
                     cover_image,
                     has_non_linear_flows,
                     metadata,
@@ -323,6 +339,7 @@ impl Document {
                     raw_page_map_source,
                     raw_page_map,
                     options,
+                    font_datas,
                 )
             }
             DocumentFormat::Fb2 => {
@@ -352,14 +369,14 @@ impl Document {
                     })
                     .collect();
                 let cover_image = book.binary.values().next().cloned();
-                let resources = Arc::new(book.binary);
+                let binary = Arc::new(book.binary);
                 Self::build(
                     vec![html],
                     "fb2://book/",
                     Arc::new(Fb2Net {
-                        resources: resources.clone(),
+                        resources: binary.clone(),
                     }),
-                    resources,
+                    ResourceSource::Fb2(binary),
                     cover_image,
                     false,
                     metadata,
@@ -367,6 +384,7 @@ impl Document {
                     String::new(),
                     Vec::new(),
                     options,
+                    font_datas,
                 )
             }
             DocumentFormat::Txt => {
@@ -391,7 +409,7 @@ impl Document {
                     vec![html],
                     "text://book/",
                     Arc::new(EmptyNet),
-                    Arc::new(HashMap::new()),
+                    ResourceSource::Empty,
                     None,
                     false,
                     metadata,
@@ -399,6 +417,7 @@ impl Document {
                     String::new(),
                     Vec::new(),
                     options,
+                    font_datas,
                 )
             }
         }
@@ -409,7 +428,7 @@ impl Document {
         htmls: Vec<String>,
         base_url: &str,
         net: Arc<dyn NetProvider>,
-        resources: Arc<HashMap<String, Vec<u8>>>,
+        resources: ResourceSource,
         cover_image: Option<Vec<u8>>,
         has_non_linear_flows: bool,
         metadata: DocumentMetadata,
@@ -417,9 +436,8 @@ impl Document {
         page_map_source: String,
         page_map_items: Vec<RawPageMapItem>,
         options: &DocumentOptions,
+        font_datas: &[Vec<u8>],
     ) -> Result<Self> {
-        let font_datas = collect_font_datas(options)?;
-
         let mut chunks = Vec::with_capacity(htmls.len());
         let mut pages = Vec::new();
         let mut page_xpointers = Vec::new();
@@ -431,7 +449,7 @@ impl Document {
         let mut running_doc_top = 0.0;
 
         for (chunk_index, html) in htmls.iter().enumerate() {
-            let doc = create_document(html, base_url, net.clone(), &font_datas, options);
+            let doc = create_document(html, base_url, net.clone(), font_datas, options);
             let root = doc.root_element();
             let lines = collect_lines(root);
             let mut line_indices: HashMap<NodeId, Vec<usize>> = HashMap::new();
@@ -577,7 +595,7 @@ impl Document {
             cover_image,
             has_non_linear_flows: has_non_linear_flows || max_flow > 0,
             net,
-            font_datas,
+            font_datas: font_datas.to_vec(),
             chunks,
             pages,
             xpointer_pages,
@@ -707,7 +725,7 @@ impl Document {
     pub fn resource(&self, path: &str) -> Option<Vec<u8>> {
         let (key, _) = href_key(path);
         let key = key.strip_prefix("binary/").unwrap_or(&key);
-        self.resources.get(key).cloned()
+        lookup_resource(&self.resources, key)
     }
 
     pub fn image_data_at(&self, position: PagePosition) -> Result<Option<Vec<u8>>> {
@@ -2543,6 +2561,17 @@ fn common_ancestor(root: &Node, left: NodeId, right: NodeId) -> Option<NodeId> {
     None
 }
 
+fn lookup_resource(resources: &ResourceSource, key: &str) -> Option<Vec<u8>> {
+    match resources {
+        ResourceSource::Empty => None,
+        ResourceSource::Fb2(map) => map.get(key).cloned(),
+        ResourceSource::Epub(provider) => {
+            let data = provider.get(key)?;
+            Some((*data).clone())
+        }
+    }
+}
+
 fn find_image_data_at(
     doc: &HtmlDocument,
     node: &Node,
@@ -2550,7 +2579,7 @@ fn find_image_data_at(
     x: f32,
     y: f32,
     base_url: &str,
-    resources: &HashMap<String, Vec<u8>>,
+    resources: &ResourceSource,
 ) -> Option<Vec<u8>> {
     if node
         .element_data()
@@ -2573,8 +2602,8 @@ fn find_image_data_at(
             };
             let (key, _) = href_key(&resolved);
             let key = key.strip_prefix("binary/").unwrap_or(&key);
-            if let Some(data) = resources.get(key) {
-                return Some(data.clone());
+            if let Some(data) = lookup_resource(resources, key) {
+                return Some(data);
             }
         }
     }
@@ -2609,7 +2638,7 @@ fn epub_cover_image(book: &EpubBook) -> Option<Vec<u8>> {
             })
         })?;
     let key = normalize_path(&item.href);
-    book.resources.get(&key).cloned()
+    book.resource(&key)
 }
 
 /// Rasterizes an SVG document into premultiplied RGBA bytes on a white background.
@@ -2667,17 +2696,41 @@ fn split_toc_href(href: &str) -> (&str, Option<&str>) {
     }
 }
 
-fn collect_font_datas(options: &DocumentOptions) -> Result<Vec<Vec<u8>>> {
-    let font_path = resolve_font_path(options)?;
-    let main_font =
-        std::fs::read(&font_path).with_context(|| format!("read font {}", font_path.display()))?;
-    let mut out: Vec<Vec<u8>> = vec![main_font];
-    for fallback_path in &options.fallback_font_paths {
-        if let Ok(data) = std::fs::read(fallback_path) {
-            out.push(data);
+pub fn resolve_font_paths(options: &DocumentOptions) -> Result<Vec<PathBuf>> {
+    let main_path = resolve_font_path(options)?;
+    let mut paths = vec![main_path];
+    for fallback_path in options.fallback_font_paths.iter() {
+        if !paths.iter().any(|existing| existing == fallback_path) {
+            paths.push(fallback_path.clone());
         }
     }
-    Ok(out)
+    Ok(paths)
+}
+
+pub fn load_font_datas(paths: &[PathBuf]) -> Vec<Vec<u8>> {
+    let mut datas: Vec<Vec<u8>> = Vec::new();
+    for path in paths.iter() {
+        if let Ok(data) = std::fs::read(path) {
+            datas.push(data);
+        }
+    }
+    datas
+}
+
+fn collect_font_datas(options: &DocumentOptions) -> Result<Vec<Vec<u8>>> {
+    let paths = resolve_font_paths(options)?;
+    if let Some(main_path) = paths.first() {
+        let main_font = std::fs::read(main_path)
+            .with_context(|| format!("read font {}", main_path.display()))?;
+        let mut datas = vec![main_font];
+        for fallback_path in paths.iter().skip(1) {
+            if let Ok(data) = std::fs::read(fallback_path) {
+                datas.push(data);
+            }
+        }
+        return Ok(datas);
+    }
+    Ok(Vec::<Vec<u8>>::new())
 }
 
 fn build_font_ctx_with_fallbacks(font_datas: &[Vec<u8>]) -> FontContext {
@@ -2979,7 +3032,7 @@ fn page_for_node(doc: &HtmlDocument, node_id: NodeId, page_starts: &[PageStart])
 }
 
 struct EpubNet {
-    resources: Arc<HashMap<String, Vec<u8>>>,
+    resource_provider: Arc<LazyResource>,
 }
 
 impl NetProvider for EpubNet {
@@ -2989,7 +3042,11 @@ impl NetProvider for EpubNet {
             .trim_start_matches('/')
             .to_string();
         let key = normalize_path(&path);
-        let bytes = self.resources.get(&key).cloned().unwrap_or_default();
+        let bytes = self
+            .resource_provider
+            .get(&key)
+            .map(|data| (*data).clone())
+            .unwrap_or_default();
         handler.bytes(request.url.to_string(), Bytes::from(bytes));
     }
 }
