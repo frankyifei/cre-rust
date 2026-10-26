@@ -2377,7 +2377,7 @@ unsafe extern "C-unwind" fn doc_nearest_word_from_position(l: *mut lua_State) ->
         let x = arg_int(l, 2) as f32;
         let y = arg_int(l, 3) as f32;
         let direction = if lua::lua_isnoneornil(l, 4) != 0 {
-            4
+            0
         } else {
             arg_int(l, 4).clamp(0, 4) as u32
         };

@@ -2419,13 +2419,14 @@ fn word_ranges(text: &str) -> Vec<(usize, usize)> {
 }
 
 fn direction_matches(point: PagePosition, rect: &TextBox, direction: u32) -> bool {
-    let right = rect.x + rect.width;
-    let bottom = rect.y + rect.height;
+    let center_x = rect.x + rect.width * 0.5;
+    let center_y = rect.y + rect.height * 0.5;
     match direction {
-        0 => point.x >= right - 1.0,
-        1 => point.y >= bottom - 1.0,
-        2 => point.x <= rect.x + 1.0,
-        3 => point.y <= rect.y + 1.0,
+        0 => true,
+        1 => center_x < point.x,
+        2 => center_x > point.x,
+        3 => center_y < point.y,
+        4 => center_y > point.y,
         _ => true,
     }
 }
@@ -2440,12 +2441,13 @@ fn word_sort_key(
     };
     let center_x = rect.x + rect.width * 0.5;
     let center_y = rect.y + rect.height * 0.5;
-    let (primary, secondary) = match direction {
-        0 | 2 => ((center_x - point.x).abs(), (center_y - point.y).abs()),
-        1 | 3 => ((center_y - point.y).abs(), (center_x - point.x).abs()),
-        _ => ((center_x - point.x).hypot(center_y - point.y), 0.0),
+    let dx = (center_x - point.x).abs();
+    let dy = (center_y - point.y).abs();
+    let primary = match direction {
+        3 | 4 => dx + dy * 100.0,
+        _ => dx + dy,
     };
-    (primary, secondary, rect.x, rect.y, word.text.clone())
+    (primary, 0.0, center_x, center_y, word.text.clone())
 }
 
 fn source_element_at_line_offset(

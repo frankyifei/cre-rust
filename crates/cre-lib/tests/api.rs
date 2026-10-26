@@ -399,7 +399,7 @@ fn document_finds_nearest_word_in_requested_directions() {
                 y: center_y,
             },
             &[1],
-            0,
+            1,
         )
         .unwrap()
         .expect("no word to the left");
@@ -417,7 +417,7 @@ fn document_finds_nearest_word_in_requested_directions() {
                 y: 0.0,
             },
             &[],
-            4,
+            0,
         )
         .unwrap()
         .is_none()
