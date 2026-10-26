@@ -867,16 +867,15 @@ fn apply_text_highlight(
     bitmap: &mut cre_lib::PageBitmap,
     boxes: &[cre_lib::TextBox],
     current_page: usize,
-    clip_offset: f32,
 ) {
     for text_box in boxes {
         if text_box.page != current_page {
             continue;
         }
         let left = text_box.x.floor().max(0.0) as u32;
-        let top = (text_box.y - clip_offset).floor().max(0.0) as u32;
+        let top = text_box.y.floor().max(0.0) as u32;
         let right = (text_box.x + text_box.width).ceil().max(0.0) as u32;
-        let bottom = (text_box.y + text_box.height - clip_offset).ceil().max(0.0) as u32;
+        let bottom = (text_box.y + text_box.height).ceil().max(0.0) as u32;
         let right = right.min(bitmap.width);
         let bottom = bottom.min(bitmap.height);
         for y in top..bottom {
@@ -2117,8 +2116,7 @@ unsafe extern "C-unwind" fn doc_draw_current_page(l: *mut lua_State) -> c_int {
                 && let Ok(boxes) = inner.boxes_between_xpointers(&start, &end)
             {
                 let mut bitmap = bitmap_arc.as_ref().clone();
-                let clip_offset = inner.page_render_clip_top_offset(current_page);
-                apply_text_highlight(&mut bitmap, &boxes, current_page, clip_offset);
+                apply_text_highlight(&mut bitmap, &boxes, current_page);
                 copy_page_bitmap_to_blit(&bitmap, color, bb);
             } else {
                 copy_page_bitmap_to_blit(bitmap_arc.as_ref(), color, bb);
@@ -2323,8 +2321,14 @@ unsafe extern "C-unwind" fn doc_word_from_position(l: *mut lua_State) -> c_int {
         let y = arg_int(l, 3) as f32;
         let word = doc_ref(l).and_then(|doc| {
             let inner = doc.inner.as_ref()?;
-            let position = page_position_for_window_point(doc, inner, x, y)?;
-            inner.word_at(position).ok().flatten()
+            inner
+                .word_at(cre_lib::PagePosition {
+                    page: inner.current_page(),
+                    x,
+                    y,
+                })
+                .ok()
+                .flatten()
         });
         let Some(word) = word else {
             return 0;
@@ -2380,13 +2384,16 @@ unsafe extern "C-unwind" fn doc_nearest_word_from_position(l: *mut lua_State) ->
         let word = doc_ref(l).and_then(|doc| {
             let inner = doc.inner.as_ref()?;
             let page_count = inner.page_count();
-            let position = page_position_for_window_point(doc, inner, x, y)?;
-            let pages = (position.page
-                ..=(position.page + doc.visible_page_count.max(1) as usize - 1))
+            let start = inner.current_page();
+            let pages = (start..=(start + doc.visible_page_count.max(1) as usize - 1))
                 .filter(|page| *page >= 1 && *page <= page_count)
                 .collect::<Vec<_>>();
             inner
-                .nearest_word_at(position, &pages, direction)
+                .nearest_word_at(
+                    cre_lib::PagePosition { page: start, x, y },
+                    &pages,
+                    direction,
+                )
                 .ok()
                 .flatten()
         });
@@ -2446,10 +2453,9 @@ unsafe extern "C-unwind" fn doc_text_from_positions(l: *mut lua_State) -> c_int 
             doc.last_boxes.clear();
             let mut result = {
                 let inner = doc.inner.as_ref()?;
-                let start_point = page_position_for_window_point(doc, inner, sx, sy)?;
-                let end_point = page_position_for_window_point(doc, inner, ex, ey)?;
-                let start = start_point;
-                let end = end_point;
+                let page = inner.current_page();
+                let start = cre_lib::PagePosition { page, x: sx, y: sy };
+                let end = cre_lib::PagePosition { page, x: ex, y: ey };
                 if is_single_point {
                     let word = inner.word_at(start).ok().flatten()?;
                     let start_pos = word.xpointer_range.start.to_xpointer();
@@ -2487,17 +2493,27 @@ unsafe extern "C-unwind" fn doc_text_from_positions(l: *mut lua_State) -> c_int 
             }
             if grab_words && !is_single_point {
                 let extension = if let Some(inner) = doc.inner.as_ref() {
-                    let start_point = page_position_for_window_point(doc, inner, sx, sy);
-                    let end_point = page_position_for_window_point(doc, inner, ex, ey);
-                    if let Some(start_word) =
-                        start_point.and_then(|position| inner.word_at(position).ok().flatten())
+                    if let Some(start_word) = inner
+                        .word_at(cre_lib::PagePosition {
+                            page: inner.current_page(),
+                            x: sx,
+                            y: sy,
+                        })
+                        .ok()
+                        .flatten()
                     {
                         if let Some(start_word_end) = start_word.xpointer_range.end.as_ref() {
                             let use_start = start_word.xpointer_range.start.to_xpointer();
                             let use_start_end = start_word_end.to_xpointer();
                             if use_start != use_start_end {
-                                if let Some(end_word) = end_point
-                                    .and_then(|position| inner.word_at(position).ok().flatten())
+                                if let Some(end_word) = inner
+                                    .word_at(cre_lib::PagePosition {
+                                        page: inner.current_page(),
+                                        x: ex,
+                                        y: ey,
+                                    })
+                                    .ok()
+                                    .flatten()
                                 {
                                     if let Some(end_pos_ref) = end_word.xpointer_range.end.as_ref()
                                     {
@@ -2618,21 +2634,6 @@ fn expand_to_visible_word_end(inner: &Document, xpointer: &str) -> String {
         .unwrap_or(xpointer.to_string())
 }
 
-fn page_position_for_window_point(
-    _doc: &Doc,
-    inner: &Document,
-    x: f32,
-    y: f32,
-) -> Option<cre_lib::PagePosition> {
-    let page = inner.current_page();
-    let clip_offset = inner.page_render_clip_top_offset(page);
-    Some(cre_lib::PagePosition {
-        page,
-        x,
-        y: y + clip_offset,
-    })
-}
-
 fn window_rect_for_page_box(
     doc: &Doc,
     inner: &Document,
@@ -2660,12 +2661,11 @@ fn window_rect_for_page_box(
         } else {
             inner.page_width() as f32
         };
-        let clip_offset = inner.page_render_clip_top_offset(text_box.page);
         Some((
             text_box.x + x_offset,
-            text_box.y - clip_offset,
+            text_box.y,
             text_box.x + text_box.width + x_offset,
-            text_box.y + text_box.height - clip_offset,
+            text_box.y + text_box.height,
         ))
     } else {
         let page_top = inner.page_start_y_or_invalid(text_box.page);
@@ -2673,8 +2673,7 @@ fn window_rect_for_page_box(
             return None;
         }
         let current_pos = current_document_pos(inner);
-        let clip_offset = inner.page_render_clip_top_offset(text_box.page);
-        let y0 = page_top as f32 + text_box.y - current_pos as f32 - clip_offset;
+        let y0 = page_top as f32 + text_box.y - current_pos as f32;
         let y1 = y0 + text_box.height;
         let view_height = doc.height.max(1) as f32;
         if y1 <= 0.0 || y0 >= view_height {
@@ -2795,8 +2794,14 @@ unsafe extern "C-unwind" fn doc_link_from_position(l: *mut lua_State) -> c_int {
         let y = arg_int(l, 3) as f32;
         let hit = doc_ref(l).and_then(|doc| {
             let inner = doc.inner.as_ref()?;
-            let position = page_position_for_window_point(doc, inner, x, y)?;
-            inner.hit_test(position).ok().flatten()
+            inner
+                .hit_test(cre_lib::PagePosition {
+                    page: inner.current_page(),
+                    x,
+                    y,
+                })
+                .ok()
+                .flatten()
         });
         if let Some(hit) = hit {
             let Some(inner) = doc_ref(l).and_then(|doc| doc.inner.as_ref()) else {
@@ -3498,18 +3503,22 @@ unsafe extern "C-unwind" fn doc_get_lang_tag(l: *mut lua_State) -> c_int {
     unsafe {
         let x = arg_int(l, 2) as f32;
         let y = arg_int(l, 3) as f32;
-        let Some(language) = doc_ref(l).and_then(|doc| {
-            let inner = doc.inner.as_ref()?;
-            let position = page_position_for_window_point(doc, inner, x, y)?;
-            let has_text =
-                inner.text_at(position).ok().is_some() || inner.word_at(position).ok().is_some();
-            if !has_text {
-                return None;
-            }
-            inner.metadata().language.clone()
-        }) else {
+        let Some(inner) = doc_ref(l).and_then(|doc| doc.inner.as_ref()) else {
             return 0;
         };
+        let position = cre_lib::PagePosition {
+            page: inner.current_page(),
+            x,
+            y,
+        };
+        let has_text =
+            inner.text_at(position).ok().is_some() || inner.word_at(position).ok().is_some();
+        let Some(language) = inner.metadata().language.clone() else {
+            return 0;
+        };
+        if !has_text {
+            return 0;
+        }
         push_str(l, &language);
     }
     1
@@ -3727,8 +3736,14 @@ unsafe extern "C-unwind" fn doc_get_image_data(l: *mut lua_State) -> c_int {
         let accept_cre_scalable_image = arg_bool(l, 4);
         let data = doc_ref(l).and_then(|doc| {
             let inner = doc.inner.as_ref()?;
-            let position = page_position_for_window_point(doc, inner, x, y)?;
-            inner.image_data_at(position).ok().flatten()
+            inner
+                .image_data_at(cre_lib::PagePosition {
+                    page: inner.current_page(),
+                    x,
+                    y,
+                })
+                .ok()
+                .flatten()
         });
         let Some(data) = data else {
             return 0;
