@@ -1,4 +1,32 @@
-use cre_lib::{Document, PageBitmap, PagePosition, TextBox, TextPosition};
+use cre_lib::{ColorPageBitmap, Document, PageBitmap, PagePosition, TextBox, TextPosition};
+
+pub(crate) fn apply_color_text_highlight(
+    bitmap: &mut ColorPageBitmap,
+    boxes: &[TextBox],
+    current_page: usize,
+) {
+    for text_box in boxes {
+        if text_box.page != current_page {
+            continue;
+        }
+        let left = text_box.x.floor().max(0.0) as u32;
+        let top = text_box.y.floor().max(0.0) as u32;
+        let right = (text_box.x + text_box.width).ceil().max(0.0) as u32;
+        let bottom = (text_box.y + text_box.height).ceil().max(0.0) as u32;
+        let right = right.min(bitmap.width);
+        let bottom = bottom.min(bitmap.height);
+        for y in top..bottom {
+            for x in left..right {
+                let index = ((y * bitmap.width + x) as usize) * 4;
+                for channel in 0..3 {
+                    if let Some(value) = bitmap.data.get_mut(index + channel) {
+                        *value = 255 - *value;
+                    }
+                }
+            }
+        }
+    }
+}
 
 pub(crate) fn apply_text_highlight(
     bitmap: &mut PageBitmap,

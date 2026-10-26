@@ -15,7 +15,9 @@ use cre_epub::{
 };
 use cre_fb2::{Fb2Book, Fb2HtmlOptions};
 use cre_paint::render_page as paint_page;
+use cre_paint::render_page_rgba as paint_page_rgba;
 
+pub use cre_paint::ColorPageBitmap;
 pub use cre_paint::PageBitmap;
 use cre_text::{TextBook, TextHtmlOptions};
 use parley::FontContext;
@@ -24,6 +26,7 @@ use parley::fontique::{Blob, Collection, CollectionOptions, FamilyId, GenericFam
 type ClippedLine = (usize, usize, TextBox, usize, usize);
 
 use parley::layout::Affinity;
+use parley::layout::Cluster;
 use percent_encoding::percent_decode_str;
 
 mod page_breaks;
@@ -877,6 +880,59 @@ impl Document {
         Ok(out)
     }
 
+    pub fn render_page_color_with_stats(
+        &mut self,
+        page: usize,
+    ) -> Result<(Arc<ColorPageBitmap>, usize, usize)> {
+        let Some(index) = page.checked_sub(1) else {
+            bail!("page numbers are 1-based");
+        };
+        let Some(snapshot) = self.pages.get(index) else {
+            bail!("page {page} is outside 1..={}", self.page_count());
+        };
+        let chunk_index = snapshot.chunk;
+        let start = snapshot.local_start;
+        let clip_top = start.clip_top - start.top;
+        let clip_bottom = snapshot.local_clip_bottom - start.top;
+
+        self.ensure_chunk(chunk_index)?;
+        let mut active = self.active.borrow_mut();
+        let active = active
+            .as_mut()
+            .context("active document chunk is missing")?;
+        let viewport_scale = self.viewport_scale;
+        active.doc.set_viewport_scroll(Point {
+            x: 0.0,
+            y: f64::from(start.top),
+        });
+        let mut scene = Scene::default();
+        blitz_paint::paint_scene(
+            &mut scene,
+            &mut active.doc,
+            viewport_scale as f64,
+            self.width,
+            self.height,
+            0,
+            0,
+        );
+
+        Ok(paint_page_rgba(
+            &scene,
+            self.width,
+            self.height,
+            0.0,
+            clip_top * viewport_scale,
+            clip_bottom * viewport_scale,
+            self.background_color,
+        ))
+    }
+
+    pub fn render_current_page_color_with_stats(
+        &mut self,
+    ) -> Result<(Arc<ColorPageBitmap>, usize, usize)> {
+        self.render_page_color_with_stats(self.current_page)
+    }
+
     pub fn render_page(&mut self, page: usize) -> Result<PageBitmap> {
         let (bitmap, _, _) = self.render_page_with_stats(page)?;
         Ok(bitmap.as_ref().clone())
@@ -1086,11 +1142,75 @@ impl Document {
         })
     }
 
-    pub fn word_at(&self, position: PagePosition) -> Result<Option<WordHit>> {
-        let Some(hit) = self.hit_test(position)? else {
+    fn parley_word_byte_range(
+        &self,
+        page: usize,
+        line_index: usize,
+        line_byte_offset: usize,
+    ) -> Result<Option<(usize, usize)>> {
+        let Some(snapshot) = self.pages.get(page.saturating_sub(1)) else {
             return Ok(None);
         };
-        let Some((start_byte, end_byte)) = word_byte_range(&hit.text, hit.byte_offset) else {
+        let chunk_index = snapshot.chunk;
+        let line_base = self.chunks[chunk_index].line_base;
+        let Some(local_line) = line_index.checked_sub(line_base) else {
+            return Ok(None);
+        };
+
+        self.with_active_chunk(chunk_index, |active| {
+            let Some(line_box) = active.lines.get(local_line) else {
+                return Ok(None);
+            };
+            let line_start = line_box.text_start;
+            let line_end = line_box.text_end;
+            if line_start >= line_end {
+                return Ok(None);
+            }
+            let absolute = line_start.saturating_add(line_byte_offset);
+            if absolute < line_start || absolute >= line_end {
+                return Ok(None);
+            }
+
+            let root = active.doc.root_element();
+            let node = root.with(line_box.node_id);
+            let Some(inline_layout) = node
+                .element_data()
+                .and_then(|element| element.inline_layout_data.as_ref())
+            else {
+                return Ok(None);
+            };
+            let Some(cluster) = Cluster::from_byte_index(&inline_layout.layout, absolute) else {
+                return Ok(None);
+            };
+
+            let mut word_start_cluster = cluster;
+            if !word_start_cluster.is_word_boundary() {
+                let Some(prev) = word_start_cluster.previous_logical_word() else {
+                    return Ok(None);
+                };
+                word_start_cluster = prev;
+            }
+            let start = word_start_cluster.text_range().start;
+            let end = word_start_cluster
+                .next_logical_word()
+                .map(|boundary| boundary.text_range().start)
+                .unwrap_or(line_end);
+
+            let rel_start = start
+                .saturating_sub(line_start)
+                .min(line_end.saturating_sub(line_start));
+            let rel_end = end
+                .saturating_sub(line_start)
+                .min(line_end.saturating_sub(line_start));
+            if rel_start >= rel_end {
+                return Ok(None);
+            }
+            Ok(Some((rel_start, rel_end)))
+        })
+    }
+
+    pub fn word_at(&self, position: PagePosition) -> Result<Option<WordHit>> {
+        let Some(hit) = self.hit_test(position)? else {
             return Ok(None);
         };
 
@@ -1104,6 +1224,25 @@ impl Document {
             .line_index
             .checked_sub(line_base)
             .context("line index is outside its chunk")?;
+
+        let fallback = word_byte_range(&hit.text, hit.byte_offset);
+        let parley_range = self
+            .parley_word_byte_range(hit.page, hit.line_index, hit.byte_offset)
+            .unwrap_or(None);
+        let use_parley = match (fallback, parley_range) {
+            (Some((fallback_start, fallback_end)), Some((parley_start, parley_end))) => {
+                parley_start >= fallback_start
+                    && parley_end <= fallback_end
+                    && parley_start < parley_end
+                    && (parley_start, parley_end) != (fallback_start, fallback_end)
+            }
+            (None, Some((parley_start, parley_end))) => parley_start < parley_end,
+            (_, None) => false,
+        };
+        let Some((start_byte, end_byte)) = (if use_parley { parley_range } else { fallback })
+        else {
+            return Ok(None);
+        };
 
         let (start_position, end_position) = self.with_active_chunk(chunk_index, |active| {
             let line = active

@@ -547,3 +547,147 @@ fn draw_image_fill(
         }
     }
 }
+
+#[derive(Clone)]
+pub struct ColorPageBitmap {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+}
+
+impl ColorPageBitmap {
+    pub fn new(width: u32, height: u32, background: u32) -> Self {
+        let pixel = [
+            ((background >> 16) & 0xff) as u8,
+            ((background >> 8) & 0xff) as u8,
+            (background & 0xff) as u8,
+            0xffu8,
+        ];
+        let data = pixel
+            .iter()
+            .copied()
+            .cycle()
+            .take((width * height * 4) as usize)
+            .collect();
+        Self {
+            width,
+            height,
+            data,
+        }
+    }
+}
+
+pub fn render_page_rgba(
+    scene: &Scene,
+    width: u32,
+    height: u32,
+    page_top: f32,
+    clip_top: f32,
+    clip_bottom: f32,
+    background: u32,
+) -> (Arc<ColorPageBitmap>, usize, usize) {
+    let mut pixmap = Pixmap::new(width, height).expect("non-zero page bitmap");
+    let background_color = tiny_skia::Color::from_rgba8(
+        ((background >> 16) & 0xff) as u8,
+        ((background >> 8) & 0xff) as u8,
+        (background & 0xff) as u8,
+        0xff,
+    );
+    pixmap.fill(background_color);
+
+    let page_transform = Affine::translate((0.0, -page_top as f64));
+    let local_top = (clip_top - page_top).clamp(0.0, height as f32);
+    let local_bottom = (clip_bottom - page_top).clamp(0.0, height as f32);
+    let clip_mask = page_clip_mask(width, height, local_top, local_bottom);
+    let (image_count, image_surface) = image_draw_stats(
+        scene,
+        width,
+        height,
+        page_transform,
+        local_top,
+        local_bottom,
+    );
+    let mut fonts = HashMap::new();
+
+    for command in &scene.commands {
+        match command {
+            RenderCommand::Fill(cmd) => match &cmd.brush {
+                Paint::Solid(color) => {
+                    draw_fill(
+                        &mut pixmap,
+                        &cmd.shape,
+                        page_transform * cmd.transform,
+                        *color,
+                        cmd.fill,
+                        clip_mask.as_ref(),
+                    );
+                }
+                Paint::Image(image_brush) => {
+                    draw_image_fill(
+                        &mut pixmap,
+                        &image_brush.image,
+                        image_brush.sampler.alpha,
+                        &cmd.shape,
+                        page_transform * cmd.transform,
+                        cmd.brush_transform,
+                        local_top,
+                        local_bottom,
+                        clip_mask.as_ref(),
+                    );
+                }
+                _ => {}
+            },
+            RenderCommand::Stroke(cmd) => {
+                if let Some(color) = solid_color(&cmd.brush) {
+                    draw_stroke(
+                        &mut pixmap,
+                        &cmd.shape,
+                        page_transform * cmd.transform,
+                        color,
+                        &cmd.style,
+                        clip_mask.as_ref(),
+                    );
+                }
+            }
+            RenderCommand::GlyphRun(cmd) => {
+                if let Some(color) = solid_color(&cmd.brush) {
+                    draw_glyphs(
+                        &mut pixmap,
+                        &cmd.font_data,
+                        cmd.font_size,
+                        &cmd.glyphs,
+                        page_transform * cmd.transform,
+                        cmd.glyph_transform,
+                        color,
+                        cmd.brush_alpha,
+                        local_top,
+                        local_bottom,
+                        &mut fonts,
+                    );
+                }
+            }
+            RenderCommand::PushLayer(_)
+            | RenderCommand::PushClipLayer(_)
+            | RenderCommand::PopLayer
+            | RenderCommand::BoxShadow(_) => {}
+        }
+    }
+
+    let mut data: Vec<u8> = Vec::with_capacity((width * height * 4) as usize);
+    for pixel in pixmap.pixels() {
+        data.push(pixel.red());
+        data.push(pixel.green());
+        data.push(pixel.blue());
+        data.push(pixel.alpha());
+    }
+
+    (
+        Arc::new(ColorPageBitmap {
+            width,
+            height,
+            data,
+        }),
+        image_count,
+        image_surface,
+    )
+}

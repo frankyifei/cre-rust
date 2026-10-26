@@ -866,6 +866,26 @@ unsafe fn copy_page_bitmap_to_blit(bitmap: &cre_lib::PageBitmap, color: bool, bb
     }
 }
 
+unsafe fn copy_color_page_bitmap_to_blit(bitmap: &cre_lib::ColorPageBitmap, bb: &BlitBuffer) {
+    let rows = bitmap.height.min(bb.h) as usize;
+    let cols = bitmap.width.min(bb.w) as usize;
+    let dst =
+        unsafe { std::slice::from_raw_parts_mut(bb.data, bb.stride.saturating_mul(bb.h as usize)) };
+    for y in 0..rows {
+        let src = &bitmap.data[y * bitmap.width as usize * 4..];
+        let dst_row = &mut dst[y * bb.stride..];
+        for x in 0..cols {
+            let src_offset = x * 4;
+            for channel in 0..3 {
+                if let Some(value) = src.get(src_offset + channel) {
+                    dst_row[x * 4 + channel] = *value;
+                }
+            }
+            dst_row[x * 4 + 3] = 0xFF;
+        }
+    }
+}
+
 unsafe fn format_name(format: DocumentFormat) -> &'static str {
     match format {
         DocumentFormat::Epub => "EPUB",
@@ -2040,28 +2060,49 @@ unsafe extern "C-unwind" fn doc_draw_current_page(l: *mut lua_State) -> c_int {
             let color = arg_bool(l, 3);
             let highlight = doc.highlight.clone();
             let current_page = inner.current_page();
-            let Ok((bitmap_arc, image_count, image_surface)) =
-                inner.render_current_page_with_stats()
-            else {
-                return (0, 0.0);
-            };
-            let total_pixels = bitmap_arc
-                .width
-                .saturating_mul(bitmap_arc.height)
-                .saturating_mul(1)
-                .max(1);
-            let stats = (image_count, image_surface as f64 / total_pixels as f64);
-            let bb = &*bb;
-            if let Some((start, end)) = highlight
-                && let Ok(boxes) = inner.boxes_between_xpointers(&start, &end)
-            {
-                let mut bitmap = bitmap_arc.as_ref().clone();
-                apply_text_highlight(&mut bitmap, &boxes, current_page);
-                copy_page_bitmap_to_blit(&bitmap, color, bb);
+            if color {
+                let Ok((image_arc, image_count, image_surface)) =
+                    inner.render_current_page_color_with_stats()
+                else {
+                    return (0, 0.0);
+                };
+                let total_pixels = image_arc.width.saturating_mul(image_arc.height).max(1);
+                let stats = (image_count, image_surface as f64 / total_pixels as f64);
+                let bb = &*bb;
+                if let Some((start, end)) = highlight
+                    && let Ok(boxes) = inner.boxes_between_xpointers(&start, &end)
+                {
+                    let mut bitmap = image_arc.as_ref().clone();
+                    apply_color_text_highlight(&mut bitmap, &boxes, current_page);
+                    copy_color_page_bitmap_to_blit(&bitmap, bb);
+                } else {
+                    copy_color_page_bitmap_to_blit(image_arc.as_ref(), bb);
+                }
+                stats
             } else {
-                copy_page_bitmap_to_blit(bitmap_arc.as_ref(), color, bb);
+                let Ok((bitmap_arc, image_count, image_surface)) =
+                    inner.render_current_page_with_stats()
+                else {
+                    return (0, 0.0);
+                };
+                let total_pixels = bitmap_arc
+                    .width
+                    .saturating_mul(bitmap_arc.height)
+                    .saturating_mul(1)
+                    .max(1);
+                let stats = (image_count, image_surface as f64 / total_pixels as f64);
+                let bb = &*bb;
+                if let Some((start, end)) = highlight
+                    && let Ok(boxes) = inner.boxes_between_xpointers(&start, &end)
+                {
+                    let mut bitmap = bitmap_arc.as_ref().clone();
+                    apply_text_highlight(&mut bitmap, &boxes, current_page);
+                    copy_page_bitmap_to_blit(&bitmap, false, bb);
+                } else {
+                    copy_page_bitmap_to_blit(bitmap_arc.as_ref(), false, bb);
+                }
+                stats
             }
-            stats
         }
     }));
     let (image_count, image_fraction) = image_stats.unwrap_or((0, 0.0));
