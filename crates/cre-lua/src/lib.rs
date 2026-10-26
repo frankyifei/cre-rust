@@ -2704,6 +2704,27 @@ unsafe extern "C-unwind" fn doc_word_boxes_from_positions(l: *mut lua_State) -> 
             lua::lua_newtable(l);
             return 1;
         };
+        if let Some((last_start, last_end)) = doc.last_range.as_ref()
+            && start == last_start.as_str()
+            && end == last_end.as_str()
+        {
+            let cached_boxes = doc.last_boxes.clone();
+            lua::lua_newtable(l);
+            let mut cached_index = 0;
+            for text_box in cached_boxes.iter() {
+                if let Some((x0, y0, x1, y1)) = window_rect_for_page_box(doc, inner, text_box) {
+                    cached_index += 1;
+                    lua::lua_createtable(l, 0, 4);
+                    for (key, value) in [("x0", x0), ("y0", y0), ("x1", x1), ("y1", y1)] {
+                        push_str(l, key);
+                        push_int(l, value.round() as i64);
+                        lua::lua_rawset(l, -3);
+                    }
+                    lua::lua_rawseti_(l, -2, cached_index as c_int);
+                }
+            }
+            return 1;
+        }
         let use_start = if get_segments {
             start.clone()
         } else {
