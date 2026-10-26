@@ -3138,8 +3138,10 @@ fn page_clip_bottom(page_starts: &[PageStart], index: usize, options: &DocumentO
 }
 
 fn collect_spine_chunks(node: &Node, chunk_index: usize, out: &mut HashMap<u32, usize>) {
-    if let Some(index) = node_attr(node, "data-spine-index").and_then(|value| value.parse().ok()) {
-        out.entry(index).or_insert(chunk_index);
+    if let Some(index) =
+        node_attr(node, "data-spine-index").and_then(|value| value.parse::<u32>().ok())
+    {
+        out.entry(index + 1).or_insert(chunk_index);
     }
     for child in &node.children {
         collect_spine_chunks(node.with(*child), chunk_index, out);
