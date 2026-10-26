@@ -1,2 +1,8 @@
 /target/
 /.opencode/
+PLAN.md
+plan1.md
+TODO.md
+AGENTS.md
+/scripts/sync-to-windows.sh
+/fixtures/
