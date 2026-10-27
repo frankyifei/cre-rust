@@ -158,7 +158,7 @@ impl Doc {
             let percent = self.interline.clamp(1, 1000);
             let line_height = (((percent as f32) / 100.0) * 1.2).clamp(0.2, 10.0);
             rules.push(format!(
-                "body, div, p, span, li, td, th, h1, h2, h3, h4, h5, h6 {{ line-height: {:.3}; }}",
+                "body, div, p, span, li, td, th, h1, h2, h3, h4, h5, h6 {{ line-height: {:.3} !important; }}",
                 line_height,
             ));
         }
@@ -168,7 +168,7 @@ impl Doc {
             {
                 if (1_i64..=1000_i64).contains(&weight) && weight != 400 {
                     rules.push(format!(
-                        "body, div, p, span, li, td, th, h1, h2, h3, h4, h5, h6 {{ font-weight: {}; }}",
+                        "body, div, p, span, li, td, th, h1, h2, h3, h4, h5, h6 {{ font-weight: {} !important; }}",
                         weight,
                     ));
                 }
@@ -197,6 +197,10 @@ impl Doc {
             let index = index.clamp(0, 30) as f32;
             return (0.65 + (index * 0.7 / 30.0)).clamp(0.5, 2.0);
         }
+        let global_gamma = f32::from_bits(GAMMA_LEVEL.load(Ordering::Relaxed));
+        if global_gamma.is_finite() && global_gamma != 1.0 {
+            return global_gamma.clamp(0.5, 2.0);
+        }
         1.0
     }
 
@@ -208,8 +212,9 @@ impl Doc {
             .iter()
             .collect::<Vec<(&String, &String)>>();
         alt_properties.sort_by(|left, right| left.0.cmp(right.0));
+        let global_gamma = f32::from_bits(GAMMA_LEVEL.load(Ordering::Relaxed));
         format!(
-            "{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
+            "{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
             path,
             self.width,
             self.height,
@@ -228,6 +233,7 @@ impl Doc {
             self.scale_font_with_dpi,
             properties,
             alt_properties,
+            global_gamma,
         )
     }
 
@@ -2100,6 +2106,7 @@ unsafe extern "C-unwind" fn doc_draw_current_page(l: *mut lua_State) -> c_int {
             let Some(doc) = doc_mut(l) else {
                 return (0, 0.0);
             };
+            let gamma = doc.render_font_gamma();
             let Some(inner) = doc.inner.as_mut() else {
                 return (0, 0.0);
             };
@@ -2110,6 +2117,7 @@ unsafe extern "C-unwind" fn doc_draw_current_page(l: *mut lua_State) -> c_int {
             let color = arg_bool(l, 3);
             let highlight = doc.highlight.clone();
             let current_page = inner.current_page();
+            inner.set_font_gamma(gamma);
             if color {
                 let Ok((image_arc, image_count, image_surface)) =
                     inner.render_current_page_color_with_stats()
