@@ -1035,9 +1035,6 @@ fn document_exposes_resources_cover_and_html() {
     assert!(doc.prev_visible_word_start(&xpointer).unwrap().is_some());
     assert!(doc.next_visible_char(&xpointer).unwrap().is_some());
     assert!(doc.prev_visible_char(&xpointer).unwrap().is_some());
-
-    let segment = doc.extend_to_sentence(&xpointer, &xpointer).unwrap();
-    assert!(segment.is_some(), "expected a sentence segment");
 }
 
 #[test]

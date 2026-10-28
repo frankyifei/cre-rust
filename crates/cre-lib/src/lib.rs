@@ -2302,40 +2302,79 @@ impl Document {
                 return Ok(None);
             };
             let chars = text.chars().collect::<Vec<_>>();
-            let mut start_offset = (start_position.codepoint_offset as usize).min(chars.len());
-            let mut end_offset = (end_position.codepoint_offset as usize).min(chars.len());
-            let sentence_break = |ch: char| matches!(ch, '.' | '!' | '?' | '。' | '！' | '？');
+            if chars.is_empty() {
+                return Ok(None);
+            }
+            let start_idx = (start_position.codepoint_offset as usize).min(chars.len());
+            let end_idx = (end_position.codepoint_offset as usize).min(chars.len());
+            if start_idx > end_idx {
+                return Ok(None);
+            }
 
-            let mut sentence_start = 0usize;
-            for index in (0..start_offset).rev() {
-                if sentence_break(chars[index]) {
-                    sentence_start = index + 1;
+            let mut is_sentence_segment = true;
+            let mut new_start = start_idx;
+            let mut grabbed_opening = false;
+            let mut index = start_idx;
+            while index > 0 {
+                index -= 1;
+                let ch = chars[index];
+                if is_space_char(ch) {
+                    continue;
+                }
+                if is_punct_opening_char(ch) {
+                    new_start = index;
+                    grabbed_opening = true;
+                    continue;
+                }
+                if is_punctuation_char(ch) {
+                    break;
+                }
+                if !grabbed_opening {
+                    is_sentence_segment = false;
+                }
+                break;
+            }
+            if !is_sentence_segment {
+                return Ok(None);
+            }
+
+            let mut new_end = end_idx;
+            let mut grabbed_closing = false;
+            if end_idx < chars.len() {
+                index = end_idx;
+                while index < chars.len() {
+                    let ch = chars[index];
+                    if is_space_char(ch) {
+                        index += 1;
+                        continue;
+                    }
+                    if is_punctuation_char(ch) && !is_punct_opening_char(ch) {
+                        new_end = index + 1;
+                        grabbed_closing = true;
+                        index += 1;
+                        continue;
+                    }
+                    if !grabbed_closing {
+                        is_sentence_segment = false;
+                    }
                     break;
                 }
             }
-            while sentence_start < start_offset && chars[sentence_start].is_whitespace() {
-                sentence_start += 1;
-            }
-            start_offset = sentence_start;
-
-            let mut sentence_end = chars.len();
-            for (index, ch) in chars.iter().enumerate().skip(end_offset) {
-                if sentence_break(*ch) {
-                    sentence_end = index + 1;
-                    break;
-                }
-            }
-            end_offset = sentence_end;
-            while end_offset > start_offset && chars[end_offset - 1].is_whitespace() {
-                end_offset -= 1;
+            if !is_sentence_segment {
+                return Ok(None);
             }
 
-            start_position.codepoint_offset = start_offset as u32;
-            end_position.codepoint_offset = end_offset as u32;
-            let start_xpointer = start_position.to_xpointer();
-            let end_xpointer = end_position.to_xpointer();
-            let text = chars[start_offset..end_offset].iter().collect::<String>();
-            Ok(Some((text, start_xpointer, end_xpointer)))
+            let out_text = chars[new_start..new_end].iter().collect::<String>();
+            if out_text.trim().is_empty() {
+                return Ok(None);
+            }
+            start_position.codepoint_offset = new_start as u32;
+            end_position.codepoint_offset = new_end as u32;
+            Ok(Some((
+                out_text,
+                start_position.to_xpointer(),
+                end_position.to_xpointer(),
+            )))
         })
     }
 
@@ -2411,6 +2450,48 @@ fn apply_gamma_byte(value: u8, gamma: f32) -> u8 {
     let x = (value as f32) / 255.0;
     let y = x.powf(1.0 / gamma);
     ((y * 255.0) + 0.5).clamp(0.0, 255.0) as u8
+}
+
+fn is_space_char(ch: char) -> bool {
+    ch.is_whitespace()
+}
+
+fn is_punct_opening_char(ch: char) -> bool {
+    if ch.is_ascii_punctuation() {
+        matches!(ch, '\x28' | '\x5B' | '\x7B')
+    } else {
+        matches!(
+            ch,
+            '\u{FF08}'
+                | '\u{FF3B}'
+                | '\u{FF5B}'
+                | '\u{3008}'
+                | '\u{300A}'
+                | '\u{300C}'
+                | '\u{300E}'
+                | '\u{3014}'
+                | '\u{3018}'
+                | '\u{301D}'
+                | '\u{301E}'
+                | '\u{2018}'
+                | '\u{201B}'
+                | '\u{201C}'
+                | '\u{201E}'
+        )
+    }
+}
+
+#[allow(clippy::manual_range_contains)]
+fn is_punctuation_char(ch: char) -> bool {
+    if ch.is_ascii_punctuation() {
+        return true;
+    }
+    let code = ch as u32;
+    (code >= 0x3000 && code <= 0x303F)
+        || (code >= 0x2000 && code <= 0x206F)
+        || (code >= 0x2E00 && code <= 0x2E7F)
+        || (code >= 0xFF01 && code <= 0xFF0B)
+        || (code >= 0xFF1A && code <= 0xFF20)
 }
 
 fn validate_options(options: &DocumentOptions) -> Result<()> {
