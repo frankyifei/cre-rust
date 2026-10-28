@@ -1,4 +1,6 @@
 /target/
+/target-arm-unknown-linux-gnueabi/
+/.cargo/
 /.opencode/
 PLAN.md
 plan1.md

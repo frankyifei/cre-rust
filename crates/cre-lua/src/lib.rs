@@ -878,9 +878,11 @@ unsafe fn arg_bytes(l: *mut lua_State, index: c_int) -> Option<Vec<u8>> {
     Some(unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) }.to_vec())
 }
 
+#[allow(clippy::useless_conversion)]
 unsafe fn arg_int(l: *mut lua_State, index: c_int) -> i64 {
     // SAFETY: `index` is a valid Lua stack index for this call.
-    unsafe { lua::lua_tointeger_(l, index) }
+    let raw = unsafe { lua::lua_tointeger_(l, index) };
+    i64::try_from(raw).unwrap_or(0)
 }
 
 unsafe fn arg_bool(l: *mut lua_State, index: c_int) -> bool {
@@ -914,6 +916,7 @@ unsafe fn push_bool(l: *mut lua_State, value: bool) {
 
 unsafe fn push_int(l: *mut lua_State, value: i64) {
     // SAFETY: Lua takes the integer by value.
+    let value = lua::lua_Integer::try_from(value).unwrap_or(lua::lua_Integer::MAX);
     unsafe { lua::lua_pushinteger(l, value) };
 }
 
@@ -3186,7 +3189,11 @@ unsafe extern "C-unwind" fn doc_set_header_progress(l: *mut lua_State) -> c_int 
             if lua::lua_istable(l, 3) != 0 {
                 let len = lua::lua_objlen(l, 3);
                 for index in 1..=len {
-                    lua::lua_rawgeti(l, 3, i64::try_from(index).unwrap_or(i64::MAX));
+                    lua::lua_rawgeti(
+                        l,
+                        3,
+                        lua::lua_Integer::try_from(index).unwrap_or(lua::lua_Integer::MAX),
+                    );
                     if lua::lua_isnumber(l, -1) != 0 {
                         let page = arg_int(l, -1);
                         bounds.push(10_000 * (page - 1) / pages);
