@@ -513,7 +513,8 @@ impl EpubBook {
             "html, body {{ margin: 0; padding: 0; }}\n\
              body {{ font-family: serif; font-size: {}px; line-height: {}; padding: {}px {}px; }}\n\
              img {{ max-width: 100%; height: auto; }}\n\
-             .cre-spine {{ display: block; }}\n",
+             .cre-spine {{ display: block; }}\n\
+             .cre-spine {{ page-break-before: always; }}\n",
             options.font_size, options.line_height, options.margin_y, options.margin_x
         ));
         html.push_str("</style></head><body>");
