@@ -198,6 +198,7 @@ pub(crate) struct LineBox {
     pub(crate) left: f32,
     pub(crate) right: f32,
     pub(crate) top: f32,
+    pub(crate) visual_top: f32,
     pub(crate) bottom: f32,
 }
 
@@ -2679,7 +2680,9 @@ fn collect_lines_inner(node: &Node, out: &mut Vec<LineBox>) {
         let root_layout = node.unrounded_layout();
         let inset = root_layout.padding + root_layout.border;
         let origin_y = inset.top + inline_layout.block_offset;
-        for line in inline_layout.layout.lines() {
+        let has_top_decoration = root_layout.border.top + root_layout.padding.top > 0.0;
+        let root_top = node.absolute_position(0.0, 0.0).y;
+        for (line_index, line) in inline_layout.layout.lines().enumerate() {
             let metrics = line.metrics();
             let line_x = metrics.offset + metrics.inline_min_coord;
             let top = node
@@ -2702,6 +2705,11 @@ fn collect_lines_inner(node: &Node, out: &mut Vec<LineBox>) {
                     .next()
                     .map(|cluster| cluster.style().brush.id)
             });
+            let visual_top = if line_index == 0 && has_top_decoration {
+                top.min(root_top)
+            } else {
+                top
+            };
             let text_range = line.text_range();
             out.push(LineBox {
                 node_id: node.id,
@@ -2711,6 +2719,7 @@ fn collect_lines_inner(node: &Node, out: &mut Vec<LineBox>) {
                 left,
                 right,
                 top,
+                visual_top,
                 bottom,
             });
         }
@@ -2740,7 +2749,7 @@ fn paginate(
         let current = starts.last().unwrap();
         let mut force_break_before = false;
         while forced_index < forced_breaks.len()
-            && forced_breaks[forced_index] <= line.top + BREAK_EPSILON
+            && forced_breaks[forced_index] <= line.visual_top + BREAK_EPSILON
         {
             if forced_breaks[forced_index] > current.clip_top + BREAK_EPSILON
                 && line.top > current.clip_top + BREAK_EPSILON
@@ -2750,22 +2759,22 @@ fn paginate(
             forced_index += 1;
         }
         if force_break_before {
-            starts.push(PageStart {
-                top: line.top - margin_top,
-                clip_top: line.top,
-            });
+            starts.push(page_start_for_line(line, margin_top));
         }
 
         let current = starts.last().unwrap();
         let clip_bottom = current.top + page_height - margin_bottom;
         if line.bottom > clip_bottom && line.top > current.clip_top {
-            starts.push(PageStart {
-                top: line.top - margin_top,
-                clip_top: line.top,
-            });
+            starts.push(page_start_for_line(line, margin_top));
         }
     }
     starts
+}
+
+fn page_start_for_line(line: &LineBox, margin_top: f32) -> PageStart {
+    let clip_top = line.visual_top;
+    let top = (clip_top - margin_top).max(0.0);
+    PageStart { top, clip_top }
 }
 
 fn collect_anchor_maps(root: &Node) -> HashMap<(String, Option<String>), NodeId> {
