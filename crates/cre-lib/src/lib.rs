@@ -14,6 +14,7 @@ use cre_epub::{
     normalize_path,
 };
 use cre_fb2::{Fb2Book, Fb2HtmlOptions};
+use cre_paint::image_draw_stats_and_rects_identity as collect_image_rects;
 use cre_paint::render_page as paint_page;
 use cre_paint::render_page_rgba as paint_page_rgba;
 
@@ -840,7 +841,7 @@ impl Document {
             ));
         }
 
-        let (bitmap, image_count, image_surface) = {
+        let (bitmap, image_count, image_surface, image_rects) = {
             self.ensure_chunk(chunk_index)?;
             let mut active = self.active.borrow_mut();
             let active = active
@@ -861,18 +862,22 @@ impl Document {
                 0,
                 0,
             );
-
-            paint_page(
+            let local_top = clip_top * viewport_scale;
+            let local_bottom = clip_bottom * viewport_scale;
+            let (_stats_count, _stats_surface, image_rects) =
+                collect_image_rects(&scene, self.width, self.height, local_top, local_bottom);
+            let (image_arc, image_count, image_surface) = paint_page(
                 &scene,
                 self.width,
                 self.height,
                 0.0,
-                clip_top * viewport_scale,
-                clip_bottom * viewport_scale,
+                local_top,
+                local_bottom,
                 self.background_color,
-            )
+            );
+            (image_arc, image_count, image_surface, image_rects)
         };
-        let bitmap = self.apply_font_gamma_page_bitmap(bitmap);
+        let bitmap = self.apply_font_gamma_page_bitmap_regions(bitmap, page, image_rects);
         let image = PageImage {
             bitmap: bitmap.clone(),
             image_count,
@@ -919,17 +924,21 @@ impl Document {
             0,
         );
 
+        let local_top = clip_top * viewport_scale;
+        let local_bottom = clip_bottom * viewport_scale;
+        let (_stats_count, _stats_surface, image_rects) =
+            collect_image_rects(&scene, self.width, self.height, local_top, local_bottom);
         let (bitmap, image_count, image_surface) = paint_page_rgba(
             &scene,
             self.width,
             self.height,
             0.0,
-            clip_top * viewport_scale,
-            clip_bottom * viewport_scale,
+            local_top,
+            local_bottom,
             self.background_color,
         );
         Ok((
-            self.apply_font_gamma_color_bitmap(bitmap),
+            self.apply_font_gamma_color_bitmap_regions(bitmap, page, image_rects),
             image_count,
             image_surface,
         ))
@@ -953,30 +962,65 @@ impl Document {
         }
     }
 
-    fn apply_font_gamma_page_bitmap(&self, bitmap: Arc<PageBitmap>) -> Arc<PageBitmap> {
+    fn apply_font_gamma_page_bitmap_regions(
+        &self,
+        bitmap: Arc<PageBitmap>,
+        page: usize,
+        image_rects: Vec<(f32, f32, f32, f32)>,
+    ) -> Arc<PageBitmap> {
         if (self.font_gamma - 1.0).abs() <= 1e-6 {
             return bitmap;
         }
-        let mut mutable = bitmap.as_ref().clone();
-        for value in mutable.data.iter_mut() {
-            *value = apply_gamma_byte(*value, self.font_gamma);
+        let text_rects: Vec<_> = self
+            .page_text_boxes_with_lines(page)
+            .unwrap_or_default()
+            .iter()
+            .map(|(_, text_box)| {
+                (
+                    text_box.x,
+                    text_box.y,
+                    text_box.x + text_box.width,
+                    text_box.y + text_box.height,
+                )
+            })
+            .collect();
+        if text_rects.is_empty() {
+            return bitmap;
         }
+        let mut mutable = bitmap.as_ref().clone();
+        let mask = build_contrast_mask(mutable.width, mutable.height, text_rects, image_rects);
+        apply_gamma_mask_gray(mutable.data.as_mut_slice(), mask, self.font_gamma);
         Arc::new(mutable)
     }
 
-    fn apply_font_gamma_color_bitmap(&self, bitmap: Arc<ColorPageBitmap>) -> Arc<ColorPageBitmap> {
+    fn apply_font_gamma_color_bitmap_regions(
+        &self,
+        bitmap: Arc<ColorPageBitmap>,
+        page: usize,
+        image_rects: Vec<(f32, f32, f32, f32)>,
+    ) -> Arc<ColorPageBitmap> {
         if (self.font_gamma - 1.0).abs() <= 1e-6 {
             return bitmap;
         }
-        let mut mutable = bitmap.as_ref().clone();
-        for index in 0..mutable.data.len() / 4 {
-            let offset = index * 4;
-            for channel in 0..3 {
-                if let Some(value) = mutable.data.get_mut(offset + channel) {
-                    *value = apply_gamma_byte(*value, self.font_gamma);
-                }
-            }
+        let text_rects: Vec<_> = self
+            .page_text_boxes_with_lines(page)
+            .unwrap_or_default()
+            .iter()
+            .map(|(_, text_box)| {
+                (
+                    text_box.x,
+                    text_box.y,
+                    text_box.x + text_box.width,
+                    text_box.y + text_box.height,
+                )
+            })
+            .collect();
+        if text_rects.is_empty() {
+            return bitmap;
         }
+        let mut mutable = bitmap.as_ref().clone();
+        let mask = build_contrast_mask(mutable.width, mutable.height, text_rects, image_rects);
+        apply_gamma_mask_color(mutable.data.as_mut_slice(), mask, self.font_gamma);
         Arc::new(mutable)
     }
 
@@ -2435,6 +2479,96 @@ impl Document {
                 )
             })
             .collect())
+    }
+}
+
+#[allow(clippy::manual_range_contains)]
+struct ContrastMask {
+    width: u32,
+    height: u32,
+    data: Vec<bool>,
+}
+
+#[allow(clippy::manual_range_contains)]
+fn rect_bounds(rect: (f32, f32, f32, f32), width: u32, height: u32) -> (u32, u32, u32, u32) {
+    let (left, top, right, bottom) = rect;
+    let left = left.floor().max(0.0).min(width as f32) as u32;
+    let top = top.floor().max(0.0).min(height as f32) as u32;
+    let right = right.ceil().max(0.0).min(width as f32) as u32;
+    let bottom = bottom.ceil().max(0.0).min(height as f32) as u32;
+    (left, top, right, bottom)
+}
+
+#[allow(clippy::manual_range_contains)]
+fn build_contrast_mask(
+    width: u32,
+    height: u32,
+    text_rects: Vec<(f32, f32, f32, f32)>,
+    image_rects: Vec<(f32, f32, f32, f32)>,
+) -> ContrastMask {
+    let count = (width as usize) * (height as usize);
+    let mut data: Vec<bool> = Vec::new();
+    data.resize(count, false);
+    let mut mask = ContrastMask {
+        width,
+        height,
+        data,
+    };
+    for rect in text_rects.iter() {
+        let (left, top, right, bottom) = rect_bounds(*rect, width, height);
+        if right <= left || bottom <= top {
+            continue;
+        }
+        for y in top..bottom {
+            for x in left..right {
+                mask.data[y as usize * width as usize + x as usize] = true;
+            }
+        }
+    }
+    for rect in image_rects.iter() {
+        let (left, top, right, bottom) = rect_bounds(*rect, width, height);
+        if right <= left || bottom <= top {
+            continue;
+        }
+        for y in top..bottom {
+            for x in left..right {
+                mask.data[y as usize * width as usize + x as usize] = false;
+            }
+        }
+    }
+    mask
+}
+
+#[allow(clippy::manual_range_contains)]
+fn apply_gamma_mask_gray(data: &mut [u8], mask: ContrastMask, gamma: f32) {
+    for y in 0..mask.height {
+        for x in 0..mask.width {
+            let index = y as usize * mask.width as usize + x as usize;
+            if !mask.data[index] {
+                continue;
+            }
+            if let Some(value) = data.get(index) {
+                data[index] = apply_gamma_byte(*value, gamma);
+            }
+        }
+    }
+}
+
+#[allow(clippy::manual_range_contains)]
+fn apply_gamma_mask_color(data: &mut [u8], mask: ContrastMask, gamma: f32) {
+    for y in 0..mask.height {
+        for x in 0..mask.width {
+            let index = y as usize * mask.width as usize + x as usize;
+            if !mask.data[index] {
+                continue;
+            }
+            let offset = index * 4;
+            for channel in 0..3 {
+                if let Some(value) = data.get(offset + channel) {
+                    data[offset + channel] = apply_gamma_byte(*value, gamma);
+                }
+            }
+        }
     }
 }
 

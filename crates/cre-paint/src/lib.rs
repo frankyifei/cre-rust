@@ -153,6 +153,67 @@ pub fn render_page(
     )
 }
 
+#[allow(clippy::type_complexity)]
+pub fn image_draw_stats_and_rects_identity(
+    scene: &Scene,
+    width: u32,
+    height: u32,
+    local_top: f32,
+    local_bottom: f32,
+) -> (usize, usize, Vec<(f32, f32, f32, f32)>) {
+    image_draw_stats_and_rects(
+        scene,
+        width,
+        height,
+        Affine::scale(1.0),
+        local_top,
+        local_bottom,
+    )
+}
+
+#[allow(clippy::type_complexity)]
+pub fn image_draw_stats_and_rects(
+    scene: &Scene,
+    width: u32,
+    height: u32,
+    page_transform: Affine,
+    local_top: f32,
+    local_bottom: f32,
+) -> (usize, usize, Vec<(f32, f32, f32, f32)>) {
+    let viewport_width = width as f32;
+    let viewport_top = local_top.max(0.0);
+    let viewport_bottom = local_bottom.min(height as f32);
+    let mut count = 0usize;
+    let mut surface = 0usize;
+    let mut rects: Vec<(f32, f32, f32, f32)> = Vec::new();
+    for command in &scene.commands {
+        if let RenderCommand::Fill(cmd) = command
+            && matches!(cmd.brush, Paint::Image(_))
+            && let Some((left, top, right, bottom)) =
+                path_bounds(&cmd.shape, page_transform * cmd.transform)
+        {
+            let visible_left = left.clamp(0.0, viewport_width);
+            let visible_right = right.clamp(0.0, viewport_width);
+            let visible_top = top.clamp(viewport_top, viewport_bottom);
+            let visible_bottom = bottom.clamp(viewport_top, viewport_bottom);
+            if visible_right <= visible_left || visible_bottom <= visible_top {
+                continue;
+            }
+            count += 1;
+            let area =
+                (visible_right - visible_left) as f64 * (visible_bottom - visible_top) as f64;
+            surface += area.clamp(0.0, f64::MAX).ceil() as usize;
+            rects.push((
+                visible_left.floor(),
+                visible_top.floor(),
+                visible_right.ceil(),
+                visible_bottom.ceil(),
+            ));
+        }
+    }
+    (count, surface, rects)
+}
+
 fn image_draw_stats(
     scene: &Scene,
     width: u32,
