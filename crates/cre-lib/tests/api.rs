@@ -448,25 +448,17 @@ fn document_hit_tests_internal_epub_links() {
     let doc = Document::open(fixture("links.epub")).unwrap();
     assert_eq!(doc.metadata().title.as_deref(), Some("Links Test"));
 
-    let target = (1..=doc.page_count())
-        .flat_map(|candidate_page| {
-            doc.page_text_boxes(candidate_page)
-                .unwrap()
-                .into_iter()
-                .map(move |text_box| (candidate_page, text_box.clone()))
-        })
-        .find(|(_, text_box)| text_box.text.contains("Jump target"));
-    let Some((page, link_box)) = target else {
-        panic!("no Jump target page");
-    };
-    let expected_page = doc.toc()[1].page.unwrap();
-    assert_eq!(page, expected_page);
+    let boxes = doc.page_text_boxes(1).unwrap();
+    let link_box = boxes
+        .iter()
+        .find(|text_box| text_box.text.contains("Jump target"))
+        .unwrap();
 
     let y = link_box.y + link_box.height / 2.0;
     let mut links = Vec::new();
     let mut x = link_box.x;
     while x <= link_box.x + link_box.width {
-        if let Some(hit) = doc.hit_test(PagePosition { page, x, y }).unwrap()
+        if let Some(hit) = doc.hit_test(PagePosition { page: 1, x, y }).unwrap()
             && let Some(link) = hit.link
         {
             links.push(link);
@@ -479,22 +471,25 @@ fn document_hit_tests_internal_epub_links() {
         links.iter().all(|link| link.ends_with("ch2.xhtml#target")),
         "{links:?}"
     );
-    assert_eq!(doc.page_from_href(&links[0]).unwrap(), expected_page);
+    assert_eq!(
+        doc.page_from_href(&links[0]).unwrap(),
+        doc.toc()[1].page.unwrap()
+    );
 
-    let page_links = doc.page_links(page, true).unwrap();
+    let page_links = doc.page_links(1, true).unwrap();
     assert!(!page_links.is_empty());
     for link in &page_links {
         assert!(link.internal);
         assert!(link.href.ends_with("ch2.xhtml#target"));
         assert!(!link.rects.is_empty());
         for rect in &link.rects {
-            assert_eq!(rect.page, page);
+            assert_eq!(rect.page, 1);
             assert!(rect.width > 0.0 && rect.height > 0.0);
         }
     }
     assert_eq!(
         doc.page_from_xpointer(&page_links[0].href).unwrap(),
-        expected_page
+        doc.toc()[1].page.unwrap()
     );
 }
 

@@ -300,14 +300,10 @@ fn collect_break_positions(node: &Node, rules: &[BreakRule], out: &mut Vec<f32>)
             let flags = break_flags_for(node, rules);
             let inset = layout.padding + layout.border;
             let origin = node.absolute_position(inset.left, inset.top);
-            let first_spine = node_attr(node, "data-spine-index")
-                .map(str::trim)
-                .map(|value| value == "1")
-                .unwrap_or(false);
-            if flags.before.unwrap_or(false) && !first_spine {
+            if flags.before.unwrap_or(false) {
                 out.push(origin.y);
             }
-            if flags.after.unwrap_or(false) && !first_spine {
+            if flags.after.unwrap_or(false) {
                 out.push(origin.y + height);
             }
         }

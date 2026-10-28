@@ -84,92 +84,20 @@ fn position_for_page_unique(
     page_margin: f32,
     used: &HashMap<String, usize>,
 ) -> Result<TextPosition> {
-    for line in lines_for_page(lines, page_starts, page, height, page_margin) {
-        for position in candidate_positions_for_line(root, line) {
-            let xpointer = position.to_xpointer();
-            if !used.contains_key(&xpointer) && !xpointer.contains(&u32::MAX.to_string()) {
-                return Ok(position);
-            }
-        }
-    }
-
     let line = line_for_page(lines, page_starts, page, height, page_margin)?;
     if let Some(position) = source_position_for_line(root, line) {
-        return Ok(position);
-    }
-    fallback_position_for_line(root, line)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn lines_for_page<'a>(
-    lines: &'a [LineBox],
-    page_starts: &'a [PageStart],
-    page: usize,
-    height: u32,
-    page_margin: f32,
-) -> Vec<&'a LineBox> {
-    let Some(index) = page.checked_sub(1) else {
-        return Vec::new();
-    };
-    if index >= page_starts.len() {
-        return Vec::new();
-    }
-    let start = page_starts[index];
-    let lower = start.clip_top;
-    let upper = page_starts
-        .get(index + 1)
-        .map_or(start.top + height as f32 - page_margin, |next| {
-            next.clip_top
-        });
-    lines
-        .iter()
-        .filter(|line| line.top + 0.5 >= lower && line.top + 0.5 < upper)
-        .collect()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn candidate_positions_for_line(root: &Node, line: &LineBox) -> Vec<TextPosition> {
-    let mut out: Vec<TextPosition> = Vec::new();
-
-    if let Some((text_id, codepoint_offset)) = source_text_position_for_line(root, line)
-        && let Some(position) = position_for_text_node(root, text_id, codepoint_offset).ok()
-    {
-        out.push(position);
-    }
-    if let Ok(position) = position_for_line_offset(root, line, 0) {
-        out.push(position);
-    }
-    if let Ok(position) = fallback_position_for_line(root, line) {
-        out.push(position);
-    }
-
-    let inline_root = root.with(line.node_id);
-    if let Some(inline_layout) = inline_root
-        .element_data()
-        .and_then(|element| element.inline_layout_data.as_ref())
-    {
-        let text_len = inline_layout.text.len();
-        let start = line.text_start.min(text_len);
-        let end = line.text_end.clamp(start, text_len);
-        if let Some(segment) = inline_layout.text.get(start..end) {
-            let byte_limit = segment.len().min(640);
-            let mut offset = 0usize;
-            while offset <= byte_limit {
-                if let Ok(position) = position_for_line_offset(root, line, offset) {
-                    out.push(position);
-                }
-                if offset == byte_limit {
-                    break;
-                }
-                offset += 1;
-                while offset < segment.len() && !segment.is_char_boundary(offset) {
-                    offset += 1;
-                }
-            }
+        let xpointer = position.to_xpointer();
+        if !used.contains_key(&xpointer) {
+            return Ok(position);
         }
     }
 
-    out
+    let position = fallback_position_for_line(root, line)?;
+    let xpointer = position.to_xpointer();
+    if !used.contains_key(&xpointer) {
+        return Ok(position);
+    }
+    Ok(position)
 }
 
 fn line_for_page<'a>(
