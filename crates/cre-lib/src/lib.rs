@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use anyrender::Scene;
-use blitz_dom::{DocumentConfig, Node, NodeId, Point, StyleThreading};
+use blitz_dom::{DocumentConfig, Node, NodeId, Point, StyleThreading, UserAgentStylesheet};
 use blitz_html::HtmlDocument;
 use blitz_traits::net::{Bytes, NetHandler, NetProvider, Request};
 use blitz_traits::shell::{ColorScheme, Viewport};
@@ -3173,7 +3173,7 @@ fn create_document(
     font_context: Arc<FontContext>,
     options: &DocumentOptions,
 ) -> HtmlDocument {
-    let config = DocumentConfig {
+    let mut config = DocumentConfig {
         viewport: Some(Viewport::new(
             options.width,
             options.layout_height,
@@ -3187,28 +3187,28 @@ fn create_document(
         ..Default::default()
     };
 
+    if let Some(stylesheet) = options
+        .stylesheet
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        config.ua_stylesheets = vec![
+            UserAgentStylesheet::default_sheet(),
+            UserAgentStylesheet::parse(stylesheet),
+        ];
+    }
+
     let stripped = if options.embedded_styles_enabled {
         String::new()
     } else {
         strip_author_styles(html)
     };
-    let base_html = if options.embedded_styles_enabled {
+    let html_source = if options.embedded_styles_enabled {
         html
     } else {
         stripped.as_str()
     };
-    let mut html_source = base_html.to_string();
-    if let Some(stylesheet) = options
-        .stylesheet
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        && !stylesheet.contains("</style")
-    {
-        html_source.push_str("<style>");
-        html_source.push_str(stylesheet);
-        html_source.push_str("</style>");
-    }
-    let mut doc = HtmlDocument::from_html(html_source.as_str(), config);
+    let mut doc = HtmlDocument::from_html(html_source, config);
     doc.resolve(0.0);
     for _ in 0..4 {
         doc.handle_messages();
