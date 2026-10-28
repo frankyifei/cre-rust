@@ -943,7 +943,7 @@ impl Document {
 
     pub fn set_font_gamma(&mut self, gamma: f32) {
         let gamma = if gamma.is_finite() {
-            gamma.clamp(0.5, 2.0)
+            gamma.clamp(0.1, 15.0)
         } else {
             1.0
         };
@@ -954,7 +954,7 @@ impl Document {
     }
 
     fn apply_font_gamma_page_bitmap(&self, bitmap: Arc<PageBitmap>) -> Arc<PageBitmap> {
-        if self.font_gamma == 1.0 {
+        if (self.font_gamma - 1.0).abs() <= 1e-6 {
             return bitmap;
         }
         let mut mutable = bitmap.as_ref().clone();
@@ -965,7 +965,7 @@ impl Document {
     }
 
     fn apply_font_gamma_color_bitmap(&self, bitmap: Arc<ColorPageBitmap>) -> Arc<ColorPageBitmap> {
-        if self.font_gamma == 1.0 {
+        if (self.font_gamma - 1.0).abs() <= 1e-6 {
             return bitmap;
         }
         let mut mutable = bitmap.as_ref().clone();
@@ -2439,16 +2439,16 @@ impl Document {
 }
 
 fn apply_gamma_byte(value: u8, gamma: f32) -> u8 {
-    if gamma == 1.0 {
+    if (gamma - 1.0).abs() <= 1e-6 {
         return value;
     }
     let gamma = if gamma.is_finite() {
-        gamma.clamp(0.5, 2.0)
+        gamma.clamp(0.1, 15.0)
     } else {
         1.0
     };
     let x = (value as f32) / 255.0;
-    let y = x.powf(1.0 / gamma);
+    let y = x.powf(gamma);
     ((y * 255.0) + 0.5).clamp(0.0, 255.0) as u8
 }
 

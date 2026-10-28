@@ -197,9 +197,9 @@ impl Doc {
             let index = index.clamp(0, 30) as f32;
             return (0.65 + (index * 0.7 / 30.0)).clamp(0.5, 2.0);
         }
-        let global_gamma = f32::from_bits(GAMMA_LEVEL.load(Ordering::Relaxed));
+        let global_gamma = gamma_level_for_index(GAMMA_INDEX.load(Ordering::Relaxed));
         if global_gamma.is_finite() && global_gamma != 1.0 {
-            return global_gamma.clamp(0.5, 2.0);
+            return (global_gamma as f32).clamp(0.1, 15.0);
         }
         1.0
     }
@@ -212,7 +212,7 @@ impl Doc {
             .iter()
             .collect::<Vec<(&String, &String)>>();
         alt_properties.sort_by(|left, right| left.0.cmp(right.0));
-        let global_gamma = f32::from_bits(GAMMA_LEVEL.load(Ordering::Relaxed));
+        let global_gamma = GAMMA_INDEX.load(Ordering::Relaxed);
         format!(
             "{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
             path,
@@ -470,8 +470,21 @@ impl CreImage {
 
 static REGISTERED_FONTS: OnceLock<Mutex<Vec<FontFace>>> = OnceLock::new();
 static FONT_BIAS: OnceLock<Mutex<HashMap<String, i32>>> = OnceLock::new();
-static GAMMA_INDEX: AtomicI32 = AtomicI32::new(2);
-static GAMMA_LEVEL: AtomicU32 = AtomicU32::new(1.0f32.to_bits());
+/// Approximate original crengine `gammatbl.h` table used by `setGammaIndex`.
+const CRE_GAMMA_LEVELS: [f64; 57] = [
+    0.300000, 0.350000, 0.400000, 0.450000, 0.500000, 0.550000, 0.600000, 0.650000, 0.700000,
+    0.750000, 0.800000, 0.850000, 0.900000, 0.950000, 0.980000, 1.000000, 1.020000, 1.050000,
+    1.100000, 1.150000, 1.200000, 1.250000, 1.300000, 1.350000, 1.400000, 1.450000, 1.500000,
+    1.600000, 1.700000, 1.800000, 1.900000, 2.000000, 2.100000, 2.200000, 2.300000, 2.400000,
+    2.500000, 2.600000, 2.700000, 2.800000, 2.900000, 3.000000, 3.500000, 4.000000, 4.500000,
+    5.000000, 5.500000, 6.000000, 7.000000, 8.000000, 9.000000, 10.000000, 11.000000, 12.000000,
+    13.000000, 14.000000, 15.000000,
+];
+static GAMMA_INDEX: AtomicI32 = AtomicI32::new(15);
+fn gamma_level_for_index(index: i32) -> f64 {
+    CRE_GAMMA_LEVELS[index.clamp(0, 56) as usize]
+}
+
 static IMAGE_REPLACEMENT_CHAR: AtomicU32 = AtomicU32::new(' ' as u32);
 const REGEX_SEARCH_ERROR_NONE: i32 = 0;
 const REGEX_SEARCH_ERROR_INVALID_PATTERN: i32 = 1;
@@ -1035,7 +1048,7 @@ unsafe extern "C-unwind" fn module_get_gamma_level(l: *mut lua_State) -> c_int {
     unsafe {
         lua::lua_pushnumber(
             l,
-            f32::from_bits(GAMMA_LEVEL.load(Ordering::Relaxed)) as f64,
+            gamma_level_for_index(GAMMA_INDEX.load(Ordering::Relaxed)),
         )
     };
     1
@@ -1050,10 +1063,8 @@ unsafe extern "C-unwind" fn module_get_gamma_index(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn module_set_gamma_index(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let index = arg_int(l, 1).clamp(0, 4) as i32;
-        let level = [0.8f32, 0.9, 1.0, 1.1, 1.2][index as usize];
+        let index = arg_int(l, 1).clamp(0, 56) as i32;
         GAMMA_INDEX.store(index, Ordering::Relaxed);
-        GAMMA_LEVEL.store(level.to_bits(), Ordering::Relaxed);
     }
     0
 }
