@@ -152,54 +152,6 @@ impl Doc {
         requested / scale
     }
 
-    fn settings_stylesheet(&self) -> String {
-        let mut rules: Vec<String> = Vec::new();
-        if self.interline != 100 {
-            let percent = self.interline.clamp(1, 1000);
-            let line_height = (((percent as f32) / 100.0) * 1.2).clamp(0.2, 10.0);
-            rules.push(format!(
-                "body, div, p, span, li, td, th, h1, h2, h3, h4, h5, h6 {{ line-height: {:.3}; }}",
-                line_height,
-            ));
-        }
-        for name in ["font.face.base.weight", "font.face.weight.embolden"] {
-            if let Some(value) = self.properties.get(name)
-                && let Ok(weight) = value.trim().parse::<i64>()
-            {
-                if (1_i64..=1000_i64).contains(&weight) && weight != 400 {
-                    rules.push(format!(
-                        "body, div, p, span, li, td, th, h1, h2, h3, h4, h5, h6 {{ font-weight: {}; }}",
-                        weight,
-                    ));
-                }
-                break;
-            }
-        }
-        let settings_css = rules.join("\n");
-        if self.stylesheet.is_empty() {
-            return settings_css;
-        }
-        if settings_css.is_empty() {
-            return self.stylesheet.clone();
-        }
-        format!("{}\n{}", settings_css, self.stylesheet)
-    }
-
-    fn render_font_gamma(&self) -> f32 {
-        if let Some(value) = self.properties.get("font.gamma")
-            && let Ok(gamma) = value.trim().parse::<f32>()
-        {
-            return gamma.clamp(0.5, 2.0);
-        }
-        if let Some(value) = self.properties.get("font.gamma.index")
-            && let Ok(index) = value.trim().parse::<i64>()
-        {
-            let index = index.clamp(0, 30) as f32;
-            return (0.65 + (index * 0.7 / 30.0)).clamp(0.5, 2.0);
-        }
-        1.0
-    }
-
     fn render_state_snapshot(&self, path: PathBuf) -> String {
         let mut properties = self.properties.iter().collect::<Vec<(&String, &String)>>();
         properties.sort_by(|left, right| left.0.cmp(right.0));
@@ -237,7 +189,6 @@ impl Doc {
             return Ok(());
         }
         self.render_state_snapshot = snapshot;
-        let effective_stylesheet = self.settings_stylesheet();
         let options = DocumentOptions {
             width: self.width,
             height: self.height,
@@ -246,7 +197,7 @@ impl Doc {
             font_size: self.render_font_css_size(),
             font_path: self.font_path.clone(),
             fallback_font_paths: self.fallback_font_paths(),
-            stylesheet: (!effective_stylesheet.is_empty()).then(|| effective_stylesheet.clone()),
+            stylesheet: (!self.stylesheet.is_empty()).then(|| self.stylesheet.clone()),
             embedded_styles_enabled: self.embedded_stylesheet_enabled,
             viewport_scale: self.render_viewport_scale(),
         };
@@ -257,7 +208,6 @@ impl Doc {
         }
         let mut opened =
             Document::with_options_with_font_data(&path, &options, &self.font_data_cache)?;
-        opened.set_font_gamma(self.render_font_gamma());
         opened.set_background_color(self.background_color_value);
         self.inner = Some(opened);
         self.path = Some(path);
@@ -2964,13 +2914,7 @@ unsafe extern "C-unwind" fn doc_set_int_property(l: *mut lua_State) -> c_int {
                 doc.margins.3 = value as i32;
                 relayout = true;
             }
-            "crengine.interline.space" => {
-                let interline = value.clamp(0, 1000) as i32;
-                if interline != doc.interline {
-                    doc.interline = interline;
-                    relayout = true;
-                }
-            }
+            "crengine.interline.space" => doc.interline = value as i32,
             "window.status.battery.percent" => doc.battery = value as i32,
             "crengine.doc.embedded.styles.enabled" => {
                 let enabled = value != 0;
@@ -2994,12 +2938,6 @@ unsafe extern "C-unwind" fn doc_set_int_property(l: *mut lua_State) -> c_int {
                 }
             }
             "crengine.doc.embedded.fonts.enabled" => {}
-            "font.gamma"
-            | "font.gamma.index"
-            | "font.face.base.weight"
-            | "font.face.weight.embolden" => {
-                relayout = true;
-            }
             _ => {}
         }
         if relayout && doc.inner.is_some() {
@@ -3033,14 +2971,6 @@ unsafe extern "C-unwind" fn doc_set_string_property(l: *mut lua_State) -> c_int 
             }
             "crengine.highlight.selection.color" => {}
             "crengine.font.fallback.faces" if previous != value && doc.inner.is_some() => {
-                doc.relayout();
-            }
-            "font.gamma"
-            | "font.gamma.index"
-            | "font.face.base.weight"
-            | "font.face.weight.embolden"
-                if previous != value && doc.inner.is_some() =>
-            {
                 doc.relayout();
             }
             _ => {}
@@ -3185,15 +3115,10 @@ unsafe extern "C-unwind" fn doc_set_default_interline(l: *mut lua_State) -> c_in
     // SAFETY: `l` is the active Lua state.
     unsafe {
         if let Some(doc) = doc_mut(l) {
-            let value = arg_int(l, 2).clamp(0, 1000) as i32;
-            if value != doc.interline {
-                doc.interline = value;
-                doc.properties
-                    .insert("crengine.interline.space".to_string(), value.to_string());
-                if doc.inner.is_some() {
-                    doc.relayout();
-                }
-            }
+            let value = arg_int(l, 2).clamp(0, 1000);
+            doc.interline = value as i32;
+            doc.properties
+                .insert("crengine.interline.space".to_string(), value.to_string());
         }
     }
     0
