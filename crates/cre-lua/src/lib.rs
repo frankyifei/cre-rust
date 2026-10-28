@@ -152,8 +152,16 @@ impl Doc {
         requested / scale
     }
 
+    fn default_font_feature_css(&self) -> String {
+        r#"body, div, p, span, li, td, th, h1, h2, h3, h4, h5, h6 { font-feature-settings: "halt" 1, "chws" 1; }"#.to_string()
+    }
+
     fn settings_stylesheet(&self) -> String {
         let mut rules: Vec<String> = Vec::new();
+        let default_font_feature_css = self.default_font_feature_css();
+        if !default_font_feature_css.is_empty() {
+            rules.push(default_font_feature_css);
+        }
         if self.interline != 100 {
             let percent = self.interline.clamp(1, 1000);
             let line_height = (((percent as f32) / 100.0) * 1.2).clamp(0.2, 10.0);
