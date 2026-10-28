@@ -1457,7 +1457,8 @@ impl Document {
                 right = right.max(x1);
             }
             if left.is_finite() && right.is_finite() && right > left {
-                return Ok(Some((left, right)));
+                let scale = self.viewport_scale;
+                return Ok(Some((left * scale, right * scale)));
             }
             Ok(None)
         })
@@ -2330,6 +2331,7 @@ impl Document {
             bail!("page {page} is outside 1..={}", self.page_count());
         };
 
+        let scale = self.viewport_scale;
         Ok(snapshot
             .boxes
             .iter()
@@ -2339,10 +2341,10 @@ impl Document {
                     TextBox {
                         text: line.text.clone(),
                         page,
-                        x: line.x,
-                        y: line.y,
-                        width: line.width,
-                        height: line.height,
+                        x: line.x * scale,
+                        y: line.y * scale,
+                        width: line.width * scale,
+                        height: line.height * scale,
                     },
                 )
             })
