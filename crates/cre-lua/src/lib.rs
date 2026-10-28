@@ -152,98 +152,21 @@ impl Doc {
         requested / scale
     }
 
-    fn get_style_percent(&self, name: &str, fallback: f32) -> f32 {
-        let key = name.to_string();
-        if let Some(value) = self.properties.get(&key)
-            && let Ok(parsed) = value.trim().parse::<f32>()
-        {
-            return parsed;
-        }
-        fallback
-    }
-
-    #[allow(clippy::manual_range_contains)]
-    fn is_cjk_for_alignment(&self, ch: char) -> bool {
-        let code = ch as u32;
-        (0x3400..=0x4DBF).contains(&code)
-            || (0x4E00..=0x9FFF).contains(&code)
-            || (0xF900..=0xFAFF).contains(&code)
-            || (0x3000..=0x303F).contains(&code)
-            || (0x3040..=0x3248).contains(&code)
-            || (0xAC00..=0xD7FF).contains(&code)
-    }
-
-    fn contains_cjk_text(&self) -> bool {
-        let Some(inner) = self.inner.as_ref() else {
-            return false;
-        };
-        let page = inner.current_page().max(1);
-        let text = inner.page_text(page).unwrap_or_default();
-        if text.chars().any(|ch| self.is_cjk_for_alignment(ch)) {
-            return true;
-        }
-        if let Some(language) = inner.metadata().language.clone() {
-            let language = language.to_lowercase();
-            return language.contains("zh")
-                || language.contains("ja")
-                || language.contains("ko")
-                || language.contains("yue")
-                || language.contains("cjk");
-        }
-        false
-    }
-
     fn settings_stylesheet(&self) -> String {
         let mut rules: Vec<String> = Vec::new();
         if self.interline != 100 {
-            let line_height =
-                (((self.interline.clamp(1, 1000)) as f32 / 100.0) * 1.2).clamp(0.2, 10.0);
+            let percent = self.interline.clamp(1, 1000);
+            let line_height = (((percent as f32) / 100.0) * 1.2).clamp(0.2, 10.0);
             rules.push(format!(
                 "body, div, p, span, li, td, th, h1, h2, h3, h4, h5, h6 {{ line-height: {:.3} !important; }}",
                 line_height,
             ));
         }
-        let font_px = self.effective_font_size().max(1) as f32;
-        let space_scale = self.get_style_percent("crengine.style.space.width.scale.percent", 100.0);
-        let condensing = self.get_style_percent("crengine.style.space.condensing.percent", 100.0);
-        let expansion =
-            self.get_style_percent("crengine.style.max.added.letter.spacing.percent", 0.0);
-        let cjk_scale = self.get_style_percent("crengine.style.cjk.width.scale.percent", 100.0);
-        let space_extra = ((space_scale - 100.0) * 0.01 * font_px * 0.25)
-            + ((condensing - 100.0) * 0.01 * font_px * 0.1);
-        if space_extra.abs() > 0.01 {
-            let word_spacing = space_extra.clamp(-font_px, font_px * 2.0);
-            rules.push(format!(
-                "body, div, p, span, li, td, th, h1, h2, h3, h4, h5, h6 {{ word-spacing: {:.2}px !important; }}",
-                word_spacing,
-            ));
-        }
-        let is_cjk = self.contains_cjk_text();
-        if expansion != 0.0 {
-            let letter_spacing = (expansion * 0.01 * font_px * 0.25).clamp(-font_px, font_px * 2.0);
-            if letter_spacing.abs() > 0.01 {
-                rules.push(format!(
-                    "body, div, p, span, li, td, th, h1, h2, h3, h4, h5, h6 {{ letter-spacing: {:.2}px !important; }}",
-                    letter_spacing,
-                ));
-            }
-        }
-        if is_cjk && cjk_scale != 100.0 {
-            let delta =
-                ((cjk_scale - 100.0) * 0.01 * font_px * 0.25).clamp(-font_px, font_px * 2.0);
-            if delta.abs() > 0.01 {
-                rules.push(format!(
-                    "body, div, p, span, li, td, th, h1, h2, h3, h4, h5, h6 {{ letter-spacing: {:.2}px !important; }}",
-                    delta,
-                ));
-            }
-        }
         for name in ["font.face.base.weight", "font.face.weight.embolden"] {
             if let Some(value) = self.properties.get(name)
                 && let Ok(weight) = value.trim().parse::<i64>()
             {
-                #[allow(clippy::manual_range_contains)]
-                if weight >= 1 && weight <= 1000 && weight != 400 {
+                if (1_i64..=1000_i64).contains(&weight) && weight != 400 {
                     rules.push(format!(
                         "body, div, p, span, li, td, th, h1, h2, h3, h4, h5, h6 {{ font-weight: {} !important; }}",
                         weight,
@@ -3093,11 +3016,7 @@ unsafe extern "C-unwind" fn doc_set_int_property(l: *mut lua_State) -> c_int {
             "font.gamma"
             | "font.gamma.index"
             | "font.face.base.weight"
-            | "font.face.weight.embolden"
-            | "crengine.style.space.width.scale.percent"
-            | "crengine.style.space.condensing.percent"
-            | "crengine.style.max.added.letter.spacing.percent"
-            | "crengine.style.cjk.width.scale.percent" => {
+            | "font.face.weight.embolden" => {
                 relayout = true;
             }
             _ => {}
@@ -3139,10 +3058,6 @@ unsafe extern "C-unwind" fn doc_set_string_property(l: *mut lua_State) -> c_int 
             | "font.gamma.index"
             | "font.face.base.weight"
             | "font.face.weight.embolden"
-            | "crengine.style.space.width.scale.percent"
-            | "crengine.style.space.condensing.percent"
-            | "crengine.style.max.added.letter.spacing.percent"
-            | "crengine.style.cjk.width.scale.percent"
                 if previous != value && doc.inner.is_some() =>
             {
                 doc.relayout();
