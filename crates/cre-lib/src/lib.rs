@@ -268,6 +268,7 @@ pub struct Document {
     page_margin: f32,
     font_css_size: f32,
     viewport_scale: f32,
+    font_gamma: f32,
     stylesheet: Option<String>,
     embedded_styles_enabled: bool,
     sources: Vec<String>,
@@ -607,6 +608,7 @@ impl Document {
             embedded_styles_enabled: options.embedded_styles_enabled,
             font_css_size: options.font_size,
             viewport_scale: options.viewport_scale,
+            font_gamma: 1.0,
             sources: htmls,
             base_url: base_url.to_string(),
             resources,
@@ -870,6 +872,7 @@ impl Document {
                 self.background_color,
             )
         };
+        let bitmap = self.apply_font_gamma_page_bitmap(bitmap);
         let image = PageImage {
             bitmap: bitmap.clone(),
             image_count,
@@ -916,7 +919,7 @@ impl Document {
             0,
         );
 
-        Ok(paint_page_rgba(
+        let (bitmap, image_count, image_surface) = paint_page_rgba(
             &scene,
             self.width,
             self.height,
@@ -924,6 +927,11 @@ impl Document {
             clip_top * viewport_scale,
             clip_bottom * viewport_scale,
             self.background_color,
+        );
+        Ok((
+            self.apply_font_gamma_color_bitmap(bitmap),
+            image_count,
+            image_surface,
         ))
     }
 
@@ -931,6 +939,45 @@ impl Document {
         &mut self,
     ) -> Result<(Arc<ColorPageBitmap>, usize, usize)> {
         self.render_page_color_with_stats(self.current_page)
+    }
+
+    pub fn set_font_gamma(&mut self, gamma: f32) {
+        let gamma = if gamma.is_finite() {
+            gamma.clamp(0.5, 2.0)
+        } else {
+            1.0
+        };
+        if gamma != self.font_gamma {
+            self.font_gamma = gamma;
+            self.clear_page_image_cache();
+        }
+    }
+
+    fn apply_font_gamma_page_bitmap(&self, bitmap: Arc<PageBitmap>) -> Arc<PageBitmap> {
+        if self.font_gamma == 1.0 {
+            return bitmap;
+        }
+        let mut mutable = bitmap.as_ref().clone();
+        for value in mutable.data.iter_mut() {
+            *value = apply_gamma_byte(*value, self.font_gamma);
+        }
+        Arc::new(mutable)
+    }
+
+    fn apply_font_gamma_color_bitmap(&self, bitmap: Arc<ColorPageBitmap>) -> Arc<ColorPageBitmap> {
+        if self.font_gamma == 1.0 {
+            return bitmap;
+        }
+        let mut mutable = bitmap.as_ref().clone();
+        for index in 0..mutable.data.len() / 4 {
+            let offset = index * 4;
+            for channel in 0..3 {
+                if let Some(value) = mutable.data.get_mut(offset + channel) {
+                    *value = apply_gamma_byte(*value, self.font_gamma);
+                }
+            }
+        }
+        Arc::new(mutable)
     }
 
     pub fn render_page(&mut self, page: usize) -> Result<PageBitmap> {
@@ -2350,6 +2397,20 @@ impl Document {
             })
             .collect())
     }
+}
+
+fn apply_gamma_byte(value: u8, gamma: f32) -> u8 {
+    if gamma == 1.0 {
+        return value;
+    }
+    let gamma = if gamma.is_finite() {
+        gamma.clamp(0.5, 2.0)
+    } else {
+        1.0
+    };
+    let x = (value as f32) / 255.0;
+    let y = x.powf(1.0 / gamma);
+    ((y * 255.0) + 0.5).clamp(0.0, 255.0) as u8
 }
 
 fn validate_options(options: &DocumentOptions) -> Result<()> {
