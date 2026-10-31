@@ -73,7 +73,7 @@ struct Doc {
     highlight: Option<(String, String)>,
     callback: Option<c_int>,
     render_requested: bool,
-    font_data_cache: Vec<Vec<u8>>,
+    font_data_cache: Vec<cre_lib::FontBlob>,
     font_cache_paths: Vec<PathBuf>,
     render_state_snapshot: String,
 }

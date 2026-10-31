@@ -347,7 +347,7 @@ impl Document {
     pub fn with_options_with_font_data(
         path: impl AsRef<Path>,
         options: &DocumentOptions,
-        font_datas: &[Vec<u8>],
+        font_datas: &[FontBlob],
     ) -> Result<Self> {
         validate_options(options)?;
         let path = path.as_ref();
@@ -561,7 +561,7 @@ impl Document {
         page_map_source: String,
         page_map_items: Vec<RawPageMapItem>,
         options: &DocumentOptions,
-        font_datas: &[Vec<u8>],
+        font_datas: &[FontBlob],
     ) -> Result<Self> {
         let build_start = std::time::Instant::now();
         let font_context = Arc::new(build_font_ctx_with_fallbacks(font_datas));
@@ -3355,33 +3355,51 @@ pub fn resolve_font_paths(options: &DocumentOptions) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-pub fn load_font_datas(paths: &[PathBuf]) -> Vec<Vec<u8>> {
-    let mut datas: Vec<Vec<u8>> = Vec::new();
+/// Shared font file bytes. Font files can be large (CJK fallbacks are tens of
+/// megabytes on Kindles), so they are mmapped when possible: the pages stay
+/// file-backed and reclaimable instead of being an anonymous heap copy, and
+/// fontique can read outlines lazily. The same allocation is shared between
+/// the document's cache and the font collection (no `to_vec()` copies).
+pub type FontBlob = Arc<dyn AsRef<[u8]> + Send + Sync>;
+
+pub fn load_font_datas(paths: &[PathBuf]) -> Vec<FontBlob> {
+    let mut datas: Vec<FontBlob> = Vec::new();
     for path in paths.iter() {
-        if let Ok(data) = std::fs::read(path) {
-            datas.push(data);
+        if let Some(blob) = load_font_blob(path) {
+            datas.push(blob);
         }
     }
     datas
 }
 
-fn collect_font_datas(options: &DocumentOptions) -> Result<Vec<Vec<u8>>> {
+fn load_font_blob(path: &Path) -> Option<FontBlob> {
+    if let Ok(file) = std::fs::File::open(path)
+        && let Ok(mapped) = unsafe { memmap2::Mmap::map(&file) }
+    {
+        return Some(Arc::new(mapped) as FontBlob);
+    }
+    std::fs::read(path)
+        .ok()
+        .map(|data| Arc::new(data) as FontBlob)
+}
+
+fn collect_font_datas(options: &DocumentOptions) -> Result<Vec<FontBlob>> {
     let paths = resolve_font_paths(options)?;
     if let Some(main_path) = paths.first() {
-        let main_font = std::fs::read(main_path)
+        let main_font = load_font_blob(main_path)
             .with_context(|| format!("read font {}", main_path.display()))?;
         let mut datas = vec![main_font];
         for fallback_path in paths.iter().skip(1) {
-            if let Ok(data) = std::fs::read(fallback_path) {
+            if let Some(data) = load_font_blob(fallback_path) {
                 datas.push(data);
             }
         }
         return Ok(datas);
     }
-    Ok(Vec::<Vec<u8>>::new())
+    Ok(Vec::<FontBlob>::new())
 }
 
-fn build_font_ctx_with_fallbacks(font_datas: &[Vec<u8>]) -> FontContext {
+fn build_font_ctx_with_fallbacks(font_datas: &[FontBlob]) -> FontContext {
     let mut ctx = FontContext {
         source_cache: SourceCache::new_shared(),
         collection: Collection::new(CollectionOptions {
@@ -3392,10 +3410,7 @@ fn build_font_ctx_with_fallbacks(font_datas: &[Vec<u8>]) -> FontContext {
     let family_ids: Vec<FamilyId> = font_datas
         .iter()
         .flat_map(|data| {
-            let decoded = data.to_vec();
-            let registered = ctx
-                .collection
-                .register_fonts(Blob::new(Arc::new(decoded) as _), None);
+            let registered = ctx.collection.register_fonts(Blob::new(data.clone()), None);
             registered
                 .iter()
                 .map(|(id, _)| *id)

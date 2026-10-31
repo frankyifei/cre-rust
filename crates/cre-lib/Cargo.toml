@@ -24,6 +24,7 @@ cre-epub = { path = "../cre-epub" }
 cre-fb2 = { path = "../cre-fb2" }
 cre-paint = { path = "../cre-paint" }
 cre-text = { path = "../cre-text" }
+memmap2 = "0.9"
 image = { version = "0.25", default-features = false, features = [
     "png",
     "jpeg",
