@@ -8,3 +8,4 @@ TODO.md
 AGENTS.md
 /scripts/sync-to-windows.sh
 /fixtures/
+/target-arm-kindlepw2-linux-gnueabi/

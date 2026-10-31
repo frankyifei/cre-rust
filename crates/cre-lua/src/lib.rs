@@ -4794,3 +4794,49 @@ pub unsafe extern "C" fn luaopen_cre(l: *mut lua_State) -> c_int {
     }
     1
 }
+
+/// Compatibility fallback for devices whose libc predates glibc 2.16
+/// (e.g. Kindle Paperwhite 2, glibc 2.12).
+///
+/// Rust std calls `getauxval(AT_MINSIGSTKSZ)` from `sigstack_size()` while
+/// setting up the alternate signal stack for every thread, but glibc only
+/// started exporting `getauxval` in 2.16. Without this definition the module
+/// cannot be loaded on such devices ("undefined symbol: getauxval").
+///
+/// Only compiled with the `old-glibc` feature (Kindle cross builds). The
+/// implementation matches glibc semantics (0 when the entry is absent), so
+/// exposing it harmlessly shadows the newer libc function on newer devices.
+#[cfg(feature = "old-glibc")]
+mod old_glibc {
+    use std::os::raw::c_ulong;
+
+    /// Reads the process auxiliary vector, mirroring glibc's `getauxval`.
+    ///
+    /// # Safety
+    /// Matches `getauxval`'s C contract; no pointers are dereferenced.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn getauxval(kind: c_ulong) -> c_ulong {
+        // AUXV entries are pairs of native-word values terminated by AT_NULL.
+        // This shim is only built for 32-bit ARM Linux (ARMv7) targets.
+        let Ok(bytes) = std::fs::read("/proc/self/auxv") else {
+            return 0;
+        };
+        let word = std::mem::size_of::<c_ulong>();
+        let mut offset = 0usize;
+        while offset + word * 2 <= bytes.len() {
+            let mut a_type = [0u8; std::mem::size_of::<c_ulong>()];
+            let mut a_val = [0u8; std::mem::size_of::<c_ulong>()];
+            a_type.copy_from_slice(&bytes[offset..offset + word]);
+            a_val.copy_from_slice(&bytes[offset + word..offset + 2 * word]);
+            let entry_type = c_ulong::from_ne_bytes(a_type);
+            if entry_type == 0 {
+                break;
+            }
+            if entry_type == kind {
+                return c_ulong::from_ne_bytes(a_val);
+            }
+            offset += word * 2;
+        }
+        0
+    }
+}
