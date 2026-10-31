@@ -404,6 +404,7 @@ dependencies = [
  "cre-fb2",
  "cre-paint",
  "cre-text",
+ "flate2",
  "image",
  "parley",
  "percent-encoding",

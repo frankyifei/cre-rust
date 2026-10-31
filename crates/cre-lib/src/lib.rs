@@ -236,17 +236,17 @@ struct PageImage {
     image_surface: usize,
 }
 
-struct PageSnapshot {
+struct PageMeta {
     chunk: usize,
     local_start: PageStart,
     local_clip_bottom: f32,
     doc_top: f32,
     render_height: f32,
-    boxes: Vec<SnapshotLine>,
     xpointer: Option<String>,
     page_flow: i64,
 }
 
+#[derive(Clone)]
 struct SnapshotLine {
     text: String,
     x: f32,
@@ -273,7 +273,7 @@ pub struct Document {
     font_gamma: f32,
     stylesheet: Option<String>,
     embedded_styles_enabled: bool,
-    sources: Vec<String>,
+    sources: Vec<Vec<u8>>,
     base_url: String,
     resources: ResourceSource,
     cover_image: Option<Vec<u8>>,
@@ -281,7 +281,7 @@ pub struct Document {
     net: Arc<dyn NetProvider>,
     font_context: Arc<FontContext>,
     chunks: Vec<ChunkMeta>,
-    pages: Vec<PageSnapshot>,
+    pages: Vec<PageMeta>,
     xpointer_pages: HashMap<String, usize>,
     href_pages: HashMap<(String, Option<String>), usize>,
     spine_to_chunk: HashMap<u32, usize>,
@@ -293,6 +293,7 @@ pub struct Document {
     background_color: u32,
     page_image_cache: HashMap<usize, PageImage>,
     page_cache_order: Vec<usize>,
+    page_boxes_cache: RefCell<Option<(usize, Vec<SnapshotLine>)>>,
 }
 
 impl Document {
@@ -516,17 +517,20 @@ impl Document {
 
             let mut previous_page_flow = 0;
             for (local_index, start) in page_starts.iter().enumerate() {
-                let clip_bottom = page_clip_bottom(&page_starts, local_index, options);
-                let boxes = snapshot_page_boxes(root, &lines, *start, clip_bottom, line_base);
-                let page_flow = if let Some(first) = boxes.first() {
-                    let local_line = first.global_line.saturating_sub(line_base);
-                    line_flows
-                        .get(local_line)
-                        .copied()
-                        .unwrap_or(previous_page_flow)
-                } else {
-                    previous_page_flow
-                };
+                let clip_bottom = page_chunk_clip_bottom(
+                    &page_starts,
+                    local_index,
+                    page_height_css,
+                    page_margin_css,
+                );
+                let page_flow = first_non_blank_line_flow(
+                    root,
+                    &lines,
+                    *start,
+                    clip_bottom,
+                    line_flows.as_slice(),
+                    previous_page_flow,
+                );
                 previous_page_flow = page_flow;
                 let render_height =
                     ((clip_bottom - start.top).max(0.0) * options.viewport_scale).max(0.0);
@@ -539,13 +543,12 @@ impl Document {
                     xpointer_pages.insert(xpointer.clone(), first_page + local_index);
                 }
                 page_xpointers.push(xpointer.clone());
-                pages.push(PageSnapshot {
+                pages.push(PageMeta {
                     chunk: chunk_index,
                     local_start: *start,
                     local_clip_bottom: clip_bottom,
                     doc_top,
                     render_height,
-                    boxes,
                     xpointer,
                     page_flow,
                 });
@@ -611,7 +614,10 @@ impl Document {
             font_css_size: options.font_size,
             viewport_scale: options.viewport_scale,
             font_gamma: 1.0,
-            sources: htmls,
+            sources: htmls
+                .into_iter()
+                .map(|html| compress_chunk_source(&html))
+                .collect(),
             base_url: base_url.to_string(),
             resources,
             cover_image,
@@ -631,6 +637,7 @@ impl Document {
             background_color: 0xFF_FFFF,
             page_image_cache: HashMap::new(),
             page_cache_order: Vec::new(),
+            page_boxes_cache: RefCell::new(None),
         };
         document.ensure_chunk(0)?;
         Ok(document)
@@ -1080,12 +1087,13 @@ impl Document {
         {
             return Ok(());
         }
-        let html = self
+        let stored = self
             .sources
             .get(index)
             .context("document chunk is missing")?;
+        let html = decompress_chunk_source(stored)?;
         let doc = create_document(
-            html,
+            &html,
             &self.base_url,
             self.net.clone(),
             self.font_context.clone(),
@@ -1939,12 +1947,13 @@ impl Document {
 
         let mut hits = Vec::new();
         for page in 1..=self.page_count() {
-            let snapshot = &self.pages[page - 1];
-            let chunk_index = snapshot.chunk;
+            let meta = &self.pages[page - 1];
+            let chunk_index = meta.chunk;
             let line_base = self.chunks[chunk_index].line_base;
+            let snapshot = self.page_snapshot_boxes(page)?;
             let mut page_text = String::new();
-            let mut spans = Vec::with_capacity(snapshot.boxes.len());
-            for line in &snapshot.boxes {
+            let mut spans = Vec::with_capacity(snapshot.len());
+            for line in &snapshot {
                 if !page_text.is_empty() {
                     page_text.push('\n');
                 }
@@ -2454,17 +2463,48 @@ impl Document {
         Ok(position.to_xpointer())
     }
 
+    fn page_meta(&self, page: usize) -> Result<&PageMeta> {
+        let index = page.checked_sub(1).context("page numbers are 1-based")?;
+        self.pages
+            .get(index)
+            .with_context(|| format!("page {page} is outside 1..={}", self.page_count()))
+    }
+
+    fn page_snapshot_boxes(&self, page: usize) -> Result<Vec<SnapshotLine>> {
+        if let Some((cached_page, cached)) = self.page_boxes_cache.borrow().as_ref()
+            && *cached_page == page
+        {
+            return Ok(cached.clone());
+        }
+        let meta = self.page_meta(page)?;
+        let (chunk_index, local_start, clip_bottom) =
+            (meta.chunk, meta.local_start, meta.local_clip_bottom);
+        let line_base = self.chunks[chunk_index].line_base;
+        let boxes = self.with_active_chunk(chunk_index, |active| {
+            let root = active.doc.root_element();
+            Ok(snapshot_page_boxes(
+                root,
+                &active.lines,
+                local_start,
+                clip_bottom,
+                line_base,
+            ))
+        })?;
+        *self.page_boxes_cache.borrow_mut() = Some((page, boxes.clone()));
+        Ok(boxes)
+    }
+
     fn page_text_boxes_with_lines(&self, page: usize) -> Result<Vec<(usize, TextBox)>> {
         let Some(index) = page.checked_sub(1) else {
             bail!("page numbers are 1-based");
         };
-        let Some(snapshot) = self.pages.get(index) else {
+        if self.pages.get(index).is_none() {
             bail!("page {page} is outside 1..={}", self.page_count());
-        };
+        }
 
+        let snapshot = self.page_snapshot_boxes(page)?;
         let scale = self.viewport_scale;
         Ok(snapshot
-            .boxes
             .iter()
             .map(|line| {
                 (
@@ -3523,6 +3563,79 @@ fn remove_link_stylesheets(bytes: Vec<u8>) -> Vec<u8> {
     current
 }
 
+fn page_chunk_clip_bottom(
+    page_starts: &[PageStart],
+    index: usize,
+    page_height_css: f32,
+    page_margin_css: f32,
+) -> f32 {
+    let start = page_starts[index];
+    page_starts
+        .get(index + 1)
+        .map_or(start.top + page_height_css - page_margin_css, |next| {
+            next.clip_top
+        })
+}
+
+fn first_non_blank_line_flow(
+    root: &Node,
+    lines: &[LineBox],
+    start: PageStart,
+    clip_bottom: f32,
+    line_flows: &[i64],
+    previous_page_flow: i64,
+) -> i64 {
+    let lower = start.clip_top;
+    let upper = clip_bottom;
+    for (local_line, line) in lines.iter().enumerate() {
+        if line.top + 0.5 < lower || line.top + 0.5 >= upper {
+            continue;
+        }
+        if let Some(text) = line_text_from_root(root, line)
+            && !text.trim().is_empty()
+        {
+            return line_flows
+                .get(local_line)
+                .copied()
+                .unwrap_or(previous_page_flow);
+        }
+    }
+    previous_page_flow
+}
+
+fn compress_chunk_source(html: &str) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder =
+        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    if encoder.write_all(html.as_bytes()).is_ok()
+        && let Ok(deflated) = encoder.finish()
+    {
+        let mut stored = Vec::with_capacity(deflated.len() + 1);
+        stored.push(1);
+        stored.extend_from_slice(&deflated);
+        return stored;
+    }
+    // Compression failed; fall back to storing the plain bytes so the
+    // document still opens (decode refuses unknown payloads).
+    let mut stored = Vec::with_capacity(html.len() + 1);
+    stored.push(0);
+    stored.extend_from_slice(html.as_bytes());
+    stored
+}
+
+fn decompress_chunk_source(stored: &[u8]) -> Result<String> {
+    match stored.first().copied() {
+        Some(1) => {
+            use std::io::Read;
+            let mut html = String::new();
+            flate2::read::DeflateDecoder::new(&stored[1..]).read_to_string(&mut html)?;
+            Ok(html)
+        }
+        Some(0) => Ok(String::from_utf8_lossy(&stored[1..]).into_owned()),
+        _ => bail!("stored chunk source is corrupted"),
+    }
+}
+
 fn snapshot_page_boxes(
     root: &Node,
     lines: &[LineBox],
@@ -3583,21 +3696,6 @@ fn css_page_geometry(
     let css_margin = page_margin / viewport_scale;
     let css_height_u32 = css_height as u32;
     (css_height_u32, css_height, css_margin)
-}
-
-fn page_clip_bottom(page_starts: &[PageStart], index: usize, options: &DocumentOptions) -> f32 {
-    let start = page_starts[index];
-    let (_page_height_css_u32, page_height_css, page_margin_css) = css_page_geometry(
-        options.width,
-        options.height,
-        options.viewport_scale,
-        options.page_margin,
-    );
-    page_starts
-        .get(index + 1)
-        .map_or(start.top + page_height_css - page_margin_css, |next| {
-            next.clip_top
-        })
 }
 
 fn collect_spine_chunks(node: &Node, chunk_index: usize, out: &mut HashMap<u32, usize>) {
