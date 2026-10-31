@@ -4781,6 +4781,9 @@ const MODULE_FUNCS: &[lua::luaL_Reg] = &regs![
 /// `l` must be a valid `lua_State` supplied by the LuaJIT module loader.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaopen_cre(l: *mut lua_State) -> c_int {
+    // Baseline of the whole interpreter before any book is opened; the
+    // difference to "[doc open]" is the memory our module is responsible for.
+    cre_lib::trace_memory("module load");
     // SAFETY: `l` is a valid Lua state supplied by the LuaJIT module loader.
     unsafe {
         lua::luaL_newmetatable_(l, CREDOC.as_ptr().cast());

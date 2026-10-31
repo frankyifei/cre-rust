@@ -250,7 +250,12 @@ fn trim_memory() {
     }
 }
 
-/// Set `CRE_LIB_TRACE=1` to log process memory (VmRSS/VmHWM) at key stages.
+/// Set `CRE_LIB_TRACE=1` to log process memory (VmRSS/VmHWM/VmSize) at key
+/// stages, together with system-wide free/available memory.
+///
+/// The system numbers matter because on a 256 MB device a SIGKILL can be
+/// caused by the system running out of memory rather than by this process
+/// alone: `avail` is what the kernel thinks it can still hand out.
 pub fn trace_memory(label: &str) {
     if !trace_enabled() {
         return;
@@ -266,12 +271,39 @@ pub fn trace_memory(label: &str) {
             .unwrap_or("?")
             .to_string()
     };
+    let system = std::fs::read_to_string("/proc/meminfo")
+        .map(|info| {
+            let field = |key: &str| {
+                info.lines()
+                    .find(|line| line.starts_with(key))
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("?")
+                    .to_string()
+            };
+            format!(
+                "sys_free={} kB sys_avail={} kB",
+                field("MemFree:"),
+                field("MemAvailable:")
+            )
+        })
+        .unwrap_or_default();
     eprintln!(
-        "cre-lib: memory [{}] rss={} kB hwm={} kB",
+        "cre-lib: memory [{}] rss={} kB hwm={} kB vsz={} kB vmpeak={} kB {}",
         label,
         value("VmRSS:"),
-        value("VmHWM:")
+        value("VmHWM:"),
+        value("VmSize:"),
+        value("VmPeak:"),
+        system
     );
+}
+
+/// One-line stage marker for a SIGKILL diagnosis: written before and after a
+/// risky step so the last line in the log names the step that died.
+fn trace_step(message: impl FnOnce() -> String) {
+    if trace_enabled() {
+        eprintln!("cre-lib: {}", message());
+    }
 }
 
 fn trace_stage<T>(label: impl FnOnce() -> String, run: impl FnOnce() -> T) -> T {
@@ -1027,8 +1059,16 @@ impl Document {
             ));
         }
 
+        trace_step(|| format!("render stage: page {page} prepare"));
         let (bitmap, image_count, image_surface) = {
+            let chunk_start = std::time::Instant::now();
             self.ensure_chunk(chunk_index)?;
+            trace_step(|| {
+                format!(
+                    "render stage: page {page} chunk {chunk_index} ready in {:.3}s",
+                    chunk_start.elapsed().as_secs_f64()
+                )
+            });
             let mut active = self.active.borrow_mut();
             let active = active
                 .as_mut()
@@ -1038,6 +1078,7 @@ impl Document {
                 x: 0.0,
                 y: f64::from(start.top),
             });
+            let scene_start = std::time::Instant::now();
             let mut scene = Scene::default();
             blitz_paint::paint_scene(
                 &mut scene,
@@ -1048,6 +1089,15 @@ impl Document {
                 0,
                 0,
             );
+            trace_step(|| {
+                format!(
+                    "render stage: page {page} scene recorded in {:.3}s ({} commands)",
+                    scene_start.elapsed().as_secs_f64(),
+                    scene.commands.len()
+                )
+            });
+            trace_memory("before paint_page");
+            let paint_start = std::time::Instant::now();
             let local_top = clip_top * viewport_scale;
             let local_bottom = clip_bottom * viewport_scale;
             let (image_arc, paint_count, paint_surface) = paint_page(
@@ -1060,6 +1110,12 @@ impl Document {
                 self.background_color,
                 self.font_gamma,
             );
+            trace_step(|| {
+                format!(
+                    "render stage: page {page} painted in {:.3}s ({paint_count} paint commands)",
+                    paint_start.elapsed().as_secs_f64()
+                )
+            });
             (image_arc, paint_count, paint_surface)
         };
         let image = PageImage {
