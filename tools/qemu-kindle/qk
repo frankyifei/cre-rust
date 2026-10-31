@@ -1,0 +1,528 @@
+#!/usr/bin/env python3
+"""qk - run the genuine Kindle KOReader build under qemu-user.
+
+A self-contained emulator harness: downloads a Kindle KOReader release,
+swaps in a cre module of your choice, preloads a small ARM shim that
+supplies the device internals (serial, framebuffer, touchscreen), and
+shows the e-ink framebuffer in an X11 window with mouse-to-touch input.
+
+Nothing here is tied to a particular checkout or machine: every path is
+configurable (config file, environment, or CLI flag).
+
+Commands
+    qk run [book]     fetch/build as needed, then run the emulator
+    qk fetch          only download the KOReader package
+    qk build          only build the shim/viewer and install the module
+    qk config         show the effective configuration
+    qk shot [file]    convert the last framebuffer to PNG (no dependencies)
+
+Configuration precedence: defaults < config file < QK_* env < CLI flags.
+
+Config file (JSON), default ~/.config/qemu-kindle/config.json:
+    {
+      "ko_version": "v2026.07.1",
+      "cache_dir": "~/.cache/qemu-kindle",
+      "triplet": "arm-kindlepw2-linux-gnueabi",
+      "toolchain": "~/x-tools/arm-kindlepw2-linux-gnueabi",
+      "qemu": "qemu-arm",
+      "sysroot": "/usr/arm-linux-gnueabi",
+      "cre_lib": "~/src/kindle-project/target-arm-kindlepw2-linux-gnueabi/armv7-unknown-linux-gnueabi/release/libkoreader-cre.so",
+      "cre_build_script": "~/src/kindle-project/scripts/build-cre-lua-luajit-module-arm-kindlepw2.sh",
+      "display": ":0",
+      "viewer_scale": 0.72,
+      "timeout": 0
+    }
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+import zipfile
+import zlib
+from pathlib import Path
+
+APP_DIR = Path(__file__).resolve().parent
+FB_WIDTH, FB_HEIGHT = 758, 1024
+
+DEFAULTS = {
+    "ko_version": "v2026.07.1",
+    "package_url": "https://github.com/koreader/koreader/releases/download/"
+    "{version}/koreader-kindlepw2-{version}.zip",
+    "cache_dir": "~/.cache/qemu-kindle",
+    "package_zip": "",
+    "package_dir": "",
+    "triplet": "arm-kindlepw2-linux-gnueabi",
+    "toolchain": "~/x-tools/arm-kindlepw2-linux-gnueabi",
+    "cc": "",
+    "qemu": "qemu-arm",
+    "sysroot": "/usr/arm-linux-gnueabi",
+    "cre_lib": "",
+    "cre_build_script": "",
+    "cre_build_output": "",
+    "display": "",
+    "viewer_scale": 0.72,
+    "viewer_cc": "cc",
+    "startup_script_dir": "/var/tmp",
+    "timeout": 0,
+    "title": "Kindle - qemu",
+    "state_dir": "",
+    "log_file": "",
+    "tap_delay": "",
+    "cre_trace": "1",
+}
+
+# Fix the URL default (kept here so tools reading DEFAULTS see the right one).
+DEFAULTS["package_url"] = (
+    "https://github.com/koreader/koreader/releases/download/"
+    "{version}/koreader-kindlepw2-{version}.zip"
+)
+
+
+def expand(value):
+    if isinstance(value, str):
+        return os.path.expanduser(os.path.expandvars(value))
+    return value
+
+
+def load_config(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"qk: invalid config {path}: {exc}")
+    if not isinstance(data, dict):
+        raise SystemExit(f"qk: config {path} must contain a JSON object")
+    return data
+
+
+def resolve_config(args) -> dict:
+    cfg = dict(DEFAULTS)
+    config_path = Path(
+        expand(args.config)
+        if args.config
+        else expand(os.environ.get("QK_CONFIG", "~/.config/qemu-kindle/config.json"))
+    )
+    cfg.update(load_config(config_path))
+
+    for key in DEFAULTS:
+        env_key = "QK_" + key.upper()
+        if env_key in os.environ and os.environ[env_key] != "":
+            cfg[key] = os.environ[env_key]
+
+    for key in DEFAULTS:
+        value = getattr(args, key, None)
+        if value is not None and value != "":
+            cfg[key] = value
+
+    for key, value in cfg.items():
+        cfg[key] = expand(value)
+    cfg["viewer_scale"] = float(cfg["viewer_scale"])
+    cfg["timeout"] = int(cfg["timeout"])
+    cfg["_config_path"] = str(config_path)
+    return cfg
+
+
+def run(cmd, **kwargs):
+    print("+", " ".join(str(c) for c in cmd), flush=True)
+    return subprocess.run(cmd, check=True, **kwargs)
+
+
+def find_target_cc(cfg) -> str:
+    if cfg["cc"]:
+        return cfg["cc"]
+    triplet = cfg["triplet"]
+    candidates = []
+    if cfg["toolchain"]:
+        candidates.append(Path(cfg["toolchain"]) / "bin" / f"{triplet}-gcc")
+    which = shutil.which(f"{triplet}-gcc")
+    if which:
+        candidates.append(Path(which))
+    for generic in ("arm-linux-gnueabi-gcc",):
+        which = shutil.which(generic)
+        if which:
+            candidates.append(Path(which))
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    raise SystemExit(
+        "qk: no ARM cross compiler found.\n"
+        "    Set 'cc' or 'toolchain' in the config, or install "
+        "gcc-arm-linux-gnueabi."
+    )
+
+
+def require_qemu(cfg) -> str:
+    qemu = cfg["qemu"]
+    if os.path.sep in qemu or qemu.startswith("~"):
+        if not os.access(expand(qemu), os.X_OK):
+            raise SystemExit(f"qk: qemu not executable: {qemu}")
+        return expand(qemu)
+    found = shutil.which(qemu)
+    if not found:
+        raise SystemExit(
+            "qk: qemu-arm not found.\n"
+            "    Install qemu-user (e.g. apt install qemu-user) or set 'qemu'."
+        )
+    return found
+
+
+def require_sysroot(cfg) -> str:
+    sysroot = cfg["sysroot"]
+    loader = Path(sysroot) / "lib" / "ld-linux.so.3"
+    if not loader.exists():
+        raise SystemExit(
+            f"qk: armel sysroot missing ({loader}).\n"
+            "    Install gcc-arm-linux-gnueabi or set 'sysroot' to an armel rootfs.\n"
+            "    (The toolchain's glibc 2.12 loader cannot run under qemu-user;\n"
+            "     KOReader only needs <= GLIBC_2.12 symbols, so a newer armel\n"
+            "     rootfs works.)"
+        )
+    return sysroot
+
+
+def ensure_package(cfg) -> Path:
+    cache = Path(cfg["cache_dir"])
+    if cfg["package_dir"]:
+        pkg = Path(cfg["package_dir"])
+        if not (pkg / "luajit").exists():
+            raise SystemExit(f"qk: package_dir has no luajit: {pkg}")
+        return pkg
+    cache.mkdir(parents=True, exist_ok=True)
+    pkg = cache / "koreader"
+    if (pkg / "luajit").exists():
+        return pkg
+    zip_path = Path(cfg["package_zip"]) if cfg["package_zip"] else cache / "ko.zip"
+    if cfg["package_zip"]:
+        if not zip_path.exists():
+            raise SystemExit(f"qk: package_zip not found: {zip_path}")
+    else:
+        url = cfg["package_url"].format(version=cfg["ko_version"])
+        print(f"== downloading {url}")
+        urllib.request.urlretrieve(url, zip_path)
+    print(f"== extracting {zip_path}")
+    with zipfile.ZipFile(zip_path) as archive:
+        archive.extractall(cache)
+    if not (pkg / "luajit").exists():
+        raise SystemExit(f"qk: unexpected package layout in {cache}")
+    return pkg
+
+
+def resolve_cre_lib(cfg) -> Path:
+    if cfg["cre_lib"]:
+        lib = Path(cfg["cre_lib"])
+        if not lib.exists():
+            raise SystemExit(f"qk: cre_lib not found: {lib}")
+        return lib
+    script = cfg["cre_build_script"]
+    if script:
+        script_path = Path(script)
+        if not script_path.exists():
+            raise SystemExit(f"qk: cre_build_script not found: {script_path}")
+        print("== building cre module")
+        run(["bash", str(script_path)])
+        if cfg["cre_build_output"]:
+            lib = Path(cfg["cre_build_output"])
+        else:
+            lib = Path(cfg["cache_dir"]) / "build" / "armv7-unknown-linux-gnueabi" / "release" / "libkoreader-cre.so"
+        if not lib.exists():
+            raise SystemExit(
+                "qk: built module not found; set 'cre_lib' or 'cre_build_output'.\n"
+                f"    looked for {lib}"
+            )
+        return lib
+    raise SystemExit(
+        "qk: no cre module configured.\n"
+        "    Set 'cre_lib' to a prebuilt libkoreader-cre.so, or\n"
+        "    'cre_build_script' to a script that builds it."
+    )
+
+
+def build_shim(cfg, state_dir: Path) -> Path:
+    cc = find_target_cc(cfg)
+    out = state_dir / "fakekindle.so"
+    run(
+        [
+            cc,
+            "-shared",
+            "-fPIC",
+            "-O2",
+            "-o",
+            str(out),
+            str(APP_DIR / "fakekindle.c"),
+            "-ldl",
+            "-lpthread",
+        ]
+    )
+    return out
+
+
+def build_viewer(cfg, cache: Path) -> Path:
+    out = cache / "qk-viewer"
+    run([cfg["viewer_cc"], "-O2", "-o", str(out), str(APP_DIR / "viewer.c"), "-lX11"])
+    return out
+
+
+def prepare_state(cfg) -> Path:
+    state = Path(cfg["state_dir"]) if cfg["state_dir"] else Path(cfg["cache_dir"]) / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "usid").write_text("B0D4123456789012\n")
+    fifo = state / "taps"
+    if fifo.exists() and not fifo.is_fifo():
+        fifo.unlink()
+    if not fifo.exists():
+        os.mkfifo(fifo)
+    with open(state / "fb0", "wb") as handle:
+        handle.truncate(FB_WIDTH * FB_HEIGHT)
+    return state
+
+
+def install_module(cfg, package: Path, cre: Path) -> None:
+    target = package / "libs" / "libkoreader-cre.so"
+    backup = target.with_suffix(".so.orig")
+    if not backup.exists() and target.exists():
+        shutil.copy2(target, backup)
+    shutil.copy2(cre, target)
+    print(f"== installed {cre} -> {target}")
+
+
+def sync_startup_script(cfg, package: Path) -> None:
+    script = package / "koreader.sh"
+    dest_dir = Path(cfg["startup_script_dir"])
+    if not script.exists() or not dest_dir.is_dir():
+        return
+    try:
+        dest = dest_dir / "koreader.sh"
+        shutil.copy2(script, dest)
+        dest.chmod(0o777)
+        print(f"== synced startup script to {dest}")
+    except OSError as exc:
+        print(f"qk: warning: could not sync startup script: {exc}", file=sys.stderr)
+
+
+def dump_png(fb_path: Path, out_path: Path) -> None:
+    data = fb_path.read_bytes()
+    pixels = data[: FB_WIDTH * FB_HEIGHT]
+    if len(pixels) < FB_WIDTH * FB_HEIGHT:
+        raise SystemExit(f"qk: framebuffer too short: {fb_path}")
+
+    raw = bytearray()
+    for row in range(FB_HEIGHT):
+        raw.append(0)
+        raw.extend(pixels[row * FB_WIDTH : (row + 1) * FB_WIDTH])
+
+    def chunk(tag: bytes, payload: bytes) -> bytes:
+        body = tag + payload
+        return struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(b"IHDR", struct.pack(">IIBBBBB", FB_WIDTH, FB_HEIGHT, 8, 0, 0, 0, 0))
+    png += chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+    png += chunk(b"IEND", b"")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(png)
+    print(f"== wrote {out_path}")
+
+
+def cmd_fetch(cfg, _args) -> int:
+    ensure_package(cfg)
+    return 0
+
+
+def cmd_build(cfg, args) -> int:
+    package = ensure_package(cfg)
+    cache = Path(cfg["cache_dir"])
+    state = prepare_state(cfg)
+    build_shim(cfg, state)
+    if not getattr(args, "no_viewer", False):
+        build_viewer(cfg, cache)
+    cre = resolve_cre_lib(cfg)
+    install_module(cfg, package, cre)
+    return 0
+
+
+def cmd_config(cfg, _args) -> int:
+    redacted = {k: v for k, v in cfg.items() if not k.startswith("_")}
+    redacted["_config_path"] = cfg["_config_path"]
+    print(json.dumps(redacted, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_shot(cfg, args) -> int:
+    state = Path(cfg["state_dir"]) if cfg["state_dir"] else Path(cfg["cache_dir"]) / "state"
+    fb = state / "fb0"
+    if not fb.exists():
+        raise SystemExit(f"qk: no framebuffer yet at {fb}")
+    out = Path(args.output) if args.output else Path(cfg["cache_dir"]) / "frame.png"
+    dump_png(fb, out)
+    return 0
+
+
+def cmd_run(cfg, args) -> int:
+    package = ensure_package(cfg)
+    qemu = require_qemu(cfg)
+    sysroot = require_sysroot(cfg)
+    cache = Path(cfg["cache_dir"])
+    cache.mkdir(parents=True, exist_ok=True)
+    state = prepare_state(cfg)
+    shim = build_shim(cfg, state)
+    viewer = None
+    display = cfg["display"] or os.environ.get("DISPLAY", "")
+    if not args.no_viewer:
+        if not display:
+            print("qk: no DISPLAY; running headless (use --no-viewer to silence)", file=sys.stderr)
+        else:
+            viewer = build_viewer(cfg, cache)
+    cre = resolve_cre_lib(cfg)
+    install_module(cfg, package, cre)
+    sync_startup_script(cfg, package)
+
+    log_file = Path(cfg["log_file"]) if cfg["log_file"] else cache / "reader.log"
+    env = dict(os.environ)
+    env.update(
+        {
+            "HOME": str(cache / "home"),
+            "FAKEKINDLE_DIR": str(state),
+            "LD_LIBRARY_PATH": f"{package / 'libs'}:{env.get('LD_LIBRARY_PATH', '')}".rstrip(":"),
+            "LD_PRELOAD": str(shim),
+            "CRE_LIB_TRACE": str(cfg["cre_trace"]),
+        }
+    )
+    if cfg["tap_delay"]:
+        env["FAKEKINDLE_TAP_DELAY"] = str(cfg["tap_delay"])
+    (cache / "home").mkdir(parents=True, exist_ok=True)
+
+    cmd = [qemu, "-L", sysroot, str(package / "luajit"), str(package / "reader.lua")]
+    book = args.book
+    if book:
+        cmd.append(str(Path(book).expanduser().resolve()))
+
+    print(f"== log: {log_file}")
+    log = open(log_file, "w")
+    proc = subprocess.Popen(cmd, cwd=package, env=env, stdout=log, stderr=subprocess.STDOUT)
+
+    viewer_proc = None
+
+    def stop(*_):
+        for child in (viewer_proc, proc):
+            if child and child.poll() is None:
+                child.terminate()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+
+    try:
+        if viewer:
+            env_v = dict(os.environ)
+            env_v["DISPLAY"] = display
+            print("== viewer window open (close it to stop)")
+            viewer_proc = subprocess.Popen(
+                [
+                    str(viewer),
+                    str(state / "fb0"),
+                    str(state / "taps"),
+                    str(cfg["viewer_scale"]),
+                    str(cfg["title"]),
+                ],
+                env=env_v,
+            )
+            if cfg["timeout"]:
+                deadline = time.time() + cfg["timeout"]
+                while viewer_proc.poll() is None and proc.poll() is None:
+                    if time.time() > deadline:
+                        break
+                    time.sleep(0.2)
+            else:
+                while viewer_proc.poll() is None and proc.poll() is None:
+                    time.sleep(0.2)
+        else:
+            if cfg["timeout"]:
+                try:
+                    proc.wait(timeout=cfg["timeout"])
+                except subprocess.TimeoutExpired:
+                    pass
+            else:
+                proc.wait()
+    finally:
+        for child in (viewer_proc, proc):
+            if child and child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+        log.close()
+
+    text = log_file.read_text(errors="replace")
+    for line in text.splitlines():
+        if "cre-lib:" in line:
+            print(line)
+    print(f"== exit; framebuffer at {state / 'fb0'} (qk shot writes a PNG)")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="qk",
+        description="Run the genuine Kindle KOReader build under qemu-user.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("--config", help="config file (default ~/.config/qemu-kindle/config.json)")
+    for key in (
+        "ko_version",
+        "cache_dir",
+        "toolchain",
+        "cc",
+        "qemu",
+        "sysroot",
+        "cre_lib",
+        "cre_build_script",
+        "display",
+        "viewer_scale",
+        "state_dir",
+        "log_file",
+    ):
+        parser.add_argument(f"--{key.replace('_', '-')}", dest=key, default=None)
+    parser.add_argument("--no-viewer", action="store_true", help="run without the X11 window")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+    run_p = sub.add_parser("run", help="run the emulator")
+    run_p.add_argument("book", nargs="?", help="book to open")
+    sub.add_parser("fetch", help="download the KOReader package")
+    sub.add_parser("build", help="build shim/viewer and install the module")
+    sub.add_parser("config", help="print the effective configuration")
+    shot_p = sub.add_parser("shot", help="convert the last framebuffer to PNG")
+    shot_p.add_argument("output", nargs="?")
+    return parser
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.no_viewer:
+        args.no_viewer = True
+    cfg = resolve_config(args)
+    handlers = {
+        "run": cmd_run,
+        "fetch": cmd_fetch,
+        "build": cmd_build,
+        "config": cmd_config,
+        "shot": cmd_shot,
+    }
+    return handlers[args.command](cfg, args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

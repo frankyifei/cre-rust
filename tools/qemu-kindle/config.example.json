@@ -1,0 +1,20 @@
+{
+  "ko_version": "v2026.07.1",
+  "cache_dir": "~/.cache/qemu-kindle",
+  "triplet": "arm-kindlepw2-linux-gnueabi",
+  "toolchain": "~/x-tools/arm-kindlepw2-linux-gnueabi",
+  "cc": "",
+  "qemu": "qemu-arm",
+  "sysroot": "/usr/arm-linux-gnueabi",
+  "cre_lib": "~/src/kindle-project/target-arm-kindlepw2-linux-gnueabi/armv7-unknown-linux-gnueabi/release/libkoreader-cre.so",
+  "cre_build_script": "~/src/kindle-project/scripts/build-cre-lua-luajit-module-arm-kindlepw2.sh",
+  "cre_build_output": "~/src/kindle-project/target-arm-kindlepw2-linux-gnueabi/armv7-unknown-linux-gnueabi/release/libkoreader-cre.so",
+  "display": ":0",
+  "viewer_scale": 0.72,
+  "viewer_cc": "cc",
+  "title": "Kindle - qemu",
+  "startup_script_dir": "/var/tmp",
+  "timeout": 0,
+  "state_dir": "",
+  "log_file": ""
+}
