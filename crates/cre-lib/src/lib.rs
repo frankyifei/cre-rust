@@ -46,6 +46,7 @@ pub enum DocumentFormat {
     Epub,
     Fb2,
     Txt,
+    Html,
 }
 
 #[derive(Clone, Debug)]
@@ -459,6 +460,69 @@ impl Document {
                     vec![html],
                     "text://book/",
                     Arc::new(EmptyNet),
+                    ResourceSource::Empty,
+                    None,
+                    false,
+                    metadata,
+                    Vec::new(),
+                    String::new(),
+                    Vec::new(),
+                    options,
+                    font_datas,
+                )
+            }
+            DocumentFormat::Html => {
+                // A standalone HTML/XHTML file is used as-is; relative
+                // resources (images, extra CSS) are loaded from its directory.
+                let bytes =
+                    std::fs::read(path).with_context(|| format!("read html {}", path.display()))?;
+                let mut html = String::from_utf8_lossy(&bytes).into_owned();
+                // Mirror the generators: give bare HTML the same base
+                // typography and page padding EPUB/FB2 chunks get, so margins
+                // and font size behave the same and the first line is not
+                // laid out above the page's top margin.
+                let (_, _, page_margin_css) = css_page_geometry(
+                    options.width,
+                    options.height,
+                    options.viewport_scale,
+                    options.page_margin,
+                );
+                html.push_str(&format!(
+                    "<style>/* cre-render-base */\n\
+                     html, body {{ margin: 0; padding: 0; }}\n\
+                     body {{ font-family: serif; font-size: {}px; line-height: 1.2; \
+                     padding: {:.3}px; }}\n\
+                     img {{ max-width: 100%; height: auto; }}</style>",
+                    options.font_size,
+                    page_margin_css.max(0.0)
+                ));
+                let directory = path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from("."));
+                let root = std::fs::canonicalize(&directory).unwrap_or(directory);
+                let base_url = url::Url::from_directory_path(&root)
+                    .map(|url| url.to_string())
+                    .unwrap_or_else(|_| "file:///".to_string());
+                let title = path
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let metadata = DocumentMetadata {
+                    format,
+                    title: Some(title),
+                    creator: None,
+                    language: None,
+                    series: None,
+                    description: None,
+                    keywords: None,
+                    identifiers: None,
+                    item_count: 1,
+                };
+                Self::build(
+                    vec![html],
+                    &base_url,
+                    Arc::new(FileNet { root: root.clone() }),
                     ResourceSource::Empty,
                     None,
                     false,
@@ -2576,6 +2640,7 @@ fn detect_format(path: &Path) -> DocumentFormat {
     {
         "fb2" => DocumentFormat::Fb2,
         "txt" => DocumentFormat::Txt,
+        "html" | "htm" | "xhtml" | "xml" => DocumentFormat::Html,
         _ => DocumentFormat::Epub,
     }
 }
@@ -2664,9 +2729,16 @@ fn paginate(
 ) -> Vec<PageStart> {
     const BREAK_EPSILON: f32 = 0.5;
 
+    // The first page starts at the top margin, but never below the first
+    // line: documents whose content begins above the configured top margin
+    // (e.g. a bare HTML file without the generator's body padding) must not
+    // lose their opening line.
+    let first_clip_top = lines
+        .first()
+        .map_or(margin_top, |line| line.visual_top.min(margin_top));
     let mut starts = vec![PageStart {
         top: 0.0,
-        clip_top: margin_top,
+        clip_top: first_clip_top,
     }];
     let mut forced_index = 0usize;
     for line in lines {
@@ -3694,6 +3766,29 @@ impl NetProvider for Fb2Net {
             .to_string();
         let name = path.strip_prefix("binary/").unwrap_or(&path).to_string();
         let bytes = self.resources.get(&name).cloned().unwrap_or_default();
+        handler.bytes(request.url.to_string(), Bytes::from(bytes));
+    }
+}
+
+/// Serves resources referenced by a standalone HTML document from the
+/// document's own directory. Paths are resolved and canonicalized, and must
+/// stay inside that directory.
+struct FileNet {
+    root: PathBuf,
+}
+
+impl NetProvider for FileNet {
+    fn fetch(&self, _doc_id: usize, request: Request, handler: Box<dyn NetHandler>) {
+        let decoded = percent_decode_str(request.url.path())
+            .decode_utf8_lossy()
+            .to_string();
+        let mut bytes = Vec::new();
+        if let Ok(candidate) = std::fs::canonicalize(&decoded)
+            && candidate.starts_with(&self.root)
+            && candidate.is_file()
+        {
+            bytes = std::fs::read(&candidate).unwrap_or_default();
+        }
         handler.bytes(request.url.to_string(), Bytes::from(bytes));
     }
 }

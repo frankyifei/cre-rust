@@ -971,6 +971,7 @@ unsafe fn format_name(format: DocumentFormat) -> &'static str {
         DocumentFormat::Epub => "EPUB",
         DocumentFormat::Fb2 => "FB2",
         DocumentFormat::Txt => "TXT",
+        DocumentFormat::Html => "HTML",
     }
 }
 
