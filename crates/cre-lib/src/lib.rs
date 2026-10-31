@@ -371,6 +371,9 @@ pub struct Document {
     xpointer_pages: HashMap<String, usize>,
     href_pages: HashMap<(String, Option<String>), usize>,
     spine_to_chunk: HashMap<u32, usize>,
+    /// Spine slot -> EPUB spine index. They differ when a spine item is split
+    /// into several parts, which get their own slot so XPointers stay unique.
+    spine_real_index: HashMap<u32, u32>,
     toc: Vec<TocEntry>,
     page_map_source: String,
     page_map: Vec<PageMapEntry>,
@@ -681,6 +684,7 @@ impl Document {
             xpointer_pages: HashMap::new(),
             href_pages: HashMap::new(),
             spine_to_chunk: HashMap::new(),
+            spine_real_index: HashMap::new(),
             toc: Vec::new(),
             page_map_source,
             page_map: Vec::new(),
@@ -731,6 +735,7 @@ impl Document {
         let mut xpointer_pages = HashMap::new();
         let mut href_pages = HashMap::new();
         let mut spine_to_chunk = HashMap::new();
+        let mut spine_real_index = HashMap::new();
         let mut line_base = 0usize;
         let mut max_flow = 0i64;
         let mut running_doc_top = 0.0;
@@ -778,7 +783,12 @@ impl Document {
                     href_pages.entry(key).or_insert(first_page + local_page - 1);
                 }
             }
-            collect_spine_chunks(root, chunk_index, &mut spine_to_chunk);
+            collect_spine_chunks(
+                root,
+                chunk_index,
+                &mut spine_to_chunk,
+                &mut spine_real_index,
+            );
 
             let mut previous_page_flow = 0;
             for (local_index, start) in page_starts.iter().enumerate() {
@@ -873,6 +883,7 @@ impl Document {
         self.xpointer_pages = xpointer_pages;
         self.href_pages = href_pages;
         self.spine_to_chunk = spine_to_chunk;
+        self.spine_real_index = spine_real_index;
         self.toc = toc;
         self.page_map = page_map;
         self.sources = htmls;
@@ -1050,6 +1061,15 @@ impl Document {
             let ancestor = common_ancestor(root, start_id, end_id).unwrap_or(start_id);
             Ok(Some(root.with(ancestor).outer_html()))
         })
+    }
+
+    /// The EPUB spine index behind a spine slot. Equal unless the spine item
+    /// was split into parts; used where a real spine index is required (CFI).
+    pub fn real_spine_index(&self, spine_slot: u32) -> u32 {
+        self.spine_real_index
+            .get(&spine_slot)
+            .copied()
+            .unwrap_or(spine_slot)
     }
 
     fn chunk_for_spine(&self, spine_index: u32) -> Result<usize> {
@@ -3831,14 +3851,23 @@ fn css_page_geometry(
     (css_height_u32, css_height, css_margin)
 }
 
-fn collect_spine_chunks(node: &Node, chunk_index: usize, out: &mut HashMap<u32, usize>) {
+fn collect_spine_chunks(
+    node: &Node,
+    chunk_index: usize,
+    out: &mut HashMap<u32, usize>,
+    real: &mut HashMap<u32, u32>,
+) {
     if let Some(index) =
         node_attr(node, "data-spine-index").and_then(|value| value.parse::<u32>().ok())
     {
-        out.entry(index + 1).or_insert(chunk_index);
+        out.entry(index).or_insert(chunk_index);
+        let real_index = node_attr(node, "data-spine-real-index")
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(index);
+        real.entry(index).or_insert(real_index);
     }
     for child in &node.children {
-        collect_spine_chunks(node.with(*child), chunk_index, out);
+        collect_spine_chunks(node.with(*child), chunk_index, out, real);
     }
 }
 

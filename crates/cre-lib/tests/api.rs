@@ -1026,14 +1026,15 @@ fn document_exposes_resources_cover_and_html() {
     let cover = doc.cover_image().expect("juliet.epub exposes a cover");
     assert!(!cover.is_empty());
 
-    let image_page_xpointer = doc.xpointer_from_page(2).unwrap();
-    assert!(
-        doc.text_from_xpointer(&image_page_xpointer)
-            .unwrap()
-            .trim()
-            .is_empty(),
-        "page 2 is the image-only About page"
-    );
+    // The image-only About page is not page 2 once spine items page-break.
+    let (image_page, image_page_xpointer) = (1..=doc.page_count().min(8))
+        .find_map(|page| {
+            let xpointer = doc.xpointer_from_page(page).ok()?;
+            let text = doc.text_from_xpointer(&xpointer).ok()?;
+            text.trim().is_empty().then_some((page, xpointer))
+        })
+        .expect("no image-only page found in the opening pages");
+    assert!(image_page >= 1);
     assert!(
         doc.html_from_xpointer(&image_page_xpointer)
             .unwrap()

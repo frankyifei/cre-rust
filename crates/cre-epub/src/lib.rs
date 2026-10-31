@@ -443,7 +443,7 @@ impl EpubBook {
         let docs = self.spine_documents()?;
         let mut html = self.html_head(options, &docs);
         for doc in &docs {
-            push_section_html(&mut html, doc);
+            push_section_html(&mut html, doc, doc.index as u32 + 1, &doc.body_html, false);
         }
         html.push_str("</body></html>");
         Ok(html)
@@ -452,25 +452,78 @@ impl EpubBook {
     pub fn to_html_chunks(&self, options: &HtmlOptions, max_bytes: usize) -> Result<Vec<String>> {
         let docs = self.spine_documents()?;
         let head = self.html_head(options, &docs);
+
+        // One "piece" is a spine document, or one part of a document that is
+        // larger than a chunk on its own.
+        struct Piece<'a> {
+            doc: &'a SpineDocument,
+            body: std::borrow::Cow<'a, str>,
+            slot: u32,
+            continuation: bool,
+        }
+        let mut pieces: Vec<Piece<'_>> = Vec::new();
+        let mut next_extra_slot = docs.len() as u32 + 1;
+        for doc in &docs {
+            let real_slot = doc.index as u32 + 1;
+            if doc.body_html.len() <= max_bytes {
+                pieces.push(Piece {
+                    doc,
+                    body: std::borrow::Cow::Borrowed(doc.body_html.as_str()),
+                    slot: real_slot,
+                    continuation: false,
+                });
+                continue;
+            }
+            for (part_index, part) in split_body_html(&doc.body_html, max_bytes)
+                .into_iter()
+                .enumerate()
+            {
+                let slot = if part_index == 0 {
+                    real_slot
+                } else {
+                    let slot = next_extra_slot;
+                    next_extra_slot += 1;
+                    slot
+                };
+                pieces.push(Piece {
+                    doc,
+                    body: std::borrow::Cow::Owned(part),
+                    slot,
+                    continuation: part_index > 0,
+                });
+            }
+        }
+
         let mut chunks = Vec::new();
         let mut body = String::new();
-        for doc in &docs {
-            let mut section = String::new();
-            push_section_html(&mut section, doc);
-            if !body.is_empty() && body.len() + section.len() > max_bytes {
-                let mut html = head.clone();
-                html.push_str(&body);
-                html.push_str("</body></html>");
-                chunks.push(html);
-                body.clear();
-            }
-            body.push_str(&section);
-        }
-        if !body.is_empty() || chunks.is_empty() {
-            let mut html = head;
-            html.push_str(&body);
+        let flush = |body: &mut String, chunks: &mut Vec<String>| {
+            let mut html = head.clone();
+            html.push_str(body);
             html.push_str("</body></html>");
             chunks.push(html);
+            body.clear();
+        };
+        for piece in pieces {
+            let mut section = String::new();
+            push_section_html(
+                &mut section,
+                piece.doc,
+                piece.slot,
+                &piece.body,
+                piece.continuation,
+            );
+            if !body.is_empty() && body.len() + section.len() > max_bytes {
+                flush(&mut body, &mut chunks);
+            }
+            body.push_str(&section);
+            // A part that was split out is already at the size limit; keep it
+            // in its own chunk so the layout budget holds.
+            if piece.continuation || piece.body.len() >= max_bytes {
+                flush(&mut body, &mut chunks);
+            }
+        }
+        if !body.is_empty() || chunks.is_empty() {
+            flush(&mut body, &mut chunks);
         }
         Ok(chunks)
     }
@@ -525,21 +578,163 @@ impl EpubBook {
     }
 }
 
-fn push_section_html(out: &mut String, doc: &SpineDocument) {
+fn push_section_html(
+    out: &mut String,
+    doc: &SpineDocument,
+    slot: u32,
+    body: &str,
+    continuation: bool,
+) {
     let nonlinear_attr = if doc.nonlinear {
         " data-spine-nonlinear=\"1\""
     } else {
         ""
     };
+    // A continuation part stays inside the same spine document; it must not
+    // add another page break (the chunk boundary already starts a page).
+    let class = if continuation {
+        "cre-spine-cont"
+    } else {
+        "cre-spine"
+    };
     out.push_str(&format!(
-        "<section class=\"cre-spine\" data-spine-index=\"{}\" data-spine-id=\"{}\" data-spine-href=\"{}\"{}>",
-        doc.index,
+        "<section class=\"{class}\" data-spine-index=\"{slot}\" data-spine-real-index=\"{}\" \
+         data-spine-id=\"{}\" data-spine-href=\"{}\"{nonlinear_attr}>",
+        doc.index as u32 + 1,
         escape_attr(&doc.id),
         escape_attr(&normalize_path(&doc.href)),
-        nonlinear_attr
     ));
-    out.push_str(&doc.body_html);
+    out.push_str(body);
     out.push_str("</section>");
+}
+
+const VOID_ELEMENTS: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
+];
+
+struct OpenTag {
+    name: String,
+    start: String,
+}
+
+/// Splits a spine item's body HTML into parts of at most `limit` bytes,
+/// cutting only between elements and re-opening whatever is still open, so
+/// every part is well-formed on its own.
+fn split_body_html(body: &str, limit: usize) -> Vec<String> {
+    if limit == 0 || body.len() <= limit {
+        return vec![body.to_string()];
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut open: Vec<OpenTag> = Vec::new();
+    let mut floor = 0usize; // bytes in `current` that cannot be flushed
+
+    let flush = |parts: &mut Vec<String>, current: &mut String, open: &[OpenTag]| {
+        let mut part = String::new();
+        part.push_str(current);
+        for tag in open.iter().rev() {
+            part.push_str("</");
+            part.push_str(&tag.name);
+            part.push('>');
+        }
+        parts.push(part);
+        current.clear();
+        for tag in open {
+            current.push_str(&tag.start);
+        }
+        current.len()
+    };
+
+    let mut index = 0usize;
+    while index < body.len() {
+        let next_tag = body[index..].find('<').map(|offset| index + offset);
+        let text_end = next_tag.unwrap_or(body.len());
+        if text_end > index {
+            let text = &body[index..text_end];
+            if current.len() + text.len() > limit && current.len() > floor && !open.is_empty() {
+                floor = flush(&mut parts, &mut current, &open);
+            }
+            current.push_str(text);
+        }
+        let Some(tag_start) = next_tag else {
+            break;
+        };
+
+        // Comments may contain '<'.
+        if body[tag_start..].starts_with("<!--") {
+            let end = body[tag_start..]
+                .find("-->")
+                .map(|offset| tag_start + offset + 3)
+                .unwrap_or(body.len());
+            let raw = &body[tag_start..end];
+            if current.len() + raw.len() > limit && current.len() > floor && !open.is_empty() {
+                floor = flush(&mut parts, &mut current, &open);
+            }
+            current.push_str(raw);
+            index = end;
+            continue;
+        }
+
+        let Some(tag_end) = find_tag_end(body, tag_start) else {
+            current.push_str(&body[tag_start..]);
+            break;
+        };
+        let raw = &body[tag_start..tag_end];
+        let name = tag_name(raw);
+        let closing = raw.starts_with("</");
+        let self_closing = raw.trim_end().ends_with("/>");
+
+        if closing {
+            if let Some(position) = open.iter().rposition(|tag| tag.name == name) {
+                open.truncate(position);
+            }
+            current.push_str(raw);
+        } else if self_closing || VOID_ELEMENTS.contains(&name.as_str()) {
+            current.push_str(raw);
+        } else {
+            if current.len() + raw.len() > limit && current.len() > floor && !open.is_empty() {
+                floor = flush(&mut parts, &mut current, &open);
+            }
+            current.push_str(raw);
+            if matches!(name.as_str(), "style" | "script" | "textarea" | "title") {
+                // Raw-text elements: copy their content verbatim so '<' inside
+                // them is not parsed as markup.
+                let close = find_closing_tag(body, tag_end, &name).unwrap_or(body.len());
+                current.push_str(&body[tag_end..close]);
+                let close_end = find_tag_end(body, close).unwrap_or(body.len());
+                current.push_str(&body[close..close_end]);
+                index = close_end;
+                continue;
+            }
+            open.push(OpenTag {
+                name,
+                start: raw.to_string(),
+            });
+        }
+        index = tag_end;
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    if parts.is_empty() {
+        parts.push(String::new());
+    }
+    parts
+}
+
+fn tag_name(raw: &str) -> String {
+    let rest = raw.trim_start_matches('<').trim_start_matches('/');
+    rest.chars()
+        .take_while(|ch| !ch.is_whitespace() && *ch != '>' && *ch != '/')
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+fn find_closing_tag(body: &str, from: usize, name: &str) -> Option<usize> {
+    let needle = format!("</{name}");
+    let haystack = body.get(from..)?;
+    haystack.find(&needle).map(|offset| from + offset)
 }
 
 fn parse_container(bytes: &[u8]) -> Result<String> {
@@ -1805,6 +2000,53 @@ fn escape_attr(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn split_body_html_keeps_content_and_balances_tags() {
+        let body = format!("<div class=\"wrap\">{}</div>", "<p>alpha</p>".repeat(50));
+        let parts = split_body_html(&body, 200);
+        assert!(
+            parts.len() > 1,
+            "expected a split, got {} part(s)",
+            parts.len()
+        );
+        for part in &parts {
+            assert_eq!(
+                part.matches("<div").count(),
+                part.matches("</div>").count(),
+                "unbalanced div in {part:?}"
+            );
+            assert_eq!(
+                part.matches("<p>").count(),
+                part.matches("</p>").count(),
+                "unbalanced p in {part:?}"
+            );
+        }
+        let joined = parts.concat();
+        assert_eq!(joined.matches("alpha").count(), 50);
+    }
+
+    #[test]
+    fn split_body_html_does_not_cut_inside_raw_text_elements() {
+        let body = format!(
+            "<p>start</p><style>p::before {{ content: '<b>not markup</b>'; }}</style>{}",
+            "<p>tail</p>".repeat(20)
+        );
+        let parts = split_body_html(&body, 120);
+        assert!(parts.len() > 1);
+        let styles = parts
+            .iter()
+            .filter(|part| part.contains("<style>"))
+            .collect::<Vec<_>>();
+        assert_eq!(styles.len(), 1, "style element must not be split");
+        assert!(styles[0].contains("'<b>not markup</b>'"));
+    }
+
+    #[test]
+    fn split_body_html_keeps_small_documents_whole() {
+        let body = "<p>only a line</p>";
+        assert_eq!(split_body_html(body, 4096), vec![body.to_string()]);
+    }
+
     use super::*;
 
     fn juliet() -> EpubBook {

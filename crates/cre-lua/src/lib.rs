@@ -920,6 +920,18 @@ unsafe fn doc_mut_synced<'a>(l: *mut lua_State) -> Option<&'a mut Doc> {
     Some(doc)
 }
 
+/// Real EPUB spine index for a position read from an XPointer (they differ
+/// when a spine item was split into parts).
+fn spine_index_for_position(l: *mut lua_State, slot: u32) -> u32 {
+    // SAFETY: `l` is the active Lua state, and this only reads the userdata.
+    unsafe {
+        doc_ref(l)
+            .and_then(|doc| doc.inner.as_ref())
+            .map(|inner| inner.real_spine_index(slot))
+            .unwrap_or(slot)
+    }
+}
+
 unsafe fn push_str(l: *mut lua_State, value: &str) {
     // SAFETY: `value` is valid for the duration of the call and Lua copies it.
     unsafe { lua::lua_pushlstring_(l, value.as_ptr().cast(), value.len()) };
@@ -4026,7 +4038,9 @@ unsafe extern "C-unwind" fn doc_epub_cfi(l: *mut lua_State) -> c_int {
             .and_then(|doc| doc.inner.as_ref())
             .and_then(|inner| inner.xpointer_from_page(inner.current_page()).ok())
             .and_then(|xp| cre_lib::parse_text_position(&xp).ok())
-            .map(|position| cfi_for_position(&position));
+            .map(|position| {
+                cfi_for_position(&position, spine_index_for_position(l, position.spine_index))
+            });
         let Some(cfi) = cfi else {
             return 0;
         };
@@ -4043,7 +4057,9 @@ unsafe extern "C-unwind" fn doc_page_epub_cfi(l: *mut lua_State) -> c_int {
             .and_then(|doc| doc.inner.as_ref())
             .and_then(|inner| inner.xpointer_from_page(page).ok())
             .and_then(|xp| cre_lib::parse_text_position(&xp).ok())
-            .map(|position| cfi_for_position(&position));
+            .map(|position| {
+                cfi_for_position(&position, spine_index_for_position(l, position.spine_index))
+            });
         let Some(cfi) = cfi else {
             return 0;
         };
@@ -4057,7 +4073,9 @@ unsafe extern "C-unwind" fn doc_epub_cfi_from_xpointer(l: *mut lua_State) -> c_i
     unsafe {
         let cfi = arg_str(l, 2)
             .and_then(|xp| cre_lib::parse_text_position(&xp).ok())
-            .map(|position| cfi_for_position(&position));
+            .map(|position| {
+                cfi_for_position(&position, spine_index_for_position(l, position.spine_index))
+            });
         let Some(cfi) = cfi else {
             return 0;
         };
@@ -4081,7 +4099,8 @@ unsafe extern "C-unwind" fn doc_epub_cfi_range(l: *mut lua_State) -> c_int {
         ) else {
             return 0;
         };
-        push_str(l, &cfi_range_for_positions(&start, &end));
+        let spine = spine_index_for_position(l, start.spine_index);
+        push_str(l, &cfi_range_for_positions(&start, &end, spine));
     }
     1
 }

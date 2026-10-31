@@ -122,10 +122,20 @@ fn line_for_page<'a>(
             next.clip_top
         });
 
-    lines
-        .iter()
-        .find(|line| line.top + 0.5 >= lower && line.top + 0.5 < upper)
-        .context("page has no line box that can produce an XPointer")
+    // Prefer a line that actually carries text: the first box of a page can be
+    // an empty line (e.g. the box of a wrapper element), which has no source
+    // position and would leave the page without an XPointer at all.
+    let mut fallback = None;
+    for line in lines {
+        if line.top + 0.5 < lower || line.top + 0.5 >= upper {
+            continue;
+        }
+        if line.text_end > line.text_start {
+            return Ok(line);
+        }
+        fallback = fallback.or(Some(line));
+    }
+    fallback.context("page has no line box that can produce an XPointer")
 }
 
 fn fallback_position_for_line(root: &Node, line: &LineBox) -> Result<TextPosition> {

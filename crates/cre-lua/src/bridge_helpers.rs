@@ -54,7 +54,9 @@ pub(crate) fn apply_text_highlight(
     }
 }
 
-pub(crate) fn cfi_for_position(position: &TextPosition) -> String {
+/// `spine_index` is the EPUB spine index, which differs from the XPointer's
+/// DocFragment slot when a spine item was split into several parts.
+pub(crate) fn cfi_for_position(position: &TextPosition, spine_index: u32) -> String {
     let mut path = String::new();
     for segment in &position.path {
         path.push('/');
@@ -62,14 +64,18 @@ pub(crate) fn cfi_for_position(position: &TextPosition) -> String {
     }
     format!(
         "epubcfi(/6/{}!/4{}:{})",
-        position.spine_index.saturating_mul(2),
+        spine_index.saturating_mul(2),
         path,
         position.codepoint_offset
     )
 }
 
-pub(crate) fn cfi_range_for_positions(start: &TextPosition, end: &TextPosition) -> String {
-    let base = cfi_for_position(start);
+pub(crate) fn cfi_range_for_positions(
+    start: &TextPosition,
+    end: &TextPosition,
+    start_spine_index: u32,
+) -> String {
+    let base = cfi_for_position(start, start_spine_index);
     let base = base
         .strip_prefix("epubcfi(")
         .and_then(|value| value.strip_suffix(')'))
