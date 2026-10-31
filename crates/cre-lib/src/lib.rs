@@ -227,19 +227,6 @@ fn chunk_target_bytes() -> usize {
         .unwrap_or(CHUNK_TARGET_BYTES)
 }
 
-/// Set `CRE_LIB_TRACE=1` to log stage timings to stderr. Used to diagnose
-/// slow/hanging opens on low-end devices (e.g. Kindle PW2) where a book
-/// open may take tens of seconds.
-fn trace_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("CRE_LIB_TRACE").is_some_and(|value| {
-            let value = value.to_string_lossy();
-            value != "0" && !value.eq_ignore_ascii_case("false")
-        })
-    })
-}
-
 /// Returns freed heap pages to the OS. Building a chunk's DOM/parley layout
 /// allocates and frees tens of megabytes; glibc keeps those arenas resident,
 /// which matters on a 256 MB device where the next page render can then OOM.
@@ -250,75 +237,6 @@ fn trim_memory() {
     }
 }
 
-/// Set `CRE_LIB_TRACE=1` to log process memory (VmRSS/VmHWM/VmSize) at key
-/// stages, together with system-wide free/available memory.
-///
-/// The system numbers matter because on a 256 MB device a SIGKILL can be
-/// caused by the system running out of memory rather than by this process
-/// alone: `avail` is what the kernel thinks it can still hand out.
-pub fn trace_memory(label: &str) {
-    if !trace_enabled() {
-        return;
-    }
-    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
-        return;
-    };
-    let value = |key: &str| {
-        status
-            .lines()
-            .find(|line| line.starts_with(key))
-            .and_then(|line| line.split_whitespace().nth(1))
-            .unwrap_or("?")
-            .to_string()
-    };
-    let system = std::fs::read_to_string("/proc/meminfo")
-        .map(|info| {
-            let field = |key: &str| {
-                info.lines()
-                    .find(|line| line.starts_with(key))
-                    .and_then(|line| line.split_whitespace().nth(1))
-                    .unwrap_or("?")
-                    .to_string()
-            };
-            format!(
-                "sys_free={} kB sys_avail={} kB",
-                field("MemFree:"),
-                field("MemAvailable:")
-            )
-        })
-        .unwrap_or_default();
-    eprintln!(
-        "cre-lib: memory [{}] rss={} kB hwm={} kB vsz={} kB vmpeak={} kB {}",
-        label,
-        value("VmRSS:"),
-        value("VmHWM:"),
-        value("VmSize:"),
-        value("VmPeak:"),
-        system
-    );
-}
-
-/// One-line stage marker for a SIGKILL diagnosis: written before and after a
-/// risky step so the last line in the log names the step that died.
-fn trace_step(message: impl FnOnce() -> String) {
-    if trace_enabled() {
-        eprintln!("cre-lib: {}", message());
-    }
-}
-
-fn trace_stage<T>(label: impl FnOnce() -> String, run: impl FnOnce() -> T) -> T {
-    if !trace_enabled() {
-        return run();
-    }
-    let start = std::time::Instant::now();
-    let out = run();
-    eprintln!(
-        "cre-lib: {} took {:.3}s",
-        label(),
-        start.elapsed().as_secs_f64()
-    );
-    out
-}
 const PAGE_IMAGE_CACHE_CAPACITY: usize = 2usize;
 
 struct ChunkMeta {
@@ -420,7 +338,7 @@ impl Document {
         let format = detect_format(path);
         match format {
             DocumentFormat::Epub => {
-                let mut book = trace_stage(|| "epub open".to_string(), || EpubBook::open(path))?;
+                let mut book = EpubBook::open(path)?;
                 let _ = book.normalize_inline_svg_images();
                 let raw_toc = std::mem::take(&mut book.toc);
                 let raw_page_map_source = std::mem::take(&mut book.page_map_source);
@@ -446,10 +364,7 @@ impl Document {
                     html_options.margin_x,
                     html_options.margin_y,
                 );
-                let htmls = trace_stage(
-                    || "epub to_html_chunks".to_string(),
-                    || book.to_html_chunks(&html_options, chunk_target_bytes()),
-                )?;
+                let htmls = book.to_html_chunks(&html_options, chunk_target_bytes())?;
                 let cover_image = epub_cover_image(&book);
                 let has_non_linear_flows = book.spine.iter().any(|item| !item.linear);
                 let resource_provider = Arc::new(book.resource_provider);
@@ -629,7 +544,6 @@ impl Document {
         options: &DocumentOptions,
         font_datas: &[FontBlob],
     ) -> Result<Self> {
-        let build_start = std::time::Instant::now();
         let font_context = Arc::new(build_font_ctx_with_fallbacks(font_datas));
         let mut chunks = Vec::with_capacity(htmls.len());
         let mut pages = Vec::new();
@@ -642,7 +556,6 @@ impl Document {
         let mut running_doc_top = 0.0;
 
         for (chunk_index, html) in htmls.iter().enumerate() {
-            let chunk_start = std::time::Instant::now();
             let doc = create_document(html, base_url, net.clone(), font_context.clone(), options);
             let root = doc.root_element();
             let lines = collect_lines(root);
@@ -730,15 +643,6 @@ impl Document {
                 first_page,
                 line_base,
             });
-            if trace_enabled() {
-                eprintln!(
-                    "cre-lib: chunk {} layout+paginate took {:.3}s ({} lines, {} pages)",
-                    chunk_index,
-                    chunk_start.elapsed().as_secs_f64(),
-                    lines.len(),
-                    page_starts.len()
-                );
-            }
             line_base += lines.len();
         }
         spine_to_chunk.entry(1).or_insert(0);
@@ -821,17 +725,7 @@ impl Document {
             page_boxes_cache: RefCell::new(None),
         };
         trim_memory();
-        trace_memory("after build trim");
         document.ensure_chunk(0)?;
-        trace_memory("after document build");
-        if trace_enabled() {
-            eprintln!(
-                "cre-lib: document build took {:.3}s ({} chunks, {} pages)",
-                build_start.elapsed().as_secs_f64(),
-                document.chunks.len(),
-                document.pages.len()
-            );
-        }
         Ok(document)
     }
 
@@ -1021,18 +915,7 @@ impl Document {
         &mut self,
         page: usize,
     ) -> Result<(Arc<PageBitmap>, usize, usize)> {
-        let render_start = std::time::Instant::now();
-        let result = self.render_page_with_stats_inner(page);
-        trace_memory("after page render");
-        if trace_enabled() {
-            eprintln!(
-                "cre-lib: render page {} took {:.3}s ({})",
-                page,
-                render_start.elapsed().as_secs_f64(),
-                if result.is_ok() { "ok" } else { "error" }
-            );
-        }
-        result
+        self.render_page_with_stats_inner(page)
     }
 
     fn render_page_with_stats_inner(
@@ -1059,16 +942,8 @@ impl Document {
             ));
         }
 
-        trace_step(|| format!("render stage: page {page} prepare"));
         let (bitmap, image_count, image_surface) = {
-            let chunk_start = std::time::Instant::now();
             self.ensure_chunk(chunk_index)?;
-            trace_step(|| {
-                format!(
-                    "render stage: page {page} chunk {chunk_index} ready in {:.3}s",
-                    chunk_start.elapsed().as_secs_f64()
-                )
-            });
             let mut active = self.active.borrow_mut();
             let active = active
                 .as_mut()
@@ -1078,7 +953,6 @@ impl Document {
                 x: 0.0,
                 y: f64::from(start.top),
             });
-            let scene_start = std::time::Instant::now();
             let mut scene = Scene::default();
             blitz_paint::paint_scene(
                 &mut scene,
@@ -1089,15 +963,6 @@ impl Document {
                 0,
                 0,
             );
-            trace_step(|| {
-                format!(
-                    "render stage: page {page} scene recorded in {:.3}s ({} commands)",
-                    scene_start.elapsed().as_secs_f64(),
-                    scene.commands.len()
-                )
-            });
-            trace_memory("before paint_page");
-            let paint_start = std::time::Instant::now();
             let local_top = clip_top * viewport_scale;
             let local_bottom = clip_bottom * viewport_scale;
             let (image_arc, paint_count, paint_surface) = paint_page(
@@ -1110,12 +975,6 @@ impl Document {
                 self.background_color,
                 self.font_gamma,
             );
-            trace_step(|| {
-                format!(
-                    "render stage: page {page} painted in {:.3}s ({paint_count} paint commands)",
-                    paint_start.elapsed().as_secs_f64()
-                )
-            });
             (image_arc, paint_count, paint_surface)
         };
         let image = PageImage {
@@ -1252,7 +1111,6 @@ impl Document {
         {
             return Ok(());
         }
-        let activate_start = std::time::Instant::now();
         let stored = self
             .sources
             .get(index)
@@ -1298,14 +1156,6 @@ impl Document {
             page_starts,
         });
         trim_memory();
-        trace_memory("after chunk activation");
-        if trace_enabled() {
-            eprintln!(
-                "cre-lib: chunk {} activation took {:.3}s",
-                index,
-                activate_start.elapsed().as_secs_f64()
-            );
-        }
         Ok(())
     }
 

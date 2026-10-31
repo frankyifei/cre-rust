@@ -7,7 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyrender = "0.14"
-fontdue = "0.9"
+ttf-parser = "0.25"
 kurbo = "0.13"
 peniko = "0.6"
 tiny-skia = "0.11"

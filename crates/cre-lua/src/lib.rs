@@ -275,7 +275,6 @@ impl Doc {
         opened.set_background_color(self.background_color_value);
         self.inner = Some(opened);
         self.path = Some(path);
-        cre_lib::trace_memory("doc open");
         self.load_document_page_map();
         Ok(())
     }
@@ -4781,9 +4780,6 @@ const MODULE_FUNCS: &[lua::luaL_Reg] = &regs![
 /// `l` must be a valid `lua_State` supplied by the LuaJIT module loader.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaopen_cre(l: *mut lua_State) -> c_int {
-    // Baseline of the whole interpreter before any book is opened; the
-    // difference to "[doc open]" is the memory our module is responsible for.
-    cre_lib::trace_memory("module load");
     // SAFETY: `l` is a valid Lua state supplied by the LuaJIT module loader.
     unsafe {
         lua::luaL_newmetatable_(l, CREDOC.as_ptr().cast());
@@ -4800,79 +4796,8 @@ pub unsafe extern "C" fn luaopen_cre(l: *mut lua_State) -> c_int {
 
         lua::lua_newtable(l);
         lua::luaL_register(l, ptr::null(), MODULE_FUNCS.as_ptr());
-        install_call_trace(l);
     }
     1
-}
-
-/// Optional call breadcrumb for diagnosing a hang/kill on a device.
-///
-/// With CRE_LUA_TRACE_PATH=<file> (or CRE_LUA_TRACE=1, default
-/// /tmp/cre-lua-calls.log), every exported doc/image/module function is
-/// wrapped by a Lua shim that appends its name to the file before calling
-/// through. The last line before a SIGKILL names the call that was running,
-/// which stderr/stdout logs cannot show once the process is killed.
-fn install_call_trace(l: *mut lua_State) {
-    unsafe {
-        let Ok(path) =
-            std::env::var("CRE_LUA_TRACE_PATH").or_else(|_| std::env::var("CRE_LUA_TRACE"))
-        else {
-            return;
-        };
-        let path = if path.is_empty() || path == "1" {
-            "/tmp/cre-lua-calls.log".to_string()
-        } else {
-            path
-        };
-        const SHIM: &str = r#"
-local path, cre, doc_mt, img_mt = ...
-local function wrap(tbl, tag)
-  if type(tbl) ~= "table" then return end
-  local names = {}
-  for k, v in pairs(tbl) do
-    if type(k) == "string" and type(v) == "function" and k:sub(1, 2) ~= "__" then
-      names[#names + 1] = k
-    end
-  end
-  for _, k in ipairs(names) do
-    local inner = tbl[k]
-    tbl[k] = function(...)
-      local fh = io.open(path, "a")
-      if fh then fh:write(tag, " ", k, "\n"); fh:close() end
-      return inner(...)
-    end
-  end
-end
-wrap(cre, "cre")
-wrap(doc_mt, "doc")
-wrap(img_mt, "img")
-"#;
-        let Ok(chunk) = std::ffi::CString::new(SHIM) else {
-            return;
-        };
-        eprintln!("cre-lua: call trace enabled -> {}", path);
-        let module_index = lua::lua_gettop(l);
-        if lua::luaL_loadstring(l, chunk.as_ptr()) != 0 {
-            let mut len = 0usize;
-            let msg = lua::lua_tolstring(l, -1, &mut len);
-            let text = if msg.is_null() {
-                "unknown".to_string()
-            } else {
-                std::ffi::CStr::from_ptr(msg).to_string_lossy().into_owned()
-            };
-            eprintln!("cre-lua: call trace chunk failed to load: {text}");
-            lua::lua_pop(l, 1);
-            return;
-        }
-        push_str(l, &path);
-        lua::lua_pushvalue(l, module_index);
-        lua::luaL_getmetatable(l, CREDOC.as_ptr().cast());
-        lua::luaL_getmetatable(l, CREIMAGE.as_ptr().cast());
-        if lua::lua_pcall(l, 4, 0, 0) != 0 {
-            eprintln!("cre-lua: call trace install failed");
-            lua::lua_pop(l, 1);
-        }
-    }
 }
 
 /// Compatibility fallback for devices whose libc predates glibc 2.16

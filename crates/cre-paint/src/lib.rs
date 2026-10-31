@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use anyrender::recording::RenderCommand;
 use anyrender::{Paint, Scene};
-use fontdue::{Font, FontSettings};
 use kurbo::{Affine, BezPath, PathEl, Point, Shape, Stroke};
 use peniko::{Color, Fill as AnyFill, ImageFormat};
 use tiny_skia::{
@@ -12,11 +11,111 @@ use tiny_skia::{
     Stroke as SkStroke, Transform,
 };
 
-/// Rasterized glyph cache: fontdue re-rasterizes a glyph on every page paint,
-/// which dominates first-page cost on slow targets. Key: font pointer, glyph
-/// id, and the raster size quantized to 1/4 px.
+/// Rasterized glyph cache. Rasterizing dominates first-page cost on slow
+/// targets, so a glyph is turned into a coverage bitmap once per paint.
+/// Key: font pointer, glyph id, and the raster size quantized to 1/4 px.
 type GlyphKey = (usize, u16, u32);
-type GlyphBitmap = Arc<(fontdue::Metrics, Vec<u8>)>;
+type GlyphBitmap = Arc<Option<GlyphRaster>>;
+
+/// One rasterized glyph as an 8-bit coverage bitmap, placed relative to the
+/// pen position on the baseline. `top` is negative for pixels above it, so
+/// both offsets can simply be added to the text origin.
+struct GlyphRaster {
+    width: u32,
+    height: u32,
+    left: f32,
+    top: f32,
+    data: Vec<u8>,
+}
+
+/// Collects a glyph outline into a `tiny-skia` path, flipping y (fonts grow
+/// upwards, page bitmaps grow downwards) and scaling font units to pixels.
+struct OutlinePath {
+    builder: PathBuilder,
+    scale: f32,
+}
+
+impl ttf_parser::OutlineBuilder for OutlinePath {
+    fn move_to(&mut self, x: f32, y: f32) {
+        self.builder.move_to(x * self.scale, -y * self.scale);
+    }
+
+    fn line_to(&mut self, x: f32, y: f32) {
+        self.builder.line_to(x * self.scale, -y * self.scale);
+    }
+
+    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+        self.builder.quad_to(
+            x1 * self.scale,
+            -y1 * self.scale,
+            x * self.scale,
+            -y * self.scale,
+        );
+    }
+
+    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+        self.builder.cubic_to(
+            x1 * self.scale,
+            -y1 * self.scale,
+            x2 * self.scale,
+            -y2 * self.scale,
+            x * self.scale,
+            -y * self.scale,
+        );
+    }
+
+    fn close(&mut self) {
+        self.builder.close();
+    }
+}
+
+/// Rasterizes one glyph outline into a coverage bitmap.
+///
+/// `ttf-parser` only parses the table directory, so this stays cheap even for
+/// a 16 MB CJK font. `fontdue::Font::from_bytes` cannot be used here: it
+/// outlines *every* glyph in the file up front, which measured 307 MB of RSS
+/// and 0.63 s for NotoSansCJKsc-Regular.otf (16 MB, ~65k glyphs) and kills
+/// KOReader on a 256 MB Kindle.
+fn rasterize_glyph(face: &ttf_parser::Face<'_>, glyph_id: u16, size: f32) -> Option<GlyphRaster> {
+    if glyph_id == 0 || !size.is_finite() || size <= 0.0 {
+        return None;
+    }
+    let units_per_em = f32::from(face.units_per_em());
+    if !units_per_em.is_finite() || units_per_em <= 0.0 {
+        return None;
+    }
+    let mut outline = OutlinePath {
+        builder: PathBuilder::new(),
+        scale: size / units_per_em,
+    };
+    face.outline_glyph(ttf_parser::GlyphId(glyph_id), &mut outline)?;
+    let path = outline.builder.finish()?;
+    let bounds = path.bounds();
+    if !bounds.width().is_finite() || !bounds.height().is_finite() {
+        return None;
+    }
+    let left = bounds.left().floor();
+    let top = bounds.top().floor();
+    let width = (bounds.right().ceil() - left) as i32;
+    let height = (bounds.bottom().ceil() - top) as i32;
+    if width <= 0 || height <= 0 || width > 4096 || height > 4096 {
+        return None;
+    }
+    let mut mask = Mask::new(width as u32, height as u32)?;
+    mask.fill_path(
+        &path,
+        FillRule::Winding,
+        true,
+        Transform::from_translate(-left, -top),
+    );
+    Some(GlyphRaster {
+        width: width as u32,
+        height: height as u32,
+        left,
+        top,
+        data: mask.data().to_vec(),
+    })
+}
 
 #[derive(Clone)]
 pub struct PageBitmap {
@@ -72,9 +171,8 @@ pub fn render_page(
         local_top,
         local_bottom,
     );
-    let mut fonts = HashMap::new();
+    let mut faces: HashMap<usize, ttf_parser::Face<'_>> = HashMap::new();
     let mut glyph_cache: HashMap<GlyphKey, GlyphBitmap> = HashMap::new();
-
     for command in &scene.commands {
         match command {
             RenderCommand::Fill(cmd) => match &cmd.brush {
@@ -129,7 +227,7 @@ pub fn render_page(
                         local_top,
                         local_bottom,
                         font_gamma,
-                        &mut fonts,
+                        &mut faces,
                         &mut glyph_cache,
                     );
                 }
@@ -395,9 +493,9 @@ fn glyph_coverage_lut(gamma: f32) -> [u8; 256] {
     lut
 }
 #[allow(clippy::too_many_arguments)]
-fn draw_glyphs(
+fn draw_glyphs<'a>(
     pixmap: &mut Pixmap,
-    font_data: &peniko::FontData,
+    font_data: &'a peniko::FontData,
     font_size: f32,
     glyphs: &[anyrender::Glyph],
     transform: Affine,
@@ -407,13 +505,14 @@ fn draw_glyphs(
     clip_top: f32,
     clip_bottom: f32,
     font_gamma: f32,
-    fonts: &mut HashMap<usize, Font>,
+    faces: &mut HashMap<usize, ttf_parser::Face<'a>>,
     glyph_cache: &mut HashMap<GlyphKey, GlyphBitmap>,
 ) {
     let coverage_lut = glyph_coverage_lut(font_gamma);
-    let key = font_data.data.data().as_ptr() as usize ^ font_data.index as usize;
-    let font = fonts.entry(key).or_insert_with(|| {
-        Font::from_bytes(font_data.data.data(), FontSettings::default()).expect("parse font data")
+    let data = font_data.data.data();
+    let key = data.as_ptr() as usize ^ font_data.index as usize;
+    let face = faces.entry(key).or_insert_with(|| {
+        ttf_parser::Face::parse(data, font_data.index).expect("parse font data")
     });
 
     let scale = transform.as_coeffs();
@@ -442,23 +541,21 @@ fn draw_glyphs(
         let cache_key: GlyphKey = (key, glyph.id as u16, (glyph_size * 4.0) as u32);
         let raster = glyph_cache
             .entry(cache_key)
-            .or_insert_with(|| Arc::new(font.rasterize_indexed(glyph.id as u16, glyph_size)))
+            .or_insert_with(|| Arc::new(rasterize_glyph(face, glyph.id as u16, glyph_size)))
             .clone();
-        let metrics = raster.0;
-        let bitmap = &raster.1;
-        if metrics.width == 0 || metrics.height == 0 {
+        let Some(raster) = raster.as_ref() else {
+            continue;
+        };
+
+        let x0 = origin.x as f32 + raster.left;
+        let y0 = origin.y as f32 + raster.top;
+        if (y0 + raster.height as f32) < clip_top || y0 > clip_bottom {
             continue;
         }
 
-        let x0 = origin.x as f32 + metrics.xmin as f32;
-        let y0 = origin.y as f32 - metrics.ymin as f32 - metrics.height as f32;
-        if (y0 + metrics.height as f32) < clip_top || y0 > clip_bottom {
-            continue;
-        }
-
-        for row in 0..metrics.height {
-            for col in 0..metrics.width {
-                let coverage_byte = bitmap[row * metrics.width + col];
+        for row in 0..raster.height {
+            for col in 0..raster.width {
+                let coverage_byte = raster.data[(row * raster.width + col) as usize];
                 if coverage_byte == 0 {
                     continue;
                 }
