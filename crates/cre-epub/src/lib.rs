@@ -508,6 +508,11 @@ impl EpubBook {
             html.push_str(style);
             html.push_str("</style>");
         }
+        // NOTE: crengine gives every EPUB spine item its own <DocFragment> and
+        // epub.css puts `page-break-before: always` on it. Doing the same here
+        // exposes a bug in xpointer generation (two pages starting inside one
+        // paragraph produce the same `text().N`), so the rule is not applied
+        // until that mapping is fixed.
         html.push_str("<style>/* cre-render-base */");
         html.push_str(&format!(
             "html, body {{ margin: 0; padding: 0; }}\n\

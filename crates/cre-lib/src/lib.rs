@@ -2885,6 +2885,10 @@ fn paginate(
         }
         if force_break_before {
             starts.push(page_start_for_line(line, margin_top));
+            // The break already starts a page at this line; running the height
+            // check as well pushed a second start for the same line, which made
+            // an empty page and a duplicate start XPointer.
+            continue;
         }
 
         let current = starts.last().unwrap();
