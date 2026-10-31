@@ -22,6 +22,28 @@ set -u
 DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)"
 OUT="diag-$(date +%Y%m%d-%H%M%S).txt"
 
+# A file argument is optional: if it is missing or wrong, KOReader falls back
+# to its file manager, which is fine -- the recording below keeps running
+# until KOReader exits either way.
+if [ "$#" -gt 0 ] && [ ! -e "$1" ]; then
+    echo "note: '$1' does not exist, starting in the file manager instead"
+    set --
+fi
+if [ "$#" -eq 0 ]; then
+    echo "Opening KOReader in the file manager."
+    echo "Pick the book that crashes; this script keeps recording until"
+    echo "KOReader exits, then writes $DIR/$OUT."
+fi
+
+# KOReader's wrapper treats a KUAL launch specially: it stops a handful of
+# Amazon services ("stored", "webreader", ...) to reclaim RAM, which changes
+# how much memory the device has left for us. Set KDIAG_KUAL=1 to reproduce
+# the normal KUAL launch while still capturing evidence.
+EXTRA_ARGS=""
+if [ -n "${KDIAG_KUAL:-}" ] && [ "${KDIAG_KUAL}" != "0" ]; then
+    EXTRA_ARGS="--kual"
+fi
+
 log() {
     echo "$@" >>"$OUT"
 }
@@ -62,11 +84,15 @@ log ""
 if [ -f crash.log ]; then
     cp -f crash.log crash.log.before
 fi
+# Same for the breadcrumb, so the tail below only shows this run.
+if [ -f cre.log ]; then
+    cp -f cre.log cre.log.before
+fi
 
 section "launch"
 CRE_LIB_TRACE=1 \
 CRE_LUA_TRACE_PATH="$DIR/cre.log" \
-    ./koreader.sh "$@" >>"$OUT" 2>&1
+    ./koreader.sh $EXTRA_ARGS "$@" >>"$OUT" 2>&1
 status=$?
 log "koreader.sh exit status: ${status}"
 
@@ -92,7 +118,19 @@ else
     tail -n 60 crash.log 2>/dev/null >>"$OUT"
 fi
 
-section "cre.log (breadcrumb tail)"
-tail -n 30 cre.log 2>/dev/null >>"$OUT"
+section "cre.log (breadcrumb, this run)"
+if [ -f cre.log.before ]; then
+    before_calls=$(wc -l <cre.log.before)
+    tail -n +$((before_calls + 1)) cre.log 2>/dev/null | tail -n 40 >>"$OUT"
+else
+    tail -n 40 cre.log 2>/dev/null >>"$OUT"
+fi
+
+section "did a book actually open?"
+if grep -q 'opening file' crash.log 2>/dev/null; then
+    grep 'opening file' crash.log | tail -n 3 >>"$OUT"
+else
+    log "(no 'opening file' line: the run never opened a document)"
+fi
 
 echo "wrote $DIR/$OUT"
