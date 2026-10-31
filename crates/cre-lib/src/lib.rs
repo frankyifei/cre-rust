@@ -2901,32 +2901,46 @@ fn paginate(
         clip_top: first_clip_top,
     }];
     let mut forced_index = 0usize;
+    let mut pending_break = false;
+    // Lines already placed on the current page. A chunk starts on a fresh page,
+    // so a break before its very first line would only add an empty page.
+    let mut lines_on_page = 0usize;
     for line in lines {
         let current = starts.last().unwrap();
-        let mut force_break_before = false;
         while forced_index < forced_breaks.len()
             && forced_breaks[forced_index] <= line.visual_top + BREAK_EPSILON
         {
             if forced_breaks[forced_index] > current.clip_top + BREAK_EPSILON
                 && line.top > current.clip_top + BREAK_EPSILON
             {
-                force_break_before = true;
+                pending_break = true;
             }
             forced_index += 1;
         }
-        if force_break_before {
-            starts.push(page_start_for_line(line, margin_top));
-            // The break already starts a page at this line; running the height
-            // check as well pushed a second start for the same line, which made
-            // an empty page and a duplicate start XPointer.
-            continue;
+
+        // A page that only holds an empty line box is a blank page between two
+        // chapters, and it cannot produce an XPointer. Wait for the first line
+        // that carries text instead.
+        let has_text = line.text_end > line.text_start;
+        if pending_break && has_text {
+            pending_break = false;
+            if lines_on_page > 0 {
+                starts.push(page_start_for_line(line, margin_top));
+                // The break already starts a page at this line; running the
+                // height check as well pushed a second start for the same line,
+                // which made an empty page and a duplicate start XPointer.
+                lines_on_page = 1;
+                continue;
+            }
         }
 
         let current = starts.last().unwrap();
         let clip_bottom = current.top + page_height - margin_bottom;
-        if line.bottom > clip_bottom && line.top > current.clip_top {
+        if has_text && line.bottom > clip_bottom && line.top > current.clip_top {
             starts.push(page_start_for_line(line, margin_top));
+            lines_on_page = 0;
         }
+        lines_on_page += 1;
     }
     starts
 }

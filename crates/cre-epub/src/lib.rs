@@ -629,22 +629,26 @@ fn split_body_html(body: &str, limit: usize) -> Vec<String> {
     let mut current = String::new();
     let mut open: Vec<OpenTag> = Vec::new();
     let mut floor = 0usize; // bytes in `current` that cannot be flushed
+    // Whether anything besides re-opened start tags went into `current`.
+    let mut dirty = false;
 
-    let flush = |parts: &mut Vec<String>, current: &mut String, open: &[OpenTag]| {
-        let mut part = String::new();
-        part.push_str(current);
-        for tag in open.iter().rev() {
-            part.push_str("</");
-            part.push_str(&tag.name);
-            part.push('>');
-        }
-        parts.push(part);
-        current.clear();
-        for tag in open {
-            current.push_str(&tag.start);
-        }
-        current.len()
-    };
+    let flush =
+        |parts: &mut Vec<String>, current: &mut String, open: &[OpenTag], dirty: &mut bool| {
+            let mut part = String::new();
+            part.push_str(current);
+            for tag in open.iter().rev() {
+                part.push_str("</");
+                part.push_str(&tag.name);
+                part.push('>');
+            }
+            parts.push(part);
+            current.clear();
+            for tag in open {
+                current.push_str(&tag.start);
+            }
+            *dirty = false;
+            current.len()
+        };
 
     let mut index = 0usize;
     while index < body.len() {
@@ -653,7 +657,10 @@ fn split_body_html(body: &str, limit: usize) -> Vec<String> {
         if text_end > index {
             let text = &body[index..text_end];
             if current.len() + text.len() > limit && current.len() > floor && !open.is_empty() {
-                floor = flush(&mut parts, &mut current, &open);
+                floor = flush(&mut parts, &mut current, &open, &mut dirty);
+            }
+            if !text.trim().is_empty() {
+                dirty = true;
             }
             current.push_str(text);
         }
@@ -669,8 +676,9 @@ fn split_body_html(body: &str, limit: usize) -> Vec<String> {
                 .unwrap_or(body.len());
             let raw = &body[tag_start..end];
             if current.len() + raw.len() > limit && current.len() > floor && !open.is_empty() {
-                floor = flush(&mut parts, &mut current, &open);
+                floor = flush(&mut parts, &mut current, &open, &mut dirty);
             }
+            dirty = true;
             current.push_str(raw);
             index = end;
             continue;
@@ -694,8 +702,9 @@ fn split_body_html(body: &str, limit: usize) -> Vec<String> {
             current.push_str(raw);
         } else {
             if current.len() + raw.len() > limit && current.len() > floor && !open.is_empty() {
-                floor = flush(&mut parts, &mut current, &open);
+                floor = flush(&mut parts, &mut current, &open, &mut dirty);
             }
+            dirty = true;
             current.push_str(raw);
             if matches!(name.as_str(), "style" | "script" | "textarea" | "title") {
                 // Raw-text elements: copy their content verbatim so '<' inside
@@ -714,7 +723,9 @@ fn split_body_html(body: &str, limit: usize) -> Vec<String> {
         }
         index = tag_end;
     }
-    if !current.is_empty() {
+    // A trailing part that only re-opened tags has no content of its own; it
+    // would render as a blank page between two chapters.
+    if !current.is_empty() && (dirty || parts.is_empty()) {
         parts.push(current);
     }
     if parts.is_empty() {
