@@ -406,6 +406,7 @@ dependencies = [
  "cre-text",
  "flate2",
  "image",
+ "libc",
  "memmap2",
  "parley",
  "percent-encoding",

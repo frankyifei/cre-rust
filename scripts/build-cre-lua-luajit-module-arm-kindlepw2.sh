@@ -72,6 +72,11 @@ else
     export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=cortex-a9 -C target-feature=+vfp3,-soft-float,+strict-align"
 fi
 
+# LTO + one codegen unit: the module is ~21 MB without it, which costs RSS
+# (executed pages) and flash space; thin LTO typically removes a third.
+export CARGO_PROFILE_RELEASE_LTO="${CARGO_PROFILE_RELEASE_LTO:-thin}"
+export CARGO_PROFILE_RELEASE_CODEGEN_UNITS="${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-1}"
+
 cargo build --release --target "$TARGET" -p cre-lua --features old-glibc
 
 release_dir="${CARGO_TARGET_DIR}/${TARGET}/release"

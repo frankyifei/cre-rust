@@ -240,6 +240,16 @@ fn trace_enabled() -> bool {
     })
 }
 
+/// Returns freed heap pages to the OS. Building a chunk's DOM/parley layout
+/// allocates and frees tens of megabytes; glibc keeps those arenas resident,
+/// which matters on a 256 MB device where the next page render can then OOM.
+fn trim_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 /// Set `CRE_LIB_TRACE=1` to log process memory (VmRSS/VmHWM) at key stages.
 pub fn trace_memory(label: &str) {
     if !trace_enabled() {
@@ -778,6 +788,8 @@ impl Document {
             page_cache_order: Vec::new(),
             page_boxes_cache: RefCell::new(None),
         };
+        trim_memory();
+        trace_memory("after build trim");
         document.ensure_chunk(0)?;
         trace_memory("after document build");
         if trace_enabled() {
@@ -1229,6 +1241,7 @@ impl Document {
             lines,
             page_starts,
         });
+        trim_memory();
         trace_memory("after chunk activation");
         if trace_enabled() {
             eprintln!(
