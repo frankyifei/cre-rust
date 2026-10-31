@@ -34,7 +34,7 @@ impl PageBitmap {
         std::fs::write(path, out)
     }
 }
-
+#[allow(clippy::too_many_arguments)]
 pub fn render_page(
     scene: &Scene,
     width: u32,
@@ -43,6 +43,7 @@ pub fn render_page(
     clip_top: f32,
     clip_bottom: f32,
     background: u32,
+    font_gamma: f32,
 ) -> (Arc<PageBitmap>, usize, usize) {
     let mut pixmap = Pixmap::new(width, height).expect("non-zero page bitmap");
     let background_color = tiny_skia::Color::from_rgba8(
@@ -120,6 +121,7 @@ pub fn render_page(
                         cmd.brush_alpha,
                         local_top,
                         local_bottom,
+                        font_gamma,
                         &mut fonts,
                     );
                 }
@@ -362,6 +364,28 @@ fn draw_stroke(
     pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), clip_mask);
 }
 
+/// Maps glyph coverage bytes through the font-contrast gamma in one place:
+/// the composite of black text covers the background proportionally to
+/// `1 - coverage`, so post-compositing `out' = out^gamma` is exactly
+/// equivalent to painting with the effective coverage `1 - (1 - coverage)^gamma`.
+/// Doing it here covers every pixel of the glyph (including anti-aliased edges
+/// that extend past line boxes), keeps the ink in glyph space, and never
+/// touches images, strokes or fills.
+fn glyph_coverage_lut(gamma: f32) -> [u8; 256] {
+    let mut lut = [0u8; 256];
+    let identity = (gamma - 1.0).abs() <= 1e-6 || !gamma.is_finite();
+    for (byte, entry) in lut.iter_mut().enumerate() {
+        let coverage = byte as f32 / 255.0;
+        let effective = if identity {
+            coverage
+        } else {
+            let gamma = gamma.clamp(0.1, 15.0);
+            1.0 - (1.0 - coverage).powf(gamma)
+        };
+        *entry = ((effective * 255.0) + 0.5).clamp(0.0, 255.0) as u8;
+    }
+    lut
+}
 #[allow(clippy::too_many_arguments)]
 fn draw_glyphs(
     pixmap: &mut Pixmap,
@@ -374,8 +398,10 @@ fn draw_glyphs(
     brush_alpha: f32,
     clip_top: f32,
     clip_bottom: f32,
+    font_gamma: f32,
     fonts: &mut HashMap<usize, Font>,
 ) {
+    let coverage_lut = glyph_coverage_lut(font_gamma);
     let key = font_data.data.data().as_ptr() as usize ^ font_data.index as usize;
     let font = fonts.entry(key).or_insert_with(|| {
         Font::from_bytes(font_data.data.data(), FontSettings::default()).expect("parse font data")
@@ -417,10 +443,11 @@ fn draw_glyphs(
 
         for row in 0..metrics.height {
             for col in 0..metrics.width {
-                let coverage = bitmap[row * metrics.width + col] as f32 / 255.0;
-                if coverage <= 0.0 {
+                let coverage_byte = bitmap[row * metrics.width + col];
+                if coverage_byte == 0 {
                     continue;
                 }
+                let coverage = coverage_lut[coverage_byte as usize] as f32 / 255.0;
                 let x = x0.round() as i32 + col as i32;
                 let y = y0.round() as i32 + row as i32;
                 if x < 0 || y < 0 || x >= pixmap.width() as i32 || y >= pixmap.height() as i32 {
@@ -637,7 +664,7 @@ impl ColorPageBitmap {
         }
     }
 }
-
+#[allow(clippy::too_many_arguments)]
 pub fn render_page_rgba(
     scene: &Scene,
     width: u32,
@@ -646,6 +673,7 @@ pub fn render_page_rgba(
     clip_top: f32,
     clip_bottom: f32,
     background: u32,
+    font_gamma: f32,
 ) -> (Arc<ColorPageBitmap>, usize, usize) {
     let mut pixmap = Pixmap::new(width, height).expect("non-zero page bitmap");
     let background_color = tiny_skia::Color::from_rgba8(
@@ -723,6 +751,7 @@ pub fn render_page_rgba(
                         cmd.brush_alpha,
                         local_top,
                         local_bottom,
+                        font_gamma,
                         &mut fonts,
                     );
                 }
