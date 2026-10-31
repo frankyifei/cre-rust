@@ -206,6 +206,9 @@ fn source_text_position_for_line(root: &Node, line: &LineBox) -> Option<(NodeId,
     if segment.is_empty() {
         return None;
     }
+    if let Some(position) = text_node_for_block_offset(inline_root, start) {
+        return Some(position);
+    }
     map_line_text_position(inline_root, line.source_element_id, segment)
 }
 
@@ -385,16 +388,79 @@ pub(crate) fn position_for_text_node(
     }
 
     path.reverse();
+    let text_index = text_index_for_node(root, target_id);
     Ok(TextPosition {
         spine_index,
         path,
+        text_index,
         codepoint_offset,
     })
+}
+
+/// 1-based index of a text node among its parent's text children, when the
+/// parent has more than one (crengine's `/text()[k]`).
+fn text_index_for_node(root: &Node, node_id: NodeId) -> Option<u32> {
+    let node = root.with(node_id);
+    if !node.is_text_node() {
+        return None;
+    }
+    let parent_id = node.parent?;
+    let parent = root.with(parent_id);
+    let mut index = 0u32;
+    let mut total = 0u32;
+    for child in &parent.children {
+        let child = root.with(*child);
+        if child.is_text_node() {
+            total += 1;
+            if child.id == node_id {
+                index = total;
+            }
+        }
+    }
+    (total > 1).then_some(index)
+}
+
+/// Maps a byte offset inside a block's inline text onto a (text node,
+/// codepoint offset) pair. Parley indexes lines against the concatenation of
+/// the block's text nodes, so summing their raw lengths reproduces the same
+/// position exactly - unlike matching text prefixes, which can hit an earlier
+/// occurrence.
+fn text_node_for_block_offset(inline_root: &Node, byte_offset: usize) -> Option<(NodeId, u32)> {
+    let inline_layout = inline_root.element_data()?.inline_layout_data.as_ref()?;
+    let mut end = byte_offset.min(inline_layout.text.len());
+    while end > 0 && !inline_layout.text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut remaining = inline_layout.text[..end].chars().count();
+    for id in collect_text_node_ids_vec(inline_root) {
+        let node = inline_root.with(id);
+        let Some(text) = node.text_data() else {
+            continue;
+        };
+        let len = text.content.chars().count();
+        if remaining < len {
+            return Some((id, remaining as u32));
+        }
+        remaining -= len;
+    }
+    None
 }
 
 pub(crate) fn resolve_text_position(root: &Node, position: &TextPosition) -> Result<NodeId> {
     let current_id = resolve_element_position(root, position)?;
     let current = root.with(current_id);
+    if let Some(wanted) = position.text_index {
+        let mut seen = 0u32;
+        for child in &current.children {
+            let child = root.with(*child);
+            if child.is_text_node() {
+                seen += 1;
+                if seen == wanted {
+                    return Ok(child.id);
+                }
+            }
+        }
+    }
     first_text_node(current, false)
         .or_else(|| first_text_node(current, true))
         .or(Some(current_id))

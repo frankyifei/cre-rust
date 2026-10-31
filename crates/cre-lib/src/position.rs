@@ -10,6 +10,11 @@ pub struct PathSegment {
 pub struct TextPosition {
     pub spine_index: u32,
     pub path: Vec<PathSegment>,
+    /// 1-based index among the parent's text nodes, when there is more than
+    /// one. crengine emits `/text()[k]` for this; without it a position inside
+    /// one paragraph is indistinguishable from another position in the same
+    /// paragraph.
+    pub text_index: Option<u32>,
     pub codepoint_offset: u32,
 }
 
@@ -24,9 +29,13 @@ impl TextPosition {
             path.push(']');
         }
 
+        let text = match self.text_index {
+            Some(index) => format!("text()[{index}]"),
+            None => "text()".to_string(),
+        };
         format!(
-            "/body/DocFragment[{}]/body{}/text().{}",
-            self.spine_index, path, self.codepoint_offset
+            "/body/DocFragment[{}]/body{}/{}.{}",
+            self.spine_index, path, text, self.codepoint_offset
         )
     }
 }
@@ -108,7 +117,7 @@ pub fn parse_text_position(input: &str) -> Result<TextPosition> {
     let Some(terminal) = parts.last() else {
         return Err(anyhow!("unsupported XPointer: path must end with text().0"));
     };
-    let codepoint_offset = parse_terminal(terminal)?;
+    let (text_index, codepoint_offset) = parse_terminal(terminal)?;
 
     let mut segments = Vec::new();
     for part in parts
@@ -122,6 +131,7 @@ pub fn parse_text_position(input: &str) -> Result<TextPosition> {
     Ok(TextPosition {
         spine_index,
         path: segments,
+        text_index,
         codepoint_offset,
     })
 }
@@ -144,16 +154,35 @@ fn parse_docfragment(segment: &str) -> Result<u32> {
     Ok(index)
 }
 
-fn parse_terminal(segment: &str) -> Result<u32> {
-    if segment == "text()" {
-        return Ok(0);
+fn parse_terminal(segment: &str) -> Result<(Option<u32>, u32)> {
+    // Accepted forms: text().N, text()[k].N
+    let (text_index, rest) = if let Some(rest) = segment.strip_prefix("text()[") {
+        let (index, rest) = rest
+            .split_once(']')
+            .ok_or_else(|| anyhow!("unsupported XPointer: malformed text()[k]"))?;
+        let index = index
+            .parse::<u32>()
+            .map_err(|_| anyhow!("unsupported XPointer: malformed text() index"))?;
+        if index == 0 {
+            return Err(anyhow!(
+                "unsupported XPointer: text() index must be positive"
+            ));
+        }
+        (Some(index), rest)
+    } else if let Some(rest) = segment.strip_prefix("text()") {
+        (None, rest)
+    } else {
+        return Err(anyhow!("unsupported XPointer: path must end with text().0"));
+    };
+
+    let rest = rest.strip_prefix('.').unwrap_or(rest);
+    if rest.is_empty() {
+        return Ok((text_index, 0));
     }
-    let value = segment
-        .strip_prefix("text().")
-        .ok_or_else(|| anyhow!("unsupported XPointer: path must end with text().0"))?;
-    value
+    let offset = rest
         .parse::<u32>()
-        .map_err(|_| anyhow!("unsupported XPointer: malformed text() offset"))
+        .map_err(|_| anyhow!("unsupported XPointer: malformed text() offset"))?;
+    Ok((text_index, offset))
 }
 
 fn parse_path_segment(segment: &str) -> Result<PathSegment> {

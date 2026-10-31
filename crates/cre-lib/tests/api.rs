@@ -448,7 +448,20 @@ fn document_hit_tests_internal_epub_links() {
     let doc = Document::open(fixture("links.epub")).unwrap();
     assert_eq!(doc.metadata().title.as_deref(), Some("Links Test"));
 
-    let boxes = doc.page_text_boxes(1).unwrap();
+    // Every spine item starts a new page, so the link is not necessarily on
+    // page 1; find the page that carries it.
+    let link_page = (1..=doc.page_count().min(5))
+        .find(|page| {
+            doc.page_text_boxes(*page)
+                .map(|boxes| {
+                    boxes
+                        .iter()
+                        .any(|text_box| text_box.text.contains("Jump target"))
+                })
+                .unwrap_or(false)
+        })
+        .expect("no page has the jump link");
+    let boxes = doc.page_text_boxes(link_page).unwrap();
     let link_box = boxes
         .iter()
         .find(|text_box| text_box.text.contains("Jump target"))
@@ -458,7 +471,13 @@ fn document_hit_tests_internal_epub_links() {
     let mut links = Vec::new();
     let mut x = link_box.x;
     while x <= link_box.x + link_box.width {
-        if let Some(hit) = doc.hit_test(PagePosition { page: 1, x, y }).unwrap()
+        if let Some(hit) = doc
+            .hit_test(PagePosition {
+                page: link_page,
+                x,
+                y,
+            })
+            .unwrap()
             && let Some(link) = hit.link
         {
             links.push(link);
@@ -476,14 +495,14 @@ fn document_hit_tests_internal_epub_links() {
         doc.toc()[1].page.unwrap()
     );
 
-    let page_links = doc.page_links(1, true).unwrap();
+    let page_links = doc.page_links(link_page, true).unwrap();
     assert!(!page_links.is_empty());
     for link in &page_links {
         assert!(link.internal);
         assert!(link.href.ends_with("ch2.xhtml#target"));
         assert!(!link.rects.is_empty());
         for rect in &link.rects {
-            assert_eq!(rect.page, 1);
+            assert_eq!(rect.page, link_page);
             assert!(rect.width > 0.0 && rect.height > 0.0);
         }
     }

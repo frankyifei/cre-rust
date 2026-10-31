@@ -93,12 +93,15 @@ fn base_typography_survives_disabled_embedded_styles() {
             opts
         })
         .unwrap();
-        let text = doc.page_text(1).unwrap_or_default();
-        assert!(
-            text.contains("MARK"),
-            "text must survive style stripping, got: {text:?}"
-        );
-        text
+        // Every spine item starts a new page, so look through the opening
+        // pages instead of assuming page 1 carries the marker.
+        (1..=doc.page_count().min(5))
+            .filter_map(|page| doc.page_text(page).ok())
+            .find(|text| text.contains("MARK"))
+            .unwrap_or_else(|| {
+                let first = doc.page_text(1).unwrap_or_default();
+                panic!("text must survive style stripping, got: {first:?}");
+            })
     };
     assert!(!text_without.is_empty());
 }
