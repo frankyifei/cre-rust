@@ -25,6 +25,7 @@ Config file (JSON), default ~/.config/qemu-kindle/config.json:
       "triplet": "arm-kindlepw2-linux-gnueabi",
       "toolchain": "~/x-tools/arm-kindlepw2-linux-gnueabi",
       "qemu": "qemu-arm",
+    "qemu_args": "-tb-size 256 -cpu cortex-a9",
       "sysroot": "/usr/arm-linux-gnueabi",
       "cre_lib": "~/src/kindle-project/target-arm-kindlepw2-linux-gnueabi/armv7-unknown-linux-gnueabi/release/libkoreader-cre.so",
       "cre_build_script": "~/src/kindle-project/scripts/build-cre-lua-luajit-module-arm-kindlepw2.sh",
@@ -65,6 +66,7 @@ DEFAULTS = {
     "toolchain": "~/x-tools/arm-kindlepw2-linux-gnueabi",
     "cc": "",
     "qemu": "qemu-arm",
+    "qemu_args": "-tb-size 256 -cpu cortex-a9",
     "sysroot": "/usr/arm-linux-gnueabi",
     "cre_lib": "",
     "cre_build_script": "",
@@ -483,8 +485,9 @@ def cmd_run(cfg, args) -> int:
         env["FAKEKINDLE_TAP_DELAY"] = str(cfg["tap_delay"])
     (cache / "home").mkdir(parents=True, exist_ok=True)
 
-    cmd = [
-        qemu,
+    cmd = [qemu]
+    cmd.extend(str(cfg["qemu_args"]).split())
+    cmd.extend([
         "-L",
         sysroot,
         "-E",
@@ -493,7 +496,7 @@ def cmd_run(cfg, args) -> int:
         f"LD_LIBRARY_PATH={package / 'libs'}",
         str(package / "luajit"),
         str(package / "reader.lua"),
-    ]
+    ])
     book = args.book
     if book:
         cmd.append(str(Path(book).expanduser().resolve()))

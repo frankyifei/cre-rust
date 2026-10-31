@@ -25,7 +25,17 @@
 #define FB_WIDTH 758
 #define FB_HEIGHT 1024
 
-static int last_ink = -1;
+static unsigned long last_hash = 0;
+
+static unsigned long frame_hash(const unsigned char *data, size_t size)
+{
+    unsigned long hash = 1469598103934665603UL;
+    for (size_t i = 0; i < size; i++) {
+        hash ^= data[i];
+        hash *= 1099511628211UL;
+    }
+    return hash;
+}
 
 static void send_cmd(const char *fifo, char cmd, int x, int y)
 {
@@ -119,6 +129,9 @@ int main(int argc, char **argv)
     int dragging = 0;
     long last_motion_ms = 0;
     int last_mx = -1, last_my = -1;
+    int press_x = -1, press_y = -1;
+    long press_ms = 0;
+    int moved = 0;
     while (running) {
         fd_set fds;
         FD_ZERO(&fds);
@@ -138,6 +151,14 @@ int main(int argc, char **argv)
                 if (fb_x >= FB_WIDTH) fb_x = FB_WIDTH - 1;
                 if (fb_y >= FB_HEIGHT) fb_y = FB_HEIGHT - 1;
                 dragging = 1;
+                moved = 0;
+                press_x = fb_x;
+                press_y = fb_y;
+                {
+                    struct timespec press_now;
+                    clock_gettime(CLOCK_MONOTONIC, &press_now);
+                    press_ms = press_now.tv_sec * 1000L + press_now.tv_nsec / 1000000L;
+                }
                 last_mx = fb_x;
                 last_my = fb_y;
                 send_cmd(tap_path, 'd', fb_x, fb_y);
@@ -151,6 +172,9 @@ int main(int argc, char **argv)
                 struct timespec now;
                 clock_gettime(CLOCK_MONOTONIC, &now);
                 long now_ms = now.tv_sec * 1000L + now.tv_nsec / 1000000L;
+                if (abs(fb_x - press_x) >= 8 || abs(fb_y - press_y) >= 8) {
+                    moved = 1;
+                }
                 if (now_ms - last_motion_ms >= 30 &&
                     (abs(fb_x - last_mx) >= 2 || abs(fb_y - last_my) >= 2)) {
                     last_motion_ms = now_ms;
@@ -166,8 +190,15 @@ int main(int argc, char **argv)
                     if (fb_y < 0) fb_y = 0;
                     if (fb_x >= FB_WIDTH) fb_x = FB_WIDTH - 1;
                     if (fb_y >= FB_HEIGHT) fb_y = FB_HEIGHT - 1;
-                    send_cmd(tap_path, 'm', fb_x, fb_y);
-                    send_cmd(tap_path, 'u', 0, 0);
+                    if (moved) {
+                        send_cmd(tap_path, 'm', fb_x, fb_y);
+                        send_cmd(tap_path, 'u', 0, 0);
+                    } else {
+                        /* A click is a click regardless of how slowly the
+                         * guest processes events: emit a complete tap and skip
+                         * the up event so the guest cannot count it twice. */
+                        send_cmd(tap_path, 't', press_x, press_y);
+                    }
                     dragging = 0;
                 }
             } else if (ev.type == DestroyNotify) {
@@ -181,23 +212,20 @@ int main(int argc, char **argv)
         }
 
         if (load_frame(fb_path, gray)) {
-            int ink = 0;
-            for (int y = 0; y < FB_HEIGHT; y++) {
-                for (int x = 0; x < FB_WIDTH; x++) {
-                    unsigned char v = gray[(size_t)y * FB_WIDTH + x];
-                    if (v != 0 && v != 255) {
-                        ink++;
-                    }
-                    size_t o = ((size_t)y * FB_WIDTH + x) * 4;
-                    rgb[o + 0] = v;
-                    rgb[o + 1] = v;
-                    rgb[o + 2] = v;
-                    rgb[o + 3] = 0;
-                }
-            }
-            if (ink != last_ink) {
-                last_ink = ink;
+            unsigned long hash = frame_hash(gray, (size_t)FB_WIDTH * FB_HEIGHT);
+            if (hash != last_hash) {
+                last_hash = hash;
                 needs_redraw = 1;
+                for (int y = 0; y < FB_HEIGHT; y++) {
+                    for (int x = 0; x < FB_WIDTH; x++) {
+                        unsigned char v = gray[(size_t)y * FB_WIDTH + x];
+                        size_t o = ((size_t)y * FB_WIDTH + x) * 4;
+                        rgb[o + 0] = v;
+                        rgb[o + 1] = v;
+                        rgb[o + 2] = v;
+                        rgb[o + 3] = 0;
+                    }
+                }
             }
         }
 

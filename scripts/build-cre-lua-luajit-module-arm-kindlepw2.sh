@@ -57,6 +57,19 @@ export CROSS_COMPILE="${TOOL_PREFIX}-"
 export LINUX=1
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target-${TOOL_PREFIX}}"
 
+# rustc's armv7-unknown-linux-gnueabi target is declared
+# "+v7,+thumb2,+soft-float,-neon" with no VFP3, so every floating point
+# operation becomes a libgcc soft-float call (__aeabi_fadd/__aeabi_dmul...).
+# That is catastrophically slow - it dominates page rendering both on the
+# device's Cortex-A9 (which has VFPv3) and under qemu. Keep the softfp ABI
+# (arguments still follow the toolchain's soft-fp convention) but let the
+# compiler emit VFP instructions for the math itself.
+# `-soft-float` removes rustc's soft-float target feature: arguments still
+# follow the toolchain's softfp ABI (verified: f64 arrives in r0/r1 and is
+# moved into VFP registers), but arithmetic uses VFP instructions instead of
+# libgcc soft-float calls.
+export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+vfp3,-soft-float"
+
 cargo build --release --target "$TARGET" -p cre-lua --features old-glibc
 
 release_dir="${CARGO_TARGET_DIR}/${TARGET}/release"

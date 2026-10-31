@@ -12,6 +12,12 @@ use tiny_skia::{
     Stroke as SkStroke, Transform,
 };
 
+/// Rasterized glyph cache: fontdue re-rasterizes a glyph on every page paint,
+/// which dominates first-page cost on slow targets. Key: font pointer, glyph
+/// id, and the raster size quantized to 1/4 px.
+type GlyphKey = (usize, u16, u32);
+type GlyphBitmap = Arc<(fontdue::Metrics, Vec<u8>)>;
+
 #[derive(Clone)]
 pub struct PageBitmap {
     pub width: u32,
@@ -67,6 +73,7 @@ pub fn render_page(
         local_bottom,
     );
     let mut fonts = HashMap::new();
+    let mut glyph_cache: HashMap<GlyphKey, GlyphBitmap> = HashMap::new();
 
     for command in &scene.commands {
         match command {
@@ -123,6 +130,7 @@ pub fn render_page(
                         local_bottom,
                         font_gamma,
                         &mut fonts,
+                        &mut glyph_cache,
                     );
                 }
             }
@@ -400,6 +408,7 @@ fn draw_glyphs(
     clip_bottom: f32,
     font_gamma: f32,
     fonts: &mut HashMap<usize, Font>,
+    glyph_cache: &mut HashMap<GlyphKey, GlyphBitmap>,
 ) {
     let coverage_lut = glyph_coverage_lut(font_gamma);
     let key = font_data.data.data().as_ptr() as usize ^ font_data.index as usize;
@@ -430,7 +439,13 @@ fn draw_glyphs(
             continue;
         }
 
-        let (metrics, bitmap) = font.rasterize_indexed(glyph.id as u16, glyph_size);
+        let cache_key: GlyphKey = (key, glyph.id as u16, (glyph_size * 4.0) as u32);
+        let raster = glyph_cache
+            .entry(cache_key)
+            .or_insert_with(|| Arc::new(font.rasterize_indexed(glyph.id as u16, glyph_size)))
+            .clone();
+        let metrics = raster.0;
+        let bitmap = &raster.1;
         if metrics.width == 0 || metrics.height == 0 {
             continue;
         }
@@ -697,6 +712,7 @@ pub fn render_page_rgba(
         local_bottom,
     );
     let mut fonts = HashMap::new();
+    let mut glyph_cache: HashMap<GlyphKey, GlyphBitmap> = HashMap::new();
 
     for command in &scene.commands {
         match command {
@@ -753,6 +769,7 @@ pub fn render_page_rgba(
                         local_bottom,
                         font_gamma,
                         &mut fonts,
+                        &mut glyph_cache,
                     );
                 }
             }

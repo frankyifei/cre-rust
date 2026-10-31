@@ -124,5 +124,12 @@ whether they page-turn depends on KOReader's swipe settings in this build.
 - Rendering is grayscale 758×1024 (PW2). Other Kindle models work by
   changing the serial prefix in `prepare_state()` and the fb geometry
   constants; they are intentionally not exposed yet.
-- Timing under qemu (TCG) is roughly 5–10× slower than hardware; use it
-  for behaviour and relative costs, not absolute performance.
+- Timing under qemu (TCG) is much slower than hardware; use it for
+  behaviour and relative costs, not absolute performance. Defaults are
+  `-tb-size 256 -cpu cortex-a9` (matches the Paperwhite 2's i.MX6
+  SoloLite / Cortex-A9); the plain `any` CPU was unstable with the VFP
+  code our module now emits.
+- The Kindle build compiles with `-C target-feature=+vfp3,-soft-float`:
+  rustc declares the armv7-gnueabi target soft-float, which turned every
+  float operation into a libgcc call. The softfp ABI is preserved (f64
+  still passed in integer registers), only the math uses VFPv3-D16.

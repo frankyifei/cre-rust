@@ -941,6 +941,23 @@ impl Document {
         &mut self,
         page: usize,
     ) -> Result<(Arc<PageBitmap>, usize, usize)> {
+        let render_start = std::time::Instant::now();
+        let result = self.render_page_with_stats_inner(page);
+        if trace_enabled() {
+            eprintln!(
+                "cre-lib: render page {} took {:.3}s ({})",
+                page,
+                render_start.elapsed().as_secs_f64(),
+                if result.is_ok() { "ok" } else { "error" }
+            );
+        }
+        result
+    }
+
+    fn render_page_with_stats_inner(
+        &mut self,
+        page: usize,
+    ) -> Result<(Arc<PageBitmap>, usize, usize)> {
         let Some(index) = page.checked_sub(1) else {
             bail!("page numbers are 1-based");
         };
