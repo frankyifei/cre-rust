@@ -191,16 +191,45 @@ def require_sysroot(cfg) -> str:
     return sysroot
 
 
+def fix_package_permissions(root: Path) -> None:
+    """Restore executable bits lost by zipfile extraction.
+
+    Python's zipfile ignores Unix modes from the archive, so the emulator
+    binaries end up non-executable and qemu exits with status 1 and no
+    output. Mark ELF files and known scripts as executable.
+    """
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        executable = path.name in ("luajit", "fbink", "koreader.sh", "zsync2") or path.suffix in (
+            ".sh",
+            ".so",
+        )
+        if not executable:
+            try:
+                with path.open("rb") as handle:
+                    executable = handle.read(4) == b"\x7fELF"
+            except OSError:
+                executable = False
+        if executable:
+            try:
+                path.chmod(path.stat().st_mode | 0o111)
+            except OSError:
+                pass
+
+
 def ensure_package(cfg) -> Path:
     cache = Path(cfg["cache_dir"])
     if cfg["package_dir"]:
         pkg = Path(cfg["package_dir"])
         if not (pkg / "luajit").exists():
             raise SystemExit(f"qk: package_dir has no luajit: {pkg}")
+        fix_package_permissions(pkg)
         return pkg
     cache.mkdir(parents=True, exist_ok=True)
     pkg = cache / "koreader"
     if (pkg / "luajit").exists():
+        fix_package_permissions(pkg)
         return pkg
     zip_path = Path(cfg["package_zip"]) if cfg["package_zip"] else cache / "ko.zip"
     if cfg["package_zip"]:
@@ -215,6 +244,7 @@ def ensure_package(cfg) -> Path:
         archive.extractall(cache)
     if not (pkg / "luajit").exists():
         raise SystemExit(f"qk: unexpected package layout in {cache}")
+    fix_package_permissions(pkg)
     return pkg
 
 
@@ -354,8 +384,32 @@ def cmd_build(cfg, args) -> int:
 def cmd_config(cfg, _args) -> int:
     redacted = {k: v for k, v in cfg.items() if not k.startswith("_")}
     redacted["_config_path"] = cfg["_config_path"]
+    redacted["_detected_display"] = detect_display(cfg)
     print(json.dumps(redacted, indent=2, sort_keys=True))
     return 0
+
+
+def cmd_view(cfg, _args) -> int:
+    state = Path(cfg["state_dir"]) if cfg["state_dir"] else Path(cfg["cache_dir"]) / "state"
+    if not (state / "fb0").exists():
+        raise SystemExit(f"qk: no framebuffer at {state}; start `qk run --no-viewer` first")
+    display = detect_display(cfg)
+    if not display:
+        raise SystemExit("qk: no X display found; set display or QK_DISPLAY")
+    viewer = build_viewer(cfg, Path(cfg["cache_dir"]))
+    env_v = dict(os.environ)
+    env_v["DISPLAY"] = display
+    print("== viewer window open (close it to stop)", flush=True)
+    return subprocess.call(
+        [
+            str(viewer),
+            str(state / "fb0"),
+            str(state / "taps"),
+            str(cfg["viewer_scale"]),
+            str(cfg["title"]),
+        ],
+        env=env_v,
+    )
 
 
 def cmd_shot(cfg, args) -> int:
@@ -377,10 +431,11 @@ def cmd_run(cfg, args) -> int:
     state = prepare_state(cfg)
     shim = build_shim(cfg, state)
     viewer = None
-    display = cfg["display"] or os.environ.get("DISPLAY", "")
+    display = detect_display(cfg)
     if not args.no_viewer:
         if not display:
-            print("qk: no DISPLAY; running headless (use --no-viewer to silence)", file=sys.stderr)
+            print("qk: no X display found (WSLg/X11 needed); running headless.\n"
+                  "    Set display in the config or QK_DISPLAY=:0.", file=sys.stderr)
         else:
             viewer = build_viewer(cfg, cache)
     cre = resolve_cre_lib(cfg)
@@ -389,20 +444,31 @@ def cmd_run(cfg, args) -> int:
 
     log_file = Path(cfg["log_file"]) if cfg["log_file"] else cache / "reader.log"
     env = dict(os.environ)
+    # Guest-only variables go through qemu's -E; passing LD_PRELOAD in qemu's
+    # own environment makes the *host* loader complain about the ARM shim.
     env.update(
         {
             "HOME": str(cache / "home"),
             "FAKEKINDLE_DIR": str(state),
-            "LD_LIBRARY_PATH": f"{package / 'libs'}:{env.get('LD_LIBRARY_PATH', '')}".rstrip(":"),
-            "LD_PRELOAD": str(shim),
             "CRE_LIB_TRACE": str(cfg["cre_trace"]),
         }
     )
+    env.pop("LD_PRELOAD", None)
     if cfg["tap_delay"]:
         env["FAKEKINDLE_TAP_DELAY"] = str(cfg["tap_delay"])
     (cache / "home").mkdir(parents=True, exist_ok=True)
 
-    cmd = [qemu, "-L", sysroot, str(package / "luajit"), str(package / "reader.lua")]
+    cmd = [
+        qemu,
+        "-L",
+        sysroot,
+        "-E",
+        f"LD_PRELOAD={shim}",
+        "-E",
+        f"LD_LIBRARY_PATH={package / 'libs'}",
+        str(package / "luajit"),
+        str(package / "reader.lua"),
+    ]
     book = args.book
     if book:
         cmd.append(str(Path(book).expanduser().resolve()))
@@ -412,6 +478,20 @@ def cmd_run(cfg, args) -> int:
     proc = subprocess.Popen(cmd, cwd=package, env=env, stdout=log, stderr=subprocess.STDOUT)
 
     viewer_proc = None
+
+    def spawn_viewer():
+        env_v = dict(os.environ)
+        env_v["DISPLAY"] = display
+        return subprocess.Popen(
+            [
+                str(viewer),
+                str(state / "fb0"),
+                str(state / "taps"),
+                str(cfg["viewer_scale"]),
+                str(cfg["title"]),
+            ],
+            env=env_v,
+        )
 
     def stop(*_):
         for child in (viewer_proc, proc):
@@ -424,36 +504,24 @@ def cmd_run(cfg, args) -> int:
 
     try:
         if viewer:
-            env_v = dict(os.environ)
-            env_v["DISPLAY"] = display
-            print("== viewer window open (close it to stop)")
-            viewer_proc = subprocess.Popen(
-                [
-                    str(viewer),
-                    str(state / "fb0"),
-                    str(state / "taps"),
-                    str(cfg["viewer_scale"]),
-                    str(cfg["title"]),
-                ],
-                env=env_v,
-            )
-            if cfg["timeout"]:
-                deadline = time.time() + cfg["timeout"]
-                while viewer_proc.poll() is None and proc.poll() is None:
-                    if time.time() > deadline:
-                        break
-                    time.sleep(0.2)
-            else:
-                while viewer_proc.poll() is None and proc.poll() is None:
-                    time.sleep(0.2)
-        else:
-            if cfg["timeout"]:
-                try:
-                    proc.wait(timeout=cfg["timeout"])
-                except subprocess.TimeoutExpired:
-                    pass
-            else:
-                proc.wait()
+            viewer_proc = spawn_viewer()
+            print("== viewer window open (close it to stop)", flush=True)
+        deadline = time.time() + cfg["timeout"] if cfg["timeout"] else None
+        viewer_restarts = 0
+        while proc.poll() is None:
+            if deadline and time.time() > deadline:
+                print("qk: timeout reached", flush=True)
+                break
+            if viewer_proc is not None and viewer_proc.poll() is not None:
+                code = viewer_proc.returncode
+                viewer_proc = None
+                viewer_restarts += 1
+                print(f"qk: viewer exited (status {code})", flush=True)
+                if viewer and viewer_restarts <= 5:
+                    print("qk: reopening window...", flush=True)
+                    time.sleep(1.0)
+                    viewer_proc = spawn_viewer()
+            time.sleep(0.2)
     finally:
         for child in (viewer_proc, proc):
             if child and child.poll() is None:
@@ -464,12 +532,49 @@ def cmd_run(cfg, args) -> int:
                     child.kill()
         log.close()
 
+    qemu_status = proc.returncode
+    print(f"== emulator exited (status {qemu_status})")
     text = log_file.read_text(errors="replace")
     for line in text.splitlines():
         if "cre-lib:" in line:
             print(line)
+    if qemu_status not in (0, None) or not text.strip():
+        print("== last log lines ==")
+        for line in text.splitlines()[-20:]:
+            print(line)
+        if not text.strip():
+            luajit = package / "luajit"
+            hint = ""
+            if not os.access(luajit, os.X_OK):
+                hint = f"\n    hint: {luajit} is not executable (zip modes?)"
+            print(f"(log {log_file} is empty: the emulator produced no output){hint}")
     print(f"== exit; framebuffer at {state / 'fb0'} (qk shot writes a PNG)")
     return 0
+
+
+
+def detect_display(cfg) -> str:
+    """Pick an X display: config, environment, then WSLg/X11 sockets.
+
+    WSLg only exports DISPLAY in login shells, so a plain `qk run` from a
+    non-login shell would otherwise silently fall back to headless.
+    """
+    if cfg["display"]:
+        return cfg["display"]
+    env_display = os.environ.get("DISPLAY", "")
+    if env_display:
+        return env_display
+    for base in ("/tmp/.X11-unix", "/mnt/wslg/.X11-unix"):
+        if not os.path.isdir(base):
+            continue
+        try:
+            entries = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.startswith("X") and entry[1:].isdigit():
+                return ":" + entry[1:]
+    return ""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -503,12 +608,17 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("fetch", help="download the KOReader package")
     sub.add_parser("build", help="build shim/viewer and install the module")
     sub.add_parser("config", help="print the effective configuration")
+    sub.add_parser("view", help="attach a window to an already running emulator")
     shot_p = sub.add_parser("shot", help="convert the last framebuffer to PNG")
     shot_p.add_argument("output", nargs="?")
     return parser
 
 
 def main(argv=None) -> int:
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, OSError):
+        pass
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.no_viewer:
@@ -520,6 +630,7 @@ def main(argv=None) -> int:
         "build": cmd_build,
         "config": cmd_config,
         "shot": cmd_shot,
+        "view": cmd_view,
     }
     return handlers[args.command](cfg, args)
 

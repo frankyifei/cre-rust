@@ -102,8 +102,10 @@ int main(int argc, char **argv)
     XStoreName(dpy, win, title);
     XSelectInput(dpy, win, ExposureMask | ButtonPressMask | ButtonReleaseMask |
                   Button1MotionMask | PointerMotionMask | StructureNotifyMask | KeyPressMask);
-    XMapWindow(dpy, win);
+    XMapRaised(dpy, win);
 
+    fprintf(stderr, "viewer: window mapped on %s (%dx%d, scale %.2f)\n",
+            DisplayString(dpy), win_w, win_h, scale);
     GC gc = XCreateGC(dpy, win, 0, NULL);
     XImage *img = XCreateImage(dpy, visual, depth, ZPixmap, 0, (char *)rgb, (unsigned)FB_WIDTH,
                                (unsigned)FB_HEIGHT, 32, 0);

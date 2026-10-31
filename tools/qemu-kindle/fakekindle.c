@@ -38,6 +38,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -347,6 +348,8 @@ int ioctl(int fd, unsigned long request, ...)
     return real(fd, request, arg);
 }
 
+
+
 /* ---- pipe write-end keepalive ------------------------------------------ */
 
 static int kept_write_ends[16];
@@ -428,6 +431,13 @@ static void send_events(struct input_event *evs, int count)
     if (fake_input_write_fd < 0) {
         return;
     }
+    /* KOReader's gesture code uses event timestamps (tap/hold/swipe timing);
+     * zeros make synthetic events look like a zero-length gesture. */
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    for (int i = 0; i < count; i++) {
+        evs[i].time = now;
+    }
     syscall(SYS_write, fake_input_write_fd, evs, (size_t)count * sizeof(struct input_event));
 }
 
@@ -465,9 +475,13 @@ static void touch_move(int x, int y)
 
 static void touch_up(void)
 {
-    struct input_event evs[5];
+    /* Select slot 0 first: KOReader's MT decoder tracks a per-slot contact,
+     * and a release frame without ABS_MT_SLOT is attached to no slot, so the
+     * gesture detector never sees the contact lift. */
+    struct input_event evs[6];
     memset(evs, 0, sizeof(evs));
     int i = 0;
+    evs[i].type = EV_ABS; evs[i].code = ABS_MT_SLOT;        evs[i].value = 0; i++;
     evs[i].type = EV_ABS; evs[i].code = ABS_MT_TRACKING_ID; evs[i].value = -1; i++;
     evs[i].type = EV_KEY; evs[i].code = BTN_TOUCH;          evs[i].value = 0; i++;
     evs[i].type = EV_KEY; evs[i].code = BTN_TOOL_FINGER;    evs[i].value = 0; i++;
