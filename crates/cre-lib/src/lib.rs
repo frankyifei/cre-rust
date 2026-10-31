@@ -214,6 +214,33 @@ struct TocAnchorId {
 }
 
 const CHUNK_TARGET_BYTES: usize = 256 * 1024;
+
+/// Set `CRE_LIB_TRACE=1` to log stage timings to stderr. Used to diagnose
+/// slow/hanging opens on low-end devices (e.g. Kindle PW2) where a book
+/// open may take tens of seconds.
+fn trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("CRE_LIB_TRACE").is_some_and(|value| {
+            let value = value.to_string_lossy();
+            value != "0" && !value.eq_ignore_ascii_case("false")
+        })
+    })
+}
+
+fn trace_stage<T>(label: impl FnOnce() -> String, run: impl FnOnce() -> T) -> T {
+    if !trace_enabled() {
+        return run();
+    }
+    let start = std::time::Instant::now();
+    let out = run();
+    eprintln!(
+        "cre-lib: {} took {:.3}s",
+        label(),
+        start.elapsed().as_secs_f64()
+    );
+    out
+}
 const PAGE_IMAGE_CACHE_CAPACITY: usize = 2usize;
 
 struct ChunkMeta {
@@ -315,7 +342,7 @@ impl Document {
         let format = detect_format(path);
         match format {
             DocumentFormat::Epub => {
-                let mut book = EpubBook::open(path)?;
+                let mut book = trace_stage(|| "epub open".to_string(), || EpubBook::open(path))?;
                 let _ = book.normalize_inline_svg_images();
                 let raw_toc = std::mem::take(&mut book.toc);
                 let raw_page_map_source = std::mem::take(&mut book.page_map_source);
@@ -341,7 +368,10 @@ impl Document {
                     html_options.margin_x,
                     html_options.margin_y,
                 );
-                let htmls = book.to_html_chunks(&html_options, CHUNK_TARGET_BYTES)?;
+                let htmls = trace_stage(
+                    || "epub to_html_chunks".to_string(),
+                    || book.to_html_chunks(&html_options, CHUNK_TARGET_BYTES),
+                )?;
                 let cover_image = epub_cover_image(&book);
                 let has_non_linear_flows = book.spine.iter().any(|item| !item.linear);
                 let resource_provider = Arc::new(book.resource_provider);
@@ -458,6 +488,7 @@ impl Document {
         options: &DocumentOptions,
         font_datas: &[Vec<u8>],
     ) -> Result<Self> {
+        let build_start = std::time::Instant::now();
         let font_context = Arc::new(build_font_ctx_with_fallbacks(font_datas));
         let mut chunks = Vec::with_capacity(htmls.len());
         let mut pages = Vec::new();
@@ -470,6 +501,7 @@ impl Document {
         let mut running_doc_top = 0.0;
 
         for (chunk_index, html) in htmls.iter().enumerate() {
+            let chunk_start = std::time::Instant::now();
             let doc = create_document(html, base_url, net.clone(), font_context.clone(), options);
             let root = doc.root_element();
             let lines = collect_lines(root);
@@ -557,6 +589,15 @@ impl Document {
                 first_page,
                 line_base,
             });
+            if trace_enabled() {
+                eprintln!(
+                    "cre-lib: chunk {} layout+paginate took {:.3}s ({} lines, {} pages)",
+                    chunk_index,
+                    chunk_start.elapsed().as_secs_f64(),
+                    lines.len(),
+                    page_starts.len()
+                );
+            }
             line_base += lines.len();
         }
         spine_to_chunk.entry(1).or_insert(0);
@@ -639,6 +680,14 @@ impl Document {
             page_boxes_cache: RefCell::new(None),
         };
         document.ensure_chunk(0)?;
+        if trace_enabled() {
+            eprintln!(
+                "cre-lib: document build took {:.3}s ({} chunks, {} pages)",
+                build_start.elapsed().as_secs_f64(),
+                document.chunks.len(),
+                document.pages.len()
+            );
+        }
         Ok(document)
     }
 
@@ -1017,6 +1066,7 @@ impl Document {
         {
             return Ok(());
         }
+        let activate_start = std::time::Instant::now();
         let stored = self
             .sources
             .get(index)
@@ -1061,6 +1111,13 @@ impl Document {
             lines,
             page_starts,
         });
+        if trace_enabled() {
+            eprintln!(
+                "cre-lib: chunk {} activation took {:.3}s",
+                index,
+                activate_start.elapsed().as_secs_f64()
+            );
+        }
         Ok(())
     }
 
