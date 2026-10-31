@@ -89,7 +89,7 @@ Environment equivalents: `QK_CRE_LIB`, `QK_TRIPLET`, `QK_QEMU`,
 
 ## How input works
 
-The viewer writes commands to a FIFO consumed by the shim:
+The viewer writes mouse actions to a FIFO:
 
 ```
 d X Y    touch down
@@ -98,8 +98,20 @@ u        touch up
 t X Y    complete tap
 ```
 
-These become Linux protocol-B touch events (`ABS_MT_*`, `BTN_TOUCH`,
-`SYN_REPORT`) inside the guest.
+Two consumers exist, and the harness routes viewer input to the plugin one:
+
+- **qkinput.koplugin** (default, installed into the package): polls the FIFO
+  and broadcasts ordinary KOReader `Gesture` events (`tap`, `swipe`). This is
+  what makes clicks work in the window. It is inert unless `QK_TAP_FIFO` is
+  set.
+- the guest shim also knows how to emulate a Linux protocol-B evdev
+  touchscreen (`ABS_MT_*`, `BTN_TOUCH`, `SYN_REPORT`) on the same FIFO
+  protocol, but under qemu-user KOReader's Lua gesture layer does not act on
+  those synthetic evdev events, so the shim reads a separate, unused FIFO
+  (`FAKEKINDLE_TAP_FIFO`) to avoid stealing the plugin's input.
+
+Taps work end to end (the page turns). Drags are emitted as `swipe` gestures;
+whether they page-turn depends on KOReader's swipe settings in this build.
 
 ## Notes and limitations
 

@@ -326,6 +326,25 @@ def install_module(cfg, package: Path, cre: Path) -> None:
     print(f"== installed {cre} -> {target}")
 
 
+def install_harness_plugin(package: Path) -> None:
+    """Install the qkinput plugin that turns viewer input into gestures.
+
+    Under qemu-user the synthetic evdev device is read by
+    libkoreader-input but the Lua gesture layer ignores it, so the harness
+    injects KOReader Gesture events from a FIFO instead. The plugin is inert
+    unless QK_TAP_FIFO is set.
+    """
+    source = APP_DIR / "plugin" / "qkinput.koplugin"
+    if not source.is_dir():
+        return
+    target = package / "plugins" / "qkinput.koplugin"
+    target.mkdir(parents=True, exist_ok=True)
+    for item in source.iterdir():
+        if item.is_file():
+            shutil.copy2(item, target / item.name)
+    print(f"== installed harness input plugin -> {target}")
+
+
 def sync_startup_script(cfg, package: Path) -> None:
     script = package / "koreader.sh"
     dest_dir = Path(cfg["startup_script_dir"])
@@ -440,6 +459,7 @@ def cmd_run(cfg, args) -> int:
             viewer = build_viewer(cfg, cache)
     cre = resolve_cre_lib(cfg)
     install_module(cfg, package, cre)
+    install_harness_plugin(package)
     sync_startup_script(cfg, package)
 
     log_file = Path(cfg["log_file"]) if cfg["log_file"] else cache / "reader.log"
@@ -451,6 +471,11 @@ def cmd_run(cfg, args) -> int:
             "HOME": str(cache / "home"),
             "FAKEKINDLE_DIR": str(state),
             "CRE_LIB_TRACE": str(cfg["cre_trace"]),
+            # The qkinput plugin owns viewer input ("taps"); the shim's own
+            # evdev injection reads a separate FIFO, otherwise both consumers
+            # race for the same lines.
+            "QK_TAP_FIFO": str(state / "taps"),
+            "FAKEKINDLE_TAP_FIFO": str(state / "taps-evdev"),
         }
     )
     env.pop("LD_PRELOAD", None)
