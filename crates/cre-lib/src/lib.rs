@@ -225,9 +225,10 @@ const LAYOUT_BYTES_PER_HTML_BYTE: usize = 128;
 const LAYOUT_MEMORY_RESERVE: usize = 24 * 1024 * 1024;
 
 /// Bounds for a layout chunk: below a page's worth of text chunking only adds
-/// relayouts, above this a single chunk is no cheaper than the whole book.
+/// relayouts; above this one layout already costs ~40 MB, which a 256 MB
+/// device cannot afford next to KOReader and the page cache.
 const MIN_CHUNK_BYTES: usize = 64 * 1024;
-const MAX_CHUNK_BYTES: usize = 1024 * 1024;
+const MAX_CHUNK_BYTES: usize = 320 * 1024;
 
 /// Explicit chunk size override (`CRE_CHUNK_BYTES`), for testing and for
 /// forcing chunking on a device where the automatic choice misjudges.
@@ -276,8 +277,12 @@ fn plan_chunk_bytes(total_html: usize, available: Option<usize>) -> usize {
         // layout for everyone.
         return usize::MAX;
     };
+    // Never plan to use more than half of what is available, and always leave
+    // the reserve free: the layout spike happens while KOReader is also
+    // allocating for the reader UI, and the kernel needs cache headroom.
     let budget = available
         .saturating_sub(LAYOUT_MEMORY_RESERVE)
+        .min(available / 2)
         .max(MIN_CHUNK_BYTES * LAYOUT_BYTES_PER_HTML_BYTE);
     let max_html = budget / LAYOUT_BYTES_PER_HTML_BYTE;
     if total_html <= max_html {
@@ -369,6 +374,11 @@ pub struct Document {
     toc: Vec<TocEntry>,
     page_map_source: String,
     page_map: Vec<PageMapEntry>,
+    /// Raw TOC/page-map items, kept until the layout can give them pages.
+    raw_toc: Vec<RawTocItem>,
+    raw_page_map_items: Vec<RawPageMapItem>,
+    /// False until the pages have been laid out by [`Document::ensure_layout`].
+    layout_done: bool,
     active: RefCell<Option<ActiveChunk>>,
     current_page: usize,
     background_color: u32,
@@ -391,6 +401,31 @@ impl Document {
         path: impl AsRef<Path>,
         options: &DocumentOptions,
         font_datas: &[FontBlob],
+    ) -> Result<Self> {
+        Self::open_inner(path, options, font_datas, false)
+    }
+
+    /// Parses the document but defers laying out its pages to
+    /// [`Self::ensure_layout`].
+    ///
+    /// KOReader applies every reading setting between `loadDocument` and
+    /// `renderDocument`. Parsing eagerly and laying out lazily means the one
+    /// layout that happens uses the final settings, instead of laying the book
+    /// out with the defaults and then all over again with the user's font,
+    /// margins and so on (~6 s each on a Kindle PW2).
+    pub fn with_options_with_font_data_parsed(
+        path: impl AsRef<Path>,
+        options: &DocumentOptions,
+        font_datas: &[FontBlob],
+    ) -> Result<Self> {
+        Self::open_inner(path, options, font_datas, true)
+    }
+
+    fn open_inner(
+        path: impl AsRef<Path>,
+        options: &DocumentOptions,
+        font_datas: &[FontBlob],
+        defer_layout: bool,
     ) -> Result<Self> {
         validate_options(options)?;
         let path = path.as_ref();
@@ -456,6 +491,7 @@ impl Document {
                     raw_page_map,
                     options,
                     font_datas,
+                    defer_layout,
                 )
             }
             DocumentFormat::Fb2 => {
@@ -501,6 +537,7 @@ impl Document {
                     Vec::new(),
                     options,
                     font_datas,
+                    defer_layout,
                 )
             }
             DocumentFormat::Txt => {
@@ -534,6 +571,7 @@ impl Document {
                     Vec::new(),
                     options,
                     font_datas,
+                    defer_layout,
                 )
             }
             DocumentFormat::Html => {
@@ -597,6 +635,7 @@ impl Document {
                     Vec::new(),
                     options,
                     font_datas,
+                    defer_layout,
                 )
             }
         }
@@ -616,8 +655,76 @@ impl Document {
         page_map_items: Vec<RawPageMapItem>,
         options: &DocumentOptions,
         font_datas: &[FontBlob],
+        defer_layout: bool,
     ) -> Result<Self> {
         let font_context = Arc::new(build_font_ctx_with_fallbacks(font_datas));
+        let mut document = Self {
+            metadata,
+            width: options.width,
+            height: options.height,
+            layout_height: options.layout_height,
+            page_margin: options.page_margin,
+            stylesheet: options.stylesheet.clone(),
+            embedded_styles_enabled: options.embedded_styles_enabled,
+            font_css_size: options.font_size,
+            viewport_scale: options.viewport_scale,
+            font_gamma: 1.0,
+            sources: htmls,
+            base_url: base_url.to_string(),
+            resources,
+            cover_image,
+            has_non_linear_flows,
+            net,
+            font_context,
+            chunks: Vec::new(),
+            pages: Vec::new(),
+            xpointer_pages: HashMap::new(),
+            href_pages: HashMap::new(),
+            spine_to_chunk: HashMap::new(),
+            toc: Vec::new(),
+            page_map_source,
+            page_map: Vec::new(),
+            raw_toc,
+            raw_page_map_items: page_map_items,
+            layout_done: false,
+            active: RefCell::new(None),
+            current_page: 1,
+            background_color: 0xFF_FFFF,
+            page_image_cache: HashMap::new(),
+            page_cache_order: Vec::new(),
+            page_boxes_cache: RefCell::new(None),
+        };
+        if !defer_layout {
+            document.ensure_layout()?;
+        }
+        Ok(document)
+    }
+
+    /// Lays out the pages, TOC page numbers and page map, unless that already
+    /// happened. Cheap to call more than once.
+    pub fn ensure_layout(&mut self) -> Result<()> {
+        if self.layout_done {
+            return Ok(());
+        }
+        self.layout_done = true;
+        let options = DocumentOptions {
+            width: self.width,
+            height: self.height,
+            layout_height: self.layout_height,
+            page_margin: self.page_margin,
+            font_size: self.font_css_size,
+            font_path: None,
+            fallback_font_paths: Vec::new(),
+            stylesheet: self.stylesheet.clone(),
+            embedded_styles_enabled: self.embedded_styles_enabled,
+            viewport_scale: self.viewport_scale,
+        };
+        let base_url = self.base_url.clone();
+        let net = self.net.clone();
+        let font_context = self.font_context.clone();
+        let htmls = std::mem::take(&mut self.sources);
+        let raw_toc = std::mem::take(&mut self.raw_toc);
+        let page_map_items = std::mem::take(&mut self.raw_page_map_items);
         let mut chunks = Vec::with_capacity(htmls.len());
         let mut pages = Vec::new();
         let mut page_xpointers = Vec::new();
@@ -629,7 +736,7 @@ impl Document {
         let mut running_doc_top = 0.0;
 
         for (chunk_index, html) in htmls.iter().enumerate() {
-            let doc = create_document(html, base_url, net.clone(), font_context.clone(), options);
+            let doc = create_document(html, &base_url, net.clone(), font_context.clone(), &options);
             let root = doc.root_element();
             let lines = collect_lines(root);
             let mut line_indices: HashMap<NodeId, Vec<usize>> = HashMap::new();
@@ -761,42 +868,20 @@ impl Document {
             .collect();
         page_map.sort_by_key(|entry| (entry.doc_y, entry.page));
 
-        let document = Self {
-            metadata,
-            width: options.width,
-            height: options.height,
-            layout_height: options.layout_height,
-            page_margin: options.page_margin,
-            stylesheet: options.stylesheet.clone(),
-            embedded_styles_enabled: options.embedded_styles_enabled,
-            font_css_size: options.font_size,
-            viewport_scale: options.viewport_scale,
-            font_gamma: 1.0,
-            sources: htmls,
-            base_url: base_url.to_string(),
-            resources,
-            cover_image,
-            has_non_linear_flows: has_non_linear_flows || max_flow > 0,
-            net,
-            font_context,
-            chunks,
-            pages,
-            xpointer_pages,
-            href_pages,
-            spine_to_chunk,
-            toc,
-            page_map_source,
-            page_map,
-            active: RefCell::new(None),
-            current_page: 1,
-            background_color: 0xFF_FFFF,
-            page_image_cache: HashMap::new(),
-            page_cache_order: Vec::new(),
-            page_boxes_cache: RefCell::new(None),
-        };
+        self.chunks = chunks;
+        self.pages = pages;
+        self.xpointer_pages = xpointer_pages;
+        self.href_pages = href_pages;
+        self.spine_to_chunk = spine_to_chunk;
+        self.toc = toc;
+        self.page_map = page_map;
+        self.sources = htmls;
+        if max_flow > 0 {
+            self.has_non_linear_flows = true;
+        }
         trim_memory();
-        document.ensure_chunk(0)?;
-        Ok(document)
+        self.ensure_chunk(0)?;
+        Ok(())
     }
 
     pub fn metadata(&self) -> &DocumentMetadata {
@@ -3656,11 +3741,14 @@ mod layout_plan_tests {
 
     #[test]
     fn large_book_is_split_to_fit_available_memory() {
-        // 80 MB available, 24 MB reserved -> 56 MB of layout, 448 kB of HTML.
+        // 80 MB available: budget is min(available - 24 MB, available / 2)
+        // = 40 MB of layout, i.e. 320 kB of HTML per layout (also the cap).
         let target = plan_chunk_bytes(4 * MB, Some(80 * MB));
-        assert_eq!(target, 448 * 1024);
+        assert_eq!(target, MAX_CHUNK_BYTES);
         let chunks = (4 * MB).div_ceil(target);
-        assert_eq!(chunks, 10, "4 MB should be split into ten chunks");
+        assert_eq!(chunks, 13, "4 MB should be split into thirteen chunks");
+        // Each planned layout stays well inside the budget: 320 kB * 128.
+        assert!(target * LAYOUT_BYTES_PER_HTML_BYTE <= 40 * MB);
     }
 
     #[test]

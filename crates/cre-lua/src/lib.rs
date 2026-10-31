@@ -81,6 +81,13 @@ struct Doc {
     /// settings (font size, margins, interline, dpi, ...) costs one rebuild
     /// instead of one per setting.
     needs_relayout: bool,
+    /// Set when the document was parsed but its pages are not laid out yet.
+    /// KOReader applies every reading setting between loadDocument and
+    /// renderDocument, so laying out during the load would use the defaults
+    /// and force a second layout afterwards.
+    needs_layout: bool,
+    /// The page map is derived from the layout and must be rebuilt after it.
+    page_map_stale: bool,
 }
 
 impl Doc {
@@ -125,6 +132,8 @@ impl Doc {
             font_cache_paths: Vec::new(),
             render_state_snapshot: String::new(),
             needs_relayout: false,
+            needs_layout: false,
+            page_map_stale: false,
         }
     }
 
@@ -275,13 +284,17 @@ impl Doc {
             self.font_data_cache = cre_lib::load_font_datas(&font_paths);
             self.font_cache_paths = font_paths.clone();
         }
+        // Parse now, lay out on the first read: the settings KOReader applies
+        // right after loadDocument then shape the single layout instead of
+        // forcing a second one.
         let mut opened =
-            Document::with_options_with_font_data(&path, &options, &self.font_data_cache)?;
+            Document::with_options_with_font_data_parsed(&path, &options, &self.font_data_cache)?;
         opened.set_font_gamma(self.render_font_gamma());
         opened.set_background_color(self.background_color_value);
         self.inner = Some(opened);
         self.path = Some(path);
-        self.load_document_page_map();
+        self.needs_layout = true;
+        self.page_map_stale = true;
         Ok(())
     }
 
@@ -329,9 +342,15 @@ impl Doc {
     /// Applies a deferred rebuild, if any. Called from every path that reads
     /// the laid out document, so callers never observe a stale layout.
     fn sync_layout(&mut self) {
-        if !self.needs_relayout {
-            return;
+        if self.needs_relayout {
+            self.rebuild_with_current_settings();
         }
+        self.layout_now();
+    }
+
+    /// Re-parses and re-opens the document so it can be laid out with the
+    /// settings that were applied since the last layout.
+    fn rebuild_with_current_settings(&mut self) {
         self.needs_relayout = false;
         let Some(path) = self.path.clone() else {
             return;
@@ -357,7 +376,21 @@ impl Doc {
         if let (Some(xpointer), Some(inner)) = (xpointer, self.inner.as_mut()) {
             let _ = inner.go_to_xpointer(&xpointer);
         }
-        self.load_document_page_map();
+    }
+
+    /// Lays the pages out if that has not happened yet, and refreshes the page
+    /// map, which is derived from the layout.
+    fn layout_now(&mut self) {
+        if self.needs_layout {
+            if let Some(inner) = self.inner.as_mut() {
+                let _ = inner.ensure_layout();
+            }
+            self.needs_layout = false;
+        }
+        if self.page_map_stale {
+            self.page_map_stale = false;
+            self.load_document_page_map();
+        }
     }
 
     fn current_xpointer(&self) -> Option<String> {
@@ -857,6 +890,17 @@ unsafe fn doc_ref<'a>(l: *mut lua_State) -> Option<&'a Doc> {
     // Readers must never see a layout that predates a pending setting change.
     doc.sync_layout();
     Some(doc)
+}
+
+/// Reader that does not lay the document out, for the metadata and settings
+/// that are available straight after parsing (title, format, font size,
+/// margins, current property values). Anything that touches pages must use
+/// `doc_ref`/`doc_mut_synced` instead, which lay the book out on demand.
+unsafe fn doc_lazy_ref<'a>(l: *mut lua_State) -> Option<&'a Doc> {
+    // SAFETY: methods registered in the `credocument` metatable always receive our userdata.
+    let ptr = unsafe { lua::lua_touserdata(l, 1) }.cast::<Doc>();
+    // SAFETY: the userdata was initialized by `new_doc_view`.
+    unsafe { ptr.as_ref() }
 }
 
 unsafe fn doc_mut<'a>(l: *mut lua_State) -> Option<&'a mut Doc> {
@@ -1636,7 +1680,7 @@ unsafe extern "C-unwind" fn doc_gc(l: *mut lua_State) -> c_int {
 unsafe fn call_document_callback(l: *mut lua_State, event: &str) {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let Some(reference) = doc_ref(l).and_then(|doc| doc.callback) else {
+        let Some(reference) = doc_lazy_ref(l).and_then(|doc| doc.callback) else {
             return;
         };
         lua::lua_rawgeti(l, lua::LUA_REGISTRYINDEX, lua::lua_Integer::from(reference));
@@ -1650,7 +1694,7 @@ unsafe fn call_document_callback(l: *mut lua_State, event: &str) {
 unsafe fn call_document_callback_str(l: *mut lua_State, event: &str, value: &str) {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let Some(reference) = doc_ref(l).and_then(|doc| doc.callback) else {
+        let Some(reference) = doc_lazy_ref(l).and_then(|doc| doc.callback) else {
             return;
         };
         lua::lua_rawgeti(l, lua::LUA_REGISTRYINDEX, lua::lua_Integer::from(reference));
@@ -1665,7 +1709,7 @@ unsafe fn call_document_callback_str(l: *mut lua_State, event: &str, value: &str
 unsafe fn call_document_callback_int(l: *mut lua_State, event: &str, value: i64) {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let Some(reference) = doc_ref(l).and_then(|doc| doc.callback) else {
+        let Some(reference) = doc_lazy_ref(l).and_then(|doc| doc.callback) else {
             return;
         };
         lua::lua_rawgeti(l, lua::LUA_REGISTRYINDEX, lua::lua_Integer::from(reference));
@@ -1691,7 +1735,7 @@ unsafe extern "C-unwind" fn doc_load(l: *mut lua_State) -> c_int {
             let opened = doc.open(PathBuf::from(path));
             if opened.is_ok() {
                 doc.record_history();
-                let format = doc_ref(l)
+                let format = doc_lazy_ref(l)
                     .and_then(|doc| doc.inner.as_ref())
                     .map(|inner| format_name(inner.metadata().format))
                     .unwrap_or("TXT");
@@ -1749,7 +1793,7 @@ unsafe extern "C-unwind" fn doc_render(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn doc_format(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let name = doc_ref(l)
+        let name = doc_lazy_ref(l)
             .and_then(|doc| doc.inner.as_ref())
             .map(|inner| format_name(inner.metadata().format))
             .unwrap_or("TXT");
@@ -1771,7 +1815,7 @@ unsafe extern "C-unwind" fn doc_props(l: *mut lua_State) -> c_int {
             ("keywords", ""),
             ("identifiers", ""),
         ];
-        if let Some(inner) = doc_ref(l).and_then(|doc| doc.inner.as_ref()) {
+        if let Some(inner) = doc_lazy_ref(l).and_then(|doc| doc.inner.as_ref()) {
             let meta = inner.metadata();
             props[0].1 = meta.title.as_deref().unwrap_or("");
             props[1].1 = meta.creator.as_deref().unwrap_or("");
@@ -2104,7 +2148,7 @@ unsafe extern "C-unwind" fn doc_page_height(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn doc_font_size(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let size = doc_ref(l).map_or(22, |doc| doc.effective_font_size());
+        let size = doc_lazy_ref(l).map_or(22, |doc| doc.effective_font_size());
         push_int(l, i64::from(size));
     }
     1
@@ -2113,7 +2157,7 @@ unsafe extern "C-unwind" fn doc_font_size(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn doc_font_face(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let face = doc_ref(l).map_or("", |doc| doc.font_face.as_str());
+        let face = doc_lazy_ref(l).map_or("", |doc| doc.font_face.as_str());
         push_str(l, face);
     }
     1
@@ -2122,7 +2166,7 @@ unsafe extern "C-unwind" fn doc_font_face(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn doc_page_margins(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let (left, top, right, bottom) = doc_ref(l).map_or((0, 0, 0, 0), |doc| doc.margins);
+        let (left, top, right, bottom) = doc_lazy_ref(l).map_or((0, 0, 0, 0), |doc| doc.margins);
         lua::lua_createtable(l, 0, 4);
         for (key, value) in [
             ("left", left),
@@ -2933,7 +2977,7 @@ unsafe extern "C-unwind" fn doc_get_int_property(l: *mut lua_State) -> c_int {
         let Some(name) = arg_str(l, 2) else {
             return 0;
         };
-        let Some(doc) = doc_ref(l) else {
+        let Some(doc) = doc_lazy_ref(l) else {
             return 0;
         };
         let (left, top, right, bottom) = doc.margins;
@@ -2975,7 +3019,7 @@ unsafe extern "C-unwind" fn doc_get_string_property(l: *mut lua_State) -> c_int 
         let Some(name) = arg_str(l, 2) else {
             return 0;
         };
-        let Some(doc) = doc_ref(l) else {
+        let Some(doc) = doc_lazy_ref(l) else {
             return 0;
         };
         let value = match name.as_str() {
@@ -3558,7 +3602,7 @@ unsafe extern "C-unwind" fn doc_get_lang_tag(l: *mut lua_State) -> c_int {
     unsafe {
         let x = arg_int(l, 2) as f32;
         let y = arg_int(l, 3) as f32;
-        let Some(inner) = doc_ref(l).and_then(|doc| doc.inner.as_ref()) else {
+        let Some(inner) = doc_lazy_ref(l).and_then(|doc| doc.inner.as_ref()) else {
             return 0;
         };
         let position = cre_lib::PagePosition {
@@ -4072,7 +4116,7 @@ unsafe extern "C-unwind" fn doc_is_page_map_document_provided(l: *mut lua_State)
 unsafe extern "C-unwind" fn doc_has_non_linear_flows(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let value = doc_ref(l)
+        let value = doc_lazy_ref(l)
             .and_then(|doc| doc.inner.as_ref())
             .is_some_and(Document::has_non_linear_flows);
         push_bool(l, value);
@@ -4442,7 +4486,7 @@ unsafe extern "C-unwind" fn doc_compare_xpointers(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn doc_visible_page_count(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let count = doc_ref(l).map_or(1, |doc| i64::from(doc.visible_page_count.max(1)));
+        let count = doc_lazy_ref(l).map_or(1, |doc| i64::from(doc.visible_page_count.max(1)));
         push_int(l, count);
     }
     1
@@ -4451,7 +4495,7 @@ unsafe extern "C-unwind" fn doc_visible_page_count(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn doc_get_visible_page_number_count(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let count = doc_ref(l).map_or(1, |doc| doc.visible_page_number_count());
+        let count = doc_lazy_ref(l).map_or(1, |doc| doc.visible_page_number_count());
         push_int(l, count);
     }
     1
@@ -4461,7 +4505,7 @@ unsafe extern "C-unwind" fn doc_render_hash(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        if let Some(doc) = doc_ref(l) {
+        if let Some(doc) = doc_lazy_ref(l) {
             doc.width.hash(&mut hasher);
             doc.height.hash(&mut hasher);
             doc.font_size.hash(&mut hasher);

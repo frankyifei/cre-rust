@@ -1061,3 +1061,41 @@ fn renders_svg_image_to_rgba() {
 
     assert!(cre_lib::render_svg_image(b"not an svg", None, None).is_none());
 }
+
+#[test]
+fn layout_can_be_deferred_to_the_first_read() {
+    require_resources();
+    let options = DocumentOptions {
+        width: 320,
+        height: 480,
+        layout_height: 100_000,
+        page_margin: 16.0,
+        font_size: 18.0,
+        font_path: None,
+        fallback_font_paths: Vec::new(),
+        stylesheet: None,
+        embedded_styles_enabled: true,
+        viewport_scale: 1.0,
+    };
+    let font_datas = cre_lib::load_font_datas(&cre_lib::resolve_font_paths(&options).unwrap());
+    let path = fixture("juliet.epub");
+
+    // Parsing only: metadata is usable, pages are not laid out yet.
+    let mut doc =
+        Document::with_options_with_font_data_parsed(&path, &options, &font_datas).unwrap();
+    assert_eq!(doc.metadata().format, DocumentFormat::Epub);
+    assert_eq!(doc.metadata().title.as_deref(), Some("Romeo and Juliet"));
+    assert_eq!(doc.page_count(), 1, "nothing should be laid out yet");
+
+    // The first read lays the book out, once.
+    doc.ensure_layout().unwrap();
+    let pages = doc.page_count();
+    assert!(pages > 50, "expected a laid out book, got {pages} pages");
+    // Page 1 is the cover; the text starts a page or two later.
+    let text = (1..=pages.min(5))
+        .filter_map(|page| doc.page_text(page).ok())
+        .find(|text| !text.trim().is_empty())
+        .expect("expected text in the first pages");
+    assert!(text.contains("Romeo"), "unexpected text: {text:?}");
+    doc.render_page(1).unwrap();
+}
