@@ -264,6 +264,20 @@ fn available_memory_bytes() -> Option<usize> {
     None
 }
 
+/// Splits a format that is produced as one HTML document (FB2, TXT, a
+/// standalone HTML file) into layout chunks when it would not fit in one,
+/// using the same memory budget as EPUB chunking.
+fn split_single_document(html: String) -> Vec<String> {
+    let target = match chunk_target_override() {
+        Some(target) => target,
+        None => plan_chunk_bytes(html.len(), available_memory_bytes()),
+    };
+    if target == usize::MAX || html.len() <= target {
+        return vec![html];
+    }
+    cre_epub::split_html_document(&html, target)
+}
+
 /// Chooses the layout chunk size for `total_html` bytes of generated content.
 ///
 /// `usize::MAX` means "lay the whole book out at once", like crengine: page
@@ -526,7 +540,7 @@ impl Document {
                 let cover_image = book.binary.values().next().cloned();
                 let binary = Arc::new(book.binary);
                 Self::build(
-                    vec![html],
+                    split_single_document(html),
                     "fb2://book/",
                     Arc::new(Fb2Net {
                         resources: binary.clone(),
@@ -562,7 +576,7 @@ impl Document {
                 };
                 let html = book.to_html(&html_options);
                 Self::build(
-                    vec![html],
+                    split_single_document(html),
                     "text://book/",
                     Arc::new(EmptyNet),
                     ResourceSource::Empty,
@@ -626,7 +640,7 @@ impl Document {
                     item_count: 1,
                 };
                 Self::build(
-                    vec![html],
+                    split_single_document(html),
                     &base_url,
                     Arc::new(FileNet { root: root.clone() }),
                     ResourceSource::Empty,

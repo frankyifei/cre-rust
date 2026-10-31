@@ -618,6 +618,43 @@ struct OpenTag {
     start: String,
 }
 
+/// Splits a complete HTML document into parts of at most `limit` bytes,
+/// repeating the document's head and closing tags in every part. Used for
+/// formats that are produced as one document (FB2, TXT, standalone HTML), so
+/// they do not have to be laid out in a single giant chunk either.
+pub fn split_html_document(html: &str, limit: usize) -> Vec<String> {
+    if limit == 0 || html.len() <= limit {
+        return vec![html.to_string()];
+    }
+    let lower = html.to_ascii_lowercase();
+    let Some(body_start) = lower.find("<body") else {
+        return vec![html.to_string()];
+    };
+    let Some(body_open_end) = lower[body_start..]
+        .find('>')
+        .map(|end| body_start + end + 1)
+    else {
+        return vec![html.to_string()];
+    };
+    let Some(body_close) = lower.rfind("</body>") else {
+        return vec![html.to_string()];
+    };
+    if body_close < body_open_end {
+        return vec![html.to_string()];
+    }
+    let body = &html[body_open_end..body_close];
+    let tail = &html[body_close..];
+    let parts = split_body_html(body, limit);
+    if parts.len() <= 1 {
+        return vec![html.to_string()];
+    }
+    let head = &html[..body_open_end];
+    parts
+        .into_iter()
+        .map(|part| format!("{head}{part}{tail}"))
+        .collect()
+}
+
 /// Splits a spine item's body HTML into parts of at most `limit` bytes,
 /// cutting only between elements and re-opening whatever is still open, so
 /// every part is well-formed on its own.
@@ -655,14 +692,38 @@ fn split_body_html(body: &str, limit: usize) -> Vec<String> {
         let next_tag = body[index..].find('<').map(|offset| index + offset);
         let text_end = next_tag.unwrap_or(body.len());
         if text_end > index {
-            let text = &body[index..text_end];
-            if current.len() + text.len() > limit && current.len() > floor && !open.is_empty() {
-                floor = flush(&mut parts, &mut current, &open, &mut dirty);
+            let mut text = &body[index..text_end];
+            while !text.is_empty() {
+                let room = limit.saturating_sub(current.len());
+                if text.len() <= room {
+                    if !text.trim().is_empty() {
+                        dirty = true;
+                    }
+                    current.push_str(text);
+                    break;
+                }
+                // Not enough room: cut at the last line break (or space) that
+                // fits, so a body made of one long text run can still be split
+                // into chunks.
+                let cut = text[..room]
+                    .rfind('\n')
+                    .map(|position| position + 1)
+                    .or_else(|| text[..room].rfind(' ').map(|position| position + 1))
+                    .unwrap_or_else(|| floor_char_boundary(text, room));
+                if cut == 0 {
+                    current.push_str(text);
+                    break;
+                }
+                let (head, rest) = text.split_at(cut);
+                if !head.trim().is_empty() {
+                    dirty = true;
+                }
+                current.push_str(head);
+                if current.len() > floor {
+                    floor = flush(&mut parts, &mut current, &open, &mut dirty);
+                }
+                text = rest;
             }
-            if !text.trim().is_empty() {
-                dirty = true;
-            }
-            current.push_str(text);
         }
         let Some(tag_start) = next_tag else {
             break;
@@ -675,7 +736,7 @@ fn split_body_html(body: &str, limit: usize) -> Vec<String> {
                 .map(|offset| tag_start + offset + 3)
                 .unwrap_or(body.len());
             let raw = &body[tag_start..end];
-            if current.len() + raw.len() > limit && current.len() > floor && !open.is_empty() {
+            if current.len() + raw.len() > limit && current.len() > floor {
                 floor = flush(&mut parts, &mut current, &open, &mut dirty);
             }
             dirty = true;
@@ -701,7 +762,7 @@ fn split_body_html(body: &str, limit: usize) -> Vec<String> {
         } else if self_closing || VOID_ELEMENTS.contains(&name.as_str()) {
             current.push_str(raw);
         } else {
-            if current.len() + raw.len() > limit && current.len() > floor && !open.is_empty() {
+            if current.len() + raw.len() > limit && current.len() > floor {
                 floor = flush(&mut parts, &mut current, &open, &mut dirty);
             }
             dirty = true;
@@ -732,6 +793,14 @@ fn split_body_html(body: &str, limit: usize) -> Vec<String> {
         parts.push(String::new());
     }
     parts
+}
+
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 fn tag_name(raw: &str) -> String {
