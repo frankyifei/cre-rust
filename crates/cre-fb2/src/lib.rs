@@ -131,7 +131,7 @@ impl Fb2Book {
         }
 
         let css = format!(
-            "body {{ font-family: serif; font-size: {}px; line-height: {}; padding: {}px {}px; background: white; color: black; }}
+            "/* cre-render-base */\nbody {{ font-family: serif; font-size: {}px; line-height: {}; padding: {}px {}px; background: white; color: black; }}
 img {{ max-width: 100%; height: auto; }}
 h1,h2,h3,h4,h5,h6 {{ font-family: sans-serif; }}
 blockquote {{ border-left: 3px solid #888; padding-left: 1em; margin: 1em 0; font-style: italic; }}

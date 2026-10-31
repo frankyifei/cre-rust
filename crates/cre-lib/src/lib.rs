@@ -3308,6 +3308,14 @@ fn create_document(
     doc
 }
 
+fn base_style_block_is_marker(body: &[u8]) -> bool {
+    // Cheap check; the marker is our own constant and ASCII.
+    body.windows(MARKER_INNER.len())
+        .any(|window| window == MARKER_INNER)
+}
+
+const MARKER_INNER: &[u8] = b"cre-render-base";
+
 fn strip_author_styles(html: &str) -> String {
     let bytes = remove_style_blocks(html.as_bytes().to_vec());
     let bytes = remove_link_stylesheets(bytes);
@@ -3355,15 +3363,30 @@ fn remove_range(bytes: &[u8], start: usize, end: usize) -> Vec<u8> {
 
 fn remove_style_blocks(bytes: Vec<u8>) -> Vec<u8> {
     let mut current = bytes;
+    let mut search_from = 0usize;
     loop {
         let lower = lower_ascii(&current);
-        let Some(start) = find_case_insensitive(&lower, b"<style", 0) else {
+        let Some(start) = find_case_insensitive(&lower, b"<style", search_from) else {
             break;
         };
-        let close = find_case_insensitive(&lower, b"</style>", start + b"<style".len())
-            .map(|end| end + b"</style>".len())
-            .unwrap_or(current.len());
-        current = remove_range(&current, start, close);
+        // Style tags in our generated chunks may carry attributes.
+        let Some(open_end) = find_case_insensitive(&lower, b">", start) else {
+            break;
+        };
+        let Some(close_tag) = find_case_insensitive(&lower, b"</style>", open_end) else {
+            break;
+        };
+        let close = close_tag + b"</style>".len();
+        if base_style_block_is_marker(&current[open_end + 1..close_tag]) {
+            // Our generated base typography CSS (font size, line height,
+            // page padding) must survive "disable embedded styles": it is
+            // our render parameter, not author styling. Keep and continue
+            // searching after it.
+            search_from = close;
+        } else {
+            current = remove_range(&current, start, close);
+            search_from = 0;
+        }
     }
     current
 }
@@ -3633,13 +3656,21 @@ fn strip_author_styles_removes_embedded_style_and_stylesheet_link() {
 <head>
 <link rel="stylesheet" href="cover.css"></link>
 <style>.hidden { visibility: hidden; }</style>
+<style type="text/css">/* cre-render-base */
+body { font-size: 20px; }
+</style>
 </head>
 <body><p class="hidden">visible</p></body>
 </html>
 "#;
     let stripped = strip_author_styles(html);
     let bytes = stripped.as_bytes();
-    assert!(find_case_insensitive(bytes, b"<style", 0).is_none());
+    // author styles are dropped
+    assert!(find_case_insensitive(bytes, b"hidden { visibility", 0).is_none());
     assert!(find_case_insensitive(bytes, b"<link", 0).is_none());
+    // our base typography CSS survives so font size (and page margins)
+    // keep working with embedded styles disabled
+    assert!(find_case_insensitive(bytes, b"cre-render-base", 0).is_some());
+    assert!(find_case_insensitive(bytes, b"font-size: 20px", 0).is_some());
     assert!(find_case_insensitive(bytes, b"visible", 0).is_some());
 }

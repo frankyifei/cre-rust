@@ -508,7 +508,7 @@ impl EpubBook {
             html.push_str(style);
             html.push_str("</style>");
         }
-        html.push_str("<style>");
+        html.push_str("<style>/* cre-render-base */");
         html.push_str(&format!(
             "html, body {{ margin: 0; padding: 0; }}\n\
              body {{ font-family: serif; font-size: {}px; line-height: {}; padding: {}px {}px; }}\n\
