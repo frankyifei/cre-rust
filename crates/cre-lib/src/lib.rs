@@ -214,17 +214,76 @@ struct TocAnchorId {
     node_id: NodeId,
 }
 
-const CHUNK_TARGET_BYTES: usize = 64 * 1024;
+/// Resident cost of keeping a book laid out, per byte of generated HTML
+/// (DOM nodes, computed styles and parley line boxes). Measured whole-book
+/// layouts: 251 kB of XHTML cost 28 MB, 579 kB cost 44 MB. 128 B/B is the
+/// safe upper bound.
+const LAYOUT_BYTES_PER_HTML_BYTE: usize = 128;
 
-/// Chunk size used when the book is split for layout. Smaller chunks mean a
-/// smaller DOM/parley layout alive at once (the open-time memory peak), at
-/// the cost of more relayouts while reading. CRE_CHUNK_BYTES overrides it.
-fn chunk_target_bytes() -> usize {
+/// Memory left untouched for KOReader's own post-open work (widgets, caches,
+/// thumbnails) and for the page bitmap handed back to it.
+const LAYOUT_MEMORY_RESERVE: usize = 24 * 1024 * 1024;
+
+/// Bounds for a layout chunk: below a page's worth of text chunking only adds
+/// relayouts, above this a single chunk is no cheaper than the whole book.
+const MIN_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// Explicit chunk size override (`CRE_CHUNK_BYTES`), for testing and for
+/// forcing chunking on a device where the automatic choice misjudges.
+fn chunk_target_override() -> Option<usize> {
     std::env::var("CRE_CHUNK_BYTES")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value >= 16 * 1024)
-        .unwrap_or(CHUNK_TARGET_BYTES)
+}
+
+/// Bytes the kernel says it can still hand out, if the platform reports it.
+fn available_memory_bytes() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let field = |key: &str| -> Option<usize> {
+            info.lines()
+                .find(|line| line.starts_with(key))
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|value| value.parse::<usize>().ok())
+        };
+        // MemAvailable exists since Linux 3.14; the Kindle PW2 runs 3.0, so
+        // fall back to the classic free+buffers+cached estimate there.
+        if let Some(available) = field("MemAvailable:") {
+            return Some(available.saturating_mul(1024));
+        }
+        let free = field("MemFree:")?;
+        let buffers = field("Buffers:").unwrap_or(0);
+        let cached = field("Cached:").unwrap_or(0);
+        return Some((free + buffers + cached).saturating_mul(1024));
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// Chooses the layout chunk size for `total_html` bytes of generated content.
+///
+/// `usize::MAX` means "lay the whole book out at once", like crengine: page
+/// breaks, page numbers and TOC targets then match the original engine and
+/// reading never re-lays out a chunk mid-book. When the book is too large for
+/// the memory actually available, the layout is split so that one chunk's DOM
+/// fits in roughly half of what the kernel can hand out.
+fn plan_chunk_bytes(total_html: usize, available: Option<usize>) -> usize {
+    let Some(available) = available else {
+        // No memory information: trust the device rather than degrading the
+        // layout for everyone.
+        return usize::MAX;
+    };
+    let budget = available
+        .saturating_sub(LAYOUT_MEMORY_RESERVE)
+        .max(MIN_CHUNK_BYTES * LAYOUT_BYTES_PER_HTML_BYTE);
+    let max_html = budget / LAYOUT_BYTES_PER_HTML_BYTE;
+    if total_html <= max_html {
+        return usize::MAX;
+    }
+    max_html.clamp(MIN_CHUNK_BYTES, MAX_CHUNK_BYTES)
 }
 
 /// Returns freed heap pages to the OS. Building a chunk's DOM/parley layout
@@ -295,7 +354,7 @@ pub struct Document {
     font_gamma: f32,
     stylesheet: Option<String>,
     embedded_styles_enabled: bool,
-    sources: Vec<Vec<u8>>,
+    sources: Vec<String>,
     base_url: String,
     resources: ResourceSource,
     cover_image: Option<Vec<u8>>,
@@ -364,7 +423,21 @@ impl Document {
                     html_options.margin_x,
                     html_options.margin_y,
                 );
-                let htmls = book.to_html_chunks(&html_options, chunk_target_bytes())?;
+                let htmls = match chunk_target_override() {
+                    Some(target) => book.to_html_chunks(&html_options, target)?,
+                    None => {
+                        // Lay the whole book out at once when it fits, which is
+                        // what crengine does and what keeps pagination stable.
+                        let whole = book.to_html_chunks(&html_options, usize::MAX)?;
+                        let total_html: usize = whole.iter().map(String::len).sum();
+                        let target = plan_chunk_bytes(total_html, available_memory_bytes());
+                        if target == usize::MAX {
+                            whole
+                        } else {
+                            book.to_html_chunks(&html_options, target)?
+                        }
+                    }
+                };
                 let cover_image = epub_cover_image(&book);
                 let has_non_linear_flows = book.spine.iter().any(|item| !item.linear);
                 let resource_provider = Arc::new(book.resource_provider);
@@ -699,10 +772,7 @@ impl Document {
             font_css_size: options.font_size,
             viewport_scale: options.viewport_scale,
             font_gamma: 1.0,
-            sources: htmls
-                .into_iter()
-                .map(|html| compress_chunk_source(&html))
-                .collect(),
+            sources: htmls,
             base_url: base_url.to_string(),
             resources,
             cover_image,
@@ -1115,7 +1185,7 @@ impl Document {
             .sources
             .get(index)
             .context("document chunk is missing")?;
-        let html = decompress_chunk_source(stored)?;
+        let html = stored.clone();
         let doc = create_document(
             &html,
             &self.base_url,
@@ -3572,36 +3642,38 @@ fn first_non_blank_line_flow(
     previous_page_flow
 }
 
-fn compress_chunk_source(html: &str) -> Vec<u8> {
-    use std::io::Write;
-    let mut encoder =
-        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
-    if encoder.write_all(html.as_bytes()).is_ok()
-        && let Ok(deflated) = encoder.finish()
-    {
-        let mut stored = Vec::with_capacity(deflated.len() + 1);
-        stored.push(1);
-        stored.extend_from_slice(&deflated);
-        return stored;
-    }
-    // Compression failed; fall back to storing the plain bytes so the
-    // document still opens (decode refuses unknown payloads).
-    let mut stored = Vec::with_capacity(html.len() + 1);
-    stored.push(0);
-    stored.extend_from_slice(html.as_bytes());
-    stored
-}
+#[cfg(test)]
+mod layout_plan_tests {
+    use super::*;
 
-fn decompress_chunk_source(stored: &[u8]) -> Result<String> {
-    match stored.first().copied() {
-        Some(1) => {
-            use std::io::Read;
-            let mut html = String::new();
-            flate2::read::DeflateDecoder::new(&stored[1..]).read_to_string(&mut html)?;
-            Ok(html)
-        }
-        Some(0) => Ok(String::from_utf8_lossy(&stored[1..]).into_owned()),
-        _ => bail!("stored chunk source is corrupted"),
+    const MB: usize = 1024 * 1024;
+
+    #[test]
+    fn small_book_fits_in_one_layout_on_a_kindle() {
+        // PW2 with the framework stopped: ~80 MB free, a 250 kB novel.
+        assert_eq!(plan_chunk_bytes(250 * 1024, Some(80 * MB)), usize::MAX);
+    }
+
+    #[test]
+    fn large_book_is_split_to_fit_available_memory() {
+        // 80 MB available, 24 MB reserved -> 56 MB of layout, 448 kB of HTML.
+        let target = plan_chunk_bytes(4 * MB, Some(80 * MB));
+        assert_eq!(target, 448 * 1024);
+        let chunks = (4 * MB).div_ceil(target);
+        assert_eq!(chunks, 10, "4 MB should be split into ten chunks");
+    }
+
+    #[test]
+    fn chunk_size_is_clamped_to_sane_bounds() {
+        // Plenty of memory: never go above a megabyte per chunk.
+        assert_eq!(plan_chunk_bytes(64 * MB, Some(512 * MB)), MAX_CHUNK_BYTES);
+        // Almost nothing left: never go below a page-sized chunk.
+        assert_eq!(plan_chunk_bytes(64 * MB, Some(MB)), MIN_CHUNK_BYTES);
+    }
+
+    #[test]
+    fn unknown_memory_keeps_the_whole_book() {
+        assert_eq!(plan_chunk_bytes(4 * MB, None), usize::MAX);
     }
 }
 

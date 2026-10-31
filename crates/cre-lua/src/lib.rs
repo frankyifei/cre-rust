@@ -76,6 +76,11 @@ struct Doc {
     font_data_cache: Vec<cre_lib::FontBlob>,
     font_cache_paths: Vec<PathBuf>,
     render_state_snapshot: String,
+    /// Set when a setting changed something layout depends on. The rebuild is
+    /// deferred to the next call that reads the layout, so applying a batch of
+    /// settings (font size, margins, interline, dpi, ...) costs one rebuild
+    /// instead of one per setting.
+    needs_relayout: bool,
 }
 
 impl Doc {
@@ -119,6 +124,7 @@ impl Doc {
             font_data_cache: Vec::new(),
             font_cache_paths: Vec::new(),
             render_state_snapshot: String::new(),
+            needs_relayout: false,
         }
     }
 
@@ -312,19 +318,40 @@ impl Doc {
         }
     }
 
+    /// Marks the built document stale instead of rebuilding it. Successive
+    /// setting changes coalesce into a single rebuild in [`Self::sync_layout`].
     fn relayout(&mut self) {
+        if self.inner.is_some() {
+            self.needs_relayout = true;
+        }
+    }
+
+    /// Applies a deferred rebuild, if any. Called from every path that reads
+    /// the laid out document, so callers never observe a stale layout.
+    fn sync_layout(&mut self) {
+        if !self.needs_relayout {
+            return;
+        }
+        self.needs_relayout = false;
         let Some(path) = self.path.clone() else {
             return;
         };
+        // Settings that do not change the rendered layout (e.g. a gamma tweak)
+        // must not cost a rebuild.
+        if self.inner.is_some()
+            && self.render_state_snapshot == self.render_state_snapshot(path.clone())
+        {
+            return;
+        }
         let xpointer = self.inner.as_ref().and_then(|inner| {
             inner
                 .xpointer_from_page(inner.current_page())
                 .ok()
                 .filter(|xp| !xp.is_empty())
         });
-        let old = self.inner.take();
+        // `open` only replaces the document on success, so a failed rebuild
+        // leaves the old layout usable.
         if self.open(path).is_err() {
-            self.inner = old;
             return;
         }
         if let (Some(xpointer), Some(inner)) = (xpointer, self.inner.as_mut()) {
@@ -824,8 +851,12 @@ fn font_bias() -> HashMap<String, i32> {
 unsafe fn doc_ref<'a>(l: *mut lua_State) -> Option<&'a Doc> {
     // SAFETY: methods registered in the `credocument` metatable always receive our userdata.
     let ptr = unsafe { lua::lua_touserdata(l, 1) }.cast::<Doc>();
-    // SAFETY: the userdata was initialized by `new_doc_view`.
-    unsafe { ptr.as_ref() }
+    // SAFETY: the userdata was initialized by `new_doc_view`, and nothing else
+    // holds a reference to it while a method runs.
+    let doc = unsafe { ptr.as_mut() }?;
+    // Readers must never see a layout that predates a pending setting change.
+    doc.sync_layout();
+    Some(doc)
 }
 
 unsafe fn doc_mut<'a>(l: *mut lua_State) -> Option<&'a mut Doc> {
@@ -833,6 +864,16 @@ unsafe fn doc_mut<'a>(l: *mut lua_State) -> Option<&'a mut Doc> {
     let ptr = unsafe { lua::lua_touserdata(l, 1) }.cast::<Doc>();
     // SAFETY: the userdata was initialized by `new_doc_view`.
     unsafe { ptr.as_mut() }
+}
+
+/// Mutable access for methods that read the laid out document and then change
+/// its position or page state (rendering, navigation, text lookup). Applies a
+/// deferred rebuild first, so they never work on a stale layout.
+unsafe fn doc_mut_synced<'a>(l: *mut lua_State) -> Option<&'a mut Doc> {
+    // SAFETY: callers are doc methods receiving our userdata at stack index 1.
+    let doc = unsafe { doc_mut(l) }?;
+    doc.sync_layout();
+    Some(doc)
 }
 
 unsafe fn push_str(l: *mut lua_State, value: &str) {
@@ -1695,7 +1736,7 @@ unsafe extern "C-unwind" fn doc_render(l: *mut lua_State) -> c_int {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: `l` is the active Lua state.
         unsafe {
-            if let Some(doc) = doc_mut(l)
+            if let Some(doc) = doc_mut_synced(l)
                 && let Some(inner) = doc.inner.as_mut()
             {
                 let _ = inner.render_current_page();
@@ -1771,7 +1812,7 @@ unsafe extern "C-unwind" fn doc_goto_page(l: *mut lua_State) -> c_int {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: `l` is the active Lua state.
         unsafe {
-            let Some(doc) = doc_mut(l) else {
+            let Some(doc) = doc_mut_synced(l) else {
                 return;
             };
             let Some(inner) = doc.inner.as_mut() else {
@@ -1783,7 +1824,7 @@ unsafe extern "C-unwind" fn doc_goto_page(l: *mut lua_State) -> c_int {
     }));
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        if let Some(doc) = doc_mut(l) {
+        if let Some(doc) = doc_mut_synced(l) {
             doc.record_history();
         }
     }
@@ -1794,7 +1835,7 @@ unsafe extern "C-unwind" fn doc_goto_percent(l: *mut lua_State) -> c_int {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: `l` is the active Lua state.
         unsafe {
-            let Some(doc) = doc_mut(l) else {
+            let Some(doc) = doc_mut_synced(l) else {
                 return;
             };
             let Some(inner) = doc.inner.as_mut() else {
@@ -1811,7 +1852,7 @@ unsafe extern "C-unwind" fn doc_goto_percent(l: *mut lua_State) -> c_int {
     }));
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        if let Some(doc) = doc_mut(l) {
+        if let Some(doc) = doc_mut_synced(l) {
             doc.record_history();
         }
     }
@@ -1822,7 +1863,7 @@ unsafe extern "C-unwind" fn doc_goto_pos(l: *mut lua_State) -> c_int {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: `l` is the active Lua state.
         unsafe {
-            let Some(doc) = doc_mut(l) else {
+            let Some(doc) = doc_mut_synced(l) else {
                 return;
             };
             let Some(inner) = doc.inner.as_mut() else {
@@ -1837,7 +1878,7 @@ unsafe extern "C-unwind" fn doc_goto_pos(l: *mut lua_State) -> c_int {
     }));
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        if let Some(doc) = doc_mut(l) {
+        if let Some(doc) = doc_mut_synced(l) {
             doc.record_history();
         }
     }
@@ -1848,7 +1889,7 @@ unsafe extern "C-unwind" fn doc_goto_xpointer(l: *mut lua_State) -> c_int {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: `l` is the active Lua state.
         unsafe {
-            let Some(doc) = doc_mut(l) else {
+            let Some(doc) = doc_mut_synced(l) else {
                 return;
             };
             let Some(xpointer) = arg_str(l, 2) else {
@@ -1861,7 +1902,7 @@ unsafe extern "C-unwind" fn doc_goto_xpointer(l: *mut lua_State) -> c_int {
     }));
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        if let Some(doc) = doc_mut(l) {
+        if let Some(doc) = doc_mut_synced(l) {
             doc.record_history();
         }
     }
@@ -2130,7 +2171,7 @@ unsafe extern "C-unwind" fn doc_draw_current_page(l: *mut lua_State) -> c_int {
         // SAFETY: `l` is the active Lua state. The BlitBuffer pointer is supplied by KOReader
         // through `lua_topointer`, matching cre.cpp.
         unsafe {
-            let Some(doc) = doc_mut(l) else {
+            let Some(doc) = doc_mut_synced(l) else {
                 return (0, 0.0);
             };
             let gamma = doc.render_font_gamma();
@@ -2514,7 +2555,7 @@ unsafe extern "C-unwind" fn doc_text_from_positions(l: *mut lua_State) -> c_int 
         } else {
             (x0, y0, x1, y1)
         };
-        let Some((text, pos0, pos1)) = doc_mut(l).and_then(|doc| {
+        let Some((text, pos0, pos1)) = doc_mut_synced(l).and_then(|doc| {
             doc.last_range = None;
             doc.last_boxes.clear();
             let mut result = {
@@ -2761,7 +2802,7 @@ unsafe extern "C-unwind" fn doc_text_from_xpointers(l: *mut lua_State) -> c_int 
             let inner = doc.inner.as_ref()?;
             inner.text_between_xpointers(&start, &end).ok()
         });
-        if draw_selection && let Some(doc) = doc_mut(l) {
+        if draw_selection && let Some(doc) = doc_mut_synced(l) {
             doc.highlight = Some((start.clone(), end.clone()));
             doc.last_range = Some((start.clone(), end.clone()));
             let _ = draw_segmented;
@@ -3399,7 +3440,7 @@ unsafe extern "C-unwind" fn doc_invalidate_cache(_l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn doc_update_toc(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        if let Some(doc) = doc_mut(l)
+        if let Some(doc) = doc_mut_synced(l)
             && doc.inner.is_some()
         {
             doc.relayout();
@@ -3447,7 +3488,7 @@ unsafe extern "C-unwind" fn doc_unknown_entities(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn doc_build_alternative_toc(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        if let Some(doc) = doc_mut(l) {
+        if let Some(doc) = doc_mut_synced(l) {
             doc.properties
                 .insert("toc.alternative".to_string(), "1".to_string());
         }
@@ -3695,7 +3736,7 @@ unsafe extern "C-unwind" fn doc_is_link_to_footnote(l: *mut lua_State) -> c_int 
 unsafe extern "C-unwind" fn doc_highlight(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let Some(doc) = doc_mut(l) else {
+        let Some(doc) = doc_mut_synced(l) else {
             return 0;
         };
         let xpointer = arg_str(l, 2);
@@ -3781,7 +3822,7 @@ unsafe extern "C-unwind" fn doc_goto_link(l: *mut lua_State) -> c_int {
         let Some(link) = arg_str(l, 2) else {
             return 0;
         };
-        if let Some(doc) = doc_mut(l) {
+        if let Some(doc) = doc_mut_synced(l) {
             let moved = doc.inner.as_mut().is_some_and(|inner| {
                 inner.go_to_xpointer(&link).is_ok() || inner.go_to_href(&link).is_ok()
             });
@@ -3796,7 +3837,7 @@ unsafe extern "C-unwind" fn doc_goto_link(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn doc_go_back(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        if let Some(doc) = doc_mut(l)
+        if let Some(doc) = doc_mut_synced(l)
             && doc.history_index > 0
             && doc.history_index < doc.history.len()
         {
@@ -3813,7 +3854,7 @@ unsafe extern "C-unwind" fn doc_go_back(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn doc_go_forward(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        if let Some(doc) = doc_mut(l)
+        if let Some(doc) = doc_mut_synced(l)
             && doc.history_index + 1 < doc.history.len()
         {
             let target = doc.history[doc.history_index + 1].clone();
@@ -3829,7 +3870,7 @@ unsafe extern "C-unwind" fn doc_go_forward(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn doc_clear_selection(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        if let Some(doc) = doc_mut(l) {
+        if let Some(doc) = doc_mut_synced(l) {
             doc.last_range = None;
             doc.last_boxes.clear();
             doc.highlight = None;
@@ -4043,7 +4084,7 @@ unsafe extern "C-unwind" fn doc_build_synthetic_page_map(l: *mut lua_State) -> c
     // SAFETY: `l` is the active Lua state.
     unsafe {
         let chars = arg_int(l, 2).max(1) as usize;
-        if let Some(doc) = doc_mut(l) {
+        if let Some(doc) = doc_mut_synced(l) {
             doc.build_synthetic_page_map(chars);
         }
     }
@@ -4054,7 +4095,7 @@ unsafe extern "C-unwind" fn doc_build_synthetic_if_none(l: *mut lua_State) -> c_
     // SAFETY: `l` is the active Lua state.
     unsafe {
         let chars = arg_int(l, 2).max(1) as usize;
-        if let Some(doc) = doc_mut(l)
+        if let Some(doc) = doc_mut_synced(l)
             && doc.page_map.is_empty()
         {
             doc.build_synthetic_page_map(chars);
