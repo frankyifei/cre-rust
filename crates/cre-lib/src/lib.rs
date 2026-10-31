@@ -240,6 +240,30 @@ fn trace_enabled() -> bool {
     })
 }
 
+/// Set `CRE_LIB_TRACE=1` to log process memory (VmRSS/VmHWM) at key stages.
+pub fn trace_memory(label: &str) {
+    if !trace_enabled() {
+        return;
+    }
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return;
+    };
+    let value = |key: &str| {
+        status
+            .lines()
+            .find(|line| line.starts_with(key))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("?")
+            .to_string()
+    };
+    eprintln!(
+        "cre-lib: memory [{}] rss={} kB hwm={} kB",
+        label,
+        value("VmRSS:"),
+        value("VmHWM:")
+    );
+}
+
 fn trace_stage<T>(label: impl FnOnce() -> String, run: impl FnOnce() -> T) -> T {
     if !trace_enabled() {
         return run();
@@ -755,6 +779,7 @@ impl Document {
             page_boxes_cache: RefCell::new(None),
         };
         document.ensure_chunk(0)?;
+        trace_memory("after document build");
         if trace_enabled() {
             eprintln!(
                 "cre-lib: document build took {:.3}s ({} chunks, {} pages)",
@@ -954,6 +979,7 @@ impl Document {
     ) -> Result<(Arc<PageBitmap>, usize, usize)> {
         let render_start = std::time::Instant::now();
         let result = self.render_page_with_stats_inner(page);
+        trace_memory("after page render");
         if trace_enabled() {
             eprintln!(
                 "cre-lib: render page {} took {:.3}s ({})",
@@ -1203,6 +1229,7 @@ impl Document {
             lines,
             page_starts,
         });
+        trace_memory("after chunk activation");
         if trace_enabled() {
             eprintln!(
                 "cre-lib: chunk {} activation took {:.3}s",
@@ -3372,7 +3399,8 @@ pub fn load_font_datas(paths: &[PathBuf]) -> Vec<FontBlob> {
     datas
 }
 
-fn load_font_blob(path: &Path) -> Option<FontBlob> {
+/// Loads a font file as a shared, mmapped blob when possible.
+pub fn load_font_blob(path: &Path) -> Option<FontBlob> {
     if let Ok(file) = std::fs::File::open(path)
         && let Ok(mapped) = unsafe { memmap2::Mmap::map(&file) }
     {

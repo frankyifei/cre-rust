@@ -275,6 +275,7 @@ impl Doc {
         opened.set_background_color(self.background_color_value);
         self.inner = Some(opened);
         self.path = Some(path);
+        cre_lib::trace_memory("doc open");
         self.load_document_page_map();
         Ok(())
     }
@@ -538,10 +539,14 @@ fn sort_font_faces(faces: &mut [FontFace]) {
 }
 
 fn parse_font_metadata(path: &Path) -> Vec<FontFace> {
-    let Ok(data) = std::fs::read(path) else {
+    // Fonts can be tens of megabytes (CJK system fonts) and this runs for
+    // every registered face during startup; mmap them instead of reading a
+    // fresh heap copy each time.
+    let Some(blob) = cre_lib::load_font_blob(path) else {
         return Vec::new();
     };
-    read_fonts::FontRef::fonts(&data)
+    let data: &[u8] = (*blob).as_ref();
+    read_fonts::FontRef::fonts(data)
         .enumerate()
         .filter_map(|(index, font)| {
             font.ok()
