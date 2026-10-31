@@ -834,6 +834,12 @@ impl Document {
                 line_base,
             });
             line_base += lines.len();
+            // The chunk's DOM and line boxes are only needed to derive page
+            // metadata; release them now so the pass stays flat in RSS
+            // instead of accumulating one chunk's arenas per iteration.
+            drop(doc);
+            drop(lines);
+            trim_memory();
         }
         spine_to_chunk.entry(1).or_insert(0);
 
@@ -1291,6 +1297,11 @@ impl Document {
             .get(index)
             .context("document chunk is missing")?;
         let html = stored.clone();
+        // Free the current chunk before building the next one: both being
+        // resident at once doubles the layout peak, which matters on a device
+        // where a single layout is already tens of megabytes.
+        drop(self.active.borrow_mut().take());
+        trim_memory();
         let doc = create_document(
             &html,
             &self.base_url,
