@@ -214,7 +214,18 @@ struct TocAnchorId {
     node_id: NodeId,
 }
 
-const CHUNK_TARGET_BYTES: usize = 256 * 1024;
+const CHUNK_TARGET_BYTES: usize = 64 * 1024;
+
+/// Chunk size used when the book is split for layout. Smaller chunks mean a
+/// smaller DOM/parley layout alive at once (the open-time memory peak), at
+/// the cost of more relayouts while reading. CRE_CHUNK_BYTES overrides it.
+fn chunk_target_bytes() -> usize {
+    std::env::var("CRE_CHUNK_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value >= 16 * 1024)
+        .unwrap_or(CHUNK_TARGET_BYTES)
+}
 
 /// Set `CRE_LIB_TRACE=1` to log stage timings to stderr. Used to diagnose
 /// slow/hanging opens on low-end devices (e.g. Kindle PW2) where a book
@@ -371,7 +382,7 @@ impl Document {
                 );
                 let htmls = trace_stage(
                     || "epub to_html_chunks".to_string(),
-                    || book.to_html_chunks(&html_options, CHUNK_TARGET_BYTES),
+                    || book.to_html_chunks(&html_options, chunk_target_bytes()),
                 )?;
                 let cover_image = epub_cover_image(&book);
                 let has_non_linear_flows = book.spine.iter().any(|item| !item.linear);
