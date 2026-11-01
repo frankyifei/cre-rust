@@ -76,6 +76,11 @@ pub struct DocumentOptions {
     pub page_margin: f32,
     pub font_size: f32,
     pub font_path: Option<PathBuf>,
+    /// Family the reader selected. A font file can be a collection (TTC/OTC)
+    /// holding several families, so the path alone does not say which face to
+    /// use; this name is put first in the generic family lists, which is how the
+    /// generators' `serif`/`sans-serif` resolve to it.
+    pub font_family: Option<String>,
     pub fallback_font_paths: Vec<PathBuf>,
     pub stylesheet: Option<String>,
     pub embedded_styles_enabled: bool,
@@ -91,6 +96,7 @@ impl Default for DocumentOptions {
             page_margin: 32.0,
             font_size: 18.0,
             font_path: None,
+            font_family: None,
             fallback_font_paths: Vec::new(),
             stylesheet: None,
             embedded_styles_enabled: true,
@@ -512,6 +518,14 @@ pub struct Document {
     viewport_scale: f32,
     font_gamma: f32,
     stylesheet: Option<String>,
+    /// Family the reader picked inside the font file (a collection can hold
+    /// several); `None` means "first family in the file".
+    font_family: Option<String>,
+    /// The blobs the current font context was built from. Kept (they are
+    /// mmapped and shared) so a family change can rebuild the context without
+    /// re-reading the files: two faces of a collection live in one file, so the
+    /// path list alone does not say whether the context is stale.
+    font_blobs: Vec<FontBlob>,
     embedded_styles_enabled: bool,
     sources: Vec<String>,
     base_url: String,
@@ -920,7 +934,10 @@ impl Document {
         font_datas: &[FontBlob],
         defer_layout: bool,
     ) -> Result<Self> {
-        let font_context = Arc::new(build_font_ctx_with_fallbacks(font_datas));
+        let font_context = Arc::new(build_font_ctx_with_fallbacks(
+            font_datas,
+            options.font_family.as_deref(),
+        ));
         // Only the EPUB generator emits chunk HTML without the layout settings
         // in it, which is what allows a relayout instead of a reopen.
         let layout_independent_sources = matches!(metadata.format, DocumentFormat::Epub);
@@ -933,6 +950,8 @@ impl Document {
             stylesheet: options.stylesheet.clone(),
             embedded_styles_enabled: options.embedded_styles_enabled,
             font_css_size: options.font_size,
+            font_family: options.font_family.clone(),
+            font_blobs: font_datas.to_vec(),
             viewport_scale: options.viewport_scale,
             font_gamma: 1.0,
             sources: htmls,
@@ -978,6 +997,7 @@ impl Document {
             page_margin: self.page_margin,
             font_size: self.font_css_size,
             font_path: None,
+            font_family: self.font_family.clone(),
             fallback_font_paths: Vec::new(),
             stylesheet: self.stylesheet.clone(),
             embedded_styles_enabled: self.embedded_styles_enabled,
@@ -991,6 +1011,10 @@ impl Document {
         self.layout_height = options.layout_height;
         self.page_margin = options.page_margin;
         self.font_css_size = options.font_size;
+        if self.font_family != options.font_family {
+            self.font_family = options.font_family.clone();
+            self.rebuild_font_context();
+        }
         self.stylesheet = options.stylesheet.clone();
         self.embedded_styles_enabled = options.embedded_styles_enabled;
         self.viewport_scale = options.viewport_scale;
@@ -999,7 +1023,18 @@ impl Document {
     /// Replaces the fonts used by the next chunk layout. Chunks already laid out
     /// keep their own copy until they are laid out again.
     pub fn set_fonts(&mut self, font_datas: &[FontBlob]) {
-        self.font_context = Arc::new(build_font_ctx_with_fallbacks(font_datas));
+        self.font_blobs = font_datas.to_vec();
+        self.rebuild_font_context();
+    }
+
+    /// Rebuilds the layout font context from the blobs it already holds, for
+    /// when the selected family changed but the files did not (a collection
+    /// holds several families in one file).
+    fn rebuild_font_context(&mut self) {
+        self.font_context = Arc::new(build_font_ctx_with_fallbacks(
+            &self.font_blobs,
+            self.font_family.as_deref(),
+        ));
         *self.active.borrow_mut() = None;
     }
 
@@ -4415,7 +4450,10 @@ fn collect_font_datas(options: &DocumentOptions) -> Result<Vec<FontBlob>> {
     Ok(Vec::<FontBlob>::new())
 }
 
-fn build_font_ctx_with_fallbacks(font_datas: &[FontBlob]) -> FontContext {
+fn build_font_ctx_with_fallbacks(
+    font_datas: &[FontBlob],
+    preferred_family: Option<&str>,
+) -> FontContext {
     let mut ctx = FontContext {
         source_cache: SourceCache::new_shared(),
         collection: Collection::new(CollectionOptions {
@@ -4433,6 +4471,28 @@ fn build_font_ctx_with_fallbacks(font_datas: &[FontBlob]) -> FontContext {
                 .collect::<Vec<FamilyId>>()
         })
         .collect();
+    // A collection registers several families from one file. Put the family the
+    // reader picked first, so the generators' `serif`/`sans-serif` resolve to
+    // that face instead of whichever one happened to be registered first.
+    let preferred = preferred_family.and_then(|name| {
+        let wanted = normalize_family_name(name);
+        let names: Vec<String> = ctx.collection.family_names().map(str::to_string).collect();
+        names
+            .iter()
+            .find(|existing| normalize_family_name(existing) == wanted)
+            .and_then(|existing| ctx.collection.family_by_name(existing))
+            .map(|family| family.id())
+    });
+    let mut ordered: Vec<FamilyId> = Vec::with_capacity(family_ids.len());
+    if let Some(id) = preferred {
+        ordered.push(id);
+    }
+    ordered.extend(
+        family_ids
+            .iter()
+            .copied()
+            .filter(|id| Some(*id) != preferred),
+    );
     for generic in [
         GenericFamily::SansSerif,
         GenericFamily::Serif,
@@ -4440,9 +4500,18 @@ fn build_font_ctx_with_fallbacks(font_datas: &[FontBlob]) -> FontContext {
         GenericFamily::SystemUi,
     ] {
         ctx.collection
-            .append_generic_families(generic, family_ids.iter().copied());
+            .append_generic_families(generic, ordered.iter().copied());
     }
     ctx
+}
+
+/// Family names are compared the way KOReader matches them: case and separators
+/// do not matter ("Noto Serif CJK SC" == "NotoSerifCJKsc").
+fn normalize_family_name(name: &str) -> String {
+    name.chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 /// block's layout text.

@@ -61,6 +61,7 @@ fn cjk_page_rasters_without_whole_font_parse() {
         page_margin: 32.0,
         font_size: 20.0,
         font_path: Some(font),
+        font_family: None,
         fallback_font_paths: Vec::new(),
         stylesheet: None,
         embedded_styles_enabled: true,
@@ -96,6 +97,7 @@ fn unicode_outlines_still_render_for_the_cff_path() {
     let html = dir.join("cff.html");
     std::fs::write(&html, "<html><body><p>漢字かなカナ</p></body></html>").unwrap();
     let options = DocumentOptions {
+        font_family: None,
         width: 400,
         height: 300,
         layout_height: 10_000,
@@ -129,6 +131,7 @@ fn latin_text_renders_with_the_same_pipeline() {
     )
     .unwrap();
     let options = DocumentOptions {
+        font_family: None,
         width: 400,
         height: 300,
         layout_height: 10_000,

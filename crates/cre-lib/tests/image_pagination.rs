@@ -17,6 +17,7 @@ fn options() -> DocumentOptions {
         page_margin: 20.0,
         font_size: 18.0,
         font_path: None,
+        font_family: None,
         fallback_font_paths: Vec::new(),
         stylesheet: None,
         embedded_styles_enabled: true,

@@ -722,6 +722,7 @@ fn document_find_text_direction_filters_by_current_page() {
     require_resources();
 
     let options = DocumentOptions {
+        font_family: None,
         width: 320,
         height: 480,
         layout_height: 100_000,
@@ -803,6 +804,7 @@ fn document_bookmarks_survive_reflow() {
     require_resources();
 
     let narrow_options = DocumentOptions {
+        font_family: None,
         width: 320,
         height: 480,
         layout_height: 100_000,
@@ -856,6 +858,7 @@ fn document_selection_spans_pages() {
     require_resources();
 
     let options = DocumentOptions {
+        font_family: None,
         width: 360,
         height: 480,
         layout_height: 100_000,
@@ -1086,6 +1089,7 @@ fn renders_svg_image_to_rgba() {
 fn layout_can_be_deferred_to_the_first_read() {
     require_resources();
     let options = DocumentOptions {
+        font_family: None,
         width: 320,
         height: 480,
         layout_height: 100_000,

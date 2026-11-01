@@ -28,6 +28,7 @@ fn options_with_stylesheet(stylesheet: Option<String>) -> DocumentOptions {
             Path::new("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf").to_path_buf(),
         ),
         fallback_font_paths: Vec::new(),
+        font_family: None,
         stylesheet,
         embedded_styles_enabled: true,
         viewport_scale: 1.0,

@@ -44,6 +44,9 @@ struct Doc {
     layout_height: u32,
     margins: (i32, i32, i32, i32),
     font_face: String,
+    /// Canonical family of the selected face, for font files that hold several
+    /// families (TTC/OTC collections).
+    font_family: Option<String>,
     font_path: Option<PathBuf>,
     font_size: i32,
     path: Option<PathBuf>,
@@ -99,6 +102,7 @@ impl Doc {
             layout_height: 100_000,
             margins: (0, 0, 0, 0),
             font_face: "Noto Serif".to_string(),
+            font_family: None,
             font_path: None,
             font_size: 22,
             path: None,
@@ -288,6 +292,7 @@ impl Doc {
             page_margin: self.margins.1.max(0) as f32,
             font_size: self.render_font_css_size(),
             font_path: self.font_path.clone(),
+            font_family: self.font_family.clone(),
             fallback_font_paths: self.fallback_font_paths(),
             stylesheet: (!effective_stylesheet.is_empty()).then(|| effective_stylesheet.clone()),
             embedded_styles_enabled: self.embedded_stylesheet_enabled,
@@ -3060,10 +3065,18 @@ unsafe extern "C-unwind" fn doc_set_font_face(l: *mut lua_State) -> c_int {
     unsafe {
         if let Some(doc) = doc_mut(l) {
             let face = arg_str(l, 2).unwrap_or_default();
-            let font_path = find_font_face(&face, false, false).map(|font| font.path.clone());
-            let changed = doc.font_face != face || doc.font_path != font_path;
+            let selected = find_font_face(&face, false, false);
+            let font_path = selected.as_ref().map(|font| font.path.clone());
+            let font_family = selected
+                .as_ref()
+                .map(|font| font.family.clone())
+                .or_else(|| (!face.trim().is_empty()).then(|| face.clone()));
+            let changed = doc.font_face != face
+                || doc.font_path != font_path
+                || doc.font_family != font_family;
             doc.font_face = face;
             doc.font_path = font_path;
+            doc.font_family = font_family;
             if changed && doc.inner.is_some() {
                 doc.relayout();
             }
@@ -3259,10 +3272,18 @@ unsafe extern "C-unwind" fn doc_set_string_property(l: *mut lua_State) -> c_int 
         doc.properties.insert(name.clone(), value.clone());
         match name.as_str() {
             "font.face.default" | "font.face" => {
-                let font_path = find_font_face(&value, false, false).map(|font| font.path.clone());
-                let changed = doc.font_face != value || doc.font_path != font_path;
+                let selected = find_font_face(&value, false, false);
+                let font_path = selected.as_ref().map(|font| font.path.clone());
+                let font_family = selected
+                    .as_ref()
+                    .map(|font| font.family.clone())
+                    .or_else(|| (!value.trim().is_empty()).then(|| value.clone()));
+                let changed = doc.font_face != value
+                    || doc.font_path != font_path
+                    || doc.font_family != font_family;
                 doc.font_face = value;
                 doc.font_path = font_path;
+                doc.font_family = font_family;
                 if changed && doc.inner.is_some() {
                     doc.relayout();
                 }
