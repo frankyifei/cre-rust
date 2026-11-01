@@ -346,6 +346,14 @@ struct PageMeta {
     page_flow: i64,
 }
 
+/// Absolute vertical extent of a replaced element (image) inside a chunk's
+/// layout, so pagination can keep it on one page instead of clipping it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ContentBox {
+    pub(crate) top: f32,
+    pub(crate) bottom: f32,
+}
+
 #[derive(Clone)]
 struct SnapshotLine {
     text: String,
@@ -768,6 +776,7 @@ impl Document {
             let mut line_flows = lines.iter().map(|_| 0i64).collect::<Vec<i64>>();
             collect_line_flows(root, 0, &mut max_flow, &line_indices, &mut line_flows);
             let forced_breaks = page_breaks::collect_forced_breaks(root);
+            let boxes = collect_content_boxes(&doc, root);
             let (page_height_css_u32, page_height_css, page_margin_css) = css_page_geometry(
                 options.width,
                 options.height,
@@ -776,6 +785,7 @@ impl Document {
             );
             let page_starts = paginate(
                 &lines,
+                &boxes,
                 &forced_breaks,
                 page_height_css,
                 page_margin_css,
@@ -1336,6 +1346,7 @@ impl Document {
         );
         let lines = collect_lines(doc.root_element());
         let forced_breaks = page_breaks::collect_forced_breaks(doc.root_element());
+        let boxes = collect_content_boxes(&doc, doc.root_element());
         let (_page_height_css_u32, page_height_css, page_margin_css) = css_page_geometry(
             self.width,
             self.height,
@@ -1344,6 +1355,7 @@ impl Document {
         );
         let page_starts = paginate(
             &lines,
+            &boxes,
             &forced_breaks,
             page_height_css,
             page_margin_css,
@@ -2896,6 +2908,7 @@ fn collect_lines_inner(node: &Node, out: &mut Vec<LineBox>) {
 
 fn paginate(
     lines: &[LineBox],
+    boxes: &[ContentBox],
     forced_breaks: &[f32],
     page_height: f32,
     margin_top: f32,
@@ -2907,9 +2920,18 @@ fn paginate(
     // line: documents whose content begins above the configured top margin
     // (e.g. a bare HTML file without the generator's body padding) must not
     // lose their opening line.
-    let first_clip_top = lines
+    let first_top = lines
         .first()
-        .map_or(margin_top, |line| line.visual_top.min(margin_top));
+        .map(|line| line.visual_top)
+        .into_iter()
+        .chain(boxes.first().map(|box_| box_.top))
+        .fold(f32::INFINITY, f32::min);
+    let first_clip_top = if first_top.is_finite() {
+        first_top.min(margin_top)
+    } else {
+        margin_top
+    };
+    let page_content_height = (page_height - margin_top - margin_bottom).max(1.0);
     let mut starts = vec![PageStart {
         top: 0.0,
         clip_top: first_clip_top,
@@ -2919,7 +2941,43 @@ fn paginate(
     // Lines already placed on the current page. A chunk starts on a fresh page,
     // so a break before its very first line would only add an empty page.
     let mut lines_on_page = 0usize;
-    for line in lines {
+
+    // Walk lines and image boxes together, in document order.
+    let mut items: Vec<(f32, Option<usize>, Option<usize>)> =
+        Vec::with_capacity(lines.len() + boxes.len());
+    for (index, line) in lines.iter().enumerate() {
+        items.push((line.visual_top, Some(index), None));
+    }
+    for (index, box_) in boxes.iter().enumerate() {
+        items.push((box_.top, None, Some(index)));
+    }
+    items.sort_by(|left, right| left.0.total_cmp(&right.0));
+
+    for (_, line_slot, box_slot) in items {
+        if let Some(box_index) = box_slot {
+            let box_ = &boxes[box_index];
+            let current = starts.last().unwrap();
+            let clip_bottom = current.top + page_height - margin_bottom;
+            let height = box_.bottom - box_.top;
+            // Keep an image whole: start a new page when it does not fit in
+            // the space left, unless it is taller than a page even on its own
+            // (then it has to be clipped, which the CSS max-height prevents).
+            if box_.bottom > clip_bottom
+                && box_.top > current.clip_top
+                && height <= page_content_height
+            {
+                starts.push(PageStart {
+                    top: (box_.top - margin_top).max(0.0),
+                    clip_top: box_.top,
+                });
+                lines_on_page = 0;
+            }
+            continue;
+        }
+        let Some(line_index) = line_slot else {
+            continue;
+        };
+        let line = &lines[line_index];
         let current = starts.last().unwrap();
         while forced_index < forced_breaks.len()
             && forced_breaks[forced_index] <= line.visual_top + BREAK_EPSILON
@@ -3636,6 +3694,21 @@ fn create_document(
         html_source.push_str(stylesheet);
         html_source.push_str("</style>");
     }
+
+    // Keep images whole: cap them to one page's content height (width is
+    // already capped), so pagination never has to clip an image. crengine
+    // scales oversized images the same way.
+    let (_, page_height_css, page_margin_css) = css_page_geometry(
+        options.width,
+        options.height,
+        options.viewport_scale,
+        options.page_margin,
+    );
+    let max_image_height = (page_height_css - page_margin_css * 2.0).max(1.0);
+    html_source.push_str(&format!(
+        "<style>img, svg, video, canvas, object, embed {{ max-width: 100%; \
+         max-height: {max_image_height:.0}px; height: auto; }}</style>"
+    ));
     let mut doc = HtmlDocument::from_html(html_source.as_str(), config);
     doc.resolve(0.0);
     for _ in 0..4 {
@@ -3825,6 +3898,36 @@ mod layout_plan_tests {
     #[test]
     fn unknown_memory_keeps_the_whole_book() {
         assert_eq!(plan_chunk_bytes(4 * MB, None), usize::MAX);
+    }
+}
+
+/// Collects the absolute rects of replaced elements (images and friends).
+fn collect_content_boxes(doc: &HtmlDocument, root: &Node) -> Vec<ContentBox> {
+    let mut boxes = Vec::new();
+    collect_content_boxes_into(doc, root, &mut boxes);
+    boxes.sort_by(|left, right| left.top.total_cmp(&right.top));
+    boxes
+}
+
+fn collect_content_boxes_into(doc: &HtmlDocument, node: &Node, out: &mut Vec<ContentBox>) {
+    if let Some(element) = node.element_data() {
+        let tag = element.name.local.to_string();
+        if matches!(
+            tag.as_str(),
+            "img" | "svg" | "video" | "canvas" | "object" | "embed"
+        ) && let Some(rect) = doc.get_client_bounding_rect(node.id)
+            && rect.height > 0.0
+        {
+            out.push(ContentBox {
+                top: rect.y as f32,
+                bottom: (rect.y + rect.height) as f32,
+            });
+            // No need to descend into a replaced element.
+            return;
+        }
+    }
+    for child in &node.children {
+        collect_content_boxes_into(doc, node.with(*child), out);
     }
 }
 
