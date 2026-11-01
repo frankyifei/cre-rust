@@ -34,8 +34,12 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 percent-encoding = "2"
 regex = "1.13.1"
+png = "0.17"
 resvg = { version = "0.48.1", default-features = false, features = [
     "text",
     "system-fonts",
+    # EPUB covers are commonly an SVG wrapper around an embedded JPEG; without
+    # this resvg renders such SVGs blank (getImageData / page-fit covers).
+    "raster-images",
 ] }
 url = "2"

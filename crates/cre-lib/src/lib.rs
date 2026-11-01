@@ -455,6 +455,15 @@ impl Document {
         validate_options(options)?;
         let path = path.as_ref();
         let format = detect_format(path);
+        // SVG images are rendered at page size: CSS caps them to the page's
+        // content box, so this is the largest they can ever be drawn.
+        let content_width = ((options.width as f32 - options.page_margin * 2.0)
+            * options.viewport_scale)
+            .max(1.0) as u32;
+        let content_height = ((options.height as f32 - options.page_margin * 2.0)
+            * options.viewport_scale)
+            .max(1.0) as u32;
+        let svg_raster = Arc::new(SvgRaster::new(content_width, content_height));
         match format {
             DocumentFormat::Epub => {
                 let mut book = EpubBook::open(path)?;
@@ -505,6 +514,7 @@ impl Document {
                     htmls,
                     "epub://book/",
                     Arc::new(EpubNet {
+                        svg: svg_raster.clone(),
                         resource_provider: resource_provider.clone(),
                     }),
                     ResourceSource::Epub(resource_provider),
@@ -552,6 +562,7 @@ impl Document {
                     "fb2://book/",
                     Arc::new(Fb2Net {
                         resources: binary.clone(),
+                        svg: svg_raster.clone(),
                     }),
                     ResourceSource::Fb2(binary),
                     cover_image,
@@ -650,7 +661,10 @@ impl Document {
                 Self::build(
                     split_single_document(html),
                     &base_url,
-                    Arc::new(FileNet { root: root.clone() }),
+                    Arc::new(FileNet {
+                        root: root.clone(),
+                        svg: svg_raster.clone(),
+                    }),
                     ResourceSource::Empty,
                     None,
                     false,
@@ -3521,6 +3535,26 @@ pub fn render_svg_image(
     target_width: Option<u32>,
     target_height: Option<u32>,
 ) -> Option<(Vec<u8>, u32, u32)> {
+    render_svg_scaled(data, target_width, target_height, true)
+}
+
+/// Rasterizes an SVG so it fits within `max_width` x `max_height` without ever
+/// enlarging it. Used for page resources: a small icon must stay small, while a
+/// cover taller than the page is scaled down to fit.
+pub fn render_svg_image_fit(
+    data: &[u8],
+    max_width: u32,
+    max_height: u32,
+) -> Option<(Vec<u8>, u32, u32)> {
+    render_svg_scaled(data, Some(max_width), Some(max_height), false)
+}
+
+fn render_svg_scaled(
+    data: &[u8],
+    target_width: Option<u32>,
+    target_height: Option<u32>,
+    allow_upscale: bool,
+) -> Option<(Vec<u8>, u32, u32)> {
     let mut options = resvg::usvg::Options::default();
     let mut fontdb = resvg::usvg::fontdb::Database::new();
     fontdb.load_system_fonts();
@@ -3533,12 +3567,15 @@ pub fn render_svg_image(
         return None;
     }
 
-    let scale = match (target_width, target_height) {
+    let mut scale = match (target_width, target_height) {
         (Some(width), Some(height)) => (width as f32 / src_width).min(height as f32 / src_height),
         (Some(width), None) => width as f32 / src_width,
         (None, Some(height)) => height as f32 / src_height,
         (None, None) => 1.0,
     };
+    if !allow_upscale {
+        scale = scale.min(1.0);
+    }
     let out_width = ((src_width * scale).round() as u32).max(1);
     let out_height = ((src_height * scale).round() as u32).max(1);
 
@@ -4059,8 +4096,84 @@ fn page_for_node(doc: &HtmlDocument, node_id: NodeId, page_starts: &[PageStart])
     Ok(page)
 }
 
+/// Rasterizes SVG resources once, at page size, and keeps the PNGs in a
+/// byte-bounded cache.
+struct SvgRaster {
+    max_width: u32,
+    max_height: u32,
+    cache: std::sync::Mutex<SvgRasterCache>,
+}
+
+#[derive(Default)]
+struct SvgRasterCache {
+    entries: HashMap<String, Arc<Vec<u8>>>,
+    order: std::collections::VecDeque<String>,
+    bytes: usize,
+    limit: usize,
+}
+
+impl SvgRaster {
+    fn new(width: u32, height: u32) -> Self {
+        Self {
+            max_width: width.max(1),
+            max_height: height.max(1),
+            cache: std::sync::Mutex::new(SvgRasterCache {
+                limit: 8 * 1024 * 1024,
+                ..SvgRasterCache::default()
+            }),
+        }
+    }
+
+    fn rasterize(&self, key: &str, bytes: &[u8]) -> Option<Vec<u8>> {
+        if !looks_like_svg(bytes) {
+            return None;
+        }
+        if let Ok(cache) = self.cache.lock()
+            && let Some(hit) = cache.entries.get(key)
+        {
+            return Some((**hit).clone());
+        }
+        let (rgba, width, height) = render_svg_image_fit(bytes, self.max_width, self.max_height)?;
+        let png = encode_png(&rgba, width, height)?;
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.bytes += png.len();
+            cache.entries.insert(key.to_string(), Arc::new(png.clone()));
+            cache.order.push_back(key.to_string());
+            while cache.bytes > cache.limit {
+                let Some(oldest) = cache.order.pop_front() else {
+                    break;
+                };
+                if let Some(removed) = cache.entries.remove(&oldest) {
+                    cache.bytes = cache.bytes.saturating_sub(removed.len());
+                }
+            }
+        }
+        Some(png)
+    }
+}
+
+fn looks_like_svg(bytes: &[u8]) -> bool {
+    let head = &bytes[..bytes.len().min(512)];
+    let text = String::from_utf8_lossy(head);
+    let text = text.trim_start_matches('\u{feff}').trim_start();
+    text.starts_with("<svg") || (text.starts_with("<?xml") && text.contains("<svg"))
+}
+
+fn encode_png(rgba: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().ok()?;
+        writer.write_image_data(rgba).ok()?;
+    }
+    Some(out)
+}
+
 struct EpubNet {
     resource_provider: Arc<LazyResource>,
+    svg: Arc<SvgRaster>,
 }
 
 impl NetProvider for EpubNet {
@@ -4075,12 +4188,14 @@ impl NetProvider for EpubNet {
             .get(&key)
             .map(|data| (*data).clone())
             .unwrap_or_default();
+        let bytes = self.svg.rasterize(&key, &bytes).unwrap_or(bytes);
         handler.bytes(request.url.to_string(), Bytes::from(bytes));
     }
 }
 
 struct Fb2Net {
     resources: Arc<HashMap<String, Vec<u8>>>,
+    svg: Arc<SvgRaster>,
 }
 
 impl NetProvider for Fb2Net {
@@ -4091,6 +4206,7 @@ impl NetProvider for Fb2Net {
             .to_string();
         let name = path.strip_prefix("binary/").unwrap_or(&path).to_string();
         let bytes = self.resources.get(&name).cloned().unwrap_or_default();
+        let bytes = self.svg.rasterize(&name, &bytes).unwrap_or(bytes);
         handler.bytes(request.url.to_string(), Bytes::from(bytes));
     }
 }
@@ -4100,6 +4216,7 @@ impl NetProvider for Fb2Net {
 /// stay inside that directory.
 struct FileNet {
     root: PathBuf,
+    svg: Arc<SvgRaster>,
 }
 
 impl NetProvider for FileNet {
@@ -4114,6 +4231,7 @@ impl NetProvider for FileNet {
         {
             bytes = std::fs::read(&candidate).unwrap_or_default();
         }
+        let bytes = self.svg.rasterize(&decoded, &bytes).unwrap_or(bytes);
         handler.bytes(request.url.to_string(), Bytes::from(bytes));
     }
 }
