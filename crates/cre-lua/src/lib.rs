@@ -228,13 +228,25 @@ impl Doc {
     }
 
     fn render_state_snapshot(&self, path: PathBuf) -> String {
-        let mut properties = self.properties.iter().collect::<Vec<(&String, &String)>>();
-        properties.sort_by(|left, right| left.0.cmp(right.0));
-        let mut alt_properties = self
-            .alt_properties
+        // Only the properties the layout actually reads may invalidate it.
+        // Hashing the whole map meant a contrast, highlight-colour or battery
+        // change re-parsed and re-paginated the book for nothing.
+        const LAYOUT_PROPERTIES: &[&str] = &[
+            "crengine.font.fallback.faces",
+            "font.face.base.weight",
+            "font.face.weight.embolden",
+            "window.pages.two.visible.as.one.page.number",
+        ];
+        let properties = LAYOUT_PROPERTIES
             .iter()
-            .collect::<Vec<(&String, &String)>>();
-        alt_properties.sort_by(|left, right| left.0.cmp(right.0));
+            .filter_map(|key| {
+                self.properties
+                    .get(*key)
+                    .map(|value| ((*key).to_string(), value.clone()))
+            })
+            .collect::<Vec<(String, String)>>();
+        // `alt_properties` (setAltDocumentProp) are never read by the layout.
+        let alt_properties: Vec<(String, String)> = Vec::new();
         // Gamma (KOReader's contrast) is applied when painting and must not
         // invalidate the layout: rebuilding the whole book for it was a
         // multi-second freeze that changed nothing on the page.
@@ -357,12 +369,17 @@ impl Doc {
         let Some(path) = self.path.clone() else {
             return;
         };
-        // Settings that do not change the rendered layout (e.g. a gamma tweak)
-        // must not cost a rebuild.
-        if self.inner.is_some()
-            && self.render_state_snapshot == self.render_state_snapshot(path.clone())
-        {
+        // Settings that do not change the rendered layout must not cost a
+        // rebuild.
+        let snapshot = self.render_state_snapshot(path.clone());
+        if self.inner.is_some() && self.render_state_snapshot == snapshot {
             return;
+        }
+        if std::env::var_os("CRE_SNAPSHOT_DEBUG").is_some() {
+            eprintln!(
+                "cre-lua: relayout, before={}\n              after ={}",
+                self.render_state_snapshot, snapshot
+            );
         }
         let xpointer = self.inner.as_ref().and_then(|inner| {
             inner
