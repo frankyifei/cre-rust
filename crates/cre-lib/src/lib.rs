@@ -225,10 +225,13 @@ const LAYOUT_BYTES_PER_HTML_BYTE: usize = 128;
 const LAYOUT_MEMORY_RESERVE: usize = 24 * 1024 * 1024;
 
 /// Bounds for a layout chunk: below a page's worth of text chunking only adds
-/// relayouts; above this one layout already costs ~40 MB, which a 256 MB
-/// device cannot afford next to KOReader and the page cache.
+/// relayouts; above this a single layout is both slow (blitz's layout cost
+/// grows faster than the text: 9.7 s for a 251 kB book as one document, versus
+/// ~4.4 s in four chunks) and expensive in memory. Pagination is unaffected as
+/// long as chunks end at spine-item boundaries, because every spine item
+/// starts a page anyway.
 const MIN_CHUNK_BYTES: usize = 64 * 1024;
-const MAX_CHUNK_BYTES: usize = 320 * 1024;
+const MAX_CHUNK_BYTES: usize = 128 * 1024;
 
 /// Explicit chunk size override (`CRE_CHUNK_BYTES`), for testing and for
 /// forcing chunking on a device where the automatic choice misjudges.
@@ -3956,8 +3959,8 @@ mod layout_plan_tests {
         let target = plan_chunk_bytes(4 * MB, Some(80 * MB));
         assert_eq!(target, MAX_CHUNK_BYTES);
         let chunks = (4 * MB).div_ceil(target);
-        assert_eq!(chunks, 13, "4 MB should be split into thirteen chunks");
-        // Each planned layout stays well inside the budget: 320 kB * 128.
+        assert_eq!(chunks, 32, "4 MB should be split into 32 chunks at the cap");
+        // Each planned layout stays well inside the budget: 128 kB * 128.
         assert!(target * LAYOUT_BYTES_PER_HTML_BYTE <= 40 * MB);
     }
 

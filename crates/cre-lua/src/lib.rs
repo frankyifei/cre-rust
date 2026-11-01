@@ -3264,17 +3264,13 @@ unsafe extern "C-unwind" fn doc_partial_count(l: *mut lua_State) -> c_int {
 }
 
 unsafe extern "C-unwind" fn doc_rerender_delayed(l: *mut lua_State) -> c_int {
-    // SAFETY: `l` is the active Lua state. Not synced: reporting the delay is
-    // what lets KOReader skip the per-setting full rerender.
-    unsafe {
-        push_bool(
-            l,
-            // Only a pending *relayout* (settings changed after the first layout) is
-            // delayed; the very first layout must not be deferred or the page count
-            // would be missing right after opening.
-            doc_lazy_ref(l).is_some_and(|doc| doc.needs_relayout),
-        )
-    };
+    // Always false: answering true here does not mean "skip the render", it
+    // starts ReaderRolling's background-rerendering automation (wait 3 s,
+    // render the document in a subprocess, wait 5 s, then reload the whole
+    // document). crengine can afford that because it really does partial
+    // rerendering; for us each step is another full layout.
+    // SAFETY: `l` is the active Lua state.
+    unsafe { push_bool(l, false) };
     1
 }
 
