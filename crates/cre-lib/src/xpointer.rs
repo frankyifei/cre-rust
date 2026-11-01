@@ -1,39 +1,9 @@
-use std::collections::HashMap;
-
 use anyhow::{Context, Result, bail};
 use blitz_dom::{Node, NodeId};
 use blitz_html::HtmlDocument;
 
 use crate::position::{PathSegment, TextPosition, parse_text_position};
 use crate::{LineBox, PageStart};
-
-pub(crate) fn page_xpointers(
-    root: &Node,
-    lines: &[LineBox],
-    page_starts: &[PageStart],
-    height: u32,
-    page_margin: f32,
-    xpointer_pages: &mut HashMap<String, usize>,
-) -> Vec<Option<String>> {
-    let mut out = Vec::with_capacity(page_starts.len());
-    for page in 1..=page_starts.len() {
-        let xpointer = position_for_page_unique(
-            root,
-            lines,
-            page_starts,
-            page,
-            height,
-            page_margin,
-            xpointer_pages,
-        )
-        .map_or_else(|_| None, |position| Some(position.to_xpointer()));
-        if let Some(xpointer) = &xpointer {
-            xpointer_pages.insert(xpointer.clone(), page);
-        }
-        out.push(xpointer);
-    }
-    out
-}
 
 pub(crate) fn xpointer_from_page(
     doc: &HtmlDocument,
@@ -73,33 +43,6 @@ fn position_for_page(
     }
     fallback_position_for_line(root, line)
 }
-
-#[allow(clippy::too_many_arguments)]
-fn position_for_page_unique(
-    root: &Node,
-    lines: &[LineBox],
-    page_starts: &[PageStart],
-    page: usize,
-    height: u32,
-    page_margin: f32,
-    used: &HashMap<String, usize>,
-) -> Result<TextPosition> {
-    let line = line_for_page(lines, page_starts, page, height, page_margin)?;
-    if let Some(position) = source_position_for_line(root, line) {
-        let xpointer = position.to_xpointer();
-        if !used.contains_key(&xpointer) {
-            return Ok(position);
-        }
-    }
-
-    let position = fallback_position_for_line(root, line)?;
-    let xpointer = position.to_xpointer();
-    if !used.contains_key(&xpointer) {
-        return Ok(position);
-    }
-    Ok(position)
-}
-
 fn line_for_page<'a>(
     lines: &'a [LineBox],
     page_starts: &[PageStart],
@@ -162,6 +105,99 @@ fn source_position_for_line(root: &Node, line: &LineBox) -> Option<TextPosition>
     position_for_text_node(root, text_id, codepoint_offset).ok()
 }
 
+/// Source position of a character offset inside a block's inline layout text,
+/// when that text is the block's text nodes concatenated.
+/// The block that owns a position (the nearest ancestor with inline layout data,
+/// or the node itself) and the byte offset of the position inside that block's
+/// layout text. This is the table key: node ids increase with document order, so
+/// `(block, byte offset)` orders positions the way the document does.
+pub(crate) fn block_and_byte_offset(root: &Node, position: &TextPosition) -> Option<(NodeId, u32)> {
+    let target = resolve_text_position(root, position).ok()?;
+    let mut current = root.with(target);
+    let block_id = loop {
+        if current
+            .element_data()
+            .and_then(|data| data.inline_layout_data.as_ref())
+            .is_some()
+        {
+            break current.id;
+        }
+        let parent = current.parent?;
+        current = root.with(parent);
+    };
+    let block = root.with(block_id);
+    let offset_chars = position.codepoint_offset as usize;
+    let mut total = 0u32;
+    let mut stack = vec![block.id];
+    while let Some(id) = stack.pop() {
+        let node = block.with(id);
+        if let Some(text) = node.text_data() {
+            if id == target {
+                let bytes: usize = text
+                    .content
+                    .chars()
+                    .take(offset_chars)
+                    .map(char::len_utf8)
+                    .sum();
+                return Some((block_id, total + bytes as u32));
+            }
+            total += text.content.len() as u32;
+            continue;
+        }
+        for child in node.children.iter().rev() {
+            stack.push(*child);
+        }
+    }
+    None
+}
+
+pub(crate) fn position_for_block_offset(
+    root: &Node,
+    block: &Node,
+    byte_offset: usize,
+) -> Option<TextPosition> {
+    let (text_id, codepoint_offset) = text_node_for_block_offset(block, byte_offset)?;
+    position_for_text_node(root, text_id, codepoint_offset).ok()
+}
+
+/// True when the block's inline layout text is exactly its text nodes
+/// concatenated, which makes byte offsets inside it map exactly. Holds for
+/// ordinary prose (the layout text even keeps `\n`); it does not when a
+/// text-transform or generated content changes the rendered text.
+pub(crate) fn block_text_matches_dom(block: &Node, layout_text: &str) -> bool {
+    let mut total = 0usize;
+    for id in collect_text_node_ids_vec(block) {
+        if let Some(text) = block.with(id).text_data() {
+            total += text.content.chars().count();
+        }
+    }
+    total == layout_text.chars().count()
+}
+
+/// Character offset of a source position inside its block, so two positions of
+/// one block can be compared and sliced even when they live in different text
+/// nodes (the clipping code used to subtract their node-relative offsets).
+pub(crate) fn block_char_offset(
+    root: &Node,
+    block: &Node,
+    position: &TextPosition,
+) -> Option<usize> {
+    let target = resolve_text_position(root, position).ok()?;
+    let mut total = 0usize;
+    for id in collect_text_node_ids_vec(block) {
+        let node = root.with(id);
+        let length = node
+            .text_data()
+            .map(|text| text.content.chars().count())
+            .unwrap_or(0);
+        if id == target {
+            return Some(total + position.codepoint_offset as usize);
+        }
+        total += length;
+    }
+    None
+}
+
 pub(crate) fn position_for_line_offset(
     root: &Node,
     line: &LineBox,
@@ -172,6 +208,18 @@ pub(crate) fn position_for_line_offset(
         .element_data()
         .and_then(|element| element.inline_layout_data.as_ref())
         .context("line has no inline layout")?;
+    // Exact mapping first: it identifies the text node that owns the offset
+    // instead of guessing it from the text content, which is what attributed
+    // lines of repeated sentences to the wrong copy (juliet.epub).
+    if block_text_matches_dom(inline_root, &inline_layout.text)
+        && let Some(position) = position_for_block_offset(
+            root,
+            inline_root,
+            line.text_start.saturating_add(byte_offset),
+        )
+    {
+        return Ok(position);
+    }
     let text_len = inline_layout.text.len();
     let line_start = line.text_start.min(text_len);
     let line_end = line.text_end.clamp(line_start, text_len);
@@ -416,7 +464,10 @@ fn text_index_for_node(root: &Node, node_id: NodeId) -> Option<u32> {
     (total > 1).then_some(index)
 }
 
-fn text_node_for_block_offset(inline_root: &Node, byte_offset: usize) -> Option<(NodeId, u32)> {
+pub(crate) fn text_node_for_block_offset(
+    inline_root: &Node,
+    byte_offset: usize,
+) -> Option<(NodeId, u32)> {
     let inline_layout = inline_root.element_data()?.inline_layout_data.as_ref()?;
     let mut end = byte_offset.min(inline_layout.text.len());
     while end > 0 && !inline_layout.text.is_char_boundary(end) {

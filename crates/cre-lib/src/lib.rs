@@ -403,8 +403,22 @@ struct PageMeta {
 /// makes a settings change cheap: the chunks that are not being read keep their
 /// pages as a provisional page list and are laid out again only when they are
 /// needed, like crengine's `ldomDocument::partialRender` for a `DocFragment`.
+/// One line's place in the book: the text node holding its first character, the
+/// offset in it and the 0-based local page. Kept XPointer-free on purpose: a
+/// path is only built for the first line of each page.
+#[derive(Clone)]
+struct LineEntry {
+    block: NodeId,
+    /// Byte offset of the line's first character in the block's layout text.
+    offset: u32,
+    page: usize,
+}
+
 struct ChunkLayout {
     pages: Vec<LocalPage>,
+    /// Every line of the chunk, sorted in document order (by text node id, then
+    /// offset) — the key page lookup binary-searches.
+    lines: Vec<LineEntry>,
     /// Page-start XPointer per local page.
     xpointers: Vec<Option<String>>,
     /// Anchors found in this chunk, to a 0-based local page.
@@ -534,9 +548,6 @@ pub struct Document {
     page_image_cache: RefCell<HashMap<usize, PageImage>>,
     page_cache_order: RefCell<Vec<usize>>,
     page_boxes_cache: RefCell<Option<(usize, Vec<SnapshotLine>)>>,
-    /// Parsed page-start XPointers, in document order (see
-    /// [`Self::sorted_page_positions`]).
-    page_positions_cache: RefCell<Option<Vec<(usize, TextPosition)>>>,
 }
 
 impl Document {
@@ -951,7 +962,6 @@ impl Document {
             page_image_cache: RefCell::new(HashMap::new()),
             page_cache_order: RefCell::new(Vec::new()),
             page_boxes_cache: RefCell::new(None),
-            page_positions_cache: RefCell::new(None),
         };
         if !defer_layout {
             document.ensure_layout()?;
@@ -1044,15 +1054,77 @@ impl Document {
             page_margin_css,
             page_margin_css,
         );
-        let mut local_xpointer_pages = HashMap::new();
-        let xpointers = xpointer::page_xpointers(
-            root,
-            &lines,
-            &page_starts,
-            page_height_css_u32,
-            page_margin_css,
-            &mut local_xpointer_pages,
-        );
+        // Every line's place in the book: the block that holds it and the byte
+        // offset of its first character inside that block's text. Block ids
+        // increase with document order, so `(block, offset)` orders positions the
+        // way the document does — which `TextPosition` cannot. Recording it is
+        // just the line's own fields, so it is cheap.
+        let mut line_positions: Vec<LineEntry> = Vec::with_capacity(lines.len());
+        let mut page = 0usize;
+        // Whether a block's layout text maps exactly onto its text nodes is
+        // checked once per block; blocks that differ (collapsed whitespace,
+        // text-transform) need the content mapping so their keys match what the
+        // lookup computes.
+        let mut block_matches: HashMap<NodeId, bool> = HashMap::new();
+        for line in lines.iter() {
+            while page + 1 < page_starts.len() && line.top + 0.5 >= page_starts[page + 1].clip_top {
+                page += 1;
+            }
+            let block = root.with(line.node_id);
+            let matches = *block_matches.entry(line.node_id).or_insert_with(|| {
+                block
+                    .element_data()
+                    .and_then(|element| element.inline_layout_data.as_ref())
+                    .is_some_and(|layout| xpointer::block_text_matches_dom(block, &layout.text))
+            });
+            let (block_id, offset) = if matches {
+                (line.node_id, line.text_start.min(u32::MAX as usize) as u32)
+            } else {
+                xpointer::position_for_line_offset(root, line, 0)
+                    .ok()
+                    .and_then(|position| xpointer::block_and_byte_offset(root, &position))
+                    .unwrap_or((line.node_id, line.text_start.min(u32::MAX as usize) as u32))
+            };
+            line_positions.push(LineEntry {
+                block: block_id,
+                offset,
+                page,
+            });
+        }
+        line_positions.sort_by(|left, right| {
+            left.block
+                .cmp(&right.block)
+                .then(left.offset.cmp(&right.offset))
+                .then(left.page.cmp(&right.page))
+        });
+        line_positions
+            .dedup_by(|left, right| left.block == right.block && left.offset == right.offset);
+        // Page starts are the first line position of each page, taken from the
+        // same table the page lookup uses, so a page start and the words on that
+        // page cannot disagree. Only one XPointer per page is built.
+        let mut local_xpointer_pages: HashMap<String, usize> = HashMap::new();
+        let mut page_positions: Vec<Option<String>> = vec![None; page_starts.len()];
+        for entry in line_positions.iter() {
+            let Some(slot) = page_positions.get_mut(entry.page) else {
+                continue;
+            };
+            if slot.is_some() {
+                continue;
+            }
+            *slot = xpointer::position_for_block_offset(
+                root,
+                root.with(entry.block),
+                entry.offset as usize,
+            )
+            .map(|position| position.to_xpointer());
+        }
+        let xpointers = page_positions;
+        for (index, xpointer) in xpointers.iter().enumerate() {
+            if let Some(xpointer) = xpointer {
+                local_xpointer_pages.insert(xpointer.clone(), index + 1);
+            }
+        }
+        let _ = page_height_css_u32;
         let mut href_pages = HashMap::new();
         for (key, node_id) in collect_anchor_maps(root) {
             if let Ok(local_page) = page_for_node(&doc, node_id, &page_starts) {
@@ -1101,6 +1173,7 @@ impl Document {
         }
         let layout = ChunkLayout {
             pages,
+            lines: line_positions,
             xpointers,
             href_pages,
             spine_slots,
@@ -1147,7 +1220,6 @@ impl Document {
         self.href_pages.clear();
         self.spine_to_chunk.clear();
         self.spine_real_index.clear();
-        *self.page_positions_cache.borrow_mut() = None;
         let mut line_base = 0usize;
         let mut running_doc_top = 0.0f32;
         let mut max_flow = 0i64;
@@ -2474,47 +2546,99 @@ impl Document {
 
         let mut lines = Vec::new();
         for page in start_page..=end_page {
-            for (line_index, rect) in self.page_text_boxes_with_lines(page)? {
-                let Some((line_start, line_end)) = self.line_bounds(page, line_index)? else {
-                    continue;
-                };
-                if line_end <= start_position || line_start >= end_position {
-                    continue;
-                }
+            let Some(snapshot) = self.pages.get(page.saturating_sub(1)) else {
+                continue;
+            };
+            let chunk_index = snapshot.chunk;
+            let line_base = self.chunks[chunk_index].line_base;
+            let page_boxes = self.page_text_boxes_with_lines(page)?;
+            let clipped = self.with_active_chunk(chunk_index, |active| {
+                let root = active.doc.root_element();
+                let mut out = Vec::new();
+                for (global_line, rect) in page_boxes.iter() {
+                    let Some(local_line) = global_line.checked_sub(line_base) else {
+                        continue;
+                    };
+                    let Some(line) = active.lines.get(local_line) else {
+                        continue;
+                    };
+                    let block = root.with(line.node_id);
+                    let Some(layout) = block
+                        .element_data()
+                        .and_then(|element| element.inline_layout_data.as_ref())
+                    else {
+                        continue;
+                    };
+                    let text = layout.text.as_str();
+                    let start_byte = line.text_start.min(text.len());
+                    let end_byte = line.text_end.clamp(start_byte, text.len());
+                    if start_byte >= end_byte {
+                        continue;
+                    }
+                    let line_start_chars = text[..start_byte].chars().count();
+                    let line_end_chars = text[..end_byte].chars().count();
+                    let line_chars = line_end_chars - line_start_chars;
 
-                let mut slice_start = 0;
-                let mut slice_end = rect.text.len();
-                if page == start_page
-                    && line_start < start_position
-                    && start_position < line_end
-                    && line_start.path == start_position.path
-                {
-                    let chars =
-                        (start_position.codepoint_offset - line_start.codepoint_offset) as usize;
-                    slice_start = byte_offset_for_char(&rect.text, chars);
+                    // Which characters of this line the range covers. Positions
+                    // inside this block are exact; a range that starts or ends
+                    // in another block is clipped to the line.
+                    let start_offset = xpointer::block_char_offset(root, block, &start_position);
+                    let end_offset = xpointer::block_char_offset(root, block, &end_position);
+                    let (from, to) = match (start_offset, end_offset) {
+                        (Some(from), Some(to)) => {
+                            if to <= line_start_chars || from >= line_end_chars {
+                                continue;
+                            }
+                            (from.max(line_start_chars), to.min(line_end_chars))
+                        }
+                        (Some(from), None) => {
+                            if from >= line_end_chars {
+                                continue;
+                            }
+                            (from.max(line_start_chars), line_end_chars)
+                        }
+                        (None, Some(to)) => {
+                            if to <= line_start_chars {
+                                continue;
+                            }
+                            (line_start_chars, to.min(line_end_chars))
+                        }
+                        (None, None) => {
+                            // Neither end is in this block: fall back to document
+                            // order, as the range spans several blocks.
+                            let Some(first) =
+                                xpointer::position_for_line_offset(root, line, 0).ok()
+                            else {
+                                continue;
+                            };
+                            let Some(last) = xpointer::position_for_line_offset(
+                                root,
+                                line,
+                                end_byte - start_byte,
+                            )
+                            .ok() else {
+                                continue;
+                            };
+                            if last <= start_position || first >= end_position {
+                                continue;
+                            }
+                            (line_start_chars, line_end_chars)
+                        }
+                    };
+                    let from_chars = from.saturating_sub(line_start_chars).min(line_chars);
+                    let to_chars = to.saturating_sub(line_start_chars).min(line_chars);
+                    if from_chars >= to_chars {
+                        continue;
+                    }
+                    let slice_start = byte_offset_for_char(&rect.text, from_chars);
+                    let slice_end = byte_offset_for_char(&rect.text, to_chars);
+                    if slice_start < slice_end {
+                        out.push((page, *global_line, rect.clone(), slice_start, slice_end));
+                    }
                 }
-                if page == end_page
-                    && line_start < end_position
-                    && end_position < line_end
-                    && line_start.path == end_position.path
-                {
-                    let chars =
-                        (end_position.codepoint_offset - line_start.codepoint_offset) as usize;
-                    slice_end = byte_offset_for_char(&rect.text, chars);
-                }
-                if slice_start >= slice_end {
-                    continue;
-                }
-                while slice_start < slice_end && !rect.text.is_char_boundary(slice_start) {
-                    slice_start += 1;
-                }
-                while slice_end > slice_start && !rect.text.is_char_boundary(slice_end) {
-                    slice_end -= 1;
-                }
-                if slice_start < slice_end {
-                    lines.push((page, line_index, rect, slice_start, slice_end));
-                }
-            }
+                Ok(out)
+            })?;
+            lines.extend(clipped);
         }
         Ok(lines)
     }
@@ -3003,158 +3127,44 @@ impl Document {
         Ok(self.chunks[chunk_index].first_page + local_page - 1)
     }
 
-    /// Where `position` sits relative to the text lines of `page`: `None` when
-    /// the page has no text (an image page), `Less` when the page ends before
-    /// the position, `Greater` when it starts after it.
-    fn page_vs_position(
-        &self,
-        page: usize,
-        position: &TextPosition,
-    ) -> Result<Option<std::cmp::Ordering>> {
-        let mut seen_line = false;
-        let mut after = false;
-        for (line_index, _) in self.page_text_boxes_with_lines(page)? {
-            let Some((line_start, line_end)) = self.line_bounds(page, line_index)? else {
-                continue;
-            };
-            seen_line = true;
-            if line_start.cmp(position) != std::cmp::Ordering::Greater
-                && line_end.cmp(position) != std::cmp::Ordering::Less
-            {
-                return Ok(Some(std::cmp::Ordering::Equal));
-            }
-            if line_end.cmp(position) == std::cmp::Ordering::Less {
-                after = true;
-            }
-        }
-        if !seen_line {
-            return Ok(None);
-        }
-        Ok(Some(if after {
-            std::cmp::Ordering::Less
-        } else {
-            std::cmp::Ordering::Greater
-        }))
-    }
-
     fn page_from_text_position_by_line_ranges(
         &self,
         position: &TextPosition,
         chunk_index: usize,
     ) -> Result<Option<usize>> {
-        if self.chunks.get(chunk_index).is_none() {
+        let Some(entry) = self.entries.get(chunk_index) else {
             return Ok(None);
-        }
-        // Page starts are line starts, and both XPointers and pages are in
-        // document order, so the page holding a position is normally the last
-        // page whose start XPointer is <= the position. That binary search
-        // replaced a scan of every page and every line (~1.2 s per call).
-        //
-        // It is only a hint, though: a page start is derived from its first
-        // line's *source* position, and for some books (repeated paragraphs,
-        // empty first lines) that position can be attributed to another node, so
-        // the list is not always in document order. Check the candidate against
-        // the lines of the page it names before trusting it.
-        let sorted = self.sorted_page_positions();
-        let chunk_first = self.chunks.get(chunk_index).map(|meta| meta.first_page);
-        let chunk_last = self
-            .pages
-            .iter()
-            .rposition(|snapshot| snapshot.chunk == chunk_index)
-            .map(|index| index + 1);
-        let in_chunk = |page: usize| {
-            chunk_first.is_some_and(|first| page >= first)
-                && chunk_last.is_some_and(|last| page <= last)
         };
-        let mut candidate: Option<usize> = None;
-        for (page, start) in sorted.iter() {
-            if !in_chunk(*page) {
-                continue;
-            }
-            if start.cmp(position) != std::cmp::Ordering::Greater {
-                candidate = Some(*page);
-            } else {
-                break;
-            }
-        }
-        if let Some(page) = candidate {
-            // The list is only a hint: a page start comes from its first line,
-            // and some pages (those that begin with an inline image or SVG, or
-            // whose text is repeated) map to a position that does not fit the
-            // document order. Check the page the hint names against its own
-            // lines and step towards the right one; a handful of steps is
-            // enough, and falling through to the full scan here would cost a
-            // second per lookup.
-            let mut page = page;
-            for _ in 0..3 {
-                match self.page_vs_position(page, position)? {
-                    Some(std::cmp::Ordering::Equal) => return Ok(Some(page)),
-                    Some(std::cmp::Ordering::Less) => {
-                        if !in_chunk(page + 1) {
-                            break;
-                        }
-                        page += 1;
-                    }
-                    Some(std::cmp::Ordering::Greater) => {
-                        if page <= 1 || !in_chunk(page - 1) {
-                            break;
-                        }
-                        page -= 1;
-                    }
-                    // An image page has no text: the position is not on it,
-                    // and it is most likely before the next text page.
-                    None => {
-                        if page <= 1 || !in_chunk(page - 1) {
-                            break;
-                        }
-                        page -= 1;
-                    }
-                }
-            }
-            // Whatever the walk settled on is the best answer available; the
-            // alternative (scanning every page) is far more expensive.
-            return Ok(Some(page));
-        }
-        // Fall back to the line-range scan for positions before the first page
-        // start (or pages without an XPointer).
-        let pages = self
-            .pages
-            .iter()
-            .enumerate()
-            .filter(|(_, snapshot)| snapshot.chunk == chunk_index)
-            .map(|(index, _)| index + 1)
-            .collect::<Vec<usize>>();
-        for page in pages.iter() {
-            for (line_index, _) in self.page_text_boxes_with_lines(*page)? {
-                let Some((line_start, line_end)) = self.line_bounds(*page, line_index)? else {
-                    continue;
-                };
-                if line_start.cmp(position) != std::cmp::Ordering::Greater
-                    && line_end.cmp(position) != std::cmp::Ordering::Less
-                {
-                    return Ok(Some(*page));
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    /// Parsed page-start XPointers, in document order, cached until the layout
-    /// changes.
-    fn sorted_page_positions(&self) -> Vec<(usize, TextPosition)> {
-        if let Some(cached) = self.page_positions_cache.borrow().as_ref() {
-            return cached.clone();
-        }
-        let mut sorted = Vec::with_capacity(self.pages.len());
-        for (index, snapshot) in self.pages.iter().enumerate() {
-            if let Some(xpointer) = snapshot.xpointer.as_deref()
-                && let Ok(position) = parse_text_position(xpointer)
+        let Some(layout) = entry.layout.as_ref() else {
+            return Ok(None);
+        };
+        let head = self
+            .chunks
+            .get(chunk_index)
+            .map(|meta| meta.first_page)
+            .unwrap_or(1);
+        // The last line whose start is <= the position holds it (a line's text
+        // runs to the next line's start). "Is <=" has to be document order, so
+        // the key is the resolved text node plus the offset in it — the same key
+        // the table was built with. `TextPosition` ordering is not document
+        // order (it compares path segments by tag first).
+        let lines = &layout.lines;
+        self.with_active_chunk(chunk_index, |active| {
+            let root = active.doc.root_element();
+            let Some(key) = xpointer::block_and_byte_offset(root, position) else {
+                return Ok(None);
+            };
+            let first_greater = lines.partition_point(|entry| (entry.block, entry.offset) < key);
+            let index = if lines
+                .get(first_greater)
+                .is_some_and(|entry| (entry.block, entry.offset) == key)
             {
-                sorted.push((index + 1, position));
-            }
-        }
-        *self.page_positions_cache.borrow_mut() = Some(sorted.clone());
-        sorted
+                Some(first_greater)
+            } else {
+                first_greater.checked_sub(1)
+            };
+            Ok(index.map(|index| head + lines[index].page))
+        })
     }
 
     pub fn go_to_xpointer(&mut self, xpointer: &str) -> Result<usize> {
@@ -4394,6 +4404,7 @@ fn build_font_ctx_with_fallbacks(font_datas: &[FontBlob]) -> FontContext {
     ctx
 }
 
+/// block's layout text.
 fn create_document(
     html: &str,
     base_url: &str,
