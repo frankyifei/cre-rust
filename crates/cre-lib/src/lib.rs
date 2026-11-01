@@ -2111,7 +2111,30 @@ impl Document {
                 .context("line snapshot is missing")?;
             let root = active.doc.root_element();
             let start = xpointer::position_for_line_offset(root, line, start_byte)?;
-            let end = xpointer::position_for_line_offset(root, line, end_byte)?;
+            let mut end = xpointer::position_for_line_offset(root, line, end_byte)?;
+            if end == start {
+                // The line -> source mapping collapsed (it matches text
+                // prefixes, so repeated sentences can resolve to the same
+                // position). A zero-length range highlights nothing, so widen
+                // it by the word's length inside the node it resolved to.
+                let word_chars = hit.text[start_byte..end_byte].chars().count().max(1) as u32;
+                let node_chars = xpointer::resolve_text_position(root, &start)
+                    .ok()
+                    .and_then(|id| {
+                        root.with(id)
+                            .text_data()
+                            .map(|data| data.content.chars().count() as u32)
+                    })
+                    .unwrap_or(u32::MAX);
+                let mut widened = start.clone();
+                widened.codepoint_offset = start
+                    .codepoint_offset
+                    .saturating_add(word_chars)
+                    .min(node_chars);
+                if widened != start {
+                    end = widened;
+                }
+            }
             Ok((start, end))
         })?;
 
@@ -2980,6 +3003,40 @@ impl Document {
         Ok(self.chunks[chunk_index].first_page + local_page - 1)
     }
 
+    /// Where `position` sits relative to the text lines of `page`: `None` when
+    /// the page has no text (an image page), `Less` when the page ends before
+    /// the position, `Greater` when it starts after it.
+    fn page_vs_position(
+        &self,
+        page: usize,
+        position: &TextPosition,
+    ) -> Result<Option<std::cmp::Ordering>> {
+        let mut seen_line = false;
+        let mut after = false;
+        for (line_index, _) in self.page_text_boxes_with_lines(page)? {
+            let Some((line_start, line_end)) = self.line_bounds(page, line_index)? else {
+                continue;
+            };
+            seen_line = true;
+            if line_start.cmp(position) != std::cmp::Ordering::Greater
+                && line_end.cmp(position) != std::cmp::Ordering::Less
+            {
+                return Ok(Some(std::cmp::Ordering::Equal));
+            }
+            if line_end.cmp(position) == std::cmp::Ordering::Less {
+                after = true;
+            }
+        }
+        if !seen_line {
+            return Ok(None);
+        }
+        Ok(Some(if after {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Greater
+        }))
+    }
+
     fn page_from_text_position_by_line_ranges(
         &self,
         position: &TextPosition,
@@ -2989,21 +3046,74 @@ impl Document {
             return Ok(None);
         }
         // Page starts are line starts, and both XPointers and pages are in
-        // document order, so the page holding a position is the last page whose
-        // start XPointer is <= the position. This replaced a scan of every page
-        // and every line (~1.2 s per call on juliet.epub), which KOReader then
-        // repeats a few times after opening a book.
+        // document order, so the page holding a position is normally the last
+        // page whose start XPointer is <= the position. That binary search
+        // replaced a scan of every page and every line (~1.2 s per call).
+        //
+        // It is only a hint, though: a page start is derived from its first
+        // line's *source* position, and for some books (repeated paragraphs,
+        // empty first lines) that position can be attributed to another node, so
+        // the list is not always in document order. Check the candidate against
+        // the lines of the page it names before trusting it.
         let sorted = self.sorted_page_positions();
+        let chunk_first = self.chunks.get(chunk_index).map(|meta| meta.first_page);
+        let chunk_last = self
+            .pages
+            .iter()
+            .rposition(|snapshot| snapshot.chunk == chunk_index)
+            .map(|index| index + 1);
+        let in_chunk = |page: usize| {
+            chunk_first.is_some_and(|first| page >= first)
+                && chunk_last.is_some_and(|last| page <= last)
+        };
         let mut candidate: Option<usize> = None;
         for (page, start) in sorted.iter() {
+            if !in_chunk(*page) {
+                continue;
+            }
             if start.cmp(position) != std::cmp::Ordering::Greater {
                 candidate = Some(*page);
             } else {
                 break;
             }
         }
-        if candidate.is_some() {
-            return Ok(candidate);
+        if let Some(page) = candidate {
+            // The list is only a hint: a page start comes from its first line,
+            // and some pages (those that begin with an inline image or SVG, or
+            // whose text is repeated) map to a position that does not fit the
+            // document order. Check the page the hint names against its own
+            // lines and step towards the right one; a handful of steps is
+            // enough, and falling through to the full scan here would cost a
+            // second per lookup.
+            let mut page = page;
+            for _ in 0..3 {
+                match self.page_vs_position(page, position)? {
+                    Some(std::cmp::Ordering::Equal) => return Ok(Some(page)),
+                    Some(std::cmp::Ordering::Less) => {
+                        if !in_chunk(page + 1) {
+                            break;
+                        }
+                        page += 1;
+                    }
+                    Some(std::cmp::Ordering::Greater) => {
+                        if page <= 1 || !in_chunk(page - 1) {
+                            break;
+                        }
+                        page -= 1;
+                    }
+                    // An image page has no text: the position is not on it,
+                    // and it is most likely before the next text page.
+                    None => {
+                        if page <= 1 || !in_chunk(page - 1) {
+                            break;
+                        }
+                        page -= 1;
+                    }
+                }
+            }
+            // Whatever the walk settled on is the best answer available; the
+            // alternative (scanning every page) is far more expensive.
+            return Ok(Some(page));
         }
         // Fall back to the line-range scan for positions before the first page
         // start (or pages without an XPointer).

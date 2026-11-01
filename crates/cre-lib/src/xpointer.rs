@@ -139,26 +139,25 @@ fn line_for_page<'a>(
 }
 
 fn fallback_position_for_line(root: &Node, line: &LineBox) -> Result<TextPosition> {
-    let text_id = match text_node_for_line(root, line) {
-        Ok(text_id) => text_id,
-        Err(_) => {
-            let element_id = nearest_real_element_id(root, line.node_id).with_context(
-                || "page line has no text node or element that can produce an XPointer",
-            )?;
-            return position_for_text_node(root, element_id, 0);
-        }
-    };
-    let content_len = root
-        .with(text_id)
-        .text_data()
-        .map_or(0, |text| text.content.chars().count() as u32);
-    let codepoint_offset = u32::try_from(line.text_start)
-        .unwrap_or(u32::MAX)
-        .min(content_len);
-    position_for_text_node(root, text_id, codepoint_offset)
+    // Same mapping the word positions use, so a page start and the words on
+    // that page stay comparable.
+    if let Ok(position) = position_for_line_offset(root, line, 0) {
+        return Ok(position);
+    }
+    let element_id = nearest_real_element_id(root, line.node_id)
+        .with_context(|| "page line has no text node or element that can produce an XPointer")?;
+    position_for_text_node(root, element_id, 0)
 }
 
 fn source_position_for_line(root: &Node, line: &LineBox) -> Option<TextPosition> {
+    // The same mapping the word positions use: it only considers the line's own
+    // block, so a page start and the words on that page stay comparable. Going
+    // through `map_line_text_position` with the line's `source_element_id`
+    // instead could attribute a page start to a body-level whitespace text node,
+    // which made the page-start list non-monotonic (juliet.epub).
+    if let Ok(position) = position_for_line_offset(root, line, 0) {
+        return Some(position);
+    }
     let (text_id, codepoint_offset) = source_text_position_for_line(root, line)?;
     position_for_text_node(root, text_id, codepoint_offset).ok()
 }
@@ -343,19 +342,6 @@ fn collect_text_node_ids_vec(node: &Node) -> Vec<NodeId> {
     out
 }
 
-fn text_node_for_line(root: &Node, line: &LineBox) -> Result<NodeId> {
-    if let Some(text_id) = first_text_node(root.with(line.node_id), false) {
-        return Ok(text_id);
-    }
-
-    let element_id = nearest_real_element_id(root, line.node_id).unwrap_or(line.node_id);
-    if let Some(text_id) = first_text_node(root.with(element_id), true) {
-        return Ok(text_id);
-    }
-
-    bail!("page line has no text node that can produce an XPointer")
-}
-
 fn nearest_real_element_id(root: &Node, node_id: NodeId) -> Option<NodeId> {
     let mut current_id = node_id;
     loop {
@@ -430,11 +416,6 @@ fn text_index_for_node(root: &Node, node_id: NodeId) -> Option<u32> {
     (total > 1).then_some(index)
 }
 
-/// Maps a byte offset inside a block's inline text onto a (text node,
-/// codepoint offset) pair. Parley indexes lines against the concatenation of
-/// the block's text nodes, so summing their raw lengths reproduces the same
-/// position exactly - unlike matching text prefixes, which can hit an earlier
-/// occurrence.
 fn text_node_for_block_offset(inline_root: &Node, byte_offset: usize) -> Option<(NodeId, u32)> {
     let inline_layout = inline_root.element_data()?.inline_layout_data.as_ref()?;
     let mut end = byte_offset.min(inline_layout.text.len());
@@ -442,6 +423,7 @@ fn text_node_for_block_offset(inline_root: &Node, byte_offset: usize) -> Option<
         end -= 1;
     }
     let mut remaining = inline_layout.text[..end].chars().count();
+    let mut last: Option<(NodeId, u32)> = None;
     for id in collect_text_node_ids_vec(inline_root) {
         let node = inline_root.with(id);
         let Some(text) = node.text_data() else {
@@ -452,8 +434,11 @@ fn text_node_for_block_offset(inline_root: &Node, byte_offset: usize) -> Option<
             return Some((id, remaining as u32));
         }
         remaining -= len;
+        last = Some((id, len as u32));
     }
-    None
+    // An offset exactly at the end of the block names the position just past
+    // its last character, which callers (line ends) need.
+    if remaining == 0 { last } else { None }
 }
 
 pub(crate) fn resolve_text_position(root: &Node, position: &TextPosition) -> Result<NodeId> {
