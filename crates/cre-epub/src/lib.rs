@@ -165,6 +165,50 @@ impl LazyResource {
         }
     }
 
+    /// Uncompressed size of a resource, straight from the zip directory.
+    /// Used to estimate how much a chunk's images will cost when decoded,
+    /// without reading (let alone decoding) them.
+    pub fn entry_size(&self, key: &str) -> Option<usize> {
+        let key = normalize_path(key);
+        if let Ok(cache) = self.cache.lock()
+            && let Some(hit) = cache.entries.get(&key)
+        {
+            return Some(hit.len());
+        }
+        let mut maybe_archive = self.zip_archive.lock().ok()?;
+        let archive = maybe_archive.as_mut()?;
+        let index = match archive.index_for_name(&key) {
+            Some(index) => Some(index),
+            None => {
+                let mut found = None;
+                for index in 0..archive.len() {
+                    if let Some(name) = archive.name_for_index(index)
+                        && normalize_path(name) == key
+                    {
+                        found = Some(index);
+                        break;
+                    }
+                }
+                found
+            }
+        }?;
+        let entry = archive.by_index(index).ok()?;
+        Some(entry.size() as usize)
+    }
+
+    /// Estimated decoded (RGBA) size of an image, from its header when the
+    /// bytes are available, else from the file size and format.
+    pub fn estimated_decoded_bytes(&self, key: &str) -> Option<usize> {
+        let key = normalize_path(key);
+        if let Some(bytes) = self.get(&key)
+            && let Some((width, height)) = image_dimensions(&bytes)
+        {
+            return Some((width as usize * height as usize * 4).max(64 * 1024));
+        }
+        self.entry_size(&key)
+            .map(|size| estimated_decoded_image_bytes(&key, size))
+    }
+
     /// (entries, bytes) currently cached, for tests and diagnostics.
     pub fn cache_stats(&self) -> (usize, usize) {
         let cache = self.cache.lock().unwrap();
@@ -514,6 +558,23 @@ impl EpubBook {
     }
 
     pub fn to_html_chunks(&self, options: &HtmlOptions, max_bytes: usize) -> Result<Vec<String>> {
+        self.to_html_chunks_budgeted(options, max_bytes, None)
+    }
+
+    /// Like [`Self::to_html_chunks`], but also caps how much image data a
+    /// chunk may reference.
+    ///
+    /// blitz decodes a chunk's images while parsing it, so a text budget
+    /// alone cannot bound memory on an illustrated book (measured: a 117 kB
+    /// chunk holding 16 JPEGs grew RSS by 57 MB inside `from_html`).
+    /// `image_budget` is in *estimated decoded* bytes, estimated from the zip
+    /// directory entry size and the image format, without decoding anything.
+    pub fn to_html_chunks_budgeted(
+        &self,
+        options: &HtmlOptions,
+        max_bytes: usize,
+        image_budget: Option<usize>,
+    ) -> Result<Vec<String>> {
         let docs = self.spine_documents()?;
         let head = self.html_head(options, &docs);
 
@@ -558,8 +619,26 @@ impl EpubBook {
             }
         }
 
+        // Estimated decoded bytes of each piece's images, so a chunk can be
+        // capped by image payload as well as by text size.
+        let piece_images: Vec<usize> = pieces
+            .iter()
+            .map(|piece| {
+                let dir = parent_dir(&piece.doc.href);
+                let mut total = 0usize;
+                for key in image_sources(&piece.body, dir) {
+                    total += self
+                        .resource_provider
+                        .estimated_decoded_bytes(&key)
+                        .unwrap_or(0);
+                }
+                total
+            })
+            .collect();
+
         let mut chunks = Vec::new();
         let mut body = String::new();
+        let mut body_images = 0usize;
         let flush = |body: &mut String, chunks: &mut Vec<String>| {
             let mut html = head.clone();
             html.push_str(body);
@@ -567,7 +646,7 @@ impl EpubBook {
             chunks.push(html);
             body.clear();
         };
-        for piece in pieces {
+        for (index, piece) in pieces.iter().enumerate() {
             let mut section = String::new();
             push_section_html(
                 &mut section,
@@ -576,14 +655,22 @@ impl EpubBook {
                 &piece.body,
                 piece.continuation,
             );
-            if !body.is_empty() && body.len() + section.len() > max_bytes {
+            let images = piece_images.get(index).copied().unwrap_or(0);
+            let over_text = !body.is_empty() && body.len() + section.len() > max_bytes;
+            let over_images = image_budget.is_some_and(|budget| {
+                !body.is_empty() && body_images > 0 && body_images + images > budget
+            });
+            if over_text || over_images {
                 flush(&mut body, &mut chunks);
+                body_images = 0;
             }
             body.push_str(&section);
+            body_images += images;
             // A part that was split out is already at the size limit; keep it
             // in its own chunk so the layout budget holds.
             if piece.continuation || piece.body.len() >= max_bytes {
                 flush(&mut body, &mut chunks);
+                body_images = 0;
             }
         }
         if !body.is_empty() || chunks.is_empty() {
@@ -867,6 +954,106 @@ fn floor_char_boundary(text: &str, index: usize) -> usize {
         index -= 1;
     }
     index
+}
+
+/// Root-relative resource paths of every `<img>` in a chunk body. Spine
+/// parsing rewrites `src` to `epub://book/...`, so both forms are accepted.
+fn image_sources(body: &str, doc_dir: &str) -> Vec<String> {
+    // ASCII lowercasing keeps byte offsets, so positions found in `lower` can
+    // be used to slice the original text (zip names are case-sensitive).
+    let lower = body.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut index = 0usize;
+    while let Some(found) = lower[index..].find("<img") {
+        let start = index + found;
+        let Some(end) = lower[start..].find('>').map(|offset| start + offset) else {
+            break;
+        };
+        if let Some(src_at) = lower[start..end].find("src=") {
+            let rest = &body[start + src_at + 4..end];
+            let rest = rest.trim_start();
+            if let Some(quote @ ('"' | '\'')) = rest.chars().next()
+                && let Some(close) = rest[1..].find(quote)
+            {
+                let value = rest[1..1 + close].split('#').next().unwrap_or("");
+                if let Some(relative) = value.strip_prefix("epub://book/") {
+                    out.push(normalize_path(relative));
+                } else if !value.is_empty() && !value.starts_with("data:") && !value.contains("://")
+                {
+                    out.push(normalize_path(&format!("{doc_dir}{value}")));
+                }
+            }
+        }
+        index = end + 1;
+    }
+    out
+}
+
+/// Width and height from an image header, without decoding the pixels.
+fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() > 24 && bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+        let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+        return Some((width, height));
+    }
+    if bytes.len() > 10 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
+        let width = u16::from_le_bytes(bytes[6..8].try_into().ok()?) as u32;
+        let height = u16::from_le_bytes(bytes[8..10].try_into().ok()?) as u32;
+        return Some((width, height));
+    }
+    if bytes.len() > 4 && bytes.starts_with(b"\xff\xd8") {
+        let mut index = 2usize;
+        while index + 9 < bytes.len() {
+            if bytes[index] != 0xFF {
+                index += 1;
+                continue;
+            }
+            let marker = bytes[index + 1];
+            if marker == 0xD8 || marker == 0xD9 || (0xD0..=0xD7).contains(&marker) {
+                index += 2;
+                continue;
+            }
+            let length = u16::from_be_bytes(bytes[index + 2..index + 4].try_into().ok()?) as usize;
+            if matches!(
+                marker,
+                0xC0 | 0xC1
+                    | 0xC2
+                    | 0xC3
+                    | 0xC5
+                    | 0xC6
+                    | 0xC7
+                    | 0xC9
+                    | 0xCA
+                    | 0xCB
+                    | 0xCD
+                    | 0xCE
+                    | 0xCF
+            ) {
+                let height =
+                    u16::from_be_bytes(bytes[index + 5..index + 7].try_into().ok()?) as u32;
+                let width = u16::from_be_bytes(bytes[index + 7..index + 9].try_into().ok()?) as u32;
+                return Some((width, height));
+            }
+            index += 2 + length;
+        }
+    }
+    None
+}
+
+/// Rough decoded size of an image resource, from its file size and format.
+fn estimated_decoded_image_bytes(name: &str, file_bytes: usize) -> usize {
+    let factor = if name.ends_with(".jpg") || name.ends_with(".jpeg") {
+        32
+    } else if name.ends_with(".png") || name.ends_with(".gif") {
+        4
+    } else if name.ends_with(".webp") {
+        12
+    } else if name.ends_with(".svg") {
+        return 2 * 1024 * 1024;
+    } else {
+        8
+    };
+    file_bytes.saturating_mul(factor)
 }
 
 fn tag_name(raw: &str) -> String {
@@ -2146,6 +2333,32 @@ fn escape_attr(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn image_budget_splits_chunks() {
+        // juliet.epub has a page-fit cover image; with a tiny image budget it
+        // must be kept apart from the rest of the text.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/koreader-test-data/juliet.epub");
+        if !path.exists() {
+            eprintln!("skipping: fixture missing");
+            return;
+        }
+        let book = EpubBook::open(&path).unwrap();
+        let options = HtmlOptions::default();
+        let free = book
+            .to_html_chunks_budgeted(&options, 8 * 1024 * 1024, None)
+            .unwrap();
+        let capped = book
+            .to_html_chunks_budgeted(&options, 8 * 1024 * 1024, Some(1024 * 1024))
+            .unwrap();
+        assert!(
+            capped.len() > free.len(),
+            "image budget did not split: {} vs {} chunks",
+            capped.len(),
+            free.len()
+        );
+    }
+
     #[test]
     fn resource_cache_is_byte_bounded() {
         let mut cache = ResourceCache::new(1000);

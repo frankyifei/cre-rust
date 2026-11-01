@@ -241,6 +241,14 @@ fn chunk_target_override() -> Option<usize> {
 
 /// Bytes the kernel says it can still hand out, if the platform reports it.
 fn available_memory_bytes() -> Option<usize> {
+    // Testing knob: pretend the device only has this much memory, so the
+    // chunk planner can be exercised on a desktop.
+    if let Ok(value) = std::env::var("CRE_AVAILABLE_MB")
+        && let Ok(mb) = value.trim().parse::<usize>()
+        && mb > 0
+    {
+        return Some(mb.saturating_mul(1024 * 1024));
+    }
     #[cfg(target_os = "linux")]
     {
         let info = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -276,6 +284,26 @@ fn split_single_document(html: String) -> Vec<String> {
         return vec![html];
     }
     cre_epub::split_html_document(&html, target)
+}
+
+/// Text and image budget for one layout chunk, from the memory the kernel can
+/// still hand out.
+///
+/// The text budget uses [`LAYOUT_BYTES_PER_HTML_BYTE`]; the image budget is in
+/// estimated decoded bytes, because blitz decodes a chunk's images while
+/// parsing it (a dense illustrated book costs far more than its text).
+fn chunk_budgets(available: Option<usize>) -> (usize, Option<usize>) {
+    let Some(available) = available else {
+        return (usize::MAX, None);
+    };
+    let budget = available
+        .saturating_sub(LAYOUT_MEMORY_RESERVE)
+        .min(available / 2)
+        .max(MIN_CHUNK_BYTES * LAYOUT_BYTES_PER_HTML_BYTE);
+    let text = (budget / LAYOUT_BYTES_PER_HTML_BYTE).clamp(MIN_CHUNK_BYTES, MAX_CHUNK_BYTES);
+    // Images may take up to 60% of the layout budget; the rest is text.
+    let images = (budget * 3) / 5;
+    (text, Some(images))
 }
 
 /// Chooses the layout chunk size for `total_html` bytes of generated content.
@@ -495,16 +523,8 @@ impl Document {
                 let htmls = match chunk_target_override() {
                     Some(target) => book.to_html_chunks(&html_options, target)?,
                     None => {
-                        // Lay the whole book out at once when it fits, which is
-                        // what crengine does and what keeps pagination stable.
-                        let whole = book.to_html_chunks(&html_options, usize::MAX)?;
-                        let total_html: usize = whole.iter().map(String::len).sum();
-                        let target = plan_chunk_bytes(total_html, available_memory_bytes());
-                        if target == usize::MAX {
-                            whole
-                        } else {
-                            book.to_html_chunks(&html_options, target)?
-                        }
+                        let (text_budget, image_budget) = chunk_budgets(available_memory_bytes());
+                        book.to_html_chunks_budgeted(&html_options, text_budget, image_budget)?
                     }
                 };
                 let cover_image = epub_cover_image(&book);
