@@ -1157,6 +1157,10 @@ unsafe fn format_name(format: DocumentFormat) -> &'static str {
         DocumentFormat::Fb2 => "FB2",
         DocumentFormat::Txt => "TXT",
         DocumentFormat::Html => "HTML",
+        // crengine reports every Palm Database book as "PDB"
+        // (`getDocFormatName(doc_format_pdb)`), and KOReader compares against
+        // that string when migrating XPointers.
+        DocumentFormat::Mobi | DocumentFormat::Azw3 => "PDB",
     }
 }
 

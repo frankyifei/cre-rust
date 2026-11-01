@@ -812,8 +812,45 @@ pub fn split_html_document(html: &str, limit: usize) -> Vec<String> {
     let head = &html[..body_open_end];
     parts
         .into_iter()
-        .map(|part| format!("{head}{part}{tail}"))
+        .enumerate()
+        .map(|(index, part)| {
+            // A `data-spine-index` names the document fragment an XPointer
+            // points into, and the layout maps it to one chunk. A section that
+            // straddles a chunk cut would otherwise be named by the same slot
+            // in two chunks, so the second one could never resolve; give every
+            // part its own slot range. (Only EPUB uses these attributes today,
+            // but single-document formats use this splitter.)
+            let part = if index == 0 {
+                part
+            } else {
+                renumber_spine_indices(&part, index)
+            };
+            format!("{head}{part}{tail}")
+        })
         .collect()
+}
+
+/// Shifts every `data-spine-index="N"` in a split part by `part * 100_000`
+/// so slots stay unique across parts.
+fn renumber_spine_indices(html: &str, part_index: usize) -> String {
+    const NEEDLE: &str = "data-spine-index=\"";
+    let base = part_index * 100_000;
+    let mut out = String::with_capacity(html.len() + 16);
+    let mut at = 0usize;
+    while let Some(relative) = html[at..].find(NEEDLE) {
+        let value_start = at + relative + NEEDLE.len();
+        let Some(length) = html[value_start..].find('"').filter(|length| *length > 0) else {
+            break;
+        };
+        let Ok(value) = html[value_start..value_start + length].parse::<u32>() else {
+            break;
+        };
+        out.push_str(&html[at..value_start]);
+        out.push_str(&(value + base as u32).to_string());
+        at = value_start + length;
+    }
+    out.push_str(&html[at..]);
+    out
 }
 
 /// Splits a spine item's body HTML into parts of at most `limit` bytes,

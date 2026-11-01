@@ -21,6 +21,8 @@ blitz-paint = { version = "=0.3.0-beta.4", default-features = false, features = 
 blitz-traits = "=0.3.0-beta.4"
 cre-epub = { path = "../cre-epub" }
 cre-fb2 = { path = "../cre-fb2" }
+cre-kf8 = { path = "../cre-kf8" }
+cre-mobi = { path = "../cre-mobi" }
 cre-paint = { path = "../cre-paint" }
 cre-text = { path = "../cre-text" }
 libc = "0.2"

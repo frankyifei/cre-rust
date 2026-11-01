@@ -385,6 +385,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cre-kf8"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cre-pdb",
+]
+
+[[package]]
 name = "cre-lib"
 version = "0.1.0"
 dependencies = [
@@ -396,6 +404,8 @@ dependencies = [
  "blitz-traits",
  "cre-epub",
  "cre-fb2",
+ "cre-kf8",
+ "cre-mobi",
  "cre-paint",
  "cre-text",
  "image",
@@ -422,6 +432,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cre-mobi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cre-pdb",
+]
+
+[[package]]
 name = "cre-paint"
 version = "0.1.0"
 dependencies = [
@@ -430,6 +448,13 @@ dependencies = [
  "peniko",
  "tiny-skia 0.11.4",
  "ttf-parser",
+]
+
+[[package]]
+name = "cre-pdb"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
 ]
 
 [[package]]

@@ -14,6 +14,8 @@ use cre_epub::{
     normalize_path,
 };
 use cre_fb2::{Fb2Book, Fb2HtmlOptions};
+use cre_kf8::{Kf8Book, Kf8HtmlOptions};
+use cre_mobi::{MobiBook, MobiHtmlOptions};
 use cre_paint::render_page as paint_page;
 use cre_paint::render_page_rgba as paint_page_rgba;
 
@@ -47,6 +49,10 @@ pub enum DocumentFormat {
     Fb2,
     Txt,
     Html,
+    /// MOBI 6 (`.mobi`, `.prc`, and `.azw` files with a MOBI 6 payload).
+    Mobi,
+    /// KF8 (`.azw3`, and `.azw` files with a KF8 payload).
+    Azw3,
 }
 
 #[derive(Clone, Debug)]
@@ -477,7 +483,8 @@ struct SnapshotLine {
 
 pub enum ResourceSource {
     Empty,
-    Fb2(Arc<HashMap<String, Vec<u8>>>),
+    /// Resources carried in memory, by name (FB2 binaries, MOBI/KF8 images).
+    Map(Arc<HashMap<String, Vec<u8>>>),
     Epub(Arc<LazyResource>),
 }
 
@@ -672,11 +679,105 @@ impl Document {
                 Self::build(
                     split_single_document(html),
                     "fb2://book/",
-                    Arc::new(Fb2Net {
+                    Arc::new(MapNet {
                         resources: binary.clone(),
                         svg: svg_raster.clone(),
                     }),
-                    ResourceSource::Fb2(binary),
+                    ResourceSource::Map(binary),
+                    cover_image,
+                    false,
+                    metadata,
+                    raw_toc,
+                    String::new(),
+                    Vec::new(),
+                    options,
+                    font_datas,
+                    defer_layout,
+                )
+            }
+            DocumentFormat::Mobi => {
+                let book = MobiBook::open(path)?;
+                let metadata = DocumentMetadata {
+                    format,
+                    title: book.title.clone(),
+                    creator: book.creator.clone(),
+                    language: book.language.clone(),
+                    series: None,
+                    description: book.description.clone(),
+                    keywords: book.keywords.clone(),
+                    identifiers: book.identifiers.clone(),
+                    item_count: book.section_count,
+                };
+                let html_options = MobiHtmlOptions {
+                    font_size: options.font_size.max(1.0),
+                    ..MobiHtmlOptions::default()
+                };
+                let (html, toc) = book.to_html_with_toc(&html_options);
+                let raw_toc = toc
+                    .into_iter()
+                    .map(|item| RawTocItem {
+                        title: item.title,
+                        href: item.href,
+                        depth: item.depth,
+                    })
+                    .collect();
+                let cover_image = book.cover_image.clone();
+                let resources = Arc::new(book.resources);
+                Self::build(
+                    split_single_document(html),
+                    "mobi://book/",
+                    Arc::new(MapNet {
+                        resources: resources.clone(),
+                        svg: svg_raster.clone(),
+                    }),
+                    ResourceSource::Map(resources),
+                    cover_image,
+                    false,
+                    metadata,
+                    raw_toc,
+                    String::new(),
+                    Vec::new(),
+                    options,
+                    font_datas,
+                    defer_layout,
+                )
+            }
+            DocumentFormat::Azw3 => {
+                let book = Kf8Book::open(path)?;
+                let metadata = DocumentMetadata {
+                    format,
+                    title: book.title.clone(),
+                    creator: book.creator.clone(),
+                    language: book.language.clone(),
+                    series: None,
+                    description: book.description.clone(),
+                    keywords: book.keywords.clone(),
+                    identifiers: book.identifiers.clone(),
+                    item_count: book.section_count,
+                };
+                let html_options = Kf8HtmlOptions {
+                    font_size: options.font_size.max(1.0),
+                    ..Kf8HtmlOptions::default()
+                };
+                let (html, toc) = book.to_html_with_toc(&html_options);
+                let raw_toc = toc
+                    .into_iter()
+                    .map(|item| RawTocItem {
+                        title: item.title,
+                        href: item.href,
+                        depth: item.depth,
+                    })
+                    .collect();
+                let cover_image = book.cover_image.clone();
+                let resources = Arc::new(book.resources);
+                Self::build(
+                    split_single_document(html),
+                    "azw3://book/",
+                    Arc::new(MapNet {
+                        resources: resources.clone(),
+                        svg: svg_raster.clone(),
+                    }),
+                    ResourceSource::Map(resources),
                     cover_image,
                     false,
                     metadata,
@@ -3286,6 +3387,12 @@ fn validate_options(options: &DocumentOptions) -> Result<()> {
 }
 
 fn detect_format(path: &Path) -> DocumentFormat {
+    // Palm Database files are identified by their header, not their extension:
+    // `.azw` holds either a MOBI 6 or a KF8 payload, and DFT files are often
+    // renamed. `sniff_pdb_format` only reads the header.
+    if let Some(format) = sniff_pdb_format(path) {
+        return format;
+    }
     match path
         .extension()
         .and_then(|e| e.to_str())
@@ -3296,8 +3403,41 @@ fn detect_format(path: &Path) -> DocumentFormat {
         "fb2" => DocumentFormat::Fb2,
         "txt" => DocumentFormat::Txt,
         "html" | "htm" | "xhtml" | "xml" => DocumentFormat::Html,
+        "mobi" | "prc" | "azw" | "pdb" => DocumentFormat::Mobi,
+        "azw3" => DocumentFormat::Azw3,
         _ => DocumentFormat::Epub,
     }
+}
+
+/// Reads just enough of a Palm Database file to tell MOBI 6 from KF8.
+///
+/// Both are `BOOKMOBI` containers; the MOBI header's version (8) plus a skeleton
+/// table (no `0xFFFFFFFF`) means the payload is KF8/AZW3.
+fn sniff_pdb_format(path: &Path) -> Option<DocumentFormat> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut header = [0u8; 82];
+    file.read_exact(&mut header).ok()?;
+    if &header[60..68] != b"BOOKMOBI" && &header[60..68] != b"TEXTREAd" {
+        return None;
+    }
+    if &header[60..68] == b"TEXTREAd" {
+        return Some(DocumentFormat::Mobi);
+    }
+    let record0 = u32::from_be_bytes([header[78], header[79], header[80], header[81]]) as u64;
+    file.seek(SeekFrom::Start(record0)).ok()?;
+    let mut mobi = [0u8; 0x110];
+    let read = file.read(&mut mobi).ok()?;
+    let mobi = &mobi[..read];
+    if mobi.len() < 0x104 {
+        return Some(DocumentFormat::Mobi);
+    }
+    let version = u32::from_be_bytes([mobi[36], mobi[37], mobi[38], mobi[39]]);
+    let skeleton = u32::from_be_bytes([mobi[0xFC], mobi[0xFD], mobi[0xFE], mobi[0xFF]]);
+    if version == 8 && skeleton != 0xFFFF_FFFF {
+        return Some(DocumentFormat::Azw3);
+    }
+    Some(DocumentFormat::Mobi)
 }
 
 fn resolve_font_path(options: &DocumentOptions) -> Result<PathBuf> {
@@ -3903,7 +4043,7 @@ fn common_ancestor(root: &Node, left: NodeId, right: NodeId) -> Option<NodeId> {
 fn lookup_resource(resources: &ResourceSource, key: &str) -> Option<Vec<u8>> {
     match resources {
         ResourceSource::Empty => None,
-        ResourceSource::Fb2(map) => map.get(key).cloned(),
+        ResourceSource::Map(map) => map.get(key).cloned(),
         ResourceSource::Epub(provider) => {
             let data = provider.get(key)?;
             Some((*data).clone())
@@ -4534,6 +4674,31 @@ fn href_key(href: &str) -> (String, Option<String>) {
     (path, fragment)
 }
 
+/// Y-position of the first laid-out node in document order at or after `target`.
+fn first_rect_after(doc: &HtmlDocument, target: NodeId) -> Option<f32> {
+    fn walk(doc: &HtmlDocument, node: &Node, target: NodeId, seen: &mut bool) -> Option<f32> {
+        if node.id == target {
+            *seen = true;
+        } else if *seen
+            // Only elements have layout data; text and comment nodes panic.
+            && node.element_data().is_some()
+            && let Some(rect) = doc.get_client_bounding_rect(node.id)
+            && rect.width > 0.0
+        {
+            return Some(rect.y as f32);
+        }
+        for child in node.children.iter() {
+            if let Some(top) = walk(doc, node.with(*child), target, seen) {
+                return Some(top);
+            }
+        }
+        None
+    }
+    let root = doc.root_element();
+    let mut seen = false;
+    walk(doc, root, target, &mut seen)
+}
+
 fn page_for_href(
     href_pages: &HashMap<(String, Option<String>), usize>,
     href: &str,
@@ -4547,10 +4712,14 @@ fn page_for_href(
 }
 
 fn page_for_node(doc: &HtmlDocument, node_id: NodeId, page_starts: &[PageStart]) -> Result<usize> {
-    let rect = doc
-        .get_client_bounding_rect(node_id)
-        .context("navigation target has no layout rect")?;
-    let top = rect.y as f32;
+    let top = match doc.get_client_bounding_rect(node_id) {
+        Some(rect) => rect.y as f32,
+        // Empty inline anchors (`<a id="fileposN"></a>`, which is what a MOBI
+        // link pointing into the middle of a text run becomes) get no layout
+        // box. The position they mean is the content that follows them, so use
+        // the first node after it that does have a box.
+        None => first_rect_after(doc, node_id).context("navigation target has no layout rect")?,
+    };
     let mut page = 1usize;
     for (index, start) in page_starts.iter().enumerate() {
         if top + 1.0 >= start.clip_top {
@@ -4659,12 +4828,14 @@ impl NetProvider for EpubNet {
     }
 }
 
-struct Fb2Net {
+/// Serves resources held in memory (FB2 binaries, MOBI/KF8 images), under
+/// `binary/<name>` or a bare `<name>`.
+struct MapNet {
     resources: Arc<HashMap<String, Vec<u8>>>,
     svg: Arc<SvgRaster>,
 }
 
-impl NetProvider for Fb2Net {
+impl NetProvider for MapNet {
     fn fetch(&self, _doc_id: usize, request: Request, handler: Box<dyn NetHandler>) {
         let path = percent_decode_str(request.url.path())
             .decode_utf8_lossy()

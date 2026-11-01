@@ -69,6 +69,8 @@ fn format_name(format: DocumentFormat) -> &'static str {
         DocumentFormat::Fb2 => "fb2",
         DocumentFormat::Txt => "txt",
         DocumentFormat::Html => "html",
+        DocumentFormat::Mobi => "mobi",
+        DocumentFormat::Azw3 => "azw3",
     }
 }
 
