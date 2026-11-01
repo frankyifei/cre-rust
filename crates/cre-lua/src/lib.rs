@@ -168,7 +168,12 @@ impl Doc {
     }
 
     fn default_font_feature_css(&self) -> String {
-        r#"body, div, p, span, li, td, th, h1, h2, h3, h4, h5, h6 { font-feature-settings: "halt" 1, "chws" 1; }"#.to_string()
+        // `chws` squeezes CJK punctuation and spacing marks, which is what
+        // crengine's character-width handling does. `halt` (alternate
+        // half-widths) is deliberately not enabled: it also changes Latin
+        // punctuation and some spacing glyphs to half an em, which crengine
+        // never does.
+        r#"body, div, p, span, li, td, th, h1, h2, h3, h4, h5, h6 { font-feature-settings: "chws" 1; }"#.to_string()
     }
 
     fn settings_stylesheet(&self) -> String {
