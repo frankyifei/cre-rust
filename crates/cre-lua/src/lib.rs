@@ -235,9 +235,11 @@ impl Doc {
             .iter()
             .collect::<Vec<(&String, &String)>>();
         alt_properties.sort_by(|left, right| left.0.cmp(right.0));
-        let global_gamma = GAMMA_INDEX.load(Ordering::Relaxed);
+        // Gamma (KOReader's contrast) is applied when painting and must not
+        // invalidate the layout: rebuilding the whole book for it was a
+        // multi-second freeze that changed nothing on the page.
         format!(
-            "{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
+            "{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
             path,
             self.width,
             self.height,
@@ -256,7 +258,6 @@ impl Doc {
             self.scale_font_with_dpi,
             properties,
             alt_properties,
-            global_gamma,
         )
     }
 
@@ -352,6 +353,7 @@ impl Doc {
     /// settings that were applied since the last layout.
     fn rebuild_with_current_settings(&mut self) {
         self.needs_relayout = false;
+        self.rerender_count = self.rerender_count.saturating_add(1);
         let Some(path) = self.path.clone() else {
             return;
         };
@@ -2084,9 +2086,12 @@ unsafe extern "C-unwind" fn doc_pos_from_xpointer(l: *mut lua_State) -> c_int {
 }
 
 unsafe extern "C-unwind" fn doc_current_pos(l: *mut lua_State) -> c_int {
-    // SAFETY: `l` is the active Lua state.
+    // SAFETY: `l` is the active Lua state. Deliberately not synced: KOReader
+    // asks for the position once per setting, and an XPointer is a text
+    // position that stays valid across a pending relayout. Forcing the rebuild
+    // here is exactly what made applying settings freeze for seconds.
     unsafe {
-        let pos = doc_ref(l)
+        let pos = doc_lazy_ref(l)
             .and_then(|doc| doc.inner.as_ref())
             .map(current_document_pos)
             .unwrap_or(0);
@@ -3126,10 +3131,9 @@ unsafe extern "C-unwind" fn doc_set_int_property(l: *mut lua_State) -> c_int {
                 }
             }
             "crengine.doc.embedded.fonts.enabled" => {}
-            "font.gamma"
-            | "font.gamma.index"
-            | "font.face.base.weight"
-            | "font.face.weight.embolden" => {
+            // font.gamma / font.gamma.index are paint-only (see
+            // render_state_snapshot); a change repaints, it does not relayout.
+            "font.face.base.weight" | "font.face.weight.embolden" => {
                 relayout = true;
             }
             _ => {}
@@ -3167,10 +3171,7 @@ unsafe extern "C-unwind" fn doc_set_string_property(l: *mut lua_State) -> c_int 
             "crengine.font.fallback.faces" if previous != value && doc.inner.is_some() => {
                 doc.relayout();
             }
-            "font.gamma"
-            | "font.gamma.index"
-            | "font.face.base.weight"
-            | "font.face.weight.embolden"
+            "font.face.base.weight" | "font.face.weight.embolden"
                 if previous != value && doc.inner.is_some() =>
             {
                 doc.relayout();
@@ -3236,17 +3237,27 @@ unsafe extern "C-unwind" fn doc_enable_partial(l: *mut lua_State) -> c_int {
 }
 
 unsafe extern "C-unwind" fn doc_partial_count(l: *mut lua_State) -> c_int {
-    // SAFETY: `l` is the active Lua state.
+    // SAFETY: `l` is the active Lua state. Not synced, for the same reason as
+    // doc_rerender_delayed.
     unsafe {
-        let count = doc_ref(l).map_or(0, |doc| doc.rerender_count as i64);
+        let count = doc_lazy_ref(l).map_or(0, |doc| doc.rerender_count as i64);
         push_int(l, count);
     }
     1
 }
 
 unsafe extern "C-unwind" fn doc_rerender_delayed(l: *mut lua_State) -> c_int {
-    // SAFETY: `l` is the active Lua state.
-    unsafe { push_bool(l, false) };
+    // SAFETY: `l` is the active Lua state. Not synced: reporting the delay is
+    // what lets KOReader skip the per-setting full rerender.
+    unsafe {
+        push_bool(
+            l,
+            // Only a pending *relayout* (settings changed after the first layout) is
+            // delayed; the very first layout must not be deferred or the page count
+            // would be missing right after opening.
+            doc_lazy_ref(l).is_some_and(|doc| doc.needs_relayout),
+        )
+    };
     1
 }
 
