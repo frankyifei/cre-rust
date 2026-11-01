@@ -4924,8 +4924,94 @@ pub unsafe extern "C" fn luaopen_cre(l: *mut lua_State) -> c_int {
 
         lua::lua_newtable(l);
         lua::luaL_register(l, ptr::null(), MODULE_FUNCS.as_ptr());
+        install_call_trace(l);
     }
     1
+}
+
+/// Optional call tracer: with `CRE_LUA_TRACE_PATH=<file>` every exported
+/// doc/image/module function appends `HH:MM:SS tag name` to the file, and
+/// calls slower than 20 ms also record their duration.
+///
+/// KOReader logs nothing while it applies settings after opening a book, so a
+/// silent window in `crash.log` cannot be attributed. The last lines here name
+/// what our module was doing (or that it was not called at all).
+fn install_call_trace(l: *mut lua_State) {
+    unsafe {
+        let Ok(path) = std::env::var("CRE_LUA_TRACE_PATH") else {
+            return;
+        };
+        const SHIM: &str = r##"
+local path, cre, doc_mt, img_mt = ...
+local function write(line)
+  local fh = io.open(path, "a")
+  if fh then fh:write(line .. string.char(10)); fh:close() end
+end
+local function pack(...) return { n = select("#", ...), ... } end
+local function replay(packed, index)
+  if index > packed.n then return end
+  return packed[index], replay(packed, index + 1)
+end
+local function wrap(tbl, tag)
+  if type(tbl) ~= "table" then return end
+  local names = {}
+  for k, v in pairs(tbl) do
+    if type(k) == "string" and type(v) == "function" and k:sub(1, 2) ~= "__" then
+      names[#names + 1] = k
+    end
+  end
+  for _, k in ipairs(names) do
+    local inner = tbl[k]
+    tbl[k] = function(...)
+      local started = os.clock()
+      local packed = pack(inner(...))
+      local elapsed = (os.clock() - started) * 1000
+      if elapsed >= 20 then
+        write(string.format("%s slow %s %s %.0fms", os.date("%H:%M:%S"), tag, k, elapsed))
+      else
+        write(string.format("%s %s %s", os.date("%H:%M:%S"), tag, k))
+      end
+      return replay(packed, 1)
+    end
+  end
+end
+wrap(cre, "cre")
+wrap(doc_mt, "doc")
+wrap(img_mt, "img")
+"##;
+        let Ok(chunk) = std::ffi::CString::new(SHIM) else {
+            return;
+        };
+        eprintln!("cre-lua: trace installing -> {path}");
+        let module_index = lua::lua_gettop(l);
+        if lua::luaL_loadstring(l, chunk.as_ptr()) != 0 {
+            let mut len = 0usize;
+            let msg = lua::lua_tolstring(l, -1, &mut len);
+            let text = if msg.is_null() {
+                "?".to_string()
+            } else {
+                std::ffi::CStr::from_ptr(msg).to_string_lossy().into_owned()
+            };
+            eprintln!("cre-lua: trace chunk error: {text}");
+            lua::lua_pop(l, 1);
+            return;
+        }
+        push_str(l, &path);
+        lua::lua_pushvalue(l, module_index);
+        lua::luaL_getmetatable(l, CREDOC.as_ptr().cast());
+        lua::luaL_getmetatable(l, CREIMAGE.as_ptr().cast());
+        if lua::lua_pcall(l, 4, 0, 0) != 0 {
+            let mut len = 0usize;
+            let msg = lua::lua_tolstring(l, -1, &mut len);
+            let text = if msg.is_null() {
+                "?".to_string()
+            } else {
+                std::ffi::CStr::from_ptr(msg).to_string_lossy().into_owned()
+            };
+            eprintln!("cre-lua: trace install failed: {text}");
+            lua::lua_pop(l, 1);
+        }
+    }
 }
 
 /// Compatibility fallback for devices whose libc predates glibc 2.16
