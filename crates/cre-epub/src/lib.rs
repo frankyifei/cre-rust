@@ -77,10 +77,69 @@ fn open_zip_archive(path: PathBuf) -> Option<LazyResourceZipArchive> {
     zip::ZipArchive::new(file).ok()
 }
 
+/// How many decompressed resource bytes are kept cached. Images are read
+/// during layout to learn their intrinsic size, so without a bound a book's
+/// whole image payload would stay resident for the session.
+const DEFAULT_RESOURCE_CACHE_BYTES: usize = 4 * 1024 * 1024;
+
+fn resource_cache_bytes() -> usize {
+    std::env::var("CRE_RESOURCE_CACHE_KB")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.saturating_mul(1024))
+        .unwrap_or(DEFAULT_RESOURCE_CACHE_BYTES)
+}
+
 pub struct LazyResource {
     pub epub_path: Option<PathBuf>,
-    cache: Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>,
+    cache: Arc<Mutex<ResourceCache>>,
     zip_archive: Arc<Mutex<Option<LazyResourceZipArchive>>>,
+}
+
+/// Small byte-bounded LRU over decompressed resources.
+#[derive(Default)]
+struct ResourceCache {
+    entries: HashMap<String, Arc<Vec<u8>>>,
+    order: std::collections::VecDeque<String>,
+    bytes: usize,
+    limit: usize,
+}
+
+impl ResourceCache {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            ..Self::default()
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<Arc<Vec<u8>>> {
+        let value = self.entries.get(key).cloned()?;
+        self.touch(key);
+        Some(value)
+    }
+
+    fn insert(&mut self, key: String, value: Arc<Vec<u8>>) {
+        self.bytes += value.len();
+        self.entries.insert(key.clone(), value);
+        self.touch(&key);
+        while self.bytes > self.limit {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(removed) = self.entries.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(removed.len());
+            }
+        }
+    }
+
+    fn touch(&mut self, key: &str) {
+        if let Some(position) = self.order.iter().position(|entry| entry == key) {
+            self.order.remove(position);
+        }
+        self.order.push_back(key.to_string());
+    }
 }
 
 impl LazyResource {
@@ -89,27 +148,32 @@ impl LazyResource {
         let zip_archive = open_zip_archive(path.clone());
         LazyResource {
             epub_path: Some(path),
-            cache: Arc::new(Mutex::new(HashMap::new())),
+            cache: Arc::new(Mutex::new(ResourceCache::new(resource_cache_bytes()))),
             zip_archive: Arc::new(Mutex::new(zip_archive)),
         }
     }
 
     pub fn from_map(resources: HashMap<String, Vec<u8>>) -> Self {
-        let mut cached: HashMap<String, Arc<Vec<u8>>> = HashMap::new();
+        let mut cache = ResourceCache::new(resource_cache_bytes());
         for (key, value) in resources.into_iter() {
-            cached.insert(normalize_path(&key), Arc::new(value));
+            cache.insert(normalize_path(&key), Arc::new(value));
         }
         LazyResource {
             epub_path: None,
-            cache: Arc::new(Mutex::new(cached)),
+            cache: Arc::new(Mutex::new(cache)),
             zip_archive: Arc::new(Mutex::new(None)),
         }
     }
 
+    /// (entries, bytes) currently cached, for tests and diagnostics.
+    pub fn cache_stats(&self) -> (usize, usize) {
+        let cache = self.cache.lock().unwrap();
+        (cache.entries.len(), cache.bytes)
+    }
+
     pub fn get(&self, key: &str) -> Option<Arc<Vec<u8>>> {
         let key = normalize_path(key);
-        let cached = self.cache.lock().unwrap().get(&key).cloned();
-        if let Some(hit) = cached {
+        if let Some(hit) = self.cache.lock().unwrap().get(&key) {
             return Some(hit);
         }
         let bytes = self.read_zip_entry(&key)?;
@@ -2080,6 +2144,20 @@ fn escape_attr(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resource_cache_is_byte_bounded() {
+        let mut cache = ResourceCache::new(1000);
+        for index in 0..10 {
+            cache.insert(format!("k{index}"), Arc::new(vec![index as u8; 300]));
+        }
+        let (entries, bytes) = (cache.entries.len(), cache.bytes);
+        assert!(bytes <= 1000, "cache holds {bytes} bytes");
+        assert!(entries <= 4, "cache kept {entries} entries");
+        // The most recently inserted entry survives, the oldest is evicted.
+        assert!(cache.get("k9").is_some());
+        assert!(cache.get("k0").is_none());
+    }
+
     #[test]
     fn split_body_html_keeps_content_and_balances_tags() {
         let body = format!("<div class=\"wrap\">{}</div>", "<p>alpha</p>".repeat(50));
