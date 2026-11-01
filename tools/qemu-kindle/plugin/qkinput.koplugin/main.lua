@@ -49,17 +49,44 @@ function QkInput:onReaderReady()
     if self.started then
         return
     end
+    self.started = true
+    self:runScript()
     self.fifo = os.getenv("QK_TAP_FIFO")
     if not self.fifo then
         return
     end
-    self.started = true
     self.fd = nil
     self.buffer = ""
     self.down = nil
     self.last = nil
     logger.info("qkinput: reading gestures from", self.fifo)
     self:schedule()
+end
+
+-- Optional automation hook: `QK_SCRIPT=<file.lua>` is loaded and must return
+-- a function, which is called with the reader UI once the document is ready.
+-- That drives real actions (open the ToC, select a chapter, change the font,
+-- turn pages) through KOReader's own modules, without synthesising menu taps.
+function QkInput:runScript()
+    local path = os.getenv("QK_SCRIPT")
+    if not path or path == "" then
+        return
+    end
+    local chunk, load_err = loadfile(path)
+    if not chunk then
+        logger.warn("qkinput: cannot load script:", load_err)
+        return
+    end
+    local ok, action = pcall(chunk)
+    if not ok or type(action) ~= "function" then
+        logger.warn("qkinput: script must return a function:", tostring(action))
+        return
+    end
+    logger.info("qkinput: running scripted action", path)
+    local ran, err = pcall(action, self.ui)
+    if not ran then
+        logger.warn("qkinput: script failed:", err)
+    end
 end
 
 function QkInput:schedule()

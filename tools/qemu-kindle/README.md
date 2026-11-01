@@ -113,6 +113,31 @@ Two consumers exist, and the harness routes viewer input to the plugin one:
 Taps work end to end (the page turns). Drags are emitted as `swipe` gestures;
 whether they page-turn depends on KOReader's swipe settings in this build.
 
+### Scripted actions (`QK_SCRIPT`)
+
+Synthesising menu taps is slow and brittle. `QK_SCRIPT=<file.lua>` makes
+`qkinput.koplugin` load a Lua file once the document is ready and call the
+function it returns with the reader UI, so any KOReader action can be driven
+through its own modules:
+
+```lua
+local UIManager = require("ui/uimanager")
+local Event = require("ui/event")
+
+return function(ui)
+    local toc = ui.document:getToc()
+    UIManager:scheduleIn(2, function()
+        local item = toc[#toc]
+        ui.link:addCurrentLocationToStack()
+        ui:handleEvent(Event:new("GotoXPointer", item.xpointer, item.xpointer))
+    end)
+end
+```
+
+`logger.info(...)` output lands in the run's `reader.log`, which makes it
+usable for timing a path (`os.clock()` around the call) as well as for
+reproducing a bug. The hook is inert unless `QK_SCRIPT` is set.
+
 ## Notes and limitations
 
 - The package's `libs/libkoreader-cre.so` is replaced; the original is
