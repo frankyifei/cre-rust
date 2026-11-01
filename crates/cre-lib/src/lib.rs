@@ -455,6 +455,9 @@ pub struct Document {
     page_image_cache: RefCell<HashMap<usize, PageImage>>,
     page_cache_order: RefCell<Vec<usize>>,
     page_boxes_cache: RefCell<Option<(usize, Vec<SnapshotLine>)>>,
+    /// Parsed page-start XPointers, in document order (see
+    /// [`Self::sorted_page_positions`]).
+    page_positions_cache: RefCell<Option<Vec<(usize, TextPosition)>>>,
 }
 
 impl Document {
@@ -770,6 +773,7 @@ impl Document {
             page_image_cache: RefCell::new(HashMap::new()),
             page_cache_order: RefCell::new(Vec::new()),
             page_boxes_cache: RefCell::new(None),
+            page_positions_cache: RefCell::new(None),
         };
         if !defer_layout {
             document.ensure_layout()?;
@@ -961,6 +965,7 @@ impl Document {
 
         self.chunks = chunks;
         self.pages = pages;
+        *self.page_positions_cache.borrow_mut() = None;
         self.xpointer_pages = xpointer_pages;
         self.href_pages = href_pages;
         self.spine_to_chunk = spine_to_chunk;
@@ -2512,6 +2517,25 @@ impl Document {
         if self.chunks.get(chunk_index).is_none() {
             return Ok(None);
         }
+        // Page starts are line starts, and both XPointers and pages are in
+        // document order, so the page holding a position is the last page whose
+        // start XPointer is <= the position. This replaced a scan of every page
+        // and every line (~1.2 s per call on juliet.epub), which KOReader then
+        // repeats a few times after opening a book.
+        let sorted = self.sorted_page_positions();
+        let mut candidate: Option<usize> = None;
+        for (page, start) in sorted.iter() {
+            if start.cmp(position) != std::cmp::Ordering::Greater {
+                candidate = Some(*page);
+            } else {
+                break;
+            }
+        }
+        if candidate.is_some() {
+            return Ok(candidate);
+        }
+        // Fall back to the line-range scan for positions before the first page
+        // start (or pages without an XPointer).
         let pages = self
             .pages
             .iter()
@@ -2532,6 +2556,24 @@ impl Document {
             }
         }
         Ok(None)
+    }
+
+    /// Parsed page-start XPointers, in document order, cached until the layout
+    /// changes.
+    fn sorted_page_positions(&self) -> Vec<(usize, TextPosition)> {
+        if let Some(cached) = self.page_positions_cache.borrow().as_ref() {
+            return cached.clone();
+        }
+        let mut sorted = Vec::with_capacity(self.pages.len());
+        for (index, snapshot) in self.pages.iter().enumerate() {
+            if let Some(xpointer) = snapshot.xpointer.as_deref()
+                && let Ok(position) = parse_text_position(xpointer)
+            {
+                sorted.push((index + 1, position));
+            }
+        }
+        *self.page_positions_cache.borrow_mut() = Some(sorted.clone());
+        sorted
     }
 
     pub fn go_to_xpointer(&mut self, xpointer: &str) -> Result<usize> {
