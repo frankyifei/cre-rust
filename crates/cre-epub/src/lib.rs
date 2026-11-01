@@ -758,7 +758,9 @@ fn split_body_html(body: &str, limit: usize) -> Vec<String> {
         if text_end > index {
             let mut text = &body[index..text_end];
             while !text.is_empty() {
-                let room = limit.saturating_sub(current.len());
+                // Byte budget, floored to a character boundary: CJK text has
+                // 3-byte characters, so a raw byte offset can land inside one.
+                let room = floor_char_boundary(text, limit.saturating_sub(current.len()));
                 if text.len() <= room {
                     if !text.trim().is_empty() {
                         dirty = true;
@@ -773,7 +775,7 @@ fn split_body_html(body: &str, limit: usize) -> Vec<String> {
                     .rfind('\n')
                     .map(|position| position + 1)
                     .or_else(|| text[..room].rfind(' ').map(|position| position + 1))
-                    .unwrap_or_else(|| floor_char_boundary(text, room));
+                    .unwrap_or(room);
                 if cut == 0 {
                     current.push_str(text);
                     break;
@@ -2197,6 +2199,30 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(styles.len(), 1, "style element must not be split");
         assert!(styles[0].contains("'<b>not markup</b>'"));
+    }
+
+    #[test]
+    fn split_body_html_cuts_cjk_text_on_char_boundaries() {
+        let body = format!(
+            "<div>{}</div>",
+            "这是一个用来测试分页切分的很长的中文句子。".repeat(200)
+        );
+        // A limit that is very unlikely to fall on a character boundary.
+        let parts = split_body_html(&body, 1001);
+        assert!(parts.len() > 1);
+        let joined = parts.concat();
+        assert_eq!(
+            joined.matches('中').count(),
+            body.matches('中').count(),
+            "CJK text must survive splitting byte-exactly"
+        );
+        for part in &parts {
+            assert_eq!(
+                part.matches("<div").count(),
+                part.matches("</div>").count(),
+                "unbalanced div in part"
+            );
+        }
     }
 
     #[test]
