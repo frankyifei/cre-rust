@@ -391,6 +391,72 @@ struct PageMeta {
     page_flow: i64,
 }
 
+/// One chunk's layout, in the chunk's own coordinates.
+///
+/// Keeping this per chunk (instead of only the flattened page list) is what
+/// makes a settings change cheap: the chunks that are not being read keep their
+/// pages as a provisional page list and are laid out again only when they are
+/// needed, like crengine's `ldomDocument::partialRender` for a `DocFragment`.
+struct ChunkLayout {
+    pages: Vec<LocalPage>,
+    /// Page-start XPointer per local page.
+    xpointers: Vec<Option<String>>,
+    /// Anchors found in this chunk, to a 0-based local page.
+    href_pages: HashMap<(String, Option<String>), usize>,
+    /// (spine slot, real spine index) of every spine item in this chunk.
+    spine_slots: Vec<(u32, u32)>,
+    line_count: usize,
+    max_flow: i64,
+}
+
+struct LocalPage {
+    start: PageStart,
+    clip_bottom: f32,
+    render_height: f32,
+    page_flow: i64,
+}
+
+impl ChunkLayout {
+    /// Rescales a provisional page list to `target` pages.
+    ///
+    /// Used after a settings change so the page count of the chunks that are not
+    /// laid out yet stays in the right ballpark; the pages themselves are
+    /// redone as soon as the chunk is read. Entries are sampled from the old
+    /// list, which keeps their order (and therefore XPointer ordering) intact.
+    fn resample(&mut self, target: usize) {
+        let current = self.pages.len();
+        if current == 0 || target == 0 || target == current {
+            return;
+        }
+        let mut pages = Vec::with_capacity(target);
+        let mut xpointers = Vec::with_capacity(target);
+        for index in 0..target {
+            let source = index * current / target;
+            let page = &self.pages[source];
+            pages.push(LocalPage {
+                start: page.start,
+                clip_bottom: page.clip_bottom,
+                render_height: page.render_height,
+                page_flow: page.page_flow,
+            });
+            xpointers.push(self.xpointers.get(source).cloned().flatten());
+        }
+        for local_page in self.href_pages.values_mut() {
+            *local_page = (*local_page * target / current).min(target - 1);
+        }
+        self.pages = pages;
+        self.xpointers = xpointers;
+    }
+}
+
+struct ChunkEntry {
+    /// `None` before this chunk has ever been laid out.
+    layout: Option<ChunkLayout>,
+    /// True when `layout` predates the current settings: its pages still stand
+    /// in for real ones, but the chunk is laid out again when it is next used.
+    stale: bool,
+}
+
 /// Absolute vertical extent of a replaced element (image) inside a chunk's
 /// layout, so pagination can keep it on one page instead of clipping it.
 #[derive(Clone, Copy, Debug)]
@@ -433,6 +499,12 @@ pub struct Document {
     has_non_linear_flows: bool,
     net: Arc<dyn NetProvider>,
     font_context: Arc<FontContext>,
+    /// Every chunk's own layout, parallel to `sources`.
+    entries: Vec<ChunkEntry>,
+    /// True when the chunk HTML carries no layout settings of its own, so new
+    /// settings can be applied by laying the existing chunks out again instead
+    /// of regenerating (and possibly re-chunking) the document.
+    layout_independent_sources: bool,
     chunks: Vec<ChunkMeta>,
     pages: Vec<PageMeta>,
     xpointer_pages: HashMap<String, usize>,
@@ -737,6 +809,9 @@ impl Document {
         defer_layout: bool,
     ) -> Result<Self> {
         let font_context = Arc::new(build_font_ctx_with_fallbacks(font_datas));
+        // Only the EPUB generator emits chunk HTML without the layout settings
+        // in it, which is what allows a relayout instead of a reopen.
+        let layout_independent_sources = matches!(metadata.format, DocumentFormat::Epub);
         let mut document = Self {
             metadata,
             width: options.width,
@@ -755,6 +830,8 @@ impl Document {
             has_non_linear_flows,
             net,
             font_context,
+            entries: Vec::new(),
+            layout_independent_sources,
             chunks: Vec::new(),
             pages: Vec::new(),
             xpointer_pages: HashMap::new(),
@@ -781,14 +858,9 @@ impl Document {
         Ok(document)
     }
 
-    /// Lays out the pages, TOC page numbers and page map, unless that already
-    /// happened. Cheap to call more than once.
-    pub fn ensure_layout(&mut self) -> Result<()> {
-        if self.layout_done {
-            return Ok(());
-        }
-        self.layout_done = true;
-        let options = DocumentOptions {
+    /// The options used to lay chunk HTML out, built from the current settings.
+    fn layout_options(&self) -> DocumentOptions {
+        DocumentOptions {
             width: self.width,
             height: self.height,
             layout_height: self.layout_height,
@@ -799,140 +871,241 @@ impl Document {
             stylesheet: self.stylesheet.clone(),
             embedded_styles_enabled: self.embedded_styles_enabled,
             viewport_scale: self.viewport_scale,
-        };
-        let base_url = self.base_url.clone();
-        let net = self.net.clone();
-        let font_context = self.font_context.clone();
-        let htmls = std::mem::take(&mut self.sources);
-        let raw_toc = std::mem::take(&mut self.raw_toc);
-        let page_map_items = std::mem::take(&mut self.raw_page_map_items);
-        let mut chunks = Vec::with_capacity(htmls.len());
-        let mut pages = Vec::new();
-        let mut page_xpointers = Vec::new();
-        let mut xpointer_pages = HashMap::new();
-        let mut href_pages = HashMap::new();
-        let mut spine_to_chunk = HashMap::new();
-        let mut spine_real_index = HashMap::new();
-        let mut line_base = 0usize;
-        let mut max_flow = 0i64;
-        let mut running_doc_top = 0.0;
+        }
+    }
 
-        for (chunk_index, html) in htmls.iter().enumerate() {
-            let doc = create_document(html, &base_url, net.clone(), font_context.clone(), &options);
-            let root = doc.root_element();
-            let lines = collect_lines(root);
-            let mut line_indices: HashMap<NodeId, Vec<usize>> = HashMap::new();
-            for (local_line, line) in lines.iter().enumerate() {
-                line_indices
-                    .entry(line.node_id)
-                    .or_default()
-                    .push(local_line);
+    fn apply_options(&mut self, options: &DocumentOptions) {
+        self.width = options.width;
+        self.height = options.height;
+        self.layout_height = options.layout_height;
+        self.page_margin = options.page_margin;
+        self.font_css_size = options.font_size;
+        self.stylesheet = options.stylesheet.clone();
+        self.embedded_styles_enabled = options.embedded_styles_enabled;
+        self.viewport_scale = options.viewport_scale;
+    }
+
+    /// Replaces the fonts used by the next chunk layout. Chunks already laid out
+    /// keep their own copy until they are laid out again.
+    pub fn set_fonts(&mut self, font_datas: &[FontBlob]) {
+        self.font_context = Arc::new(build_font_ctx_with_fallbacks(font_datas));
+        *self.active.borrow_mut() = None;
+    }
+
+    /// Lays out one chunk with the current settings.
+    ///
+    /// The built DOM is returned too: the caller that is about to draw from this
+    /// chunk installs it as the active chunk, instead of parsing the HTML a
+    /// second time.
+    fn layout_chunk(
+        &self,
+        chunk_index: usize,
+    ) -> Result<(ChunkLayout, HtmlDocument, Vec<LineBox>, Vec<PageStart>)> {
+        let started = std::time::Instant::now();
+        let html = self
+            .sources
+            .get(chunk_index)
+            .context("document chunk is missing")?
+            .clone();
+        let options = self.layout_options();
+        let doc = create_document(
+            &html,
+            &self.base_url,
+            self.net.clone(),
+            self.font_context.clone(),
+            &options,
+        );
+        let root = doc.root_element();
+        let lines = collect_lines(root);
+        let mut line_indices: HashMap<NodeId, Vec<usize>> = HashMap::new();
+        for (local_line, line) in lines.iter().enumerate() {
+            line_indices
+                .entry(line.node_id)
+                .or_default()
+                .push(local_line);
+        }
+        let mut max_flow = 0i64;
+        let mut line_flows = lines.iter().map(|_| 0i64).collect::<Vec<i64>>();
+        collect_line_flows(root, 0, &mut max_flow, &line_indices, &mut line_flows);
+        let forced_breaks = page_breaks::collect_forced_breaks(root);
+        let boxes = collect_content_boxes(&doc, root);
+        let (page_height_css_u32, page_height_css, page_margin_css) = css_page_geometry(
+            options.width,
+            options.height,
+            options.viewport_scale,
+            options.page_margin,
+        );
+        let page_starts = paginate(
+            &lines,
+            &boxes,
+            &forced_breaks,
+            page_height_css,
+            page_margin_css,
+            page_margin_css,
+        );
+        let mut local_xpointer_pages = HashMap::new();
+        let xpointers = xpointer::page_xpointers(
+            root,
+            &lines,
+            &page_starts,
+            page_height_css_u32,
+            page_margin_css,
+            &mut local_xpointer_pages,
+        );
+        let mut href_pages = HashMap::new();
+        for (key, node_id) in collect_anchor_maps(root) {
+            if let Ok(local_page) = page_for_node(&doc, node_id, &page_starts) {
+                href_pages.entry(key).or_insert(local_page - 1);
             }
-            let mut line_flows = lines.iter().map(|_| 0i64).collect::<Vec<i64>>();
-            collect_line_flows(root, 0, &mut max_flow, &line_indices, &mut line_flows);
-            let forced_breaks = page_breaks::collect_forced_breaks(root);
-            let boxes = collect_content_boxes(&doc, root);
-            let (page_height_css_u32, page_height_css, page_margin_css) = css_page_geometry(
-                options.width,
-                options.height,
-                options.viewport_scale,
-                options.page_margin,
-            );
-            let page_starts = paginate(
-                &lines,
-                &boxes,
-                &forced_breaks,
-                page_height_css,
-                page_margin_css,
-                page_margin_css,
-            );
-            let first_page = pages.len() + 1;
-            let mut local_xpointer_pages = HashMap::new();
-            let local_page_xpointers = xpointer::page_xpointers(
-                root,
-                &lines,
-                &page_starts,
-                page_height_css_u32,
-                page_margin_css,
-                &mut local_xpointer_pages,
-            );
-            let anchors = collect_anchor_maps(root);
-            for (key, node_id) in anchors {
-                if let Ok(local_page) = page_for_node(&doc, node_id, &page_starts) {
-                    href_pages.entry(key).or_insert(first_page + local_page - 1);
-                }
-            }
+        }
+        let mut spine_slots = Vec::new();
+        {
+            let mut spine_to_chunk = HashMap::new();
+            let mut spine_real_index = HashMap::new();
             collect_spine_chunks(
                 root,
                 chunk_index,
                 &mut spine_to_chunk,
                 &mut spine_real_index,
             );
+            spine_slots.extend(
+                spine_to_chunk
+                    .keys()
+                    .map(|slot| (*slot, *spine_real_index.get(slot).unwrap_or(slot))),
+            );
+            spine_slots.sort_unstable();
+        }
+        let mut pages = Vec::with_capacity(page_starts.len());
+        let mut previous_page_flow = 0;
+        for (local_index, start) in page_starts.iter().enumerate() {
+            let clip_bottom =
+                page_chunk_clip_bottom(&page_starts, local_index, page_height_css, page_margin_css);
+            let page_flow = first_non_blank_line_flow(
+                root,
+                &lines,
+                *start,
+                clip_bottom,
+                line_flows.as_slice(),
+                previous_page_flow,
+            );
+            previous_page_flow = page_flow;
+            let render_height =
+                ((clip_bottom - start.top).max(0.0) * options.viewport_scale).max(0.0);
+            pages.push(LocalPage {
+                start: *start,
+                clip_bottom,
+                render_height,
+                page_flow,
+            });
+        }
+        let layout = ChunkLayout {
+            pages,
+            xpointers,
+            href_pages,
+            spine_slots,
+            line_count: lines.len(),
+            max_flow,
+        };
+        if std::env::var_os("CRE_LAYOUT_TIMING").is_some() {
+            eprintln!(
+                "cre-lib: chunk {chunk_index} laid out in {:.0} ms ({} pages, {} lines)",
+                started.elapsed().as_secs_f64() * 1000.0,
+                layout.pages.len(),
+                layout.line_count
+            );
+        }
+        Ok((layout, doc, lines, page_starts))
+    }
 
-            let mut previous_page_flow = 0;
-            for (local_index, start) in page_starts.iter().enumerate() {
-                let clip_bottom = page_chunk_clip_bottom(
-                    &page_starts,
-                    local_index,
-                    page_height_css,
-                    page_margin_css,
-                );
-                let page_flow = first_non_blank_line_flow(
-                    root,
-                    &lines,
-                    *start,
-                    clip_bottom,
-                    line_flows.as_slice(),
-                    previous_page_flow,
-                );
-                previous_page_flow = page_flow;
-                let render_height =
-                    ((clip_bottom - start.top).max(0.0) * options.viewport_scale).max(0.0);
-                let doc_top = running_doc_top;
-                running_doc_top += render_height;
-                let xpointer = local_page_xpointers
-                    .get(local_index)
-                    .and_then(|xpointer| xpointer.clone());
-                if let Some(xpointer) = &xpointer {
-                    xpointer_pages.insert(xpointer.clone(), first_page + local_index);
+    /// Lays out `chunk_index` and keeps its DOM active, ready to draw.
+    fn lay_out_chunk_now(&mut self, chunk_index: usize) -> Result<()> {
+        let (layout, doc, lines, page_starts) = self.layout_chunk(chunk_index)?;
+        if let Some(entry) = self.entries.get_mut(chunk_index) {
+            *entry = ChunkEntry {
+                layout: Some(layout),
+                stale: false,
+            };
+        }
+        *self.active.borrow_mut() = Some(ActiveChunk {
+            index: chunk_index,
+            doc,
+            lines,
+            page_starts,
+        });
+        *self.page_boxes_cache.borrow_mut() = None;
+        self.clear_page_image_cache();
+        Ok(())
+    }
+
+    /// Rebuilds the flattened page list, TOC page numbers and page map from the
+    /// per-chunk layouts.
+    fn rebuild_view(&mut self) {
+        self.pages.clear();
+        self.chunks.clear();
+        self.xpointer_pages.clear();
+        self.href_pages.clear();
+        self.spine_to_chunk.clear();
+        self.spine_real_index.clear();
+        *self.page_positions_cache.borrow_mut() = None;
+        let mut line_base = 0usize;
+        let mut running_doc_top = 0.0f32;
+        let mut max_flow = 0i64;
+        for (chunk_index, entry) in self.entries.iter().enumerate() {
+            let first_page = self.pages.len() + 1;
+            if let Some(layout) = entry.layout.as_ref() {
+                for (local_index, page) in layout.pages.iter().enumerate() {
+                    let doc_top = running_doc_top;
+                    running_doc_top += page.render_height;
+                    let xpointer = layout.xpointers.get(local_index).cloned().flatten();
+                    if let Some(xpointer) = xpointer.as_ref() {
+                        self.xpointer_pages
+                            .insert(xpointer.clone(), first_page + local_index);
+                    }
+                    self.pages.push(PageMeta {
+                        chunk: chunk_index,
+                        local_start: page.start,
+                        local_clip_bottom: page.clip_bottom,
+                        doc_top,
+                        render_height: page.render_height,
+                        xpointer,
+                        page_flow: page.page_flow,
+                    });
                 }
-                page_xpointers.push(xpointer.clone());
-                pages.push(PageMeta {
-                    chunk: chunk_index,
-                    local_start: *start,
-                    local_clip_bottom: clip_bottom,
-                    doc_top,
-                    render_height,
-                    xpointer,
-                    page_flow,
-                });
+                for (key, local_page) in layout.href_pages.iter() {
+                    self.href_pages
+                        .entry(key.clone())
+                        .or_insert(first_page + local_page);
+                }
+                for (slot, real) in layout.spine_slots.iter() {
+                    self.spine_to_chunk.insert(*slot, chunk_index);
+                    self.spine_real_index.insert(*slot, *real);
+                }
+                max_flow = max_flow.max(layout.max_flow);
             }
-
-            chunks.push(ChunkMeta {
+            self.chunks.push(ChunkMeta {
                 first_page,
                 line_base,
             });
-            line_base += lines.len();
-            // The chunk's DOM and line boxes are only needed to derive page
-            // metadata; release them now so the pass stays flat in RSS
-            // instead of accumulating one chunk's arenas per iteration.
-            drop(doc);
-            drop(lines);
-            trim_memory();
+            line_base += entry
+                .layout
+                .as_ref()
+                .map(|layout| layout.line_count)
+                .unwrap_or(0);
         }
-        spine_to_chunk.entry(1).or_insert(0);
+        self.spine_to_chunk.entry(1).or_insert(0);
 
-        let toc = raw_toc
-            .into_iter()
+        let toc = self
+            .raw_toc
+            .iter()
             .map(|item| {
-                let page = page_for_href(&href_pages, &item.href).ok();
+                let page = page_for_href(&self.href_pages, &item.href).ok();
                 let xpointer = page.and_then(|page| {
-                    page_xpointers
+                    self.pages
                         .get(page.saturating_sub(1))
-                        .and_then(|xpointer| xpointer.clone())
+                        .and_then(|snapshot| snapshot.xpointer.clone())
                 });
                 TocEntry {
-                    title: item.title,
+                    title: item.title.clone(),
                     href: item.href.clone(),
                     depth: item.depth,
                     page,
@@ -940,42 +1113,239 @@ impl Document {
                 }
             })
             .collect();
+        self.toc = toc;
 
-        let mut page_map: Vec<PageMapEntry> = page_map_items
-            .into_iter()
+        let mut page_map: Vec<PageMapEntry> = self
+            .raw_page_map_items
+            .iter()
             .filter_map(|item| {
-                let page = page_for_href(&href_pages, &item.href).ok()?;
-                let xpointer = page_xpointers
-                    .get(page.saturating_sub(1))
-                    .cloned()
-                    .flatten();
-                let doc_y = pages
-                    .get(page.saturating_sub(1))
+                let page = page_for_href(&self.href_pages, &item.href).ok()?;
+                let snapshot = self.pages.get(page.saturating_sub(1));
+                let xpointer = snapshot.and_then(|snapshot| snapshot.xpointer.clone());
+                let doc_y = snapshot
                     .map(|snapshot| snapshot.doc_top.max(0.0).round() as i64)
-                    .unwrap_or(page.saturating_sub(1) as i64 * options.height as i64);
+                    .unwrap_or(page.saturating_sub(1) as i64 * self.height as i64);
                 Some(PageMapEntry {
                     page,
                     xpointer,
                     doc_y,
-                    label: item.label,
+                    label: item.label.clone(),
                 })
             })
             .collect();
         page_map.sort_by_key(|entry| (entry.doc_y, entry.page));
-
-        self.chunks = chunks;
-        self.pages = pages;
-        *self.page_positions_cache.borrow_mut() = None;
-        self.xpointer_pages = xpointer_pages;
-        self.href_pages = href_pages;
-        self.spine_to_chunk = spine_to_chunk;
-        self.spine_real_index = spine_real_index;
-        self.toc = toc;
         self.page_map = page_map;
-        self.sources = htmls;
+
         if max_flow > 0 {
             self.has_non_linear_flows = true;
         }
+    }
+
+    /// True when these settings can be applied without regenerating the chunk
+    /// HTML, i.e. [`Self::relayout`] can do the work.
+    pub fn can_relayout_with(&self, options: &DocumentOptions) -> bool {
+        self.layout_independent_sources
+            && self.layout_done
+            && !self.sources.is_empty()
+            && !self.entries.is_empty()
+            // Image normalisation and the page-size CSS are baked into the chunk
+            // HTML, so a different page size needs a reopen.
+            && options.width == self.width
+            && options.height == self.height
+    }
+
+    /// Applies new layout settings without re-parsing the document.
+    ///
+    /// Only the chunk holding the current position is laid out now; every other
+    /// chunk keeps its previous pages as a provisional page list and is laid out
+    /// again the first time it is needed (see [`Self::ensure_page_layout`]).
+    /// That turns a font change on a large book from "lay out the whole book"
+    /// into "lay out the chapter being read", which is what crengine's partial
+    /// rerendering does. Returns `false` when the change needs a reopen.
+    pub fn relayout(&mut self, options: &DocumentOptions) -> Result<bool> {
+        if !self.can_relayout_with(options) {
+            return Ok(false);
+        }
+        // The chunk being read is laid out again straight away, so the page the
+        // reader is on is exact; everything else stays provisional.
+        let anchor = self
+            .current_page
+            .saturating_sub(1)
+            .min(self.pages.len().saturating_sub(1));
+        let (anchor_chunk, anchor_local) = match self.pages.get(anchor) {
+            Some(page) => (
+                page.chunk,
+                anchor + 1
+                    - self
+                        .chunks
+                        .get(page.chunk)
+                        .map(|c| c.first_page)
+                        .unwrap_or(1),
+            ),
+            None => (0, 0),
+        };
+        self.apply_options(options);
+        for entry in self.entries.iter_mut() {
+            entry.stale = entry.layout.is_some();
+        }
+        *self.page_boxes_cache.borrow_mut() = None;
+        self.clear_page_image_cache();
+        let old_anchor_pages = self
+            .entries
+            .get(anchor_chunk)
+            .and_then(|entry| entry.layout.as_ref())
+            .map(|layout| layout.pages.len())
+            .unwrap_or(0);
+        self.lay_out_chunk_now(anchor_chunk)?;
+        // The chunk that was laid out says what the new settings do to a page
+        // count; apply that ratio to the chunks that keep their old pages, so the
+        // total the reader is shown is close to the truth until it settles.
+        if old_anchor_pages > 0 {
+            let new_anchor_pages = self
+                .entries
+                .get(anchor_chunk)
+                .and_then(|entry| entry.layout.as_ref())
+                .map(|layout| layout.pages.len())
+                .unwrap_or(0);
+            if new_anchor_pages > 0 {
+                let ratio = new_anchor_pages as f32 / old_anchor_pages as f32;
+                if (ratio - 1.0).abs() > 0.02 {
+                    for entry in self.entries.iter_mut() {
+                        if entry.stale
+                            && let Some(layout) = entry.layout.as_mut()
+                        {
+                            let target =
+                                (layout.pages.len() as f32 * ratio).round().max(1.0) as usize;
+                            layout.resample(target);
+                        }
+                    }
+                }
+            }
+        }
+        self.rebuild_view();
+        let first_page = self
+            .chunks
+            .get(anchor_chunk)
+            .map(|c| c.first_page)
+            .unwrap_or(1);
+        let page_count = self
+            .entries
+            .get(anchor_chunk)
+            .and_then(|entry| entry.layout.as_ref())
+            .map(|layout| layout.pages.len())
+            .unwrap_or(1);
+        self.current_page = first_page + anchor_local.min(page_count.saturating_sub(1));
+        self.layout_done = true;
+        trim_memory();
+        Ok(true)
+    }
+
+    /// Remaps the page indices that move when chunk `chunk` is laid out again and
+    /// its page count changes from `old_count` to `new_count`.
+    fn rebase_pages(&mut self, chunk: usize, old_count: usize, new_count: usize) {
+        let Some(head) = self.chunks.get(chunk).map(|meta| meta.first_page) else {
+            return;
+        };
+        let page = self.current_page;
+        if page >= head + old_count {
+            let delta = new_count as i64 - old_count as i64;
+            self.current_page = (page as i64 + delta).max(1) as usize;
+        } else if page >= head {
+            let local = page - head;
+            self.current_page = head + local.min(new_count.saturating_sub(1));
+        }
+    }
+
+    /// Lays out `page`'s chunk if it still holds a provisional page list.
+    ///
+    /// Returns the page index to use: a chunk whose page count changes moves the
+    /// pages after it, including the requested page.
+    pub fn ensure_page_layout(&mut self, page: usize) -> Result<usize> {
+        let Some(index) = page.checked_sub(1) else {
+            return Ok(page);
+        };
+        let Some(snapshot) = self.pages.get(index) else {
+            return Ok(page);
+        };
+        let chunk = snapshot.chunk;
+        if !self.entries.get(chunk).is_some_and(|entry| entry.stale) {
+            return Ok(page);
+        }
+        let old_head = self
+            .chunks
+            .get(chunk)
+            .map(|meta| meta.first_page)
+            .unwrap_or(1);
+        let old_count = self
+            .entries
+            .get(chunk)
+            .and_then(|entry| entry.layout.as_ref())
+            .map(|layout| layout.pages.len())
+            .unwrap_or(0);
+        let local = page.saturating_sub(old_head);
+        self.lay_out_chunk_now(chunk)?;
+        self.rebuild_view();
+        let new_count = self
+            .entries
+            .get(chunk)
+            .and_then(|entry| entry.layout.as_ref())
+            .map(|layout| layout.pages.len())
+            .unwrap_or(1);
+        self.rebase_pages(chunk, old_count, new_count);
+        Ok(old_head + local.min(new_count.saturating_sub(1)))
+    }
+
+    /// Lays out the chunk an XPointer points into, if it is still provisional.
+    ///
+    /// Every XPointer names its `DocFragment` (spine item), and a spine item
+    /// belongs to exactly one chunk, so the target chunk is known without the
+    /// page list.
+    pub fn ensure_xpointer_layout(&mut self, xpointer: &str) -> Result<()> {
+        let Ok(position) = parse_text_position(xpointer) else {
+            return Ok(());
+        };
+        let Some(chunk) = self.spine_to_chunk.get(&position.spine_index).copied() else {
+            return Ok(());
+        };
+        if self.entries.get(chunk).is_some_and(|entry| entry.stale) {
+            let head = self
+                .chunks
+                .get(chunk)
+                .map(|meta| meta.first_page)
+                .unwrap_or(1);
+            let _ = self.ensure_page_layout(head)?;
+        }
+        Ok(())
+    }
+
+    /// Lays out every chunk, building the page list, TOC page numbers and page
+    /// map. Cheap to call more than once.
+    pub fn ensure_layout(&mut self) -> Result<()> {
+        if self.layout_done {
+            return Ok(());
+        }
+        self.layout_done = true;
+        self.entries = (0..self.sources.len())
+            .map(|_| ChunkEntry {
+                layout: None,
+                stale: false,
+            })
+            .collect();
+        for chunk_index in 0..self.sources.len() {
+            let (layout, doc, lines, page_starts) = self.layout_chunk(chunk_index)?;
+            self.entries[chunk_index] = ChunkEntry {
+                layout: Some(layout),
+                stale: false,
+            };
+            // The chunk's DOM and line boxes are only needed to derive page
+            // metadata; release them now so the pass stays flat in RSS instead
+            // of accumulating one chunk's arenas per iteration.
+            drop(doc);
+            drop(lines);
+            drop(page_starts);
+            trim_memory();
+        }
+        self.rebuild_view();
         trim_memory();
         self.ensure_chunk(0)?;
         Ok(())
@@ -1183,6 +1553,9 @@ impl Document {
         &mut self,
         page: usize,
     ) -> Result<(Arc<PageBitmap>, usize, usize)> {
+        // A chunk that has not been laid out since the last settings change only
+        // has provisional pages; lay it out before trusting its geometry.
+        let page = self.ensure_page_layout(page)?;
         let Some(index) = page.checked_sub(1) else {
             bail!("page numbers are 1-based");
         };
@@ -1252,6 +1625,7 @@ impl Document {
         &mut self,
         page: usize,
     ) -> Result<(Arc<ColorPageBitmap>, usize, usize)> {
+        let page = self.ensure_page_layout(page)?;
         let Some(index) = page.checked_sub(1) else {
             bail!("page numbers are 1-based");
         };
@@ -1390,18 +1764,7 @@ impl Document {
             &self.base_url,
             self.net.clone(),
             self.font_context.clone(),
-            &DocumentOptions {
-                width: self.width,
-                height: self.height,
-                layout_height: self.layout_height,
-                page_margin: self.page_margin,
-                font_size: self.font_css_size,
-                font_path: None,
-                fallback_font_paths: Vec::new(),
-                stylesheet: self.stylesheet.clone(),
-                embedded_styles_enabled: self.embedded_styles_enabled,
-                viewport_scale: self.viewport_scale,
-            },
+            &self.layout_options(),
         );
         let lines = collect_lines(doc.root_element());
         let forced_breaks = page_breaks::collect_forced_breaks(doc.root_element());
@@ -2374,6 +2737,9 @@ impl Document {
         if page < 1 || page > self.page_count() {
             bail!("page {page} is outside 1..={}", self.page_count());
         }
+        // Landing in a provisional chunk lays that chunk out now, so the page
+        // number we report is a real one.
+        let page = self.ensure_page_layout(page)?;
         self.current_page = page;
         Ok(page)
     }
@@ -2392,22 +2758,25 @@ impl Document {
     }
 
     pub fn go_to_first_page(&mut self) -> usize {
-        self.current_page = 1;
+        self.current_page = self.ensure_page_layout(1).unwrap_or(1);
         self.current_page
     }
 
     pub fn go_to_last_page(&mut self) -> usize {
-        self.current_page = self.page_count();
+        let page = self.page_count();
+        self.current_page = self.ensure_page_layout(page).unwrap_or(page);
         self.current_page
     }
 
     pub fn go_to_next_page(&mut self) -> usize {
-        self.current_page = (self.current_page + 1).min(self.page_count());
+        let page = (self.current_page + 1).min(self.page_count());
+        self.current_page = self.ensure_page_layout(page).unwrap_or(page);
         self.current_page
     }
 
     pub fn go_to_previous_page(&mut self) -> usize {
-        self.current_page = self.current_page.saturating_sub(1).max(1);
+        let page = self.current_page.saturating_sub(1).max(1);
+        self.current_page = self.ensure_page_layout(page).unwrap_or(page);
         self.current_page
     }
 
@@ -2417,6 +2786,7 @@ impl Document {
 
     pub fn go_to_href(&mut self, href: &str) -> Result<usize> {
         let page = self.page_from_href(href)?;
+        let page = self.ensure_page_layout(page)?;
         self.current_page = page;
         Ok(page)
     }
@@ -2577,6 +2947,9 @@ impl Document {
     }
 
     pub fn go_to_xpointer(&mut self, xpointer: &str) -> Result<usize> {
+        // Lay out the chunk the target lives in first: its provisional pages
+        // would otherwise put us on the wrong page for the new settings.
+        self.ensure_xpointer_layout(xpointer)?;
         let page = self.page_from_xpointer(xpointer)?;
         self.current_page = page;
         Ok(page)
@@ -3828,6 +4201,17 @@ fn create_document(
         "<style>img, svg, video, canvas, object, embed {{ max-width: 100%; \
          max-height: {max_image_height:.0}px; height: auto; }}</style>"
     ));
+    // The generators leave the base font size as a token so the chunk HTML (and
+    // the chunk boundaries that page numbers derive from) does not change with
+    // it; the layout settings are applied here instead.
+    let html_source = if html_source.contains(cre_epub::FONT_SIZE_TOKEN) {
+        html_source.replace(
+            cre_epub::FONT_SIZE_TOKEN,
+            &format!("{:.2}", options.font_size),
+        )
+    } else {
+        html_source
+    };
     let mut doc = HtmlDocument::from_html(html_source.as_str(), config);
     doc.resolve(0.0);
     for _ in 0..4 {

@@ -51,6 +51,15 @@ pub struct PageMapItem {
     pub href: String,
 }
 
+/// Placeholder for the base font size in generated markup.
+///
+/// The size is a *layout* setting, not part of the document: leaving it as a
+/// token keeps a book's chunk HTML (and therefore its chunk boundaries) byte for
+/// byte identical across font-size changes, so a font change can re-lay out the
+/// chunks it already has instead of regenerating and re-chunking the book.
+/// `cre_lib::create_document` substitutes it.
+pub const FONT_SIZE_TOKEN: &str = "__CRE_FONT_SIZE_PX__";
+
 #[derive(Clone, Debug)]
 pub struct HtmlOptions {
     pub font_size: f32,
@@ -719,10 +728,11 @@ impl EpubBook {
         html.push_str("<style>/* cre-render-base */");
         html.push_str(&format!(
             "html, body {{ margin: 0; padding: 0; }}\n\
-             body {{ font-family: serif; font-size: {}px; line-height: {}; padding: {}px {}px; }}\n\
+             body {{ font-family: serif; font-size: {FONT_SIZE_TOKEN}px; line-height: {}; \
+             padding: {}px {}px; }}\n\
              img {{ max-width: 100%; height: auto; }}\n\
              .cre-spine {{ display: block; page-break-before: always; }}\n",
-            options.font_size, options.line_height, options.margin_y, options.margin_x
+            options.line_height, options.margin_y, options.margin_x
         ));
         html.push_str("</style></head><body>");
         html

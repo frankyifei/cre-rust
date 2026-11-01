@@ -273,14 +273,10 @@ impl Doc {
         )
     }
 
-    fn open(&mut self, path: PathBuf) -> anyhow::Result<()> {
-        let snapshot = self.render_state_snapshot(path.clone());
-        if self.inner.is_some() && self.render_state_snapshot == snapshot {
-            return Ok(());
-        }
-        self.render_state_snapshot = snapshot;
+    /// The engine options the current settings ask for.
+    fn document_options(&self) -> DocumentOptions {
         let effective_stylesheet = self.settings_stylesheet();
-        let options = DocumentOptions {
+        DocumentOptions {
             width: self.width,
             height: self.height,
             layout_height: self.layout_height,
@@ -291,12 +287,29 @@ impl Doc {
             stylesheet: (!effective_stylesheet.is_empty()).then(|| effective_stylesheet.clone()),
             embedded_styles_enabled: self.embedded_stylesheet_enabled,
             viewport_scale: self.render_viewport_scale(),
-        };
-        let font_paths = cre_lib::resolve_font_paths(&options)?;
-        if self.font_cache_paths != font_paths {
-            self.font_data_cache = cre_lib::load_font_datas(&font_paths);
-            self.font_cache_paths = font_paths.clone();
         }
+    }
+
+    /// Loads the font files the settings ask for, reusing the previous load when
+    /// the paths did not change. Returns whether they changed.
+    fn refresh_font_data(&mut self, options: &DocumentOptions) -> anyhow::Result<bool> {
+        let font_paths = cre_lib::resolve_font_paths(options)?;
+        if self.font_cache_paths == font_paths {
+            return Ok(false);
+        }
+        self.font_data_cache = cre_lib::load_font_datas(&font_paths);
+        self.font_cache_paths = font_paths;
+        Ok(true)
+    }
+
+    fn open(&mut self, path: PathBuf) -> anyhow::Result<()> {
+        let snapshot = self.render_state_snapshot(path.clone());
+        if self.inner.is_some() && self.render_state_snapshot == snapshot {
+            return Ok(());
+        }
+        self.render_state_snapshot = snapshot;
+        let options = self.document_options();
+        let _ = self.refresh_font_data(&options)?;
         // Parse now, lay out on the first read: the settings KOReader applies
         // right after loadDocument then shape the single layout instead of
         // forcing a second one.
@@ -361,11 +374,19 @@ impl Doc {
         self.layout_now();
     }
 
-    /// Re-parses and re-opens the document so it can be laid out with the
-    /// settings that were applied since the last layout.
+    /// Applies the settings that were changed since the last layout.
+    ///
+    /// The document is *not* re-parsed and the whole book is not laid out again:
+    /// the chunk holding the current position is laid out with the new settings
+    /// and every other chunk keeps its previous pages as a provisional page
+    /// list, to be laid out the first time it is read. That is how crengine's
+    /// partial rerendering keeps a font change instant on a large book, and it
+    /// is also why the page count can settle over the next few page turns.
+    ///
+    /// Falls back to a full reopen when the change cannot be applied this way
+    /// (formats whose HTML embeds the settings, or a different page size).
     fn rebuild_with_current_settings(&mut self) {
         self.needs_relayout = false;
-        self.rerender_count = self.rerender_count.saturating_add(1);
         let Some(path) = self.path.clone() else {
             return;
         };
@@ -381,12 +402,40 @@ impl Doc {
                 self.render_state_snapshot, snapshot
             );
         }
-        let xpointer = self.inner.as_ref().and_then(|inner| {
-            inner
-                .xpointer_from_page(inner.current_page())
-                .ok()
-                .filter(|xp| !xp.is_empty())
-        });
+        self.rerender_count = self.rerender_count.saturating_add(1);
+        let xpointer = self.current_xpointer();
+        let options = self.document_options();
+        let fonts_changed = self.refresh_font_data(&options).unwrap_or(false);
+        if self
+            .inner
+            .as_ref()
+            .is_some_and(|inner| inner.can_relayout_with(&options))
+        {
+            let fonts = &self.font_data_cache;
+            let relaid = match self.inner.as_mut() {
+                Some(inner) => {
+                    if fonts_changed {
+                        inner.set_fonts(fonts);
+                    }
+                    match inner.relayout(&options) {
+                        Ok(true) => {
+                            if let Some(xpointer) = xpointer.as_deref() {
+                                let _ = inner.go_to_xpointer(xpointer);
+                            }
+                            true
+                        }
+                        _ => false,
+                    }
+                }
+                None => false,
+            };
+            if relaid {
+                self.render_state_snapshot = snapshot;
+                self.needs_layout = false;
+                self.page_map_stale = true;
+                return;
+            }
+        }
         // `open` only replaces the document on success, so a failed rebuild
         // leaves the old layout usable.
         if self.open(path).is_err() {
@@ -898,6 +947,17 @@ fn font_bias() -> HashMap<String, i32> {
         Ok(bias) => bias.clone(),
         Err(_) => HashMap::new(),
     }
+}
+
+/// Mutable access to the document, for calls that may have to lay a chunk out.
+unsafe fn doc_ref_mut<'a>(l: *mut lua_State) -> Option<&'a mut Doc> {
+    // SAFETY: methods registered in the `credocument` metatable always receive our userdata.
+    let ptr = unsafe { lua::lua_touserdata(l, 1) }.cast::<Doc>();
+    // SAFETY: the userdata was initialized by `new_doc_view`, and nothing else
+    // holds a reference to it while a method runs.
+    let doc = unsafe { ptr.as_mut() }?;
+    doc.sync_layout();
+    Some(doc)
 }
 
 unsafe fn doc_ref<'a>(l: *mut lua_State) -> Option<&'a Doc> {
@@ -2012,10 +2072,16 @@ unsafe extern "C-unwind" fn doc_page_xpointer(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn doc_page_from_xpointer(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
+        // Only the chunk the XPointer lands in has to be laid out to answer
+        // this, which is what makes a jump right after a font change cheap.
         let page = arg_str(l, 2)
             .and_then(|xp| {
-                doc_ref(l)
-                    .and_then(|doc| doc.inner.as_ref())
+                let doc = doc_ref_mut(l)?;
+                if let Some(inner) = doc.inner.as_mut() {
+                    let _ = inner.ensure_xpointer_layout(&xp);
+                }
+                doc.inner
+                    .as_ref()
                     .and_then(|inner| inner.page_from_xpointer(&xp).ok())
             })
             .unwrap_or(1);
@@ -2064,7 +2130,15 @@ unsafe extern "C-unwind" fn doc_pos_from_xpointer(l: *mut lua_State) -> c_int {
             push_int(l, 0);
             return 2;
         };
-        let Some(inner) = doc_ref(l).and_then(|doc| doc.inner.as_ref()) else {
+        let Some(doc) = doc_ref_mut(l) else {
+            push_int(l, 0);
+            push_int(l, 0);
+            return 2;
+        };
+        if let Some(inner) = doc.inner.as_mut() {
+            let _ = inner.ensure_xpointer_layout(&xp);
+        }
+        let Some(inner) = doc.inner.as_ref() else {
             push_int(l, 0);
             push_int(l, 0);
             return 2;
