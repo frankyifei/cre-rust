@@ -2575,58 +2575,99 @@ impl Document {
                     if start_byte >= end_byte {
                         continue;
                     }
-                    let line_start_chars = text[..start_byte].chars().count();
-                    let line_end_chars = text[..end_byte].chars().count();
-                    let line_chars = line_end_chars - line_start_chars;
-
-                    // Which characters of this line the range covers. Positions
-                    // inside this block are exact; a range that starts or ends
-                    // in another block is clipped to the line.
-                    let start_offset = xpointer::block_char_offset(root, block, &start_position);
-                    let end_offset = xpointer::block_char_offset(root, block, &end_position);
-                    let (from, to) = match (start_offset, end_offset) {
-                        (Some(from), Some(to)) => {
-                            if to <= line_start_chars || from >= line_end_chars {
-                                continue;
+                    let line_chars = rect.text.chars().count();
+                    let matches = xpointer::block_text_matches_dom(block, text);
+                    let (from_chars, to_chars) = if matches {
+                        // Exact: character offsets from the block's text nodes,
+                        // so a range that crosses text nodes still slices.
+                        let line_start_chars = text[..start_byte].chars().count();
+                        let line_end_chars = text[..end_byte].chars().count();
+                        let start_offset =
+                            xpointer::block_char_offset(root, block, &start_position);
+                        let end_offset = xpointer::block_char_offset(root, block, &end_position);
+                        match (start_offset, end_offset) {
+                            (Some(from), Some(to)) => {
+                                if to <= line_start_chars || from >= line_end_chars {
+                                    continue;
+                                }
+                                (
+                                    from.max(line_start_chars) - line_start_chars,
+                                    to.min(line_end_chars) - line_start_chars,
+                                )
                             }
-                            (from.max(line_start_chars), to.min(line_end_chars))
-                        }
-                        (Some(from), None) => {
-                            if from >= line_end_chars {
-                                continue;
+                            (Some(from), None) => {
+                                if from >= line_end_chars {
+                                    continue;
+                                }
+                                (
+                                    from.max(line_start_chars) - line_start_chars,
+                                    line_end_chars - line_start_chars,
+                                )
                             }
-                            (from.max(line_start_chars), line_end_chars)
-                        }
-                        (None, Some(to)) => {
-                            if to <= line_start_chars {
-                                continue;
+                            (None, Some(to)) => {
+                                if to <= line_start_chars {
+                                    continue;
+                                }
+                                (0, to.min(line_end_chars) - line_start_chars)
                             }
-                            (line_start_chars, to.min(line_end_chars))
-                        }
-                        (None, None) => {
-                            // Neither end is in this block: fall back to document
-                            // order, as the range spans several blocks.
-                            let Some(first) =
-                                xpointer::position_for_line_offset(root, line, 0).ok()
-                            else {
-                                continue;
-                            };
-                            let Some(last) = xpointer::position_for_line_offset(
-                                root,
-                                line,
-                                end_byte - start_byte,
-                            )
-                            .ok() else {
-                                continue;
-                            };
-                            if last <= start_position || first >= end_position {
-                                continue;
+                            (None, None) => {
+                                // Neither end is in this block: the range spans
+                                // several blocks, so include the whole line.
+                                let Some(first) =
+                                    xpointer::position_for_line_offset(root, line, 0).ok()
+                                else {
+                                    continue;
+                                };
+                                let Some(last) = xpointer::position_for_line_offset(
+                                    root,
+                                    line,
+                                    end_byte - start_byte,
+                                )
+                                .ok() else {
+                                    continue;
+                                };
+                                if last <= start_position || first >= end_position {
+                                    continue;
+                                }
+                                (0, line_end_chars - line_start_chars)
                             }
-                            (line_start_chars, line_end_chars)
                         }
+                    } else {
+                        // The block's layout text differs from its DOM text
+                        // (collapsed whitespace, text-transform), so block
+                        // offsets would drift. Compare against the line's own
+                        // bounds, as the word positions were produced.
+                        let Some(first) = xpointer::position_for_line_offset(root, line, 0).ok()
+                        else {
+                            continue;
+                        };
+                        let Some(last) =
+                            xpointer::position_for_line_offset(root, line, end_byte - start_byte)
+                                .ok()
+                        else {
+                            continue;
+                        };
+                        if last <= start_position || first >= end_position {
+                            continue;
+                        }
+                        let from = if start_position >= first && start_position <= last {
+                            start_position
+                                .codepoint_offset
+                                .saturating_sub(first.codepoint_offset)
+                                as usize
+                        } else {
+                            0
+                        };
+                        let to = if end_position >= first && end_position <= last {
+                            end_position
+                                .codepoint_offset
+                                .saturating_sub(first.codepoint_offset)
+                                as usize
+                        } else {
+                            line_chars
+                        };
+                        (from.min(line_chars), to.min(line_chars))
                     };
-                    let from_chars = from.saturating_sub(line_start_chars).min(line_chars);
-                    let to_chars = to.saturating_sub(line_start_chars).min(line_chars);
                     if from_chars >= to_chars {
                         continue;
                     }

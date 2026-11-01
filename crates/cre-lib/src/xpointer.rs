@@ -406,6 +406,14 @@ pub(crate) fn position_for_text_node(
     target_id: NodeId,
     codepoint_offset: u32,
 ) -> Result<TextPosition> {
+    // Positions must name a valid offset inside the node: the content-matching
+    // fallback can overshoot (see `map_line_text_position`), and an out-of-range
+    // offset makes the range unusable for boxes and selections.
+    let codepoint_offset = root
+        .with(target_id)
+        .text_data()
+        .map(|text| text.content.chars().count() as u32)
+        .map_or(codepoint_offset, |length| codepoint_offset.min(length));
     let body_id = find_body_id(root).context("document has no body element")?;
     let spine_root_id = find_spine_ancestor_id(root, target_id, body_id).unwrap_or(body_id);
     let spine_index = if spine_root_id == body_id {
