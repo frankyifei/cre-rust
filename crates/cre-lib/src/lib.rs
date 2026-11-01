@@ -301,8 +301,16 @@ fn chunk_budgets(available: Option<usize>) -> (usize, Option<usize>) {
         .min(available / 2)
         .max(MIN_CHUNK_BYTES * LAYOUT_BYTES_PER_HTML_BYTE);
     let text = (budget / LAYOUT_BYTES_PER_HTML_BYTE).clamp(MIN_CHUNK_BYTES, MAX_CHUNK_BYTES);
-    // Images may take up to 60% of the layout budget; the rest is text.
-    let mut images = (budget * 3) / 5;
+    // Images get 60% of the layout budget when there is plenty of memory, but
+    // only a third on a small device: a chunk activation (e.g. jumping to
+    // another part of the book) has to fit next to the reader UI and the page
+    // cache, not just next to the text layout.
+    let image_share = if available < 128 * 1024 * 1024 {
+        budget / 3
+    } else {
+        (budget * 3) / 5
+    };
+    let mut images = image_share;
     if let Ok(value) = std::env::var("CRE_IMAGE_BUDGET_MB")
         && let Ok(mb) = value.trim().parse::<usize>()
         && mb > 0
@@ -441,8 +449,8 @@ pub struct Document {
     active: RefCell<Option<ActiveChunk>>,
     current_page: usize,
     background_color: u32,
-    page_image_cache: HashMap<usize, PageImage>,
-    page_cache_order: Vec<usize>,
+    page_image_cache: RefCell<HashMap<usize, PageImage>>,
+    page_cache_order: RefCell<Vec<usize>>,
     page_boxes_cache: RefCell<Option<(usize, Vec<SnapshotLine>)>>,
 }
 
@@ -756,8 +764,8 @@ impl Document {
             active: RefCell::new(None),
             current_page: 1,
             background_color: 0xFF_FFFF,
-            page_image_cache: HashMap::new(),
-            page_cache_order: Vec::new(),
+            page_image_cache: RefCell::new(HashMap::new()),
+            page_cache_order: RefCell::new(Vec::new()),
             page_boxes_cache: RefCell::new(None),
         };
         if !defer_layout {
@@ -1314,37 +1322,37 @@ impl Document {
         self.render_page_with_stats(self.current_page)
     }
 
-    fn cached_page_image(&mut self, page: usize) -> Option<PageImage> {
-        if let Some(image) = self.page_image_cache.get(&page) {
-            let image = image.clone();
-            self.touch_page_image_cache(page);
-            return Some(image);
-        }
-        None
-    }
-
-    fn touch_page_image_cache(&mut self, page: usize) {
-        self.page_cache_order = self
-            .page_cache_order
-            .iter()
-            .filter(|cached| **cached != page)
-            .copied()
-            .collect::<Vec<usize>>();
-        self.page_cache_order.push(page);
-    }
-
-    fn cache_page_image(&mut self, page: usize, image: PageImage) {
+    fn cached_page_image(&self, page: usize) -> Option<PageImage> {
+        let image = self.page_image_cache.borrow().get(&page).cloned()?;
         self.touch_page_image_cache(page);
-        while self.page_cache_order.len() > PAGE_IMAGE_CACHE_CAPACITY {
-            let evicted = self.page_cache_order.remove(0);
-            self.page_image_cache.remove(&evicted);
-        }
-        self.page_image_cache.insert(page, image);
+        Some(image)
     }
 
-    fn clear_page_image_cache(&mut self) {
-        self.page_image_cache.clear();
-        self.page_cache_order.clear();
+    fn touch_page_image_cache(&self, page: usize) {
+        let mut order = self.page_cache_order.borrow_mut();
+        order.retain(|cached| *cached != page);
+        order.push(page);
+    }
+
+    fn cache_page_image(&self, page: usize, image: PageImage) {
+        self.touch_page_image_cache(page);
+        let mut cache = self.page_image_cache.borrow_mut();
+        loop {
+            let evicted = {
+                let mut order = self.page_cache_order.borrow_mut();
+                if order.len() <= PAGE_IMAGE_CACHE_CAPACITY {
+                    break;
+                }
+                order.remove(0)
+            };
+            cache.remove(&evicted);
+        }
+        cache.insert(page, image);
+    }
+
+    fn clear_page_image_cache(&self) {
+        self.page_image_cache.borrow_mut().clear();
+        self.page_cache_order.borrow_mut().clear();
     }
 
     fn ensure_chunk(&self, index: usize) -> Result<()> {
@@ -1363,8 +1371,11 @@ impl Document {
         let html = stored.clone();
         // Free the current chunk before building the next one: both being
         // resident at once doubles the layout peak, which matters on a device
-        // where a single layout is already tens of megabytes.
+        // where a single layout is already tens of megabytes. The cached page
+        // bitmaps belong to the old chunk too, so drop them as well.
         drop(self.active.borrow_mut().take());
+        self.clear_page_image_cache();
+        *self.page_boxes_cache.borrow_mut() = None;
         trim_memory();
         let doc = create_document(
             &html,
