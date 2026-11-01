@@ -103,6 +103,12 @@ fn resource_cache_bytes() -> usize {
 pub struct LazyResource {
     pub epub_path: Option<PathBuf>,
     cache: Arc<Mutex<ResourceCache>>,
+    /// Resources the engine itself produced: rewritten spine documents and the
+    /// SVG wrappers generated for image-only blocks. They have no zip entry to
+    /// read again, so the LRU must never evict them: a book with enough images
+    /// pushes all of them out of a byte-bounded cache, and the pages that use
+    /// them then render blank.
+    pinned: Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>,
     zip_archive: Arc<Mutex<Option<LazyResourceZipArchive>>>,
 }
 
@@ -158,6 +164,7 @@ impl LazyResource {
         LazyResource {
             epub_path: Some(path),
             cache: Arc::new(Mutex::new(ResourceCache::new(resource_cache_bytes()))),
+            pinned: Arc::new(Mutex::new(HashMap::new())),
             zip_archive: Arc::new(Mutex::new(zip_archive)),
         }
     }
@@ -170,6 +177,7 @@ impl LazyResource {
         LazyResource {
             epub_path: None,
             cache: Arc::new(Mutex::new(cache)),
+            pinned: Arc::new(Mutex::new(HashMap::new())),
             zip_archive: Arc::new(Mutex::new(None)),
         }
     }
@@ -179,6 +187,11 @@ impl LazyResource {
     /// without reading (let alone decoding) them.
     pub fn entry_size(&self, key: &str) -> Option<usize> {
         let key = normalize_path(key);
+        if let Ok(pinned) = self.pinned.lock()
+            && let Some(hit) = pinned.get(&key)
+        {
+            return Some(hit.len());
+        }
         if let Ok(cache) = self.cache.lock()
             && let Some(hit) = cache.entries.get(&key)
         {
@@ -226,6 +239,11 @@ impl LazyResource {
 
     pub fn get(&self, key: &str) -> Option<Arc<Vec<u8>>> {
         let key = normalize_path(key);
+        if let Ok(pinned) = self.pinned.lock()
+            && let Some(hit) = pinned.get(&key)
+        {
+            return Some(hit.clone());
+        }
         if let Some(hit) = self.cache.lock().unwrap().get(&key) {
             return Some(hit);
         }
@@ -235,11 +253,22 @@ impl LazyResource {
         Some(shared)
     }
 
+    /// Stores a resource the engine produced. Unlike zip entries, it cannot be
+    /// read back from the archive, so it is pinned for the session instead of
+    /// going through the LRU.
     pub fn put(&self, key: &str, value: Arc<Vec<u8>>) {
-        self.cache
+        self.pinned
             .lock()
             .unwrap()
             .insert(normalize_path(key), value);
+    }
+
+    /// Bytes held by pinned engine-generated resources (diagnostics).
+    pub fn pinned_bytes(&self) -> usize {
+        self.pinned
+            .lock()
+            .map(|pinned| pinned.values().map(|value| value.len()).sum())
+            .unwrap_or(0)
     }
 
     fn read_zip_entry(&self, key: &str) -> Option<Vec<u8>> {
@@ -425,7 +454,6 @@ impl EpubBook {
     pub fn normalize_inline_svg_images(&mut self) -> usize {
         let spine = self.spine.clone();
         let mut updates = Vec::new();
-        let mut generated_counter = 0usize;
 
         for item in spine.iter().filter(|item| item.linear) {
             if !is_html_resource(&item.media_type, &item.href) {
@@ -440,27 +468,21 @@ impl EpubBook {
                 continue;
             }
 
-            let mut generated = HashMap::new();
             let normalized = rewrite_inline_svg_image_blocks(
                 &text,
                 parent_dir(&doc_key),
                 &self.resource_provider,
-                &mut generated,
-                &mut generated_counter,
             );
-            if !generated.is_empty() {
-                updates.push((doc_key, normalized, generated));
+            if normalized != text {
+                updates.push((doc_key, normalized));
             }
         }
 
         let mut changed = 0usize;
-        for (doc_key, normalized, generated) in updates {
-            for (key, value) in generated {
-                self.resource_provider.put(&key, value);
-                changed += 1;
-            }
+        for (doc_key, normalized) in updates {
             self.resource_provider
                 .put(&doc_key, Arc::new(normalized.into_bytes()));
+            changed += 1;
         }
         changed
     }
@@ -1457,13 +1479,7 @@ fn file_extension(path: &str) -> String {
         .unwrap_or_default()
 }
 
-fn rewrite_inline_svg_image_blocks(
-    html: &str,
-    doc_dir: &str,
-    provider: &LazyResource,
-    generated: &mut HashMap<String, Arc<Vec<u8>>>,
-    generated_counter: &mut usize,
-) -> String {
+fn rewrite_inline_svg_image_blocks(html: &str, doc_dir: &str, provider: &LazyResource) -> String {
     let lower = html.to_ascii_lowercase();
     let mut out = String::with_capacity(html.len());
     let mut cursor = 0usize;
@@ -1482,15 +1498,9 @@ fn rewrite_inline_svg_image_blocks(
             break;
         };
 
-        if let Some(replacement) = replace_image_only_svg_block(
-            html,
-            open_start,
-            close_start,
-            doc_dir,
-            provider,
-            generated,
-            generated_counter,
-        ) {
+        if let Some(replacement) =
+            replace_image_only_svg_block(html, open_start, close_start, doc_dir, provider)
+        {
             out.push_str(&replacement);
         } else {
             out.push_str(&html[open_start..close_end]);
@@ -1507,8 +1517,6 @@ fn replace_image_only_svg_block(
     close_start: usize,
     doc_dir: &str,
     provider: &LazyResource,
-    generated: &mut HashMap<String, Arc<Vec<u8>>>,
-    generated_counter: &mut usize,
 ) -> Option<String> {
     let lower = html.to_ascii_lowercase();
     let svg_open_end = find_tag_end(html, open_start)?;
@@ -1546,22 +1554,33 @@ fn replace_image_only_svg_block(
     }
 
     let image_key = resolve_href(doc_dir, &value_without_fragment(href));
-    let image_bytes = provider.get(&image_key)?;
-    let image_mime = image_mime(&image_bytes, &image_key);
+    // The block is an image with a viewBox, not a drawing: point an <img>
+    // straight at it instead of duplicating its bytes base64 inside a
+    // generated SVG wrapper. That keeps the resource cache free for the real
+    // resources and lets the image be decoded like any other <img>.
+    provider.get(&image_key)?;
 
-    let view_size = svg_attrs
-        .get("viewbox")
-        .and_then(|value| parse_view_box(value))
-        .or_else(|| numeric_size(&svg_attrs))
-        .or_else(|| numeric_size(&image_attrs))?;
-    let image_size = numeric_size(&image_attrs).unwrap_or(view_size);
+    Some(svg_image_tag(&image_key, &svg_attrs, &image_attrs))
+}
 
-    *generated_counter += 1;
-    let generated_key = normalize_path(&generated_svg_key(doc_dir, *generated_counter));
-    let svg = generated_svg_document(view_size, image_size, image_mime, &image_bytes);
-    generated.insert(generated_key.clone(), Arc::new(svg.into_bytes()));
-
-    Some(generated_image_tag(&generated_key, &svg_attrs))
+fn svg_image_tag(
+    image_key: &str,
+    svg_attrs: &HashMap<String, String>,
+    image_attrs: &HashMap<String, String>,
+) -> String {
+    let src = format!("epub://book/{}", encode_path(image_key));
+    let mut tag = format!("<img src=\"{}\"", escape_attr(&src));
+    if let Some(id) = svg_attrs.get("id").or_else(|| image_attrs.get("id")) {
+        tag.push_str(&format!(" id=\"{}\"", escape_attr(id)));
+    }
+    if let Some(class) = svg_attrs.get("class").or_else(|| image_attrs.get("class")) {
+        tag.push_str(&format!(" class=\"{}\"", escape_attr(class)));
+    }
+    if let Some(alt) = image_attrs.get("alt").or_else(|| svg_attrs.get("alt")) {
+        tag.push_str(&format!(" alt=\"{}\"", escape_attr(alt)));
+    }
+    tag.push_str(" style=\"max-width:100%;height:auto\">");
+    tag
 }
 
 fn next_tag_start(text: &str, from: usize, tag_lower: &str) -> Option<usize> {
@@ -1700,45 +1719,6 @@ fn has_meaningful_text(text: &str) -> bool {
     false
 }
 
-fn generated_svg_key(doc_dir: &str, counter: usize) -> String {
-    if doc_dir.is_empty() {
-        format!("cre-inline-svg-{counter}.svg")
-    } else {
-        format!("{doc_dir}/cre-inline-svg-{counter}.svg")
-    }
-}
-
-fn generated_svg_document(
-    view_size: (f32, f32),
-    image_size: (f32, f32),
-    mime: &str,
-    image_bytes: &[u8],
-) -> String {
-    let (view_width, view_height) = view_size;
-    let (image_width, image_height) = image_size;
-    let encoded = base64_encode(image_bytes);
-    format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"{view_width}\" height=\"{view_height}\" viewBox=\"0 0 {view_width} {view_height}\"><image width=\"{image_width}\" height=\"{image_height}\" xlink:href=\"data:{mime};base64,{encoded}\" /></svg>"
-    )
-}
-
-fn generated_image_tag(generated_key: &str, svg_attrs: &HashMap<String, String>) -> String {
-    let src = format!("epub://book/{}", encode_path(generated_key));
-    let mut tag = format!("<img src=\"{}\"", escape_attr(&src));
-    if let Some(id) = svg_attrs.get("id") {
-        tag.push_str(&format!(" id=\"{}\"", escape_attr(id)));
-    }
-    if let Some(class) = svg_attrs.get("class") {
-        tag.push_str(&format!(" class=\"{}\"", escape_attr(class)));
-    }
-    let style = svg_css_style(svg_attrs);
-    if !style.is_empty() {
-        tag.push_str(&format!(" style=\"{}\"", escape_attr(&style)));
-    }
-    tag.push('>');
-    tag
-}
-
 fn rewrite_full_page_image_tags(
     html: &str,
     doc_dir: &str,
@@ -1858,82 +1838,6 @@ fn style_has_full_height(style: &str) -> bool {
         }
     }
     false
-}
-
-fn svg_css_style(attrs: &HashMap<String, String>) -> String {
-    let mut style = attrs.get("style").cloned().unwrap_or_default();
-    if let Some(value) = attrs.get("width").and_then(|value| css_length(value)) {
-        append_style_declaration(&mut style, "width", &value);
-    }
-    if let Some(value) = attrs.get("height").and_then(|value| css_length(value)) {
-        append_style_declaration(&mut style, "height", &value);
-    }
-    style
-}
-
-fn append_style_declaration(style: &mut String, property: &str, value: &str) {
-    if value.is_empty() {
-        return;
-    }
-    if !style.is_empty() && !style.ends_with(';') {
-        style.push(';');
-    }
-    style.push_str(property);
-    style.push(':');
-    style.push_str(value);
-    style.push(';');
-}
-
-fn css_length(value: &str) -> Option<String> {
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
-    }
-    if let Some(number) = parse_number(value) {
-        return Some(format!("{number}px"));
-    }
-    if value.len() <= 64
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '%' | '-' | '_' | '|'))
-    {
-        return Some(value.to_string());
-    }
-    None
-}
-
-fn numeric_size(attrs: &HashMap<String, String>) -> Option<(f32, f32)> {
-    let width = attrs.get("width").and_then(|value| parse_number(value))?;
-    let height = attrs.get("height").and_then(|value| parse_number(value))?;
-    if width > 0.0 && height > 0.0 {
-        Some((width, height))
-    } else {
-        None
-    }
-}
-
-fn parse_view_box(value: &str) -> Option<(f32, f32)> {
-    let normalized = value.replace(',', " ");
-    let numbers: Vec<f32> = normalized
-        .split_whitespace()
-        .filter_map(parse_number)
-        .collect();
-    if numbers.len() != 4 {
-        return None;
-    }
-    let width = numbers[2];
-    let height = numbers[3];
-    if width > 0.0 && height > 0.0 {
-        Some((width, height))
-    } else {
-        None
-    }
-}
-
-fn parse_number(value: &str) -> Option<f32> {
-    let lower = value.trim().to_ascii_lowercase();
-    let number = lower.strip_suffix("px").unwrap_or(&lower).trim();
-    number.parse::<f32>().ok().filter(|value| value.is_finite())
 }
 
 fn image_mime(data: &[u8], path: &str) -> &'static str {
@@ -2421,6 +2325,29 @@ mod tests {
     }
 
     #[test]
+    fn generated_resources_survive_cache_pressure() {
+        let provider = LazyResource {
+            epub_path: None,
+            cache: Arc::new(Mutex::new(ResourceCache::new(64))),
+            pinned: Arc::new(Mutex::new(HashMap::new())),
+            zip_archive: Arc::new(Mutex::new(None)),
+        };
+        provider.put("cre-page-fit-1.svg", Arc::new(vec![7u8; 128]));
+        for index in 0..10 {
+            provider
+                .cache
+                .lock()
+                .unwrap()
+                .insert(format!("img{index}"), Arc::new(vec![index as u8; 32]));
+        }
+        assert_eq!(
+            provider.get("cre-page-fit-1.svg").map(|value| value.len()),
+            Some(128),
+            "a generated resource must not be evicted by zip entries"
+        );
+    }
+
+    #[test]
     fn split_body_html_keeps_content_and_balances_tags() {
         let body = format!("<div class=\"wrap\">{}</div>", "<p>alpha</p>".repeat(50));
         let parts = split_body_html(&body, 200);
@@ -2588,18 +2515,19 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_inline_svg_image_wrappers_to_raster_svg_resources() {
+    fn image_only_svg_blocks_become_plain_images() {
         let mut book = EpubBook::from_bytes(synthetic_inline_svg_epub()).unwrap();
         assert_eq!(book.normalize_inline_svg_images(), 1);
 
-        let generated_key = "cre-inline-svg-1.svg";
-        let generated_svg = String::from_utf8(book.resource(generated_key).unwrap()).unwrap();
-        assert!(generated_svg.contains("viewBox=\"0 0 100 200\""));
-        assert!(generated_svg.contains("xlink:href=\"data:image/jpeg;base64,"));
+        // An image-only SVG is an image with a viewBox, not a drawing: it must
+        // be rewritten to an <img> that points at the image itself, with no
+        // generated wrapper carrying a base64 copy.
+        assert!(book.resource("cre-inline-svg-1.svg").is_none());
 
         let html = book.to_html(&HtmlOptions::default()).unwrap();
-        assert!(html.contains(&format!("epub://book/{generated_key}")));
-        assert!(html.contains("width:100%;height:100%"));
+        assert!(html.contains("epub://book/images/one.jpg"));
+        assert!(html.contains("max-width:100%;height:auto"));
+        assert!(!html.contains("data:image/jpeg;base64,"));
     }
 
     #[test]

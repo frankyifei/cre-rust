@@ -168,3 +168,52 @@ fn epub_toc_entries_expose_page_and_xpointer_round_trip() {
         );
     }
 }
+
+fn html_options() -> cre_lib::DocumentOptions {
+    cre_lib::DocumentOptions {
+        width: 600,
+        height: 800,
+        layout_height: 100_000,
+        page_margin: 32.0,
+        font_size: 18.0,
+        font_path: Some(
+            Path::new("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf").to_path_buf(),
+        ),
+        font_family: None,
+        fallback_font_paths: Vec::new(),
+        stylesheet: None,
+        embedded_styles_enabled: true,
+        viewport_scale: 1.0,
+    }
+}
+
+/// A heading line can be made of several text nodes (`<h1><span>Chapter</span>
+/// One</h1>`). The line bounds then start in the span and end in the heading's
+/// own text node, which `TextPosition` ordering does not compare in document
+/// order; the old code found no line and walked forward until the stack
+/// overflowed. This is the regression test for that crash.
+#[test]
+fn multi_node_line_start_maps_to_a_point() {
+    require_resources();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/heading.html");
+    assert!(path.exists(), "missing fixture: {}", path.display());
+    let doc = Document::with_options(&path, &html_options()).unwrap();
+    let xpointer = doc.xpointer_from_page(1).unwrap();
+    let (x, y) = doc
+        .point_from_xpointer(&xpointer)
+        .unwrap()
+        .expect("the start of a multi-node line must map to a point");
+    let first = doc
+        .page_text_boxes(1)
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("page 1 has no text boxes");
+    assert_eq!(first.text, "Chapter One");
+    assert!(
+        (y - first.y).abs() < 1.0,
+        "y {y} is not on the heading line at {}",
+        first.y
+    );
+    assert!(x >= first.x && x <= first.x + first.width);
+}

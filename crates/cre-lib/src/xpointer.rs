@@ -198,6 +198,35 @@ pub(crate) fn block_char_offset(
     None
 }
 
+/// Byte offset of a source position inside its block's inline layout text.
+/// [`position_for_line_offset`] takes byte offsets, so line bounds have to be
+/// compared in the same space: comparing `TextPosition`s directly is wrong for
+/// a line that spans several text nodes (a heading such as
+/// `<h1><span>第一章</span>　十二月的礼物</h1>`), because a child node and its
+/// parent are not ordered the way the rendered text is.
+pub(crate) fn block_byte_offset(
+    root: &Node,
+    block: &Node,
+    position: &TextPosition,
+) -> Option<usize> {
+    let target = resolve_text_position(root, position).ok()?;
+    let mut total = 0usize;
+    for id in collect_text_node_ids_vec(block) {
+        let content = root.with(id).text_data().map(|text| text.content.clone())?;
+        if id == target {
+            let chars = position.codepoint_offset as usize;
+            let byte = content
+                .char_indices()
+                .nth(chars)
+                .map(|(offset, _)| offset)
+                .unwrap_or(content.len());
+            return Some(total + byte);
+        }
+        total += content.len();
+    }
+    None
+}
+
 pub(crate) fn position_for_line_offset(
     root: &Node,
     line: &LineBox,

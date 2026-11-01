@@ -2455,34 +2455,60 @@ impl Document {
     }
 
     pub fn point_from_xpointer(&self, xpointer: &str) -> Result<Option<(f32, f32)>> {
-        let target = parse_text_position(xpointer)?;
-        let page = self.page_from_xpointer(xpointer)?;
-        for (line_index, rect) in self.page_text_boxes_with_lines(page)? {
-            let Some((start, end)) = self.line_bounds(page, line_index)? else {
-                continue;
-            };
-            if target < start || target > end {
-                continue;
+        // Walk forward to the next visible character when the position itself
+        // is not inside a line (an XPointer at a block boundary, or one whose
+        // node is not laid out). This used to recurse; a position that never
+        // matches a line made the recursion run through the whole book and
+        // overflow the stack (a SIGSEGV that killed KOReader while painting a
+        // page with a highlight). A few dozen steps are enough for the cases
+        // this exists for; anything further is not visible text.
+        let mut current = xpointer.to_string();
+        for _ in 0..64 {
+            let target = parse_text_position(&current)?;
+            let page = self.page_from_xpointer(&current)?;
+            for (line_index, rect) in self.page_text_boxes_with_lines(page)? {
+                if let Some(chars) = self.line_relative_chars(page, line_index, &target)? {
+                    let char_count = rect.text.chars().count().max(1) as f32;
+                    let start_chars = (chars as f32).min(char_count - 1.0);
+                    return Ok(Some((
+                        rect.x + rect.width * (start_chars / char_count),
+                        rect.y,
+                    )));
+                }
+                // Fallback for lines whose layout text no longer matches the
+                // DOM (text-transform, generated content): compare the mapped
+                // positions, which is only exact for single-node lines.
+                let Some((start, end)) = self.line_bounds(page, line_index)? else {
+                    continue;
+                };
+                if target < start || target > end {
+                    continue;
+                }
+                let chars = if target == end {
+                    rect.text.chars().count().saturating_sub(1)
+                } else {
+                    (target
+                        .codepoint_offset
+                        .saturating_sub(start.codepoint_offset)) as usize
+                };
+                let byte = byte_offset_for_char(&rect.text, chars);
+                let char_count = rect.text.chars().count().max(1) as f32;
+                let start_chars = rect.text[..byte].chars().count() as f32;
+                return Ok(Some((
+                    rect.x + rect.width * (start_chars / char_count),
+                    rect.y,
+                )));
             }
-            let chars = if target == end {
-                rect.text.chars().count().saturating_sub(1)
-            } else {
-                (target
-                    .codepoint_offset
-                    .saturating_sub(start.codepoint_offset)) as usize
+            let Some(next) = self.next_visible_char(&current)? else {
+                return Ok(None);
             };
-            let byte = byte_offset_for_char(&rect.text, chars);
-            let char_count = rect.text.chars().count().max(1) as f32;
-            let start_chars = rect.text[..byte].chars().count() as f32;
-            return Ok(Some((
-                rect.x + rect.width * (start_chars / char_count),
-                rect.y,
-            )));
+            if next == current {
+                return Ok(None);
+            }
+            current = next;
         }
-        if let Some(next) = self.next_visible_char(xpointer)?
-            && next != xpointer
-        {
-            return self.point_from_xpointer(&next);
+        if std::env::var_os("CRE_XP_POINT_DEBUG").is_some() {
+            eprintln!("point_from_xpointer: no line after 64 steps from {xpointer}");
         }
         Ok(None)
     }
@@ -2717,6 +2743,62 @@ impl Document {
             lines.extend(clipped);
         }
         Ok(lines)
+    }
+
+    /// Where a position falls inside a line, as a character index from the
+    /// line start. Uses the line's inline layout text, so a line made of
+    /// several text nodes (a `<span>` inside a heading) is handled correctly;
+    /// returns `None` when the position is not on the line or the layout text
+    /// no longer matches the DOM.
+    fn line_relative_chars(
+        &self,
+        page: usize,
+        line_index: usize,
+        target: &TextPosition,
+    ) -> Result<Option<usize>> {
+        let Some(snapshot) = self.pages.get(page.saturating_sub(1)) else {
+            return Ok(None);
+        };
+        let chunk_index = snapshot.chunk;
+        let line_base = self.chunks[chunk_index].line_base;
+        let Some(local_line) = line_index.checked_sub(line_base) else {
+            return Ok(None);
+        };
+        self.with_active_chunk(chunk_index, |active| {
+            let Some(line) = active.lines.get(local_line) else {
+                return Ok(None);
+            };
+            let root = active.doc.root_element();
+            let inline_root = root.with(line.node_id);
+            let Some(layout) = inline_root
+                .element_data()
+                .and_then(|element| element.inline_layout_data.as_ref())
+            else {
+                return Ok(None);
+            };
+            if !xpointer::block_text_matches_dom(inline_root, &layout.text) {
+                return Ok(None);
+            }
+            let Some(byte) = xpointer::block_byte_offset(root, inline_root, target) else {
+                return Ok(None);
+            };
+            let start = line.text_start.min(layout.text.len());
+            let end = line.text_end.min(layout.text.len());
+            if byte < start || byte > end || !layout.text.is_char_boundary(start) {
+                return Ok(None);
+            }
+            let segment = &layout.text[start..end];
+            let relative = byte - start;
+            if !segment.is_char_boundary(relative) {
+                return Ok(None);
+            }
+            let chars = segment[..relative].chars().count();
+            Ok(Some(if relative >= segment.len() {
+                chars.saturating_sub(1)
+            } else {
+                chars
+            }))
+        })
     }
 
     fn line_bounds(
