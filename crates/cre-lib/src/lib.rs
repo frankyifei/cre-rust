@@ -302,7 +302,13 @@ fn chunk_budgets(available: Option<usize>) -> (usize, Option<usize>) {
         .max(MIN_CHUNK_BYTES * LAYOUT_BYTES_PER_HTML_BYTE);
     let text = (budget / LAYOUT_BYTES_PER_HTML_BYTE).clamp(MIN_CHUNK_BYTES, MAX_CHUNK_BYTES);
     // Images may take up to 60% of the layout budget; the rest is text.
-    let images = (budget * 3) / 5;
+    let mut images = (budget * 3) / 5;
+    if let Ok(value) = std::env::var("CRE_IMAGE_BUDGET_MB")
+        && let Ok(mb) = value.trim().parse::<usize>()
+        && mb > 0
+    {
+        images = mb * 1024 * 1024;
+    }
     (text, Some(images))
 }
 
