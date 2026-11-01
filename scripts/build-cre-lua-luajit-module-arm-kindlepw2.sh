@@ -22,7 +22,7 @@
 # in the upstream libkoreader-cre.so.
 set -euo pipefail
 
-cd /home/frank/src/kindle-project
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 X_TOOLS="${X_TOOLS:-$HOME/x-tools/arm-kindlepw2-linux-gnueabi}"
 TOOL_PREFIX="${TOOL_PREFIX:-arm-kindlepw2-linux-gnueabi}"

@@ -2,7 +2,7 @@
 # Builds the cre-lua crate as a LuaJIT loadable module.
 set -euo pipefail
 
-cd /home/frank/src/kindle-project
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 cargo build --release -p cre-lua
 

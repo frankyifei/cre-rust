@@ -1,12 +1,7 @@
 /target/
-/target-arm-unknown-linux-gnueabi/
+/target-*/
 /.cargo/
 /.opencode/
-PLAN.md
-plan1.md
-TODO.md
-AGENTS.md
-/scripts/sync-to-windows.sh
-/fixtures/
-/target-arm-kindlepw2-linux-gnueabi/
+/.loopx/
 /tools/qemu-kindle/__pycache__/
+*.pgm

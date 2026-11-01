@@ -26,12 +26,25 @@ the device internals a PC lacks.
 
 ## Quick start
 
+From the repository root:
+
 ```sh
-qk run ~/books/juliet.epub
+tools/qemu-kindle/run.sh ~/books/juliet.epub
 ```
 
-On first run it downloads the package into `~/.cache/qemu-kindle`; later
-runs are instant. `qk shot` writes the last frame to a PNG.
+`run.sh` builds this repository's ARM module and installs it. It uses
+`~/.cache/cre-qemu-kindle` for the package cache. Set `CRE_QEMU_CACHE` to
+change the cache directory.
+
+Run without a window:
+
+```sh
+tools/qemu-kindle/run.sh --headless ~/books/juliet.epub
+```
+
+To use `qk` directly, install the module yourself or set `cre_lib` in the
+configuration. `qk run` uses `~/.cache/qemu-kindle` by default. `qk shot`
+writes the last frame to a PNG.
 
 ## Configuration
 
@@ -49,7 +62,7 @@ Config file: `~/.config/qemu-kindle/config.json` (or `--config FILE`):
   "cc": "",
   "qemu": "qemu-arm",
   "sysroot": "/usr/arm-linux-gnueabi",
-  "cre_lib": "~/work/kindle-project/target-arm-kindlepw2-linux-gnueabi/armv7-unknown-linux-gnueabi/release/libkoreader-cre.so",
+  "cre_lib": "~/src/cre-rust/target-arm-kindlepw2-linux-gnueabi/armv7-unknown-linux-gnueabi/release/libkoreader-cre.so",
   "cre_build_script": "",
   "display": ":0",
   "viewer_scale": 0.72,

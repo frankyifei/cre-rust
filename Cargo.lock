@@ -354,17 +354,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cre-blitz-spike"
-version = "0.1.0"
-dependencies = [
- "anyrender",
- "blitz-dom",
- "blitz-html",
- "blitz-paint",
- "blitz-traits",
-]
-
-[[package]]
 name = "cre-epub"
 version = "0.1.0"
 dependencies = [

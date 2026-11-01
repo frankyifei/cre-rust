@@ -27,8 +27,8 @@ Config file (JSON), default ~/.config/qemu-kindle/config.json:
       "qemu": "qemu-arm",
     "qemu_args": "-tb-size 256 -cpu cortex-a9",
       "sysroot": "/usr/arm-linux-gnueabi",
-      "cre_lib": "~/src/kindle-project/target-arm-kindlepw2-linux-gnueabi/armv7-unknown-linux-gnueabi/release/libkoreader-cre.so",
-      "cre_build_script": "~/src/kindle-project/scripts/build-cre-lua-luajit-module-arm-kindlepw2.sh",
+      "cre_lib": "~/src/cre-rust/target-arm-kindlepw2-linux-gnueabi/armv7-unknown-linux-gnueabi/release/libkoreader-cre.so",
+      "cre_build_script": "~/src/cre-rust/scripts/build-cre-lua-luajit-module-arm-kindlepw2.sh",
       "display": ":0",
       "viewer_scale": 0.72,
       "timeout": 0
