@@ -496,3 +496,75 @@ fn word_on_line(
     }
     None
 }
+
+/// `TextPosition`'s ordering compares XPointer path tags, so the paragraph's
+/// direct text (`p` -> `text()`) sorted before text inside `span[2]`, even
+/// though the span's text comes first. `compare_xpointers` is used to sort
+/// TOC entries and highlights, so it must follow document order.
+#[test]
+fn compare_xpointers_follows_document_order_across_text_nodes() {
+    require_resources();
+    let path = synthetic_fixture("float-dropcap.html");
+    let doc = Document::with_options(&path, &cover_options()).unwrap();
+    let boxes = doc.page_text_boxes(1).unwrap();
+    let line = boxes
+        .iter()
+        .find(|line| line.text.contains("from the barn"))
+        .expect("no line with the paragraph's direct text");
+    let y = line.y + line.height / 2.0;
+    let he = word_on_line(&doc, line, y, "he").expect("no he");
+    let from = word_on_line(&doc, line, y, "from").expect("no from");
+    let he_xpointer = he.xpointer_range.start.to_xpointer();
+    let from_xpointer = from.xpointer_range.start.to_xpointer();
+    assert_eq!(
+        doc.compare_xpointers(&he_xpointer, &from_xpointer).unwrap(),
+        1,
+        "`he` (inside span[2]) must come before `from` (p's direct text)"
+    );
+    assert_eq!(
+        doc.compare_xpointers(&from_xpointer, &he_xpointer).unwrap(),
+        -1
+    );
+    assert_eq!(
+        doc.compare_xpointers(&he_xpointer, &he_xpointer).unwrap(),
+        0
+    );
+}
+
+/// A run can contain clusters with different brushes (a link's text and the
+/// punctuation after it), and multibyte punctuation precedes the word. The
+/// layout map must split the run by cluster brush and use byte offsets, not
+/// character indices. Both used to shift the XPointer end into the next text.
+#[test]
+fn words_after_multibyte_prefixes_and_link_runs_round_trip() {
+    require_resources();
+    let path = synthetic_fixture("multibyte-link.html");
+    assert!(path.exists(), "missing fixture: {}", path.display());
+    let doc = Document::with_options(&path, &cover_options()).unwrap();
+    let boxes = doc.page_text_boxes(1).unwrap();
+    let line = boxes
+        .iter()
+        .find(|line| line.text.contains("anchor"))
+        .expect("no line with anchor");
+    let y = line.y + line.height / 2.0;
+    for target in ["anchor", "then", "read"] {
+        let word = word_on_line(&doc, line, y, target)
+            .unwrap_or_else(|| panic!("no word position for {target}"));
+        assert_eq!(word.text, target, "hit-test text for {target}");
+        let start = word.xpointer_range.start.to_xpointer();
+        let end = word
+            .xpointer_range
+            .end
+            .as_ref()
+            .map(|position| position.to_xpointer())
+            .expect("word end");
+        assert_eq!(
+            doc.text_between_xpointers(&start, &end).unwrap(),
+            target,
+            "XPointer text for {target}"
+        );
+        let highlight = doc.boxes_between_xpointers(&start, &end).unwrap();
+        let first = highlight.first().expect("no highlight box");
+        assert_eq!(first.text, target, "highlight text for {target}");
+    }
+}

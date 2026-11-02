@@ -1096,33 +1096,17 @@ impl Document {
         // just the line's own fields, so it is cheap.
         let mut line_positions: Vec<LineEntry> = Vec::with_capacity(lines.len());
         let mut page = 0usize;
-        // Whether a block's layout text maps exactly onto its text nodes is
-        // checked once per block; blocks that differ (collapsed whitespace,
-        // text-transform) need the content mapping so their keys match what the
-        // lookup computes.
-        let mut block_matches: HashMap<NodeId, bool> = HashMap::new();
         for line in lines.iter() {
             while page + 1 < page_starts.len() && line.top + 0.5 >= page_starts[page + 1].clip_top {
                 page += 1;
             }
-            let block = root.with(line.node_id);
-            let matches = *block_matches.entry(line.node_id).or_insert_with(|| {
-                block
-                    .element_data()
-                    .and_then(|element| element.inline_layout_data.as_ref())
-                    .is_some_and(|layout| xpointer::block_text_matches_dom(block, &layout.text))
-            });
-            let (block_id, offset) = if matches {
-                (line.node_id, line.text_start.min(u32::MAX as usize) as u32)
-            } else {
-                xpointer::position_for_line_offset(root, line, 0)
-                    .ok()
-                    .and_then(|position| xpointer::block_and_byte_offset(root, &position))
-                    .unwrap_or((line.node_id, line.text_start.min(u32::MAX as usize) as u32))
-            };
+            // The key is the line's block and its own byte offset in that
+            // block's layout text. Both sides of the page lookup use
+            // `LayoutTextMap`, so they agree for every block (floats,
+            // collapsed whitespace, text-transform included).
             line_positions.push(LineEntry {
-                block: block_id,
-                offset,
+                block: line.node_id,
+                offset: line.text_start.min(u32::MAX as usize) as u32,
                 page,
             });
         }
@@ -1146,7 +1130,7 @@ impl Document {
             if slot.is_some() {
                 continue;
             }
-            *slot = xpointer::position_for_block_offset(
+            *slot = xpointer::position_for_layout_offset(
                 root,
                 root.with(entry.block),
                 entry.offset as usize,
@@ -2243,7 +2227,17 @@ impl Document {
                 .context("line snapshot is missing")?;
             let root = active.doc.root_element();
             let start = xpointer::position_for_line_offset(root, line, start_byte)?;
-            let mut end = xpointer::position_for_line_offset(root, line, end_byte)?;
+            // The end byte is the boundary after the word. Map it to the
+            // position just after the word's own last character, not to the
+            // first character of the next text node: a word ending at a link
+            // or span boundary otherwise produces a range split across blocks.
+            let block = root.with(line.node_id);
+            let mut end = xpointer::position_after_layout_offset(
+                root,
+                block,
+                line.text_start.saturating_add(end_byte),
+            )
+            .unwrap_or(xpointer::position_for_line_offset(root, line, end_byte)?);
             if end == start {
                 // The line -> source mapping collapsed (it matches text
                 // prefixes, so repeated sentences can resolve to the same
@@ -2506,29 +2500,6 @@ impl Document {
                         rect.y,
                     )));
                 }
-                // Fallback for lines whose layout text no longer matches the
-                // DOM (text-transform, generated content): compare the mapped
-                // positions, which is only exact for single-node lines.
-                let Some((start, end)) = self.line_bounds(page, line_index)? else {
-                    continue;
-                };
-                if target < start || target > end {
-                    continue;
-                }
-                let chars = if target == end {
-                    rect.text.chars().count().saturating_sub(1)
-                } else {
-                    (target
-                        .codepoint_offset
-                        .saturating_sub(start.codepoint_offset)) as usize
-                };
-                let byte = byte_offset_for_char(&rect.text, chars);
-                let char_count = rect.text.chars().count().max(1) as f32;
-                let start_chars = rect.text[..byte].chars().count() as f32;
-                return Ok(Some((
-                    rect.x + rect.width * (start_chars / char_count),
-                    rect.y,
-                )));
             }
             let Some(next) = self.next_visible_char(&current)? else {
                 return Ok(None);
@@ -2537,9 +2508,6 @@ impl Document {
                 return Ok(None);
             }
             current = next;
-        }
-        if std::env::var_os("CRE_XP_POINT_DEBUG").is_some() {
-            eprintln!("point_from_xpointer: no line after 64 steps from {xpointer}");
         }
         Ok(None)
     }
@@ -2629,8 +2597,15 @@ impl Document {
         let mut end_position = parse_text_position(end)?;
         let mut start_page = self.page_from_xpointer(start)?;
         let mut end_page = self.page_from_xpointer(end)?;
-        let reversed =
-            start_page > end_page || (start_page == end_page && start_position > end_position);
+        let mut reversed = start_page > end_page;
+        if !reversed && start_page == end_page {
+            // Same page: compare the two positions in document order. Their
+            // XPointer paths cannot be compared directly (a child span sorts
+            // after its parent's tag even when its text comes first).
+            reversed =
+                self.compare_positions_on_page(start_page, &start_position, &end_position)?
+                    == Some(std::cmp::Ordering::Greater);
+        }
         if reversed {
             std::mem::swap(&mut start_page, &mut end_page);
             std::mem::swap(&mut start_position, &mut end_position);
@@ -2667,122 +2642,57 @@ impl Document {
                     if start_byte >= end_byte {
                         continue;
                     }
-                    let line_chars = rect.text.chars().count();
-                    let matches = xpointer::block_text_matches_dom(block, text);
-                    let (from_chars, to_chars) = if matches {
-                        // Exact: character offsets from the block's text nodes,
-                        // so a range that crosses text nodes still slices.
-                        let line_start_chars = text[..start_byte].chars().count();
-                        let line_end_chars = text[..end_byte].chars().count();
-                        let start_offset =
-                            xpointer::block_char_offset(root, block, &start_position);
-                        let end_offset = xpointer::block_char_offset(root, block, &end_position);
-                        match (start_offset, end_offset) {
-                            (Some(from), Some(to)) => {
-                                if to <= line_start_chars || from >= line_end_chars {
-                                    continue;
-                                }
-                                (
-                                    from.max(line_start_chars) - line_start_chars,
-                                    to.min(line_end_chars) - line_start_chars,
-                                )
+                    // Where the two ends of the range fall: inside this line's
+                    // block (exact layout offset) or in another block (compare
+                    // source nodes in document order). No line-end position is
+                    // needed, so a neighbouring inline root cannot make the
+                    // line look longer than it is.
+                    let start_key = xpointer::block_and_layout_offset(root, &start_position);
+                    let end_key = xpointer::block_and_layout_offset(root, &end_position);
+                    let line_first = xpointer::position_for_line_offset(root, line, 0)
+                        .ok()
+                        .and_then(|position| {
+                            xpointer::resolve_text_position(root, &position).ok()
+                        });
+                    let from_byte = match start_key {
+                        Some((id, offset)) if id == block.id => {
+                            if offset >= end_byte {
+                                continue;
                             }
-                            (Some(from), None) => {
-                                if from >= line_end_chars {
-                                    continue;
-                                }
-                                (
-                                    from.max(line_start_chars) - line_start_chars,
-                                    line_end_chars - line_start_chars,
-                                )
-                            }
-                            (None, Some(to)) => {
-                                if to <= line_start_chars {
-                                    continue;
-                                }
-                                (0, to.min(line_end_chars) - line_start_chars)
-                            }
-                            (None, None) => {
-                                // Neither end is in this block: the range spans
-                                // several blocks, so include the whole line.
-                                let Some(first) =
-                                    xpointer::position_for_line_offset(root, line, 0).ok()
-                                else {
-                                    continue;
-                                };
-                                let Some(last) = xpointer::position_for_line_offset(
-                                    root,
-                                    line,
-                                    end_byte - start_byte,
-                                )
-                                .ok() else {
-                                    continue;
-                                };
-                                if last <= start_position || first >= end_position {
-                                    continue;
-                                }
-                                (0, line_end_chars - line_start_chars)
-                            }
+                            offset.max(start_byte)
                         }
-                    } else {
-                        // The block's layout text differs from its DOM text
-                        // (a float, collapsed whitespace, text-transform), so
-                        // block offsets are not the layout offsets. They are
-                        // still monotonic within the block, so compare the
-                        // range against the line through them: comparing
-                        // `TextPosition`s directly orders a child span and its
-                        // parent's direct text node wrongly (the drop-cap
-                        // paragraph's "from" looked before the line start).
-                        let Some(first) = xpointer::position_for_line_offset(root, line, 0).ok()
-                        else {
-                            continue;
-                        };
-                        let Some(last) =
-                            xpointer::position_for_line_offset(root, line, end_byte - start_byte)
-                                .ok()
-                        else {
-                            continue;
-                        };
-                        let first_chars = xpointer::block_char_offset(root, block, &first);
-                        let last_chars = xpointer::block_char_offset(root, block, &last);
-                        let start_chars = xpointer::block_char_offset(root, block, &start_position);
-                        let end_chars = xpointer::block_char_offset(root, block, &end_position);
-                        match (first_chars, last_chars, start_chars, end_chars) {
-                            (Some(first_chars), Some(last_chars), Some(from), Some(to)) => {
-                                if to <= first_chars || from >= last_chars {
-                                    continue;
-                                }
-                                (
-                                    from.max(first_chars) - first_chars,
-                                    to.min(last_chars) - first_chars,
-                                )
+                        Some(_) => {
+                            let start_text =
+                                xpointer::resolve_text_position(root, &start_position).ok();
+                            if matches!((start_text, line_first), (Some(start), Some(first)) if start > first)
+                            {
+                                continue;
                             }
-                            (Some(first_chars), Some(last_chars), Some(from), None) => {
-                                if from >= last_chars {
-                                    continue;
-                                }
-                                (
-                                    from.max(first_chars) - first_chars,
-                                    last_chars - first_chars,
-                                )
-                            }
-                            (Some(first_chars), Some(last_chars), None, Some(to)) => {
-                                if to <= first_chars {
-                                    continue;
-                                }
-                                (0, to.min(last_chars) - first_chars)
-                            }
-                            _ => {
-                                // Neither end resolves inside this block: the
-                                // range spans several blocks, so include the
-                                // whole line.
-                                if last <= start_position || first >= end_position {
-                                    continue;
-                                }
-                                (0, line_chars)
-                            }
+                            start_byte
                         }
+                        None => start_byte,
                     };
+                    let to_byte = match end_key {
+                        Some((id, offset)) if id == block.id => {
+                            if offset <= start_byte {
+                                continue;
+                            }
+                            offset.min(end_byte)
+                        }
+                        Some(_) => {
+                            let end_text =
+                                xpointer::resolve_text_position(root, &end_position).ok();
+                            if matches!((end_text, line_first), (Some(end), Some(first)) if end < first)
+                            {
+                                continue;
+                            }
+                            end_byte
+                        }
+                        None => end_byte,
+                    };
+                    let line_start_chars = text[..start_byte].chars().count();
+                    let from_chars = text[..from_byte].chars().count() - line_start_chars;
+                    let to_chars = text[..to_byte].chars().count() - line_start_chars;
                     if from_chars >= to_chars {
                         continue;
                     }
@@ -2836,80 +2746,14 @@ impl Document {
                 return Ok(None);
             }
             let line_chars = layout.text[start..end].chars().count();
-
-            if xpointer::block_text_matches_dom(inline_root, &layout.text) {
-                let Some(byte) = xpointer::block_byte_offset(root, inline_root, target) else {
-                    return Ok(None);
-                };
-                if byte < start || byte > end || !layout.text.is_char_boundary(start) {
-                    return Ok(None);
-                }
-                let segment = &layout.text[start..end];
-                let relative = byte - start;
-                if !segment.is_char_boundary(relative) {
-                    return Ok(None);
-                }
-                let chars = segment[..relative].chars().count();
-                return Ok(Some(if relative >= segment.len() {
-                    chars.saturating_sub(1)
-                } else {
-                    chars
-                }));
-            }
-
-            // A float makes the block's layout text differ from its DOM text,
-            // so the exact byte offset above does not apply. The line's start
-            // and end still map to source positions through the same run
-            // mapping the words use; compare all three as block character
-            // offsets, which stay monotonic across text nodes.
-            let start_position = xpointer::position_for_line_offset(root, line, 0).ok();
-            let end_position = xpointer::position_for_line_offset(root, line, end - start).ok();
-            let (Some(start_position), Some(end_position)) = (start_position, end_position) else {
+            let Some(byte) = xpointer::layout_offset_in_block(root, inline_root, target) else {
                 return Ok(None);
             };
-            let start_chars = xpointer::block_char_offset(root, inline_root, &start_position);
-            let end_chars = xpointer::block_char_offset(root, inline_root, &end_position);
-            let target_chars = xpointer::block_char_offset(root, inline_root, target);
-            let (Some(start_chars), Some(end_chars), Some(target_chars)) =
-                (start_chars, end_chars, target_chars)
-            else {
-                return Ok(None);
-            };
-            if target_chars < start_chars || target_chars > end_chars {
+            if byte < start || byte > end {
                 return Ok(None);
             }
-            Ok(Some(
-                (target_chars - start_chars).min(line_chars.saturating_sub(1)),
-            ))
-        })
-    }
-
-    fn line_bounds(
-        &self,
-        page: usize,
-        line_index: usize,
-    ) -> Result<Option<(TextPosition, TextPosition)>> {
-        let Some(snapshot) = self.pages.get(page.saturating_sub(1)) else {
-            return Ok(None);
-        };
-        let chunk_index = snapshot.chunk;
-        let line_base = self.chunks[chunk_index].line_base;
-        let Some(local_line) = line_index.checked_sub(line_base) else {
-            return Ok(None);
-        };
-
-        self.with_active_chunk(chunk_index, |active| {
-            let Some(line) = active.lines.get(local_line) else {
-                return Ok(None);
-            };
-            let root = active.doc.root_element();
-            let start = xpointer::position_for_line_offset(root, line, 0)?;
-            let end = xpointer::position_for_line_offset(
-                root,
-                line,
-                line.text_end.saturating_sub(line.text_start),
-            )?;
-            Ok(Some((start, end)))
+            let chars = layout.text[start..byte].chars().count();
+            Ok(Some(chars.min(line_chars.saturating_sub(1))))
         })
     }
 
@@ -3392,13 +3236,14 @@ impl Document {
         let lines = &layout.lines;
         self.with_active_chunk(chunk_index, |active| {
             let root = active.doc.root_element();
-            let Some(key) = xpointer::block_and_byte_offset(root, position) else {
+            let Some(key) = xpointer::block_and_layout_offset(root, position) else {
                 return Ok(None);
             };
-            let first_greater = lines.partition_point(|entry| (entry.block, entry.offset) < key);
+            let first_greater =
+                lines.partition_point(|entry| (entry.block, entry.offset as usize) < key);
             let index = if lines
                 .get(first_greater)
-                .is_some_and(|entry| (entry.block, entry.offset) == key)
+                .is_some_and(|entry| (entry.block, entry.offset as usize) == key)
             {
                 Some(first_greater)
             } else {
@@ -3417,10 +3262,47 @@ impl Document {
         Ok(page)
     }
 
+    fn compare_positions_in_chunk(
+        &self,
+        chunk_index: usize,
+        left: &TextPosition,
+        right: &TextPosition,
+    ) -> Result<Option<std::cmp::Ordering>> {
+        self.with_active_chunk(chunk_index, |active| {
+            let root = active.doc.root_element();
+            Ok(xpointer::compare_text_positions(root, left, right))
+        })
+    }
+
+    fn compare_positions_on_page(
+        &self,
+        page: usize,
+        left: &TextPosition,
+        right: &TextPosition,
+    ) -> Result<Option<std::cmp::Ordering>> {
+        let Some(snapshot) = self.pages.get(page.saturating_sub(1)) else {
+            return Ok(None);
+        };
+        self.compare_positions_in_chunk(snapshot.chunk, left, right)
+    }
+
     pub fn compare_xpointers(&self, left: &str, right: &str) -> Result<i32> {
         let left = parse_text_position(left)?;
         let right = parse_text_position(right)?;
-        Ok(match right.cmp(&left) {
+        let left_chunk = self.spine_to_chunk.get(&left.spine_index).copied();
+        let right_chunk = self.spine_to_chunk.get(&right.spine_index).copied();
+        // Return 1 when `right` is after `left`, like cre.cpp's
+        // `nodep2.compare(nodep1)`. Resolve both positions to text nodes so the
+        // comparison follows document order, not XPointer path strings.
+        let right_vs_left = match (left_chunk, right_chunk) {
+            (Some(left_chunk), Some(right_chunk)) if left_chunk == right_chunk => {
+                self.compare_positions_in_chunk(left_chunk, &right, &left)?
+            }
+            (Some(left_chunk), Some(right_chunk)) => Some(right_chunk.cmp(&left_chunk)),
+            _ => None,
+        };
+        let ordering = right_vs_left.unwrap_or_else(|| right.cmp(&left));
+        Ok(match ordering {
             std::cmp::Ordering::Greater => 1,
             std::cmp::Ordering::Less => -1,
             std::cmp::Ordering::Equal => 0,

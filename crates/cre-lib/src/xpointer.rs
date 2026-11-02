@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail};
 use blitz_dom::node::TextLayout;
@@ -41,10 +41,9 @@ fn position_for_page(
     page_margin: f32,
 ) -> Result<TextPosition> {
     let line = line_for_page(lines, page_starts, page, height, page_margin)?;
-    if let Some(position) = source_position_for_line(root, line) {
-        return Ok(position);
-    }
-    fallback_position_for_line(root, line)
+    // The same mapping the word positions use: a page start and the words on
+    // that page cannot disagree.
+    position_for_line_offset(root, line, 0).or_else(|_| fallback_position_for_line(root, line))
 }
 fn line_for_page<'a>(
     lines: &'a [LineBox],
@@ -85,149 +84,191 @@ fn line_for_page<'a>(
 }
 
 fn fallback_position_for_line(root: &Node, line: &LineBox) -> Result<TextPosition> {
-    // Same mapping the word positions use, so a page start and the words on
-    // that page stay comparable.
-    if let Ok(position) = position_for_line_offset(root, line, 0) {
-        return Ok(position);
-    }
     let element_id = nearest_real_element_id(root, line.node_id)
         .with_context(|| "page line has no text node or element that can produce an XPointer")?;
     position_for_text_node(root, element_id, 0)
 }
 
-fn source_position_for_line(root: &Node, line: &LineBox) -> Option<TextPosition> {
-    // The same mapping the word positions use: it only considers the line's own
-    // block, so a page start and the words on that page stay comparable. Going
-    // through `map_line_text_position` with the line's `source_element_id`
-    // instead could attribute a page start to a body-level whitespace text node,
-    // which made the page-start list non-monotonic (juliet.epub).
-    if let Ok(position) = position_for_line_offset(root, line, 0) {
-        return Some(position);
-    }
-    let (text_id, codepoint_offset) = source_text_position_for_line(root, line)?;
-    position_for_text_node(root, text_id, codepoint_offset).ok()
+/// Exact mapping between a block's inline layout text and its source text
+/// nodes, built from parley's runs.
+///
+/// Every run carries the brush of the element whose style span pushed its
+/// text (`Cluster::style().brush`). Replaying the runs in layout order over
+/// the text nodes that element owns recovers, for every layout character, the
+/// text node and codepoint offset it came from. This is the only mapping the
+/// XPointer code uses: it is derived from the same data blitz laid out, so it
+/// cannot drift from what is rendered. Characters added by generated content
+/// (or changed by a text-transform that cannot be inverted) are stored as
+/// `None` and skipped when converting a position.
+pub(crate) struct LayoutTextMap {
+    /// `(layout byte offset, source position)` per character, in layout order.
+    chars: Vec<(usize, Option<(NodeId, u32)>)>,
+    /// `(codepoint offset, layout byte offset, byte length)` per text node, in
+    /// layout order. Used for the inverse direction.
+    nodes: HashMap<NodeId, Vec<(u32, usize, usize)>>,
 }
 
-/// Source position of a character offset inside a block's inline layout text,
-/// when that text is the block's text nodes concatenated.
-/// The block that owns a position (the nearest ancestor with inline layout data,
-/// or the node itself) and the byte offset of the position inside that block's
-/// layout text. This is the table key: node ids increase with document order, so
-/// `(block, byte offset)` orders positions the way the document does.
-pub(crate) fn block_and_byte_offset(root: &Node, position: &TextPosition) -> Option<(NodeId, u32)> {
-    let target = resolve_text_position(root, position).ok()?;
-    let mut current = root.with(target);
-    let block_id = loop {
-        if current
-            .element_data()
-            .and_then(|data| data.inline_layout_data.as_ref())
-            .is_some()
-        {
-            break current.id;
-        }
-        let parent = current.parent?;
-        current = root.with(parent);
-    };
-    let block = root.with(block_id);
-    let offset_chars = position.codepoint_offset as usize;
-    let mut total = 0u32;
-    let mut stack = vec![block.id];
-    while let Some(id) = stack.pop() {
-        let node = block.with(id);
-        if let Some(text) = node.text_data() {
-            if id == target {
-                let bytes: usize = text
-                    .content
-                    .chars()
-                    .take(offset_chars)
-                    .map(char::len_utf8)
-                    .sum();
-                return Some((block_id, total + bytes as u32));
+impl LayoutTextMap {
+    pub(crate) fn new(root: &Node, inline_layout: &TextLayout) -> Option<Self> {
+        let mut pieces: Vec<(std::ops::Range<usize>, NodeId)> = Vec::new();
+        for line in inline_layout.layout.lines() {
+            for run in line.runs() {
+                for cluster in run.clusters() {
+                    let brush = cluster.style().brush.id;
+                    let range = cluster.text_range();
+                    match pieces.last_mut() {
+                        Some((last, last_brush))
+                            if *last_brush == brush && last.end == range.start =>
+                        {
+                            last.end = range.end;
+                        }
+                        _ => pieces.push((range, brush)),
+                    }
+                }
             }
-            total += text.content.len() as u32;
-            continue;
         }
-        for child in node.children.iter().rev() {
-            stack.push(*child);
+        let runs = pieces;
+        let mut brushes = runs.iter().map(|(_, brush)| *brush).collect::<HashSet<_>>();
+        // Out-of-flow boxes (a float such as a drop cap) also own text, but
+        // their text is not part of this block's layout text, so they produce
+        // no run here. Their inline-box id is still the element that owns the
+        // text; stopping at it keeps that text out of the parent's cursor.
+        brushes.extend(
+            inline_layout
+                .layout
+                .inline_boxes()
+                .map(|inline_box| NodeId::from_u64(inline_box.id)),
+        );
+        let mut cursors: HashMap<NodeId, RunTextCursor> = HashMap::new();
+        let mut chars = Vec::new();
+        let mut nodes: HashMap<NodeId, Vec<(u32, usize, usize)>> = HashMap::new();
+        for (range, brush) in runs {
+            let cursor = cursors
+                .entry(brush)
+                .or_insert_with(|| RunTextCursor::new(root, brush, &brushes));
+            let text = inline_layout.text.get(range.clone())?;
+            let mapping = cursor.align(text);
+            for (char_index, (byte, character)) in text.char_indices().enumerate() {
+                let position = mapping.get(char_index).copied().flatten();
+                if let Some((node_id, offset)) = position {
+                    nodes.entry(node_id).or_default().push((
+                        offset,
+                        range.start + byte,
+                        character.len_utf8(),
+                    ));
+                }
+                chars.push((range.start + byte, position));
+            }
+        }
+        chars.sort_by_key(|(byte, _)| *byte);
+        chars.dedup_by_key(|(byte, _)| *byte);
+        for entries in nodes.values_mut() {
+            entries.sort_by_key(|(offset, _, _)| *offset);
+        }
+        Some(Self { chars, nodes })
+    }
+
+    /// Source position for a layout byte offset. A `None` character (generated
+    /// content) resolves to the next real character; past the end of the block
+    /// it resolves to one past the last source character.
+    pub(crate) fn position_at(&self, byte: usize) -> Option<(NodeId, u32)> {
+        let index = self.chars.partition_point(|(offset, _)| *offset < byte);
+        if let Some((_, Some(position))) = self.chars.get(index) {
+            return Some(*position);
+        }
+        if let Some((_, position)) = self.chars[index..]
+            .iter()
+            .find(|(_, position)| position.is_some())
+        {
+            return *position;
+        }
+        let (_, position) = self.chars[..index]
+            .iter()
+            .rev()
+            .find(|(_, position)| position.is_some())?;
+        let (node_id, offset) = (*position)?;
+        Some((node_id, offset.saturating_add(1)))
+    }
+
+    /// Source position after the last real character before `byte`. Used for a
+    /// word's end: the character at `byte` is the boundary after the word and
+    /// may belong to the next text node, while the position after the word's
+    /// own last character stays in the same node.
+    pub(crate) fn position_after(&self, byte: usize) -> Option<(NodeId, u32)> {
+        let index = self.chars.partition_point(|(offset, _)| *offset < byte);
+        let (_, position) = self.chars[..index]
+            .iter()
+            .rev()
+            .find(|(_, position)| position.is_some())?;
+        let (node_id, offset) = (*position)?;
+        Some((node_id, offset.saturating_add(1)))
+    }
+
+    /// Layout byte offset of a source position. A position inside collapsed
+    /// whitespace resolves to the next visible character; at the end of a node
+    /// it resolves to the byte after its last character.
+    pub(crate) fn layout_offset(&self, node_id: NodeId, codepoint_offset: u32) -> Option<usize> {
+        let entries = self.nodes.get(&node_id)?;
+        match entries.binary_search_by_key(&codepoint_offset, |(offset, _, _)| *offset) {
+            Ok(index) => Some(entries[index].1),
+            Err(index) => {
+                if let Some((_, byte, _)) = entries.get(index) {
+                    Some(*byte)
+                } else {
+                    let (_, byte, length) = *entries.last()?;
+                    Some(byte + length)
+                }
+            }
         }
     }
-    None
 }
 
-pub(crate) fn position_for_block_offset(
+/// Block and layout byte offset of a source position. This is the page table
+/// key: both sides come from the same `LayoutTextMap`, so they always agree.
+pub(crate) fn block_and_layout_offset(
+    root: &Node,
+    position: &TextPosition,
+) -> Option<(NodeId, usize)> {
+    let text_id = resolve_text_position(root, position).ok()?;
+    let text = root.with(text_id);
+    let block = text.inline_root_ancestor()?;
+    let layout = block.element_data()?.inline_layout_data.as_ref()?;
+    let map = LayoutTextMap::new(block, layout)?;
+    let offset = map.layout_offset(text_id, position.codepoint_offset)?;
+    Some((block.id, offset))
+}
+
+/// Layout byte offset of a source position inside `block`, or `None` when the
+/// position belongs to another block.
+pub(crate) fn layout_offset_in_block(
+    root: &Node,
+    block: &Node,
+    position: &TextPosition,
+) -> Option<usize> {
+    block_and_layout_offset(root, position)
+        .and_then(|(block_id, offset)| (block_id == block.id).then_some(offset))
+}
+
+pub(crate) fn position_for_layout_offset(
     root: &Node,
     block: &Node,
     byte_offset: usize,
 ) -> Option<TextPosition> {
-    let (text_id, codepoint_offset) = text_node_for_block_offset(block, byte_offset)?;
+    let layout = block.element_data()?.inline_layout_data.as_ref()?;
+    let map = LayoutTextMap::new(block, layout)?;
+    let (text_id, codepoint_offset) = map.position_at(byte_offset)?;
     position_for_text_node(root, text_id, codepoint_offset).ok()
 }
 
-/// True when the block's inline layout text is exactly its text nodes
-/// concatenated, which makes byte offsets inside it map exactly. Holds for
-/// ordinary prose (the layout text even keeps `\n`); it does not when a
-/// text-transform or generated content changes the rendered text.
-pub(crate) fn block_text_matches_dom(block: &Node, layout_text: &str) -> bool {
-    let mut total = 0usize;
-    for id in collect_text_node_ids_vec(block) {
-        if let Some(text) = block.with(id).text_data() {
-            total += text.content.chars().count();
-        }
-    }
-    total == layout_text.chars().count()
-}
-
-/// Character offset of a source position inside its block, so two positions of
-/// one block can be compared and sliced even when they live in different text
-/// nodes (the clipping code used to subtract their node-relative offsets).
-pub(crate) fn block_char_offset(
+pub(crate) fn position_after_layout_offset(
     root: &Node,
     block: &Node,
-    position: &TextPosition,
-) -> Option<usize> {
-    let target = resolve_text_position(root, position).ok()?;
-    let mut total = 0usize;
-    for id in collect_text_node_ids_vec(block) {
-        let node = root.with(id);
-        let length = node
-            .text_data()
-            .map(|text| text.content.chars().count())
-            .unwrap_or(0);
-        if id == target {
-            return Some(total + position.codepoint_offset as usize);
-        }
-        total += length;
-    }
-    None
-}
-
-/// Byte offset of a source position inside its block's inline layout text.
-/// [`position_for_line_offset`] takes byte offsets, so line bounds have to be
-/// compared in the same space: comparing `TextPosition`s directly is wrong for
-/// a line that spans several text nodes (a heading such as
-/// `<h1><span>第一章</span>　十二月的礼物</h1>`), because a child node and its
-/// parent are not ordered the way the rendered text is.
-pub(crate) fn block_byte_offset(
-    root: &Node,
-    block: &Node,
-    position: &TextPosition,
-) -> Option<usize> {
-    let target = resolve_text_position(root, position).ok()?;
-    let mut total = 0usize;
-    for id in collect_text_node_ids_vec(block) {
-        let content = root.with(id).text_data().map(|text| text.content.clone())?;
-        if id == target {
-            let chars = position.codepoint_offset as usize;
-            let byte = content
-                .char_indices()
-                .nth(chars)
-                .map(|(offset, _)| offset)
-                .unwrap_or(content.len());
-            return Some(total + byte);
-        }
-        total += content.len();
-    }
-    None
+    byte_offset: usize,
+) -> Option<TextPosition> {
+    let layout = block.element_data()?.inline_layout_data.as_ref()?;
+    let map = LayoutTextMap::new(block, layout)?;
+    let (text_id, codepoint_offset) = map.position_after(byte_offset)?;
+    position_for_text_node(root, text_id, codepoint_offset).ok()
 }
 
 pub(crate) fn position_for_line_offset(
@@ -235,66 +276,21 @@ pub(crate) fn position_for_line_offset(
     line: &LineBox,
     byte_offset: usize,
 ) -> Result<TextPosition> {
-    let inline_root = root.with(line.node_id);
-    let inline_layout = inline_root
+    let block = root.with(line.node_id);
+    let layout = block
         .element_data()
         .and_then(|element| element.inline_layout_data.as_ref())
         .context("line has no inline layout")?;
-    // Exact mapping first: it identifies the text node that owns the offset
-    // instead of guessing it from the text content, which is what attributed
-    // lines of repeated sentences to the wrong copy (juliet.epub).
-    if block_text_matches_dom(inline_root, &inline_layout.text)
-        && let Some(position) = position_for_block_offset(
-            root,
-            inline_root,
-            line.text_start.saturating_add(byte_offset),
-        )
-    {
-        return Ok(position);
-    }
-    let text_len = inline_layout.text.len();
-    let line_start = line.text_start.min(text_len);
-    let line_end = line.text_end.clamp(line_start, text_len);
-    let segment = inline_layout
-        .text
-        .get(line_start..line_end)
-        .context("line text range is not a valid string range")?;
-
-    // The line text can span several text nodes (a drop cap is a float, an
-    // inline span, a link...). Parley's runs remember which element pushed
-    // each piece of text, so map the offset through the run that owns it
-    // instead of guessing from the line's first run.
-    let absolute = line.text_start.saturating_add(byte_offset).min(text_len);
-    let absolute = floor_char_boundary(&inline_layout.text, absolute);
-    if let Some((text_id, codepoint_offset)) =
-        map_layout_offset_to_text_node(inline_root, inline_layout, absolute)
-    {
-        return position_for_text_node(root, text_id, codepoint_offset);
-    }
-
-    let mut offset = byte_offset.min(segment.len());
-    while offset > 0 && !segment.is_char_boundary(offset) {
-        offset -= 1;
-    }
-
-    if offset < segment.len()
-        && !segment[offset..].trim().is_empty()
-        && let Some((text_id, codepoint_offset)) =
-            map_line_text_position(inline_root, line.source_element_id, &segment[offset..])
-    {
-        return position_for_text_node(root, text_id, codepoint_offset);
-    }
-
-    let (text_id, codepoint_offset) =
-        map_line_text_position(inline_root, line.source_element_id, segment)
-            .context("line has no text source position")?;
-    let char_offset = segment[..offset].chars().count() as u32;
-    let content_len = root
-        .with(text_id)
-        .text_data()
-        .map(|text| text.content.chars().count() as u32);
-    let final_offset = (codepoint_offset + char_offset).min(content_len.unwrap_or(u32::MAX));
-    position_for_text_node(root, text_id, final_offset)
+    let target = line
+        .text_start
+        .saturating_add(byte_offset)
+        .min(layout.text.len());
+    let target = floor_char_boundary(&layout.text, target);
+    let map = LayoutTextMap::new(block, layout).context("line block has no layout map")?;
+    let (text_id, codepoint_offset) = map
+        .position_at(target)
+        .with_context(|| format!("line offset {target} has no source character"))?;
+    position_for_text_node(root, text_id, codepoint_offset)
 }
 
 fn floor_char_boundary(text: &str, mut index: usize) -> usize {
@@ -302,56 +298,6 @@ fn floor_char_boundary(text: &str, mut index: usize) -> usize {
         index -= 1;
     }
     index
-}
-
-/// Maps a byte offset in a block's inline layout text to the text node that
-/// produced it, and to a codepoint offset inside that node.
-///
-/// Parley keeps, for every run, the brush of the element whose style span
-/// pushed the text (`Cluster::style().brush`). The text a run covers is a
-/// contiguous slice of the text nodes owned by that element, so a cursor per
-/// element can replay the runs in layout order and recover the node and
-/// offset. This handles the cases the text-prefix search cannot: a line split
-/// across a float and the paragraph (3.epub's drop cap), several runs of one
-/// block, and collapsed whitespace.
-fn map_layout_offset_to_text_node(
-    inline_root: &Node,
-    inline_layout: &TextLayout,
-    target: usize,
-) -> Option<(NodeId, u32)> {
-    let runs = inline_layout
-        .layout
-        .lines()
-        .flat_map(|line| line.runs())
-        .filter_map(|run| {
-            let brush = run.clusters().next()?.style().brush.id;
-            Some((run.text_range(), brush))
-        })
-        .collect::<Vec<_>>();
-
-    let target_index = runs
-        .iter()
-        .position(|(range, _)| range.start <= target && target < range.end)
-        .or_else(|| runs.iter().rposition(|(range, _)| range.end <= target))?;
-    let target_range = runs[target_index].0.clone();
-    let target_brush = runs[target_index].1;
-
-    let mut cursors: HashMap<NodeId, RunTextCursor> = HashMap::new();
-    for (range, brush) in runs.iter().take(target_index + 1) {
-        if *brush != target_brush {
-            continue;
-        }
-        let cursor = cursors
-            .entry(*brush)
-            .or_insert_with(|| RunTextCursor::new(inline_root, *brush));
-        let text = inline_layout.text.get(range.clone())?;
-        let mapping = cursor.align(text)?;
-        if *range == target_range {
-            let index = target.saturating_sub(range.start);
-            return mapping.get(index).copied().or_else(|| cursor.position());
-        }
-    }
-    cursors.get(&target_brush)?.position()
 }
 
 /// Walks the text nodes owned by one brush element in document order, matching
@@ -363,15 +309,14 @@ struct RunTextCursor {
 }
 
 impl RunTextCursor {
-    fn new(root: &Node, element: NodeId) -> Self {
-        let nodes = root
-            .with(element)
-            .children
-            .iter()
-            .copied()
+    fn new(root: &Node, element: NodeId, brushes: &HashSet<NodeId>) -> Self {
+        let mut ids = Vec::new();
+        collect_owned_text_nodes(root, element, false, brushes, &mut ids);
+        let nodes = ids
+            .into_iter()
             .filter_map(|id| {
                 let content = root.with(id).text_data()?.content.clone();
-                Some((id, content.chars().collect()))
+                Some((id, content.chars().collect::<Vec<_>>()))
             })
             .collect();
         Self {
@@ -382,23 +327,25 @@ impl RunTextCursor {
     }
 
     fn position(&self) -> Option<(NodeId, u32)> {
-        let (node_id, _) = self.nodes.get(self.node_index)?;
-        Some((*node_id, self.char_index as u32))
+        let (node_id, chars) = self.nodes.get(self.node_index)?;
+        Some((*node_id, self.char_index.min(chars.len()) as u32))
     }
 
-    /// Maps every char of `text` to a `(text node, codepoint offset)`. Returns
-    /// `None` when the run does not line up with the node text (a
-    /// text-transform that changes characters, generated content...), so the
-    /// caller can fall back to the content search.
-    fn align(&mut self, text: &str) -> Option<Vec<(NodeId, u32)>> {
+    /// Maps each char of `text` to the source character it came from. Chars the
+    /// layout added, or transformed beyond recognition, become `None`; they do
+    /// not consume source text.
+    fn align(&mut self, text: &str) -> Vec<Option<(NodeId, u32)>> {
         if text == "\n" {
             // A `<br>` run: it consumes no character of the surrounding node.
-            return Some(vec![self.position()?]);
+            return vec![self.position()];
         }
         let mut out = Vec::with_capacity(text.chars().count());
         for run_char in text.chars() {
             loop {
-                let (node_id, chars) = self.nodes.get(self.node_index)?;
+                let Some((node_id, chars)) = self.nodes.get(self.node_index) else {
+                    out.push(None);
+                    break;
+                };
                 if self.char_index >= chars.len() {
                     self.node_index += 1;
                     self.char_index = 0;
@@ -406,7 +353,7 @@ impl RunTextCursor {
                 }
                 let node_char = chars[self.char_index];
                 if run_char.is_whitespace() {
-                    out.push((*node_id, self.char_index as u32));
+                    out.push(Some((*node_id, self.char_index as u32)));
                     if node_char.is_whitespace() {
                         while self.char_index < chars.len()
                             && chars[self.char_index].is_whitespace()
@@ -424,152 +371,58 @@ impl RunTextCursor {
                     }
                     continue;
                 }
-                if node_char != run_char && !node_char.eq_ignore_ascii_case(&run_char) {
-                    return None;
+                if !chars_equal_fold(node_char, run_char) {
+                    out.push(None);
+                    break;
                 }
-                out.push((*node_id, self.char_index as u32));
+                out.push(Some((*node_id, self.char_index as u32)));
                 self.char_index += 1;
                 break;
             }
         }
-        Some(out)
+        out
     }
 }
-fn source_text_position_for_line(root: &Node, line: &LineBox) -> Option<(NodeId, u32)> {
-    let inline_root = root.with(line.node_id);
-    let inline_layout = inline_root.element_data()?.inline_layout_data.as_ref()?;
-    let text_len = inline_layout.text.len();
-    let start = line.text_start.min(text_len);
-    let end = line.text_end.clamp(start, text_len);
-    let segment = inline_layout.text.get(start..end)?;
-    if segment.is_empty() {
-        return None;
-    }
-    if let Some(position) = text_node_for_block_offset(inline_root, start) {
-        return Some(position);
-    }
-    map_line_text_position(inline_root, line.source_element_id, segment)
-}
 
-fn map_line_text_position(
-    inline_root: &Node,
-    source_element_id: Option<NodeId>,
-    segment: &str,
-) -> Option<(NodeId, u32)> {
-    let source_id = source_element_id.unwrap_or(inline_root.id);
-    let source_node = inline_root.with(source_id);
-    let text_node_ids = collect_text_node_ids_vec(source_node);
-    let candidates = text_node_ids
-        .into_iter()
-        .filter_map(|id| {
-            let node = inline_root.with(id);
-            let content = node.text_data()?.content.as_str();
-            let (normalized, codepoint_map) = normalize_text_with_codepoint_map(content);
-            (!normalized.is_empty()).then_some(NormalizedTextNode {
-                id,
-                content: content.to_string(),
-                normalized,
-                codepoint_map,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let mut bases = vec![segment.trim_end_matches(is_whitespace)];
-    let trimmed = segment
-        .trim_start_matches(is_whitespace)
-        .trim_end_matches(is_whitespace);
-    if trimmed != bases[0] {
-        bases.push(trimmed);
-    }
-
-    for base in bases {
-        let char_count = base.chars().count();
-        for take in (1..=char_count).rev() {
-            let prefix: String = base.chars().take(take).collect();
-            for candidate in &candidates {
-                if let Some(offset) = find_normalized_text_offset(candidate, &prefix) {
-                    return Some((candidate.id, offset));
-                }
+/// Text nodes that belong to `element`'s style span: its text descendants,
+/// stopping at elements that opened a span of their own (they are runs with a
+/// different brush). Elements that did not push a span (`display: contents`)
+/// are transparent, so their text stays with the ancestor.
+fn collect_owned_text_nodes(
+    root: &Node,
+    element: NodeId,
+    nested: bool,
+    brushes: &HashSet<NodeId>,
+    out: &mut Vec<NodeId>,
+) {
+    for child in root.with(element).children.iter().copied() {
+        let node = root.with(child);
+        if node.is_text_node() {
+            if !nested {
+                out.push(child);
             }
+        } else if node.element_data().is_some() {
+            collect_owned_text_nodes(
+                root,
+                child,
+                nested || brushes.contains(&child),
+                brushes,
+                out,
+            );
         }
     }
-
-    let text_id = first_text_node(source_node, false)
-        .or_else(|| first_text_node(inline_root, false))
-        .or_else(|| first_text_node(source_node, true))?;
-    Some((text_id, 0))
 }
 
-struct NormalizedTextNode {
-    id: NodeId,
-    content: String,
-    normalized: String,
-    codepoint_map: Vec<usize>,
-}
-
-fn normalize_text_with_codepoint_map(content: &str) -> (String, Vec<usize>) {
-    let mut normalized = String::new();
-    let mut codepoint_map = Vec::new();
-    let chars = content.chars().collect::<Vec<_>>();
-    let mut index = 0usize;
-    let mut codepoint_offset = 0usize;
-
-    while index < chars.len() {
-        if chars[index].is_whitespace() {
-            let start_codepoint = codepoint_offset;
-            while index < chars.len() && chars[index].is_whitespace() {
-                index += 1;
-                codepoint_offset += 1;
-            }
-            normalized.push(' ');
-            codepoint_map.push(start_codepoint);
-        } else {
-            normalized.push(chars[index]);
-            codepoint_map.push(codepoint_offset);
-            index += 1;
-            codepoint_offset += 1;
-        }
+fn chars_equal_fold(left: char, right: char) -> bool {
+    if left == right || left.eq_ignore_ascii_case(&right) {
+        return true;
     }
-
-    (normalized, codepoint_map)
-}
-
-fn find_normalized_text_offset(candidate: &NormalizedTextNode, prefix: &str) -> Option<u32> {
-    let byte_pos = candidate.normalized.find(prefix)?;
-    let char_pos = candidate.normalized[..byte_pos].chars().count();
-    let raw_offset = *candidate.codepoint_map.get(char_pos)?;
-    Some(first_non_whitespace_codepoint_offset(
-        &candidate.content,
-        raw_offset,
-    ))
-}
-
-fn first_non_whitespace_codepoint_offset(content: &str, start: usize) -> u32 {
-    for (offset, ch) in content.chars().enumerate() {
-        if offset >= start && !ch.is_whitespace() {
-            return offset as u32;
-        }
+    let mut left = left.to_lowercase();
+    let mut right = right.to_lowercase();
+    match (left.next(), left.next(), right.next(), right.next()) {
+        (Some(left), None, Some(right), None) => left == right,
+        _ => false,
     }
-    start as u32
-}
-
-fn is_whitespace(ch: char) -> bool {
-    ch.is_whitespace()
-}
-
-fn collect_text_node_ids(node: &Node, out: &mut Vec<NodeId>) {
-    if node.is_text_node() {
-        out.push(node.id);
-    }
-    for child in node.children.iter() {
-        collect_text_node_ids(node.with(*child), out);
-    }
-}
-
-fn collect_text_node_ids_vec(node: &Node) -> Vec<NodeId> {
-    let mut out = Vec::new();
-    collect_text_node_ids(node, &mut out);
-    out
 }
 
 fn nearest_real_element_id(root: &Node, node_id: NodeId) -> Option<NodeId> {
@@ -588,9 +441,9 @@ pub(crate) fn position_for_text_node(
     target_id: NodeId,
     codepoint_offset: u32,
 ) -> Result<TextPosition> {
-    // Positions must name a valid offset inside the node: the content-matching
-    // fallback can overshoot (see `map_line_text_position`), and an out-of-range
-    // offset makes the range unusable for boxes and selections.
+    // Positions must name a valid offset inside the node: a position at the
+    // end of a block resolves to one past its last character, and an
+    // out-of-range offset makes the range unusable for boxes and selections.
     let codepoint_offset = root
         .with(target_id)
         .text_data()
@@ -654,32 +507,25 @@ fn text_index_for_node(root: &Node, node_id: NodeId) -> Option<u32> {
     (total > 1).then_some(index)
 }
 
-pub(crate) fn text_node_for_block_offset(
-    inline_root: &Node,
-    byte_offset: usize,
-) -> Option<(NodeId, u32)> {
-    let inline_layout = inline_root.element_data()?.inline_layout_data.as_ref()?;
-    let mut end = byte_offset.min(inline_layout.text.len());
-    while end > 0 && !inline_layout.text.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut remaining = inline_layout.text[..end].chars().count();
-    let mut last: Option<(NodeId, u32)> = None;
-    for id in collect_text_node_ids_vec(inline_root) {
-        let node = inline_root.with(id);
-        let Some(text) = node.text_data() else {
-            continue;
-        };
-        let len = text.content.chars().count();
-        if remaining < len {
-            return Some((id, remaining as u32));
-        }
-        remaining -= len;
-        last = Some((id, len as u32));
-    }
-    // An offset exactly at the end of the block names the position just past
-    // its last character, which callers (line ends) need.
-    if remaining == 0 { last } else { None }
+/// Document order of two source positions.
+///
+/// `TextPosition`'s `Ord` compares path segments by tag, so a child span
+/// (`span[2]`) sorts after its parent's direct text (`p` -> `text()`), even
+/// though the span's text comes first in the document. Resolving both
+/// positions to their text nodes and comparing node ids (which increase in
+/// document order) gives the order crengine's `ldomXPointer::compare` uses.
+pub(crate) fn compare_text_positions(
+    root: &Node,
+    left: &TextPosition,
+    right: &TextPosition,
+) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    let left_id = resolve_text_position(root, left).ok()?;
+    let right_id = resolve_text_position(root, right).ok()?;
+    Some(match left_id.cmp(&right_id) {
+        Ordering::Equal => left.codepoint_offset.cmp(&right.codepoint_offset),
+        order => order,
+    })
 }
 
 pub(crate) fn resolve_text_position(root: &Node, position: &TextPosition) -> Result<NodeId> {
@@ -887,11 +733,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalizes_whitespace_and_maps_unicode_scalar_offsets() {
-        let input = "a\u{e9}\u{1f600}  \nb";
-        let (normalized, map) = normalize_text_with_codepoint_map(input);
-        assert_eq!(normalized, "a\u{e9}\u{1f600} b");
-        assert_eq!(map, [0, 1, 2, 3, 6]);
-        assert_eq!(first_non_whitespace_codepoint_offset(input, 3), 6);
+    fn case_folding_matches_ascii_and_single_char_lowercase() {
+        assert!(chars_equal_fold('A', 'a'));
+        assert!(chars_equal_fold('\u{c9}', '\u{e9}'));
+        assert!(!chars_equal_fold('a', 'b'));
     }
 }
