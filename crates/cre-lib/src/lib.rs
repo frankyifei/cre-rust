@@ -4766,12 +4766,13 @@ fn create_document(
         "<style>img, svg, video, canvas, object, embed {{ max-width: 100%; \
          max-height: {max_image_height:.0}px; height: auto; }}</style>"
     ));
-    // An empty heading/paragraph still reserves a full line box. Converters
-    // leave these behind (the first page of zyj.epub is `<h1></h1>` followed by
-    // a full-page image), which produced a blank first page. They carry no
-    // content, so hide them.
+    // An empty heading still reserves a full line box. Converters leave these
+    // behind (the first page of zyj.epub is `<h1></h1>` followed by a
+    // full-page image), which produced a blank first page. Only headings are
+    // hidden: an empty <p> can be layout-critical (for example
+    // `<p class="cb"></p>` clearing floats on a title page).
     html_source.push_str(
-        "<style>h1:empty, h2:empty, h3:empty, h4:empty, h5:empty, h6:empty, p:empty \
+        "<style>h1:empty, h2:empty, h3:empty, h4:empty, h5:empty, h6:empty \
          { display: none !important; }</style>",
     );
     // The generators leave the base font size as a token so the chunk HTML (and
