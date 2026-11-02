@@ -124,6 +124,29 @@ pub struct TextBox {
     pub height: f32,
 }
 
+/// A byte range on one rendered line, used to build its box with parley's
+/// selection geometry.
+struct WordSpan<'a> {
+    page: usize,
+    line_index: usize,
+    line: &'a TextBox,
+    start_byte: usize,
+    end_byte: usize,
+    text: &'a str,
+}
+
+/// A word found while scanning, before its box is built (building the box
+/// borrows the active chunk again, which cannot happen inside the scan).
+struct PendingWord {
+    page: usize,
+    line_index: usize,
+    line: TextBox,
+    start_byte: usize,
+    end_byte: usize,
+    start: TextPosition,
+    end: Option<TextPosition>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PagePosition {
     pub page: usize,
@@ -193,12 +216,6 @@ pub struct PageMapEntry {
     pub xpointer: Option<String>,
     pub doc_y: i64,
     pub label: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Bookmark {
-    pub page: usize,
-    pub xpointer: Option<String>,
 }
 
 #[derive(Debug)]
@@ -384,6 +401,10 @@ struct ActiveChunk {
     doc: HtmlDocument,
     lines: Vec<LineBox>,
     page_starts: Vec<PageStart>,
+    /// Text nodes that took part in a block's inline layout. Hidden nodes
+    /// (`display: none`) are not in here, so text navigation never moves into
+    /// text that is not rendered.
+    rendered_text_nodes: std::collections::HashSet<NodeId>,
 }
 
 #[derive(Clone)]
@@ -1246,6 +1267,7 @@ impl Document {
         }
         *self.active.borrow_mut() = Some(ActiveChunk {
             index: chunk_index,
+            rendered_text_nodes: rendered_text_nodes(&doc, &lines),
             doc,
             lines,
             page_starts,
@@ -1596,10 +1618,6 @@ impl Document {
         self.page_margin.round() as i64
     }
 
-    pub fn page_count_1based(&self) -> usize {
-        self.page_count()
-    }
-
     pub fn has_document_page_map(&self) -> bool {
         !self.page_map.is_empty()
     }
@@ -1650,10 +1668,6 @@ impl Document {
             .get(index)
             .map(|snapshot| render_length_to_i64(snapshot.render_height))
             .unwrap_or(i64::from(self.height))
-    }
-
-    pub fn current_pos(&self) -> i64 {
-        self.page_start_y(self.current_page)
     }
 
     pub fn current_page(&self) -> usize {
@@ -2002,6 +2016,7 @@ impl Document {
         );
         *self.active.borrow_mut() = Some(ActiveChunk {
             index,
+            rendered_text_nodes: rendered_text_nodes(&doc, &lines),
             doc,
             lines,
             page_starts,
@@ -2265,18 +2280,15 @@ impl Document {
         })?;
 
         let text = hit.text[start_byte..end_byte].to_string();
-        let char_count = hit.text.chars().count().max(1) as f32;
-        let start_chars = hit.text[..start_byte].chars().count() as f32;
-        let end_chars = hit.text[..end_byte].chars().count() as f32;
-        let x0 = hit.rect.x + hit.rect.width * (start_chars / char_count);
-        let x1 = hit.rect.x + hit.rect.width * (end_chars / char_count);
-        let rect = TextBox {
-            text: text.clone(),
+        let Some(rect) = self.word_box(WordSpan {
             page: hit.page,
-            x: x0,
-            y: hit.rect.y,
-            width: (x1 - x0).max(1.0),
-            height: hit.rect.height,
+            line_index: hit.line_index,
+            line: &hit.rect,
+            start_byte,
+            end_byte,
+            text: &text,
+        }) else {
+            return Ok(None);
         };
 
         Ok(Some(WordHit {
@@ -2290,6 +2302,24 @@ impl Document {
         }))
     }
 
+    /// Box of a byte range on one line, from parley's selection geometry.
+    /// Returns `None` when the line has no parley layout; callers omit the box
+    /// rather than estimating one.
+    fn word_box(&self, span: WordSpan<'_>) -> Option<TextBox> {
+        let (x0, x1) = self
+            .parley_segment_x_bounds(span.page, span.line_index, span.start_byte, span.end_byte)
+            .ok()
+            .flatten()?;
+        Some(TextBox {
+            text: span.text.to_string(),
+            page: span.page,
+            x: x0,
+            y: span.line.y,
+            width: (x1 - x0).max(1.0),
+            height: span.line.height,
+        })
+    }
+
     pub fn nearest_word_at(
         &self,
         position: PagePosition,
@@ -2297,6 +2327,7 @@ impl Document {
         direction: u32,
     ) -> Result<Option<WordHit>> {
         let mut candidates = Vec::new();
+        let mut pending = Vec::new();
         for page in pages.iter().copied() {
             if page == 0 || page > self.page_count() {
                 continue;
@@ -2316,42 +2347,55 @@ impl Document {
                         return Ok(());
                     };
                     let root = active.doc.root_element();
-                    let char_count = rect.text.chars().count().max(1) as f32;
+                    let block = root.with(line.node_id);
                     for (start_byte, end_byte) in ranges {
                         let Ok(start_position) =
                             xpointer::position_for_line_offset(root, line, start_byte)
                         else {
                             continue;
                         };
-                        let Ok(end_position) =
-                            xpointer::position_for_line_offset(root, line, end_byte)
-                        else {
-                            continue;
-                        };
-                        let start_chars = rect.text[..start_byte].chars().count() as f32;
-                        let end_chars = rect.text[..end_byte].chars().count() as f32;
-                        let x0 = rect.x + rect.width * (start_chars / char_count);
-                        let x1 = rect.x + rect.width * (end_chars / char_count);
-                        candidates.push(WordHit {
-                            text: rect.text[start_byte..end_byte].to_string(),
-                            xpointer_range: XPointerRange {
-                                start: start_position,
-                                end: Some(end_position),
-                                id: None,
-                            },
-                            rects: vec![TextBox {
-                                text: rect.text[start_byte..end_byte].to_string(),
-                                page,
-                                x: x0,
-                                y: rect.y,
-                                width: (x1 - x0).max(1.0),
-                                height: rect.height,
-                            }],
+                        let end_position = xpointer::position_after_layout_offset(
+                            root,
+                            block,
+                            line.text_start.saturating_add(end_byte),
+                        )
+                        .or_else(|| xpointer::position_for_line_offset(root, line, end_byte).ok());
+                        pending.push(PendingWord {
+                            page,
+                            line_index: global_line,
+                            line: rect.clone(),
+                            start_byte,
+                            end_byte,
+                            start: start_position,
+                            end: end_position,
                         });
                     }
                     Ok(())
                 })?;
             }
+        }
+
+        for pending in pending {
+            let text = pending.line.text[pending.start_byte..pending.end_byte].to_string();
+            let Some(text_box) = self.word_box(WordSpan {
+                page: pending.page,
+                line_index: pending.line_index,
+                line: &pending.line,
+                start_byte: pending.start_byte,
+                end_byte: pending.end_byte,
+                text: &text,
+            }) else {
+                continue;
+            };
+            candidates.push(WordHit {
+                text,
+                xpointer_range: XPointerRange {
+                    start: pending.start,
+                    end: pending.end,
+                    id: None,
+                },
+                rects: vec![text_box],
+            });
         }
 
         let word = candidates
@@ -2376,22 +2420,12 @@ impl Document {
             self.clipped_lines_between_xpointers(start, end)?
         {
             let text_slice = rect.text[slice_start..slice_end].to_string();
-            if let Some((x0, x1)) = self
+            let Some((x0, x1)) = self
                 .parley_segment_x_bounds(page, line_index, slice_start, slice_end)
                 .unwrap_or(None)
-            {
-                rect.text = text_slice;
-                rect.x = x0;
-                rect.width = (x1 - x0).max(1.0);
-                boxes.push(rect);
+            else {
                 continue;
-            }
-
-            let total_chars = rect.text.chars().count().max(1) as f32;
-            let start_chars = rect.text[..slice_start].chars().count() as f32;
-            let end_chars = rect.text[..slice_end].chars().count() as f32;
-            let x0 = rect.x + rect.width * (start_chars / total_chars);
-            let x1 = rect.x + rect.width * (end_chars / total_chars);
+            };
             rect.text = text_slice;
             rect.x = x0;
             rect.width = (x1 - x0).max(1.0);
@@ -2493,12 +2527,20 @@ impl Document {
             let page = self.page_from_xpointer(&current)?;
             for (line_index, rect) in self.page_text_boxes_with_lines(page)? {
                 if let Some(chars) = self.line_relative_chars(page, line_index, &target)? {
-                    let char_count = rect.text.chars().count().max(1) as f32;
-                    let start_chars = (chars as f32).min(char_count - 1.0);
-                    return Ok(Some((
-                        rect.x + rect.width * (start_chars / char_count),
-                        rect.y,
-                    )));
+                    let byte = byte_offset_for_char(&rect.text, chars);
+                    let next = rect.text[byte..]
+                        .chars()
+                        .next()
+                        .map(|ch| byte + ch.len_utf8())
+                        .unwrap_or(byte + 1);
+                    if let Ok(Some((x, _))) =
+                        self.parley_segment_x_bounds(page, line_index, byte, next)
+                    {
+                        return Ok(Some((x, rect.y)));
+                    }
+                    // The line has no parley geometry for this character; try
+                    // the next visible one instead of estimating.
+                    break;
                 }
             }
             let Some(next) = self.next_visible_char(&current)? else {
@@ -3044,25 +3086,14 @@ impl Document {
             } else {
                 hits.retain(|hit| hit.page <= current_page);
             }
-            hits.sort_by(|left, right| {
-                right
-                    .xpointer_range
-                    .start
-                    .cmp(&left.xpointer_range.start)
-                    .then_with(|| right.page.cmp(&left.page))
-            });
+            // `search` appends hits page by page in reading order; reverse is
+            // all that is needed. Sorting by `TextPosition` was not document
+            // order (it compares path tags).
+            hits.reverse();
+        } else if origin == -1 {
+            hits.retain(|hit| hit.page <= current_page);
         } else {
-            if origin == -1 {
-                hits.retain(|hit| hit.page <= current_page);
-            } else {
-                hits.retain(|hit| hit.page >= current_page);
-            }
-            hits.sort_by(|left, right| {
-                left.xpointer_range
-                    .start
-                    .cmp(&right.xpointer_range.start)
-                    .then_with(|| left.page.cmp(&right.page))
-            });
+            hits.retain(|hit| hit.page >= current_page);
         }
     }
 
@@ -3122,29 +3153,6 @@ impl Document {
         let page = self.ensure_page_layout(page)?;
         self.current_page = page;
         Ok(page)
-    }
-
-    pub fn bookmark_page(&self, page: usize) -> Result<Bookmark> {
-        if page < 1 || page > self.page_count() {
-            bail!("page {page} is outside 1..={}", self.page_count());
-        }
-        Ok(Bookmark {
-            page,
-            xpointer: self.xpointer_from_page(page).ok(),
-        })
-    }
-
-    pub fn bookmark_current_page(&self) -> Result<Bookmark> {
-        self.bookmark_page(self.current_page)
-    }
-
-    pub fn go_to_bookmark(&mut self, bookmark: &Bookmark) -> Result<usize> {
-        let page = bookmark
-            .xpointer
-            .as_deref()
-            .and_then(|xpointer| self.page_from_xpointer(xpointer).ok())
-            .unwrap_or(bookmark.page);
-        self.go_to_page(page)
     }
 
     pub fn xpointer_from_page(&self, page: usize) -> Result<String> {
@@ -3344,7 +3352,7 @@ impl Document {
         self.with_active_chunk(chunk_index, |active| {
             let root = active.doc.root_element();
             let current_id = xpointer::resolve_text_position(root, &position)?;
-            let flat = flat_text_characters(root);
+            let flat = flat_text_characters(root, &active.rendered_text_nodes);
             let Some(current_start) = flat.iter().position(|entry| entry.node == current_id) else {
                 return Ok(None);
             };
@@ -3502,11 +3510,6 @@ impl Document {
                 .map(|text| text.content.clone())
                 .unwrap_or_default())
         })
-    }
-
-    pub fn current_position(&self) -> Result<TextPosition> {
-        let xpointer = self.xpointer_from_page(self.current_page)?;
-        parse_text_position(&xpointer)
     }
 
     pub fn xpointer_from_position(&self, position: &TextPosition) -> Result<String> {
@@ -3698,6 +3701,31 @@ fn collect_lines(root: &Node) -> Vec<LineBox> {
     collect_lines_inner(root, &mut lines);
     lines.sort_by(|a, b| a.top.total_cmp(&b.top));
     lines
+}
+
+/// Text nodes that took part in a block's inline layout. Text outside every
+/// layout (a `display: none` subtree) is absent, so navigation and XPointer
+/// lookups stay on text that is actually rendered.
+fn rendered_text_nodes(doc: &HtmlDocument, lines: &[LineBox]) -> std::collections::HashSet<NodeId> {
+    let root = doc.root_element();
+    let mut seen = std::collections::HashSet::new();
+    let mut rendered = std::collections::HashSet::new();
+    for line in lines {
+        if !seen.insert(line.node_id) {
+            continue;
+        }
+        let block = root.with(line.node_id);
+        let Some(layout) = block
+            .element_data()
+            .and_then(|element| element.inline_layout_data.as_ref())
+        else {
+            continue;
+        };
+        if let Some(map) = xpointer::LayoutTextMap::new(block, layout) {
+            rendered.extend(map.source_nodes());
+        }
+    }
+    rendered
 }
 
 fn collect_lines_inner(node: &Node, out: &mut Vec<LineBox>) {
@@ -4162,14 +4190,23 @@ struct FlatCharacter {
     ch: char,
 }
 
-fn flat_text_characters(root: &Node) -> Vec<FlatCharacter> {
+fn flat_text_characters(
+    root: &Node,
+    rendered: &std::collections::HashSet<NodeId>,
+) -> Vec<FlatCharacter> {
     let mut out = Vec::new();
-    collect_flat_characters(root, &mut out);
+    collect_flat_characters(root, rendered, &mut out);
     out
 }
 
-fn collect_flat_characters(node: &Node, out: &mut Vec<FlatCharacter>) {
-    if let Some(text) = node.text_data() {
+fn collect_flat_characters(
+    node: &Node,
+    rendered: &std::collections::HashSet<NodeId>,
+    out: &mut Vec<FlatCharacter>,
+) {
+    if let Some(text) = node.text_data()
+        && rendered.contains(&node.id)
+    {
         for (offset, ch) in text.content.chars().enumerate() {
             out.push(FlatCharacter {
                 node: node.id,
@@ -4179,7 +4216,7 @@ fn collect_flat_characters(node: &Node, out: &mut Vec<FlatCharacter>) {
         }
     }
     for child in node.children.iter() {
-        collect_flat_characters(node.with(*child), out);
+        collect_flat_characters(node.with(*child), rendered, out);
     }
 }
 

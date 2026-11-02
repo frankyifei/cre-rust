@@ -89,14 +89,14 @@ fn txt_page_xpointers_round_trip_all_pages() {
 }
 
 #[test]
-fn current_position_and_position_to_xpointer_round_trip() {
+fn page_xpointer_and_position_round_trip() {
     require_resources();
 
     let mut doc = Document::open(fixture("sample.txt")).unwrap();
     doc.go_to_page(2).unwrap();
 
     let generated = doc.xpointer_from_page(2).unwrap();
-    let current = doc.current_position().unwrap();
+    let current = parse_text_position(&generated).unwrap();
     let from_position = doc.xpointer_from_position(&current).unwrap();
 
     assert_eq!(generated, from_position);
@@ -567,4 +567,50 @@ fn words_after_multibyte_prefixes_and_link_runs_round_trip() {
         let first = highlight.first().expect("no highlight box");
         assert_eq!(first.text, target, "highlight text for {target}");
     }
+}
+
+/// Navigation walks the flattened text, but only text that was laid out.
+/// A `display: none` span must not be visited by next/prev char or word.
+#[test]
+fn visible_navigation_skips_text_that_is_not_rendered() {
+    require_resources();
+    let path = synthetic_fixture("hidden-text.html");
+    assert!(path.exists(), "missing fixture: {}", path.display());
+    let doc = Document::with_options(&path, &cover_options()).unwrap();
+    let boxes = doc.page_text_boxes(1).unwrap();
+    let line = boxes
+        .iter()
+        .find(|line| line.text.contains("alpha"))
+        .expect("no line with alpha");
+    let y = line.y + line.height / 2.0;
+    let alpha = word_on_line(&doc, line, y, "alpha").expect("no alpha");
+    let start = alpha.xpointer_range.start.to_xpointer();
+
+    let next_word = doc
+        .next_visible_word_start(&start)
+        .unwrap()
+        .expect("no next word");
+    let next_word_text = doc.text_from_xpointer(&next_word).unwrap();
+    assert!(
+        next_word_text.contains("omega"),
+        "next word landed in {next_word_text:?}"
+    );
+    assert!(!next_word_text.contains("hidden"));
+
+    let alpha_end = alpha
+        .xpointer_range
+        .end
+        .as_ref()
+        .expect("alpha end")
+        .to_xpointer();
+    let next_char = doc
+        .next_visible_char(&alpha_end)
+        .unwrap()
+        .expect("no next char");
+    let next_char_text = doc.text_from_xpointer(&next_char).unwrap();
+    assert!(
+        next_char_text.contains("omega"),
+        "next char landed in {next_char_text:?}"
+    );
+    assert!(!next_char_text.contains("hidden"));
 }

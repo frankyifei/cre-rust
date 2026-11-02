@@ -168,6 +168,11 @@ impl LayoutTextMap {
         Some(Self { chars, nodes })
     }
 
+    /// Text nodes that produced at least one layout character.
+    pub(crate) fn source_nodes(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.nodes.keys().copied()
+    }
+
     /// Source position for a layout byte offset. A `None` character (generated
     /// content) resolves to the next real character; past the end of the block
     /// it resolves to one past the last source character.
@@ -372,6 +377,15 @@ impl RunTextCursor {
                     continue;
                 }
                 if !chars_equal_fold(node_char, run_char) {
+                    if self.char_index == 0 {
+                        // A text node that did not contribute to the layout
+                        // (for example under `display: none`) never matches the
+                        // run. Skip it and keep looking in this element's next
+                        // text node; the run may continue there.
+                        self.node_index += 1;
+                        self.char_index = 0;
+                        continue;
+                    }
                     out.push(None);
                     break;
                 }

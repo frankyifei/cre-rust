@@ -800,60 +800,6 @@ fn document_find_text_direction_filters_by_current_page() {
 }
 
 #[test]
-fn document_bookmarks_survive_reflow() {
-    require_resources();
-
-    let narrow_options = DocumentOptions {
-        font_family: None,
-        width: 320,
-        height: 480,
-        layout_height: 100_000,
-        page_margin: 16.0,
-        font_size: 18.0,
-        font_path: None,
-        fallback_font_paths: Vec::new(),
-        stylesheet: None,
-        embedded_styles_enabled: true,
-        viewport_scale: 1.0,
-    };
-    let narrow = Document::with_options(fixture("sample.txt"), &narrow_options).unwrap();
-    assert!(narrow.page_count() > 3);
-    let page = narrow.page_count() / 2;
-
-    let bookmark = narrow.bookmark_page(page).unwrap();
-    assert_eq!(bookmark.page, page);
-    assert!(bookmark.xpointer.is_some());
-    let page_start = narrow
-        .page_text(page)
-        .unwrap()
-        .lines()
-        .next()
-        .unwrap()
-        .trim()
-        .to_string();
-
-    let wide_options = DocumentOptions {
-        width: 700,
-        height: 900,
-        page_margin: 32.0,
-        ..narrow_options
-    };
-    let mut wide = Document::with_options(fixture("sample.txt"), &wide_options).unwrap();
-    let mapped = wide.go_to_bookmark(&bookmark).unwrap();
-    assert!(
-        wide.page_text(mapped).unwrap().contains(&page_start),
-        "bookmark moved to page {mapped} without restoring {page_start:?}"
-    );
-
-    let invalid = cre_lib::Bookmark {
-        page: mapped,
-        xpointer: Some("xpointer(not-a-valid-path)".to_string()),
-    };
-    assert_eq!(wide.go_to_bookmark(&invalid).unwrap(), mapped);
-    assert!(narrow.bookmark_page(0).is_err());
-}
-
-#[test]
 fn document_selection_spans_pages() {
     require_resources();
 
@@ -1054,10 +1000,16 @@ fn document_exposes_resources_cover_and_html() {
     let html = doc.html_from_xpointer(&xpointer).unwrap();
     assert!(html.is_some(), "expected HTML from {xpointer}");
 
-    assert!(doc.next_visible_word_start(&xpointer).unwrap().is_some());
-    assert!(doc.prev_visible_word_start(&xpointer).unwrap().is_some());
-    assert!(doc.next_visible_char(&xpointer).unwrap().is_some());
-    assert!(doc.prev_visible_char(&xpointer).unwrap().is_some());
+    let next_word = doc
+        .next_visible_word_start(&xpointer)
+        .unwrap()
+        .expect("no next visible word");
+    assert!(doc.prev_visible_word_start(&next_word).unwrap().is_some());
+    let next_char = doc
+        .next_visible_char(&xpointer)
+        .unwrap()
+        .expect("no next visible char");
+    assert!(doc.prev_visible_char(&next_char).unwrap().is_some());
 }
 
 #[test]

@@ -2157,23 +2157,8 @@ unsafe extern "C-unwind" fn doc_pos_from_xpointer(l: *mut lua_State) -> c_int {
             push_int(l, 0);
             return 2;
         };
-        let mut page = inner.page_from_xpointer(&xp).ok();
-        let mut point = inner.point_from_xpointer(&xp).ok().flatten();
-        if page.is_none() || point.is_none() {
-            let next = inner
-                .next_visible_char(&xp)
-                .ok()
-                .flatten()
-                .filter(|next| *next != xp);
-            if let Some(next) = next {
-                if page.is_none() {
-                    page = inner.page_from_xpointer(&next).ok();
-                }
-                if point.is_none() {
-                    point = inner.point_from_xpointer(&next).ok().flatten();
-                }
-            }
-        }
+        let page = inner.page_from_xpointer(&xp).ok();
+        let point = inner.point_from_xpointer(&xp).ok().flatten();
         let Some(page) = page else {
             push_int(l, 0);
             push_int(l, 0);
