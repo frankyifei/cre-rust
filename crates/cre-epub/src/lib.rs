@@ -504,7 +504,7 @@ impl EpubBook {
         let mut updates = Vec::new();
         let mut generated_counter = 0usize;
 
-        for item in spine.iter().filter(|item| item.linear) {
+        for item in spine.iter() {
             if !is_html_resource(&item.media_type, &item.href) {
                 continue;
             }
@@ -518,28 +518,32 @@ impl EpubBook {
             }
 
             let mut generated = HashMap::new();
+            let image_only = document_is_image_only(&text);
             let normalized = rewrite_full_page_image_tags(
                 &text,
                 parent_dir(&doc_key),
                 &self.resource_provider,
                 &mut generated,
                 &mut generated_counter,
-                available_width,
-                available_height,
+                (available_width, available_height),
+                image_only,
             );
-            if !generated.is_empty() {
+            if !generated.is_empty() || normalized != text {
                 updates.push((doc_key, normalized, generated));
             }
         }
 
         let mut changed = 0usize;
         for (doc_key, normalized, generated) in updates {
+            let generated_count = generated.len();
             for (key, value) in generated {
                 self.resource_provider.put(&key, value);
-                changed += 1;
             }
             self.resource_provider
                 .put(&doc_key, Arc::new(normalized.into_bytes()));
+            // A document can change without a generated resource when the
+            // image only needs a fit style.
+            changed += generated_count.max(1);
         }
         changed
     }
@@ -1719,14 +1723,39 @@ fn has_meaningful_text(text: &str) -> bool {
     false
 }
 
+/// True when the body has text outside its tags. `has_meaningful_text` is for
+/// a slice between two known tags; it cannot be used on a whole body.
+fn body_has_text(body: &str) -> bool {
+    let mut in_tag = false;
+    for ch in body.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag && !ch.is_whitespace() => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// True when the spine document holds exactly one image and no text. Such a
+/// document is a full-page image: the image can use the whole content box.
+fn document_is_image_only(html: &str) -> bool {
+    let Some(body) = extract_body(html) else {
+        return false;
+    };
+    let lower = body.to_ascii_lowercase();
+    lower.matches("<img").count() == 1 && !body_has_text(&body)
+}
+
 fn rewrite_full_page_image_tags(
     html: &str,
     doc_dir: &str,
     provider: &LazyResource,
     generated: &mut HashMap<String, Arc<Vec<u8>>>,
     generated_counter: &mut usize,
-    available_width: f32,
-    available_height: f32,
+    available: (f32, f32),
+    image_only_document: bool,
 ) -> String {
     let lower = html.to_ascii_lowercase();
     let mut out = String::with_capacity(html.len());
@@ -1745,8 +1774,8 @@ fn rewrite_full_page_image_tags(
             provider,
             generated,
             generated_counter,
-            available_width,
-            available_height,
+            available,
+            image_only_document,
         ) {
             out.push_str(&replacement);
         } else {
@@ -1765,14 +1794,15 @@ fn full_page_image_replacement(
     provider: &LazyResource,
     generated: &mut HashMap<String, Arc<Vec<u8>>>,
     generated_counter: &mut usize,
-    available_width: f32,
-    available_height: f32,
+    available: (f32, f32),
+    image_only_document: bool,
 ) -> Option<String> {
+    let (available_width, available_height) = available;
     let attrs = parse_attrs(tag);
-    if !attrs
+    let full_height = attrs
         .get("style")
-        .is_some_and(|style| style_has_full_height(style))
-    {
+        .is_some_and(|style| style_has_full_height(style));
+    if !full_height && !image_only_document {
         return None;
     }
     let src = attrs.get("src").map(String::as_str).unwrap_or_default();
@@ -1786,6 +1816,14 @@ fn full_page_image_replacement(
     let image_mime = image_mime(&image_bytes, &image_key);
     if image_mime == "image/svg+xml" {
         return None;
+    }
+    if !full_height {
+        let (width, height) = image_dimensions(&image_bytes)?;
+        let scaled_height = available_width * height as f32 / width.max(1) as f32;
+        if scaled_height <= available_height + 0.5 {
+            return None;
+        }
+        return Some(image_fit_tag(&attrs, &image_key, available_height));
     }
 
     *generated_counter += 1;
@@ -1806,6 +1844,32 @@ fn full_page_image_svg_document(width: f32, height: f32, mime: &str, image_bytes
     format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"{width:.0}\" height=\"{height:.0}\" viewBox=\"0 0 {width:.0} {height:.0}\"><image x=\"0\" y=\"0\" width=\"{width:.0}\" height=\"{height:.0}\" preserveAspectRatio=\"xMidYMid meet\" xlink:href=\"data:{mime};base64,{encoded}\" /></svg>"
     )
+}
+
+/// A lone image that is taller than the page. Blitz scales an image with
+/// `max-width`/`max-height` and automatic width/height, so a style is enough;
+/// no generated SVG or base64 copy is needed.
+fn image_fit_tag(
+    image_attrs: &HashMap<String, String>,
+    image_key: &str,
+    available_height: f32,
+) -> String {
+    let src = format!("epub://book/{}", encode_path(image_key));
+    let mut tag = format!("<img src=\"{}\"", escape_attr(&src));
+    if let Some(id) = image_attrs.get("id") {
+        tag.push_str(&format!(" id=\"{}\"", escape_attr(id)));
+    }
+    if let Some(class) = image_attrs.get("class") {
+        tag.push_str(&format!(" class=\"{}\"", escape_attr(class)));
+    }
+    if let Some(alt) = image_attrs.get("alt") {
+        tag.push_str(&format!(" alt=\"{}\"", escape_attr(alt)));
+    }
+    tag.push_str(&format!(
+        " style=\"max-width:100%;max-height:{:.0}px;width:auto;height:auto\">",
+        available_height
+    ));
+    tag
 }
 
 fn full_page_image_tag(generated_key: &str, image_attrs: &HashMap<String, String>) -> String {

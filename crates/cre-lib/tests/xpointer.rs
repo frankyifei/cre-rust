@@ -280,3 +280,65 @@ fn toc_file_target_uses_the_page_of_the_title() {
     assert_eq!(doc.go_to_xpointer(xpointer).unwrap(), page);
     assert_eq!(doc.go_to_href(&entry.href).unwrap(), page);
 }
+
+fn cover_options() -> cre_lib::DocumentOptions {
+    cre_lib::DocumentOptions {
+        width: 540,
+        height: 720,
+        layout_height: 100_000,
+        page_margin: 10.0,
+        font_size: 22.0,
+        font_path: Some(
+            Path::new("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf").to_path_buf(),
+        ),
+        font_family: None,
+        fallback_font_paths: Vec::new(),
+        stylesheet: None,
+        embedded_styles_enabled: true,
+        viewport_scale: 1.0,
+    }
+}
+
+fn normalized(text: String) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The first image is slightly too tall for the space that is left on the
+/// page. It must be fitted to the page, not pushed to page 2 (which would
+/// leave page 1 blank). The section after it must still start on a new page.
+#[test]
+fn first_page_image_is_fitted_before_the_section_break() {
+    require_resources();
+    let path = synthetic_fixture("cover-overflow.epub");
+    assert!(path.exists(), "missing fixture: {}", path.display());
+    let options = cover_options();
+    let mut doc = Document::with_options(&path, &options).unwrap();
+
+    assert_eq!(
+        doc.page_from_href("OPS/cover.xhtml").unwrap(),
+        1,
+        "the cover must be on page 1"
+    );
+    let ink = doc
+        .render_page(1)
+        .unwrap()
+        .data
+        .iter()
+        .filter(|value| **value < 128)
+        .count();
+    assert!(ink > 1000, "page 1 has no cover image (ink={ink})");
+
+    assert_eq!(
+        doc.page_from_href("OPS/after.xhtml").unwrap(),
+        2,
+        "the section after an image-only page must start on a new page"
+    );
+    let text = normalized(doc.page_text(2).unwrap_or_default());
+    assert!(
+        text.contains("After cover"),
+        "page 2 does not hold the next section: {text:?}"
+    );
+
+    let xpointer = doc.xpointer_from_page(2).unwrap();
+    assert_eq!(doc.page_from_xpointer(&xpointer).unwrap(), 2);
+}
