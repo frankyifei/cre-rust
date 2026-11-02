@@ -559,13 +559,41 @@ impl EpubBook {
                 .get(&item.href)
                 .with_context(|| format!("spine document missing: {}", item.href))?;
             let text = decode_text(&bytes);
-            let body_opt = extract_body(&text);
-            if body_opt.is_none() && nonlinear {
+            let html_body = extract_body(&text);
+            // A spine item does not have to be an XHTML document. EPUB allows
+            // SVG and raster images (and, rarely, foreign XML/JSON) directly in
+            // the spine. Turning the whole book into an open error because of
+            // one such item makes otherwise readable books unusable. Render
+            // images as an image page, and fall back to a placeholder for
+            // foreign resources so the rest of the publication remains
+            // accessible.
+            let (body, has_html_body) = if let Some(body) = html_body {
+                (body, true)
+            } else if is_image_resource(&item.media_type, &item.href) {
+                let file = item.href.rsplit('/').next().unwrap_or(&item.href);
+                (
+                    format!(
+                        "<div class=\"cre-image-spine\"><img src=\"{}\" alt=\"\"/></div>",
+                        escape_attr(file)
+                    ),
+                    false,
+                )
+            } else if nonlinear {
                 continue;
-            }
-            let body =
-                body_opt.with_context(|| format!("spine document has no <body>: {}", item.href))?;
-            let (css_urls, inline_styles) = extract_styles(&text, &self.opf_dir, &item.href);
+            } else {
+                (
+                    format!(
+                        "<p class=\"cre-unsupported\">Unsupported spine item: {}</p>",
+                        escape_html(&item.href)
+                    ),
+                    false,
+                )
+            };
+            let (css_urls, inline_styles) = if has_html_body {
+                extract_styles(&text, &self.opf_dir, &item.href)
+            } else {
+                (Vec::new(), Vec::new())
+            };
             docs.push(SpineDocument {
                 index,
                 id: item.idref.clone(),
@@ -1472,6 +1500,18 @@ fn is_html_resource(media_type: &str, href: &str) -> bool {
         return true;
     }
     matches!(file_extension(href).as_str(), "xhtml" | "html" | "htm")
+}
+
+/// True for resources that a reading system can show as an image page when
+/// they appear directly in the spine.
+fn is_image_resource(media_type: &str, href: &str) -> bool {
+    if media_type.to_ascii_lowercase().starts_with("image/") {
+        return true;
+    }
+    matches!(
+        file_extension(href).as_str(),
+        "svg" | "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+    )
 }
 
 fn file_extension(path: &str) -> String {
@@ -2615,6 +2655,53 @@ mod tests {
         let mut book = EpubBook::from_bytes(synthetic_normal_image_epub()).unwrap();
         assert_eq!(book.normalize_full_page_images(600.0, 800.0, 40.0, 32.0), 0);
         assert!(book.resource("cre-page-fit-1.svg").is_none());
+    }
+
+    #[test]
+    fn image_in_spine_does_not_abort_the_book() {
+        let container = r#"<?xml version="1.0"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+  <rootfiles>
+    <rootfile full-path="pkg.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#;
+        let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="id">urn:uuid:image-spine-test</dc:identifier>
+    <dc:title>Image Spine Test</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="s1" href="sec1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="img" href="images/one.jpg" media-type="image/jpeg"/>
+  </manifest>
+  <spine>
+    <itemref idref="s1"/>
+    <itemref idref="img"/>
+  </spine>
+</package>"#;
+        let doc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head><title>Sec1</title></head>
+  <body><p>Text before the image page.</p></body>
+</html>"#;
+        let book = EpubBook::from_bytes(synthetic_epub_fixture(
+            container,
+            opf,
+            doc,
+            &jpg_fixture_bytes(),
+        ))
+        .unwrap();
+        let docs = book.spine_documents().unwrap();
+        assert_eq!(docs.len(), 2, "the image spine item must remain a page");
+        assert!(
+            docs[1].body_html.contains("cre-image-spine"),
+            "image spine item was not converted to an image page: {}",
+            docs[1].body_html
+        );
+        let html = book.to_html(&HtmlOptions::default()).unwrap();
+        assert!(html.contains("epub://book/images/one.jpg"));
     }
 
     /// A tall image is not only used as a cover: a chapter can hold one inline.
