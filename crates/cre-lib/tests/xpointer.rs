@@ -217,3 +217,66 @@ fn multi_node_line_start_maps_to_a_point() {
     );
     assert!(x >= first.x && x <= first.x + first.width);
 }
+
+fn synthetic_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
+
+fn small_page_options() -> cre_lib::DocumentOptions {
+    cre_lib::DocumentOptions {
+        width: 320,
+        height: 240,
+        layout_height: 100_000,
+        page_margin: 10.0,
+        font_size: 16.0,
+        font_path: Some(
+            Path::new("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf").to_path_buf(),
+        ),
+        font_family: None,
+        fallback_font_paths: Vec::new(),
+        stylesheet: None,
+        embedded_styles_enabled: true,
+        viewport_scale: 1.0,
+    }
+}
+
+/// A file-level TOC target is a spine document. Its forced page break is
+/// applied at the first line that carries text, so a title page with a large
+/// top margin has its section top on the previous page. The TOC must use the
+/// page of the title, not the page of the section top.
+#[test]
+fn toc_file_target_uses_the_page_of_the_title() {
+    require_resources();
+    let path = synthetic_fixture("toc-title-margin.epub");
+    assert!(path.exists(), "missing fixture: {}", path.display());
+    let options = small_page_options();
+    let doc = Document::with_options(&path, &options).unwrap();
+    let entry = doc
+        .toc()
+        .iter()
+        .find(|entry| entry.title == "Chapter One")
+        .expect("TOC entry")
+        .clone();
+    let page = entry.page.expect("TOC page");
+    assert!(page > 1, "title page should not be the first page");
+    let normalize = |text: String| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let text = normalize(doc.page_text(page).unwrap_or_default());
+    assert!(
+        text.contains("Unique Chapter Title"),
+        "TOC page {page} does not show the title: {text:?}"
+    );
+    let previous = normalize(doc.page_text(page - 1).unwrap_or_default());
+    assert!(
+        !previous.contains("Unique Chapter Title"),
+        "TOC page {page} is one page late"
+    );
+    assert_eq!(doc.page_from_href(&entry.href).unwrap(), page);
+    let xpointer = entry.xpointer.as_deref().expect("TOC xpointer");
+    assert_eq!(doc.page_from_xpointer(xpointer).unwrap(), page);
+
+    let mut doc = Document::with_options(&path, &options).unwrap();
+    assert_eq!(doc.go_to_xpointer(xpointer).unwrap(), page);
+    assert_eq!(doc.go_to_href(&entry.href).unwrap(), page);
+}

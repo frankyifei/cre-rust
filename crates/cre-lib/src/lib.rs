@@ -1162,7 +1162,16 @@ impl Document {
         let _ = page_height_css_u32;
         let mut href_pages = HashMap::new();
         for (key, node_id) in collect_anchor_maps(root) {
-            if let Ok(local_page) = page_for_node(&doc, node_id, &page_starts) {
+            // A file-level target is a spine document. Its forced page break is
+            // applied at the first line that carries text, not at the section
+            // top, so use the first page start at or after the section top.
+            // Fragment targets keep the page that contains the node.
+            let local_page = if key.1.is_none() {
+                page_for_spine_node(&doc, node_id, &lines, &boxes, &page_starts)
+            } else {
+                page_for_node(&doc, node_id, &page_starts).ok()
+            };
+            if let Some(local_page) = local_page {
                 href_pages.entry(key).or_insert(local_page - 1);
             }
         }
@@ -5024,6 +5033,58 @@ fn page_for_href(
         .context("navigation target was not found in the rendered document")
 }
 
+/// Page of a spine document target.
+///
+/// `page-break-before: always` is deferred to the first line that carries text
+/// (see [`paginate`]). A title page with a large top margin therefore has its
+/// section top on the previous page, while its first content (the title line)
+/// is on the next page. Map the href to the page of the section's first
+/// content, not to the page that contains the section top edge.
+fn page_for_spine_node(
+    doc: &HtmlDocument,
+    node_id: NodeId,
+    lines: &[LineBox],
+    boxes: &[ContentBox],
+    page_starts: &[PageStart],
+) -> Option<usize> {
+    let rect = doc.get_client_bounding_rect(node_id)?;
+    let top = rect.y as f32;
+    let bottom = (rect.y + rect.height) as f32 + 1.0;
+    let first_line = lines
+        .iter()
+        .filter(|line| line.text_end > line.text_start)
+        .map(|line| line.visual_top)
+        .filter(|y| *y + 1.0 >= top && *y <= bottom)
+        .min_by(f32::total_cmp);
+    let first_box = boxes
+        .iter()
+        .map(|box_| box_.top)
+        .filter(|y| *y + 1.0 >= top && *y <= bottom)
+        .min_by(f32::total_cmp);
+    // Use the first content of the section. `top` is only a fallback for an
+    // empty section: taking the minimum with it would select the section top
+    // again and bring back the previous-page mapping.
+    let target = match (first_line, first_box) {
+        (Some(line), Some(box_)) => line.min(box_),
+        (Some(line), None) => line,
+        (None, Some(box_)) => box_,
+        (None, None) => top,
+    };
+    Some(page_containing_top(target, page_starts))
+}
+
+fn page_containing_top(top: f32, page_starts: &[PageStart]) -> usize {
+    let mut page = 1usize;
+    for (index, start) in page_starts.iter().enumerate() {
+        if top + 1.0 >= start.clip_top {
+            page = index + 1;
+        } else {
+            break;
+        }
+    }
+    page
+}
+
 fn page_for_node(doc: &HtmlDocument, node_id: NodeId, page_starts: &[PageStart]) -> Result<usize> {
     let top = match doc.get_client_bounding_rect(node_id) {
         Some(rect) => rect.y as f32,
@@ -5033,15 +5094,7 @@ fn page_for_node(doc: &HtmlDocument, node_id: NodeId, page_starts: &[PageStart])
         // the first node after it that does have a box.
         None => first_rect_after(doc, node_id).context("navigation target has no layout rect")?,
     };
-    let mut page = 1usize;
-    for (index, start) in page_starts.iter().enumerate() {
-        if top + 1.0 >= start.clip_top {
-            page = index + 1;
-        } else {
-            break;
-        }
-    }
-    Ok(page)
+    Ok(page_containing_top(top, page_starts))
 }
 
 /// Rasterizes SVG resources once, at page size, and keeps the PNGs in a
