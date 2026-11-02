@@ -1807,11 +1807,23 @@ fn full_page_image_replacement(
     }
     let src = attrs.get("src").map(String::as_str).unwrap_or_default();
     let src = src.trim();
-    if src.is_empty() || src.starts_with("data:") || src.contains("://") {
+    if src.is_empty() || src.starts_with("data:") {
         return None;
     }
 
-    let image_key = resolve_href(doc_dir, src);
+    // `normalize_inline_svg_images` rewrites an SVG-backed image to
+    // `epub://book/<key>`. Treat our own scheme like a relative source;
+    // rejecting every `://` here skipped the fit style for exactly those
+    // full-page images, so a tall image got its own page after a blank one.
+    let image_key = if let Some(relative) = src.strip_prefix("epub://book/") {
+        let relative = percent_decode_str(relative).decode_utf8_lossy();
+        normalize_path(&relative)
+    } else {
+        if src.contains("://") {
+            return None;
+        }
+        resolve_href(doc_dir, src)
+    };
     let image_bytes = provider.get(&image_key)?;
     let image_mime = image_mime(&image_bytes, &image_key);
     if image_mime == "image/svg+xml" {
@@ -2625,6 +2637,20 @@ mod tests {
         assert!(book.resource("cre-page-fit-1.svg").is_none());
     }
 
+    /// `normalize_inline_svg_images` turns a lone full-page SVG image into
+    /// `<img src="epub://book/...">`. The full-page pass must accept that
+    /// scheme too, or a tall cover stays unclipped, gets its own page, and
+    /// leaves the preceding page blank (14.epub/15.epub at a 1080x1440 view).
+    #[test]
+    fn fits_a_full_page_image_with_an_epub_url_source() {
+        let mut book = EpubBook::from_bytes(synthetic_epub_url_image_epub()).unwrap();
+        assert_eq!(book.normalize_full_page_images(600.0, 800.0, 40.0, 32.0), 1);
+        let html = book.to_html(&HtmlOptions::default()).unwrap();
+        assert!(html.contains("epub://book/images/one.jpg"));
+        assert!(html.contains("max-height:736px"));
+        assert!(!html.contains("height: 100%"));
+    }
+
     #[test]
     fn parses_extended_metadata() {
         let book = EpubBook::from_bytes(synthetic_metadata_epub()).unwrap();
@@ -2704,6 +2730,49 @@ mod tests {
   </body>
 </html>"#;
         synthetic_epub_fixture(container, opf, doc, &jpg_fixture_bytes())
+    }
+
+    fn synthetic_epub_url_image_epub() -> Vec<u8> {
+        let container = r#"<?xml version="1.0"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+  <rootfiles>
+    <rootfile full-path="pkg.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#;
+        let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="id">urn:uuid:epub-url-image-test</dc:identifier>
+    <dc:title>EPUB URL Image Test</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="s1" href="sec1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="img" href="images/one.jpg" media-type="image/jpeg"/>
+  </manifest>
+  <spine>
+    <itemref idref="s1"/>
+  </spine>
+</package>"#;
+        let doc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head><title>Cover</title></head>
+  <body>
+    <img src="epub://book/images/one.jpg" alt="Cover" style="max-width:100%;height:auto" />
+  </body>
+</html>"#;
+        synthetic_epub_fixture(container, opf, doc, &tall_png_bytes(100, 1000))
+    }
+
+    /// PNG header with the given dimensions; enough for `image_dimensions`.
+    fn tall_png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&13u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&[8, 2, 0, 0, 0, 0, 0, 0, 0, 0]);
+        bytes
     }
 
     fn synthetic_metadata_epub() -> Vec<u8> {
