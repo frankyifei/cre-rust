@@ -1736,6 +1736,16 @@ impl Document {
         let page_bottom = (snapshot.local_clip_bottom - page_top).max(0.0);
 
         self.with_active_chunk(chunk_index, |active| {
+            // `get_client_bounding_rect` subtracts the document's current
+            // viewport scroll. `render_page` leaves it at this page's top, but
+            // image hit-testing may also run before the first render, so make
+            // the page origin explicit and treat the returned rects as
+            // page-local. Subtracting `page_top` again shifted images by one
+            // page and made long-press return the next page's image.
+            active.doc.set_viewport_scroll(Point {
+                x: 0.0,
+                y: f64::from(page_top),
+            });
             let root = active.doc.root_element();
             // `position` is in rendered (device) pixels, like `TextBox`; the
             // document's layout rectangles are CSS pixels. Without dividing by
@@ -1746,7 +1756,6 @@ impl Document {
             Ok(find_image_data_at(
                 &active.doc,
                 root,
-                page_top,
                 page_bottom,
                 position.x / scale,
                 position.y / scale,
@@ -4365,11 +4374,9 @@ fn lookup_resource(resources: &ResourceSource, key: &str) -> Option<Vec<u8>> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn find_image_data_at(
     doc: &HtmlDocument,
     node: &Node,
-    page_top: f32,
     page_bottom: f32,
     x: f32,
     y: f32,
@@ -4381,7 +4388,7 @@ fn find_image_data_at(
         .is_some_and(|element| element.name.local.to_string() == "img")
         && let Some(rect) = doc.get_client_bounding_rect(node.id)
     {
-        let local_top = rect.y as f32 - page_top;
+        let local_top = rect.y as f32;
         let visible_top = local_top.max(0.0);
         let visible_bottom = (local_top + rect.height as f32).min(page_bottom);
         let hit = visible_bottom > visible_top
@@ -4410,7 +4417,6 @@ fn find_image_data_at(
         if let Some(data) = find_image_data_at(
             doc,
             node.with(*child),
-            page_top,
             page_bottom,
             x,
             y,
@@ -4644,6 +4650,59 @@ fn normalize_family_name(name: &str) -> String {
         .collect()
 }
 
+fn column_declaration_regex() -> &'static regex::Regex {
+    static REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    REGEX.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)(?:-webkit-)?column-(?:count|width)\s*:\s*[^;{}]*;?|(?i)(?:-webkit-)?columns\s*:\s*[^;{}]*;?",
+        )
+        .expect("column declaration regex is valid")
+    })
+}
+
+fn strip_multi_column_declarations(css: &str) -> String {
+    column_declaration_regex().replace_all(css, "").into_owned()
+}
+
+fn strip_multi_column_styles(html: &str) -> String {
+    static STYLE_BLOCK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static STYLE_ATTR: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let style_block = STYLE_BLOCK.get_or_init(|| {
+        regex::Regex::new(r"(?is)(<style\b[^>]*>)(.*?)(</style\s*>)").expect("style regex is valid")
+    });
+    let html = style_block
+        .replace_all(html, |captures: &regex::Captures<'_>| {
+            format!(
+                "{}{}{}",
+                &captures[1],
+                strip_multi_column_declarations(&captures[2]),
+                &captures[3]
+            )
+        })
+        .into_owned();
+    let style_attr = STYLE_ATTR.get_or_init(|| {
+        regex::Regex::new(r#"(?is)(\sstyle\s*=\s*)(?:"([^"]*)"|'([^']*)')"#)
+            .expect("style attribute regex is valid")
+    });
+    style_attr
+        .replace_all(&html, |captures: &regex::Captures<'_>| {
+            if let Some(value) = captures.get(2) {
+                format!(
+                    "{}\"{}\"",
+                    &captures[1],
+                    strip_multi_column_declarations(value.as_str())
+                )
+            } else {
+                format!(
+                    "{}'{}'",
+                    &captures[1],
+                    strip_multi_column_declarations(captures.get(3).map_or("", |m| m.as_str()))
+                )
+            }
+        })
+        .into_owned()
+}
+
 /// block's layout text.
 fn create_document(
     html: &str,
@@ -4676,7 +4735,12 @@ fn create_document(
     } else {
         stripped.as_str()
     };
-    let mut html_source = base_html.to_string();
+    // crengine does not implement CSS multi-column layout: column-count and
+    // column-width are ignored and text stays in one column. Blitz parses them
+    // but lays the container out badly (the following image was pulled above
+    // the overflowing text in Juliet's home page). Remove the declarations
+    // before layout so both engines behave the same.
+    let mut html_source = strip_multi_column_styles(base_html);
     if let Some(stylesheet) = options
         .stylesheet
         .as_deref()
@@ -4684,7 +4748,7 @@ fn create_document(
         && !stylesheet.contains("</style")
     {
         html_source.push_str("<style>");
-        html_source.push_str(stylesheet);
+        html_source.push_str(&strip_multi_column_declarations(stylesheet));
         html_source.push_str("</style>");
     }
 
@@ -4702,6 +4766,14 @@ fn create_document(
         "<style>img, svg, video, canvas, object, embed {{ max-width: 100%; \
          max-height: {max_image_height:.0}px; height: auto; }}</style>"
     ));
+    // An empty heading/paragraph still reserves a full line box. Converters
+    // leave these behind (the first page of zyj.epub is `<h1></h1>` followed by
+    // a full-page image), which produced a blank first page. They carry no
+    // content, so hide them.
+    html_source.push_str(
+        "<style>h1:empty, h2:empty, h3:empty, h4:empty, h5:empty, h6:empty, p:empty \
+         { display: none !important; }</style>",
+    );
     // The generators leave the base font size as a token so the chunk HTML (and
     // the chunk boundaries that page numbers derive from) does not change with
     // it; the layout settings are applied here instead.
@@ -4870,6 +4942,21 @@ fn first_non_blank_line_flow(
 #[cfg(test)]
 mod layout_plan_tests {
     use super::*;
+
+    #[test]
+    fn strips_column_declarations_from_inline_and_block_styles() {
+        let html = r#"<html><head><style>div { column-count: 3; color: red; }</style></head>
+<body><div style="column-count: 3; color: blue; -webkit-column-width: 10px">x</div>
+<p style='columns: 2'>y</p></body></html>"#;
+        let stripped = strip_multi_column_styles(html);
+        assert!(!stripped.contains("column-count"));
+        assert!(!stripped.contains("column-width"));
+        assert!(!stripped.contains("columns: 2"));
+        assert!(stripped.contains("color: red"));
+        assert!(stripped.contains("color: blue"));
+        assert!(stripped.contains(">x<"));
+        assert!(stripped.contains(">y<"));
+    }
 
     const MB: usize = 1024 * 1024;
 

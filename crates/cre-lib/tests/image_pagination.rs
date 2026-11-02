@@ -144,3 +144,45 @@ fn image_hit_test_uses_device_coordinates() {
         "device image corner {position:?} did not hit the image"
     );
 }
+
+/// `get_client_bounding_rect` returns coordinates relative to the document's
+/// current viewport scroll. `render_page` leaves that scroll at the last page
+/// rendered. Image hit-testing must reset it for the page it is asked about,
+/// otherwise an image on page 1 stops hitting after page 2 has been rendered,
+/// and an image on page N can answer for page N-1.
+#[test]
+fn image_hit_test_uses_the_queried_page_origin() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/image-page-break.epub");
+    let mut options = options();
+    options.width = 600;
+    options.height = 800;
+    options.page_margin = 20.0;
+    let mut doc = Document::with_options(&path, &options).unwrap();
+
+    // The first page is the picture. Remember a dark point in its painted bbox.
+    let bitmap = doc.render_page(1).unwrap();
+    let mut point = None;
+    'rows: for y in 0..bitmap.height {
+        for x in 0..bitmap.width {
+            if bitmap.data[(y * bitmap.width + x) as usize] < 128 {
+                point = Some((x, y));
+                break 'rows;
+            }
+        }
+    }
+    let (x, y) = point.expect("the fixture image should be painted");
+    let position = cre_lib::PagePosition {
+        page: 1,
+        x: (x + 2) as f32,
+        y: (y + 2) as f32,
+    };
+    assert!(doc.image_data_at(position).unwrap().is_some());
+
+    // Rendering page 2 moves the viewport scroll. Page 1 must still hit.
+    assert!(doc.page_count() > 1);
+    doc.render_page(2).unwrap();
+    assert!(
+        doc.image_data_at(position).unwrap().is_some(),
+        "page 1 image missed after page 2 changed the viewport scroll"
+    );
+}
