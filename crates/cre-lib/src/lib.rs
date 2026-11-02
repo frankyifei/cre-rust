@@ -1729,6 +1729,11 @@ impl Document {
         let snapshot = self.pages.get(index).context("page snapshot is missing")?;
         let chunk_index = snapshot.chunk;
         let page_top = snapshot.local_start.top;
+        // The image's document rectangle can extend past this page. Only the
+        // part that is actually painted here may answer a tap; otherwise a
+        // blank strip at the bottom of page N opens the image that starts on
+        // page N+1 (KOReader asks for images before words).
+        let page_bottom = (snapshot.local_clip_bottom - page_top).max(0.0);
 
         self.with_active_chunk(chunk_index, |active| {
             let root = active.doc.root_element();
@@ -1742,6 +1747,7 @@ impl Document {
                 &active.doc,
                 root,
                 page_top,
+                page_bottom,
                 position.x / scale,
                 position.y / scale,
                 &self.base_url,
@@ -4359,10 +4365,12 @@ fn lookup_resource(resources: &ResourceSource, key: &str) -> Option<Vec<u8>> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn find_image_data_at(
     doc: &HtmlDocument,
     node: &Node,
     page_top: f32,
+    page_bottom: f32,
     x: f32,
     y: f32,
     base_url: &str,
@@ -4374,11 +4382,14 @@ fn find_image_data_at(
         && let Some(rect) = doc.get_client_bounding_rect(node.id)
     {
         let local_top = rect.y as f32 - page_top;
-        if x >= rect.x as f32
+        let visible_top = local_top.max(0.0);
+        let visible_bottom = (local_top + rect.height as f32).min(page_bottom);
+        let hit = visible_bottom > visible_top
+            && x >= rect.x as f32
             && x <= (rect.x + rect.width) as f32
-            && y >= local_top
-            && y <= local_top + rect.height as f32
-        {
+            && y >= visible_top
+            && y <= visible_bottom;
+        if hit {
             let src = node_attr(node, "src")?;
             let resolved = if src.contains("://") {
                 src.to_string()
@@ -4396,9 +4407,16 @@ fn find_image_data_at(
     }
 
     for child in node.children.iter() {
-        if let Some(data) =
-            find_image_data_at(doc, node.with(*child), page_top, x, y, base_url, resources)
-        {
+        if let Some(data) = find_image_data_at(
+            doc,
+            node.with(*child),
+            page_top,
+            page_bottom,
+            x,
+            y,
+            base_url,
+            resources,
+        ) {
             return Some(data);
         }
     }
