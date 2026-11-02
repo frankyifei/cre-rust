@@ -101,3 +101,46 @@ fn small_image_stays_with_the_text() {
         "a small image must not force a page break"
     );
 }
+
+/// Image hit-testing gets screen pixels from KOReader, but `getClientBoundingRect`
+/// is in CSS pixels. At a HiDPI viewport (scale 2) the image's device rectangle
+/// is twice as wide/tall as its layout rectangle. Without dividing the touch
+/// point by the scale, tapping the visible image finds nothing.
+#[test]
+fn image_hit_test_uses_device_coordinates() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/svg-image.epub");
+    let mut options = options();
+    options.width = 600;
+    options.height = 800;
+    options.page_margin = 20.0;
+    options.viewport_scale = 2.0;
+    let mut doc = Document::with_options(&path, &options).unwrap();
+
+    let bitmap = doc.render_page(1).unwrap();
+    let mut last_black_row = None;
+    for y in (0..bitmap.height).rev() {
+        if (0..bitmap.width).any(|x| bitmap.data[(y * bitmap.width + x) as usize] < 128) {
+            last_black_row = Some(y);
+            break;
+        }
+    }
+    let y = last_black_row.expect("the fixture image should be painted");
+    let xs: Vec<u32> = (0..bitmap.width)
+        .filter(|x| bitmap.data[(y * bitmap.width + x) as usize] < 128)
+        .collect();
+    let left = *xs.first().unwrap();
+    let right = *xs.last().unwrap();
+    assert!(right > left, "expected a painted image row");
+
+    // The bottom-right corner of the painted (device) image is outside the
+    // image's CSS rectangle, so it only hits after the scale conversion.
+    let position = cre_lib::PagePosition {
+        page: 1,
+        x: (right - 1) as f32,
+        y: (y - 1) as f32,
+    };
+    assert!(
+        doc.image_data_at(position).unwrap().is_some(),
+        "device image corner {position:?} did not hit the image"
+    );
+}

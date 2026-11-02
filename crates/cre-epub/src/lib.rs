@@ -518,7 +518,6 @@ impl EpubBook {
             }
 
             let mut generated = HashMap::new();
-            let image_only = document_is_image_only(&text);
             let normalized = rewrite_full_page_image_tags(
                 &text,
                 parent_dir(&doc_key),
@@ -526,7 +525,6 @@ impl EpubBook {
                 &mut generated,
                 &mut generated_counter,
                 (available_width, available_height),
-                image_only,
             );
             if !generated.is_empty() || normalized != text {
                 updates.push((doc_key, normalized, generated));
@@ -1723,31 +1721,6 @@ fn has_meaningful_text(text: &str) -> bool {
     false
 }
 
-/// True when the body has text outside its tags. `has_meaningful_text` is for
-/// a slice between two known tags; it cannot be used on a whole body.
-fn body_has_text(body: &str) -> bool {
-    let mut in_tag = false;
-    for ch in body.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag && !ch.is_whitespace() => return true,
-            _ => {}
-        }
-    }
-    false
-}
-
-/// True when the spine document holds exactly one image and no text. Such a
-/// document is a full-page image: the image can use the whole content box.
-fn document_is_image_only(html: &str) -> bool {
-    let Some(body) = extract_body(html) else {
-        return false;
-    };
-    let lower = body.to_ascii_lowercase();
-    lower.matches("<img").count() == 1 && !body_has_text(&body)
-}
-
 fn rewrite_full_page_image_tags(
     html: &str,
     doc_dir: &str,
@@ -1755,7 +1728,6 @@ fn rewrite_full_page_image_tags(
     generated: &mut HashMap<String, Arc<Vec<u8>>>,
     generated_counter: &mut usize,
     available: (f32, f32),
-    image_only_document: bool,
 ) -> String {
     let lower = html.to_ascii_lowercase();
     let mut out = String::with_capacity(html.len());
@@ -1775,7 +1747,6 @@ fn rewrite_full_page_image_tags(
             generated,
             generated_counter,
             available,
-            image_only_document,
         ) {
             out.push_str(&replacement);
         } else {
@@ -1795,16 +1766,12 @@ fn full_page_image_replacement(
     generated: &mut HashMap<String, Arc<Vec<u8>>>,
     generated_counter: &mut usize,
     available: (f32, f32),
-    image_only_document: bool,
 ) -> Option<String> {
     let (available_width, available_height) = available;
     let attrs = parse_attrs(tag);
     let full_height = attrs
         .get("style")
         .is_some_and(|style| style_has_full_height(style));
-    if !full_height && !image_only_document {
-        return None;
-    }
     let src = attrs.get("src").map(String::as_str).unwrap_or_default();
     let src = src.trim();
     if src.is_empty() || src.starts_with("data:") {
@@ -1826,18 +1793,26 @@ fn full_page_image_replacement(
     };
     let image_bytes = provider.get(&image_key)?;
     let image_mime = image_mime(&image_bytes, &image_key);
-    if image_mime == "image/svg+xml" {
-        return None;
-    }
+    let is_svg = image_mime == "image/svg+xml" || image_key.ends_with(".svg");
     if !full_height {
-        let (width, height) = image_dimensions(&image_bytes)?;
-        let scaled_height = available_width * height as f32 / width.max(1) as f32;
-        if scaled_height <= available_height + 0.5 {
+        // A raster image only needs a fit style when its natural width would
+        // overflow the content height. SVG dimensions are harder to read
+        // reliably here, so cap every SVG image; max-width/max-height never
+        // enlarge a small icon.
+        if let Some((width, height)) = image_dimensions(&image_bytes) {
+            let scaled_height = available_width * height as f32 / width.max(1) as f32;
+            if scaled_height <= available_height + 0.5 && !is_svg {
+                return None;
+            }
+        } else if !is_svg {
             return None;
         }
         return Some(image_fit_tag(&attrs, &image_key, available_height));
     }
 
+    if image_mime == "image/svg+xml" {
+        return None;
+    }
     *generated_counter += 1;
     let generated_key = generated_full_page_image_key(*generated_counter);
     let svg =
@@ -1877,10 +1852,15 @@ fn image_fit_tag(
     if let Some(alt) = image_attrs.get("alt") {
         tag.push_str(&format!(" alt=\"{}\"", escape_attr(alt)));
     }
-    tag.push_str(&format!(
-        " style=\"max-width:100%;max-height:{:.0}px;width:auto;height:auto\">",
+    let mut style = image_attrs.get("style").cloned().unwrap_or_default();
+    if !style.trim().is_empty() && !style.trim_end().ends_with(';') {
+        style.push(';');
+    }
+    style.push_str(&format!(
+        "max-width:100%;max-height:{:.0}px;width:auto;height:auto",
         available_height
     ));
+    tag.push_str(&format!(" style=\"{}\">", escape_attr(&style)));
     tag
 }
 
@@ -2637,6 +2617,24 @@ mod tests {
         assert!(book.resource("cre-page-fit-1.svg").is_none());
     }
 
+    /// A tall image is not only used as a cover: a chapter can hold one inline.
+    /// Such an image must be capped to the page too, or it overflows the page
+    /// and paints over the following text. Its own style (borders, margins)
+    /// must survive when the fit properties are appended.
+    #[test]
+    fn caps_a_tall_inline_image_and_keeps_its_style() {
+        let mut book = EpubBook::from_bytes(synthetic_tall_image_with_text_epub()).unwrap();
+        assert_eq!(book.normalize_full_page_images(600.0, 800.0, 40.0, 32.0), 1);
+        let html = book.to_html(&HtmlOptions::default()).unwrap();
+        assert!(html.contains("epub://book/images/one.jpg"));
+        assert!(html.contains("max-height:736px"));
+        assert!(
+            html.contains("border: 1px solid red;max-width:100%;max-height:736px"),
+            "the original inline style was lost: {html}"
+        );
+        assert!(!html.contains("height: 100%"));
+    }
+
     /// `normalize_inline_svg_images` turns a lone full-page SVG image into
     /// `<img src="epub://book/...">`. The full-page pass must accept that
     /// scheme too, or a tall cover stays unclipped, gets its own page, and
@@ -2730,6 +2728,39 @@ mod tests {
   </body>
 </html>"#;
         synthetic_epub_fixture(container, opf, doc, &jpg_fixture_bytes())
+    }
+
+    fn synthetic_tall_image_with_text_epub() -> Vec<u8> {
+        let container = r#"<?xml version="1.0"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+  <rootfiles>
+    <rootfile full-path="pkg.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#;
+        let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="id">urn:uuid:tall-inline-image-test</dc:identifier>
+    <dc:title>Tall Inline Image Test</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="s1" href="sec1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="img" href="images/one.jpg" media-type="image/jpeg"/>
+  </manifest>
+  <spine>
+    <itemref idref="s1"/>
+  </spine>
+</package>"#;
+        let doc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head><title>Sec1</title></head>
+  <body>
+    <p>Text before the picture.</p>
+    <img src="images/one.jpg" alt="Tall" style="border: 1px solid red;" />
+  </body>
+</html>"#;
+        synthetic_epub_fixture(container, opf, doc, &tall_png_bytes(100, 1000))
     }
 
     fn synthetic_epub_url_image_epub() -> Vec<u8> {

@@ -660,8 +660,8 @@ impl Document {
                     ..HtmlOptions::default()
                 };
                 let _ = book.normalize_full_page_images(
-                    options.width as f32,
-                    options.height as f32,
+                    options.width as f32 / options.viewport_scale.max(0.1),
+                    options.height as f32 / options.viewport_scale.max(0.1),
                     html_options.margin_x,
                     html_options.margin_y,
                 );
@@ -1703,6 +1703,26 @@ impl Document {
     }
 
     pub fn image_data_at(&self, position: PagePosition) -> Result<Option<Vec<u8>>> {
+        // Text wins when an image rectangle overlaps a rendered line. A
+        // floating/oversized image can otherwise cover text on this page (or a
+        // neighbouring page's rectangle can overlap it), and KOReader checks
+        // images before asking for the word: long-press then opens the image
+        // viewer instead of selecting the text.
+        if self
+            .page_text_boxes(position.page)
+            .ok()
+            .is_some_and(|boxes| {
+                boxes.iter().any(|line| {
+                    !line.text.trim().is_empty()
+                        && position.x >= line.x
+                        && position.x <= line.x + line.width
+                        && position.y >= line.y
+                        && position.y <= line.y + line.height
+                })
+            })
+        {
+            return Ok(None);
+        }
         let Some(index) = position.page.checked_sub(1) else {
             bail!("page numbers are 1-based");
         };
@@ -1712,12 +1732,18 @@ impl Document {
 
         self.with_active_chunk(chunk_index, |active| {
             let root = active.doc.root_element();
+            // `position` is in rendered (device) pixels, like `TextBox`; the
+            // document's layout rectangles are CSS pixels. Without dividing by
+            // the viewport scale, a HiDPI view compares device coordinates to
+            // CSS rectangles: images from the next page appear to cover text on
+            // this page, so long-press opens an image instead of selecting.
+            let scale = self.viewport_scale.max(0.1);
             Ok(find_image_data_at(
                 &active.doc,
                 root,
                 page_top,
-                position.x,
-                position.y,
+                position.x / scale,
+                position.y / scale,
                 &self.base_url,
                 &self.resources,
             ))
