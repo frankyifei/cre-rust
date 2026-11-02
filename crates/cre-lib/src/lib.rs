@@ -3878,6 +3878,34 @@ fn paginate(
     for (_, line_slot, box_slot) in items {
         if let Some(box_index) = box_slot {
             let box_ = &boxes[box_index];
+            // A spine item can start with an image instead of text (image-only
+            // chapters, pre-paginated manga pages). Forced page breaks were
+            // only consumed in the text-line branch, so the break at such a
+            // section was ignored and two spine items shared a page. Consume
+            // the break here too, before deciding whether the image fits.
+            while forced_index < forced_breaks.len()
+                && forced_breaks[forced_index] <= box_.top + BREAK_EPSILON
+            {
+                if forced_breaks[forced_index] > starts.last().unwrap().clip_top + BREAK_EPSILON
+                    && box_.top > starts.last().unwrap().clip_top + BREAK_EPSILON
+                    && page_has_content
+                {
+                    starts.push(PageStart {
+                        top: (box_.top - margin_top).max(0.0),
+                        clip_top: box_.top,
+                    });
+                    page_has_content = false;
+                }
+                forced_index += 1;
+            }
+            let current_clip_top = starts.last().unwrap().clip_top;
+            if pending_break && page_has_content && box_.top > current_clip_top + BREAK_EPSILON {
+                starts.push(PageStart {
+                    top: (box_.top - margin_top).max(0.0),
+                    clip_top: box_.top,
+                });
+            }
+            pending_break = false;
             let current = starts.last().unwrap();
             let clip_bottom = current.top + page_height - margin_bottom;
             let height = box_.bottom - box_.top;

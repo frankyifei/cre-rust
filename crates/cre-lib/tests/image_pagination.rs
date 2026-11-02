@@ -145,6 +145,32 @@ fn image_hit_test_uses_device_coordinates() {
     );
 }
 
+#[test]
+fn image_only_sections_honor_forced_page_breaks() {
+    // A spine item often starts with an image and no text. The forced break
+    // used to be consumed only in the text-line branch, so two image-only
+    // sections shared a page when both images were short enough to fit.
+    let body = r##"
+        <div style="page-break-before: always">
+          <svg width="100" height="100" viewBox="0 0 100 100">
+            <rect width="100" height="100" fill="#000000"/>
+          </svg>
+        </div>
+        <div style="page-break-before: always">
+          <svg width="100" height="100" viewBox="0 0 100 100">
+            <rect width="100" height="100" fill="#000000"/>
+          </svg>
+        </div>
+        <p>after</p>"##;
+    let path = write_page("image-section-breaks.html", body);
+    let doc = Document::with_options(Path::new(&path), &options()).unwrap();
+    assert!(
+        doc.page_count() >= 2,
+        "image-only sections ignored page-break-before: {} page(s)",
+        doc.page_count()
+    );
+}
+
 /// `get_client_bounding_rect` returns coordinates relative to the document's
 /// current viewport scroll. `render_page` leaves that scroll at the last page
 /// rendered. Image hit-testing must reset it for the page it is asked about,
