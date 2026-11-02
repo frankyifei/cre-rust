@@ -1153,13 +1153,29 @@ impl Document {
             )
             .map(|position| position.to_xpointer());
         }
+        // A page that holds only images can have no line with a text offset.
+        // Use the same fallback the on-demand lookup uses, and store it in the
+        // page table, so `xpointer_from_page` and `page_from_xpointer` agree.
+        for (index, slot) in page_positions.iter_mut().enumerate() {
+            if slot.is_none()
+                && let Ok(xpointer) = xpointer::xpointer_from_page(
+                    &doc,
+                    &lines,
+                    &page_starts,
+                    index + 1,
+                    page_height_css_u32,
+                    page_margin_css,
+                )
+            {
+                *slot = Some(xpointer);
+            }
+        }
         let xpointers = page_positions;
         for (index, xpointer) in xpointers.iter().enumerate() {
             if let Some(xpointer) = xpointer {
                 local_xpointer_pages.insert(xpointer.clone(), index + 1);
             }
         }
-        let _ = page_height_css_u32;
         let mut href_pages = HashMap::new();
         for (key, node_id) in collect_anchor_maps(root) {
             // A file-level target is a spine document. Its forced page break is
@@ -3834,9 +3850,10 @@ fn paginate(
     }];
     let mut forced_index = 0usize;
     let mut pending_break = false;
-    // Lines already placed on the current page. A chunk starts on a fresh page,
-    // so a break before its very first line would only add an empty page.
-    let mut lines_on_page = 0usize;
+    // Visible content on the current page: a line with text or an image box.
+    // A chunk starts on a fresh page, so a break before its very first content
+    // would only add an empty page.
+    let mut page_has_content = false;
 
     // Walk lines and image boxes together, in document order.
     let mut items: Vec<(f32, Option<usize>, Option<usize>)> =
@@ -3866,8 +3883,8 @@ fn paginate(
                     top: (box_.top - margin_top).max(0.0),
                     clip_top: box_.top,
                 });
-                lines_on_page = 0;
             }
+            page_has_content = true;
             continue;
         }
         let Some(line_index) = line_slot else {
@@ -3892,12 +3909,12 @@ fn paginate(
         let has_text = line.text_end > line.text_start;
         if pending_break && has_text {
             pending_break = false;
-            if lines_on_page > 0 {
+            if page_has_content {
                 starts.push(page_start_for_line(line, margin_top));
                 // The break already starts a page at this line; running the
                 // height check as well pushed a second start for the same line,
                 // which made an empty page and a duplicate start XPointer.
-                lines_on_page = 1;
+                page_has_content = true;
                 continue;
             }
         }
@@ -3906,9 +3923,10 @@ fn paginate(
         let clip_bottom = current.top + page_height - margin_bottom;
         if has_text && line.bottom > clip_bottom && line.top > current.clip_top {
             starts.push(page_start_for_line(line, margin_top));
-            lines_on_page = 0;
         }
-        lines_on_page += 1;
+        if has_text {
+            page_has_content = true;
+        }
     }
     starts
 }

@@ -342,3 +342,36 @@ fn first_page_image_is_fitted_before_the_section_break() {
     let xpointer = doc.xpointer_from_page(2).unwrap();
     assert_eq!(doc.page_from_xpointer(&xpointer).unwrap(), 2);
 }
+
+/// A section after an image-only page must start on a new page. The paginator
+/// used to count only text lines, so `page-break-before` after an image was
+/// skipped and the following text shared the image page.
+#[test]
+fn section_break_after_an_image_page_starts_a_new_page() {
+    require_resources();
+    let path = synthetic_fixture("image-page-break.epub");
+    assert!(path.exists(), "missing fixture: {}", path.display());
+    let options = cover_options();
+    let doc = Document::with_options(&path, &options).unwrap();
+
+    assert_eq!(doc.page_from_href("OPS/image.xhtml").unwrap(), 1);
+    assert_eq!(
+        doc.page_from_href("OPS/after.xhtml").unwrap(),
+        2,
+        "the section after the image must start on page 2"
+    );
+    let text = normalized(doc.page_text(2).unwrap_or_default());
+    assert!(
+        text.contains("After image"),
+        "page 2 does not hold the next section: {text:?}"
+    );
+
+    // The image page has no text line, so page 2 is the first page with a
+    // line-based page-start XPointer. It must round-trip.
+    let xpointer = doc.xpointer_from_page(2).unwrap();
+    assert_eq!(
+        doc.page_from_xpointer(&xpointer).unwrap(),
+        2,
+        "page 2 xpointer did not round-trip: {xpointer}"
+    );
+}
