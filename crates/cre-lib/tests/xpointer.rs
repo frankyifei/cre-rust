@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use cre_lib::{Document, parse_text_position};
+use cre_lib::{Document, PagePosition, parse_text_position};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -373,5 +373,48 @@ fn section_break_after_an_image_page_starts_a_new_page() {
         doc.page_from_xpointer(&xpointer).unwrap(),
         2,
         "page 2 xpointer did not round-trip: {xpointer}"
+    );
+}
+
+/// A float (drop cap) shifts the first lines to the right. The highlight box
+/// for a word on such a line must use the line's inline start, not only the
+/// parley line offset: otherwise it is shifted right by the float width.
+#[test]
+fn highlight_boxes_follow_a_float_line_start() {
+    require_resources();
+    let path = synthetic_fixture("float-dropcap.html");
+    assert!(path.exists(), "missing fixture: {}", path.display());
+    let doc = Document::with_options(&path, &cover_options()).unwrap();
+    let boxes = doc.page_text_boxes(1).unwrap();
+    let line = boxes
+        .iter()
+        .find(|line| line.text.contains("owl"))
+        .expect("no line with owl");
+    assert!(
+        line.x > 60.0,
+        "the drop cap should indent the line (x={})",
+        line.x
+    );
+    let chars = line.text.chars().count().max(1) as f32;
+    let before = line.text[..line.text.find("owl").unwrap()].chars().count() as f32;
+    let x = line.x + line.width * (before / chars) + 2.0;
+    let y = line.y + line.height / 2.0;
+    let position = PagePosition { page: 1, x, y };
+    let word = doc.word_at(position).unwrap().expect("word at owl");
+    assert_eq!(word.text, "owl");
+    let start = word.xpointer_range.start.to_xpointer();
+    let end = word
+        .xpointer_range
+        .end
+        .as_ref()
+        .map(|position| position.to_xpointer())
+        .expect("word end");
+    let highlight = doc.boxes_between_xpointers(&start, &end).unwrap();
+    let first = highlight.first().expect("no highlight box");
+    assert!(
+        (first.x - word.rects[0].x).abs() < 8.0,
+        "highlight x {} is far from the word x {} (float shift)",
+        first.x,
+        word.rects[0].x
     );
 }

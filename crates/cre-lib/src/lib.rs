@@ -2447,6 +2447,12 @@ impl Document {
                 return Ok(None);
             };
             let line_metrics = target_line.metrics();
+            // `bbox` is in the inline layout space, and `line_box.left` is
+            // already shifted by the line's inline start. Subtract that start
+            // (offset + inline_min_coord) before adding the absolute left.
+            // Without the inline_min_coord part, a line next to a float (a
+            // drop cap) is shifted right by the float width.
+            let line_start = line_metrics.offset + line_metrics.inline_min_coord;
 
             let start_byte = line_box.text_start.saturating_add(slice_start);
             let end_byte = line_box.text_start.saturating_add(slice_end);
@@ -2464,8 +2470,8 @@ impl Document {
                 if line_idx != target_index {
                     continue;
                 }
-                let x0 = line_box.left + ((bbox.x0 as f32) - line_metrics.offset);
-                let x1 = line_box.left + ((bbox.x1 as f32) - line_metrics.offset);
+                let x0 = line_box.left + ((bbox.x0 as f32) - line_start);
+                let x1 = line_box.left + ((bbox.x1 as f32) - line_start);
                 left = left.min(x0);
                 left = left.min(x1);
                 right = right.max(x0);
