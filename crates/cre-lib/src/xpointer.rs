@@ -1,4 +1,7 @@
+use std::collections::HashMap;
+
 use anyhow::{Context, Result, bail};
+use blitz_dom::node::TextLayout;
 use blitz_dom::{Node, NodeId};
 use blitz_html::HtmlDocument;
 
@@ -257,6 +260,18 @@ pub(crate) fn position_for_line_offset(
         .get(line_start..line_end)
         .context("line text range is not a valid string range")?;
 
+    // The line text can span several text nodes (a drop cap is a float, an
+    // inline span, a link...). Parley's runs remember which element pushed
+    // each piece of text, so map the offset through the run that owns it
+    // instead of guessing from the line's first run.
+    let absolute = line.text_start.saturating_add(byte_offset).min(text_len);
+    let absolute = floor_char_boundary(&inline_layout.text, absolute);
+    if let Some((text_id, codepoint_offset)) =
+        map_layout_offset_to_text_node(inline_root, inline_layout, absolute)
+    {
+        return position_for_text_node(root, text_id, codepoint_offset);
+    }
+
     let mut offset = byte_offset.min(segment.len());
     while offset > 0 && !segment.is_char_boundary(offset) {
         offset -= 1;
@@ -282,6 +297,144 @@ pub(crate) fn position_for_line_offset(
     position_for_text_node(root, text_id, final_offset)
 }
 
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// Maps a byte offset in a block's inline layout text to the text node that
+/// produced it, and to a codepoint offset inside that node.
+///
+/// Parley keeps, for every run, the brush of the element whose style span
+/// pushed the text (`Cluster::style().brush`). The text a run covers is a
+/// contiguous slice of the text nodes owned by that element, so a cursor per
+/// element can replay the runs in layout order and recover the node and
+/// offset. This handles the cases the text-prefix search cannot: a line split
+/// across a float and the paragraph (3.epub's drop cap), several runs of one
+/// block, and collapsed whitespace.
+fn map_layout_offset_to_text_node(
+    inline_root: &Node,
+    inline_layout: &TextLayout,
+    target: usize,
+) -> Option<(NodeId, u32)> {
+    let runs = inline_layout
+        .layout
+        .lines()
+        .flat_map(|line| line.runs())
+        .filter_map(|run| {
+            let brush = run.clusters().next()?.style().brush.id;
+            Some((run.text_range(), brush))
+        })
+        .collect::<Vec<_>>();
+
+    let target_index = runs
+        .iter()
+        .position(|(range, _)| range.start <= target && target < range.end)
+        .or_else(|| runs.iter().rposition(|(range, _)| range.end <= target))?;
+    let target_range = runs[target_index].0.clone();
+    let target_brush = runs[target_index].1;
+
+    let mut cursors: HashMap<NodeId, RunTextCursor> = HashMap::new();
+    for (range, brush) in runs.iter().take(target_index + 1) {
+        if *brush != target_brush {
+            continue;
+        }
+        let cursor = cursors
+            .entry(*brush)
+            .or_insert_with(|| RunTextCursor::new(inline_root, *brush));
+        let text = inline_layout.text.get(range.clone())?;
+        let mapping = cursor.align(text)?;
+        if *range == target_range {
+            let index = target.saturating_sub(range.start);
+            return mapping.get(index).copied().or_else(|| cursor.position());
+        }
+    }
+    cursors.get(&target_brush)?.position()
+}
+
+/// Walks the text nodes owned by one brush element in document order, matching
+/// the runs parley produced for that element.
+struct RunTextCursor {
+    nodes: Vec<(NodeId, Vec<char>)>,
+    node_index: usize,
+    char_index: usize,
+}
+
+impl RunTextCursor {
+    fn new(root: &Node, element: NodeId) -> Self {
+        let nodes = root
+            .with(element)
+            .children
+            .iter()
+            .copied()
+            .filter_map(|id| {
+                let content = root.with(id).text_data()?.content.clone();
+                Some((id, content.chars().collect()))
+            })
+            .collect();
+        Self {
+            nodes,
+            node_index: 0,
+            char_index: 0,
+        }
+    }
+
+    fn position(&self) -> Option<(NodeId, u32)> {
+        let (node_id, _) = self.nodes.get(self.node_index)?;
+        Some((*node_id, self.char_index as u32))
+    }
+
+    /// Maps every char of `text` to a `(text node, codepoint offset)`. Returns
+    /// `None` when the run does not line up with the node text (a
+    /// text-transform that changes characters, generated content...), so the
+    /// caller can fall back to the content search.
+    fn align(&mut self, text: &str) -> Option<Vec<(NodeId, u32)>> {
+        if text == "\n" {
+            // A `<br>` run: it consumes no character of the surrounding node.
+            return Some(vec![self.position()?]);
+        }
+        let mut out = Vec::with_capacity(text.chars().count());
+        for run_char in text.chars() {
+            loop {
+                let (node_id, chars) = self.nodes.get(self.node_index)?;
+                if self.char_index >= chars.len() {
+                    self.node_index += 1;
+                    self.char_index = 0;
+                    continue;
+                }
+                let node_char = chars[self.char_index];
+                if run_char.is_whitespace() {
+                    out.push((*node_id, self.char_index as u32));
+                    if node_char.is_whitespace() {
+                        while self.char_index < chars.len()
+                            && chars[self.char_index].is_whitespace()
+                        {
+                            self.char_index += 1;
+                        }
+                    }
+                    // Otherwise the space was collapsed in between two nodes.
+                    break;
+                }
+                if node_char.is_whitespace() {
+                    // Parley dropped this whitespace when it built the text.
+                    while self.char_index < chars.len() && chars[self.char_index].is_whitespace() {
+                        self.char_index += 1;
+                    }
+                    continue;
+                }
+                if node_char != run_char && !node_char.eq_ignore_ascii_case(&run_char) {
+                    return None;
+                }
+                out.push((*node_id, self.char_index as u32));
+                self.char_index += 1;
+                break;
+            }
+        }
+        Some(out)
+    }
+}
 fn source_text_position_for_line(root: &Node, line: &LineBox) -> Option<(NodeId, u32)> {
     let inline_root = root.with(line.node_id);
     let inline_layout = inline_root.element_data()?.inline_layout_data.as_ref()?;
@@ -544,10 +697,23 @@ pub(crate) fn resolve_text_position(root: &Node, position: &TextPosition) -> Res
             }
         }
     }
-    first_text_node(current, false)
+    // `/text()` in crengine selects a direct text child of the element, not
+    // the first text node anywhere below it (3.epub's drop cap: the direct
+    // text of the paragraph starts after a float span, and picking the first
+    // descendant text node returned the drop cap letter instead).
+    first_direct_text_node(current, false)
+        .or_else(|| first_direct_text_node(current, true))
+        .or_else(|| first_text_node(current, false))
         .or_else(|| first_text_node(current, true))
         .or(Some(current_id))
         .context("XPointer target element has no text node")
+}
+
+fn first_direct_text_node(node: &Node, allow_whitespace: bool) -> Option<NodeId> {
+    node.children.iter().copied().find(|child_id| {
+        let child = node.with(*child_id);
+        child.is_text_node() && text_content_ok(child, allow_whitespace)
+    })
 }
 
 pub(crate) fn resolve_element_position(root: &Node, position: &TextPosition) -> Result<NodeId> {

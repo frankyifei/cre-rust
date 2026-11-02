@@ -418,3 +418,81 @@ fn highlight_boxes_follow_a_float_line_start() {
         word.rects[0].x
     );
 }
+
+/// A float splits a line into several parley runs: the text before the float
+/// and the paragraph's direct text after it. The XPointer for a word in the
+/// later run must name that run's text node; using the line's first run mapped
+/// "from" to "owl"/"T" in 3.epub, so the word text, the XPointer text and the
+/// highlight disagreed.
+#[test]
+fn words_after_a_float_map_to_their_own_text_node() {
+    require_resources();
+    let path = synthetic_fixture("float-dropcap.html");
+    assert!(path.exists(), "missing fixture: {}", path.display());
+    let doc = Document::with_options(&path, &cover_options()).unwrap();
+    let boxes = doc.page_text_boxes(1).unwrap();
+    let line = boxes
+        .iter()
+        .find(|line| line.text.contains("from the barn"))
+        .expect("no line with the paragraph's direct text");
+    let y = line.y + line.height / 2.0;
+    for target in ["screaming", "from", "barn"] {
+        let word = word_on_line(&doc, line, y, target)
+            .unwrap_or_else(|| panic!("no word position for {target}"));
+        assert_eq!(word.text, target, "hit-test text for {target}");
+        let start = word.xpointer_range.start.to_xpointer();
+        let end = word
+            .xpointer_range
+            .end
+            .as_ref()
+            .map(|position| position.to_xpointer())
+            .expect("word end");
+        assert_eq!(
+            doc.text_between_xpointers(&start, &end).unwrap(),
+            target,
+            "XPointer text for {target}"
+        );
+        let highlight = doc.boxes_between_xpointers(&start, &end).unwrap();
+        let first = highlight.first().expect("no highlight box");
+        assert_eq!(first.text, target, "highlight text for {target}");
+        assert!(
+            first.x > line.x,
+            "{target} highlight fell on the float (x={})",
+            first.x
+        );
+        let point = doc
+            .point_from_xpointer(&start)
+            .unwrap()
+            .unwrap_or_else(|| panic!("no point for {target}"));
+        assert!(
+            point.0 >= line.x && point.0 <= line.x + line.width,
+            "{target} point is outside its line: {} not in {}..{}",
+            point.0,
+            line.x,
+            line.x + line.width
+        );
+    }
+}
+
+fn word_on_line(
+    doc: &Document,
+    line: &cre_lib::TextBox,
+    y: f32,
+    target: &str,
+) -> Option<cre_lib::WordHit> {
+    const STEPS: usize = 200;
+    for step in 0..=STEPS {
+        let x = line.x + line.width * step as f32 / STEPS as f32;
+        let position = PagePosition {
+            page: line.page,
+            x,
+            y,
+        };
+        if let Ok(Some(word)) = doc.word_at(position)
+            && word.text == target
+        {
+            return Some(word);
+        }
+    }
+    None
+}
