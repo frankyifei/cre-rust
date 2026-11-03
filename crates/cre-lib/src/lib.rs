@@ -396,6 +396,12 @@ struct ChunkMeta {
     line_base: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct FixedLayout {
+    width: f32,
+    height: f32,
+}
+
 struct ActiveChunk {
     index: usize,
     doc: HtmlDocument,
@@ -549,6 +555,8 @@ pub struct Document {
     font_blobs: Vec<FontBlob>,
     embedded_styles_enabled: bool,
     sources: Vec<String>,
+    /// Pre-paginated chunks and their own CSS viewport, parallel to `sources`.
+    fixed_layouts: Vec<Option<FixedLayout>>,
     base_url: String,
     resources: ResourceSource,
     cover_image: Option<Vec<u8>>,
@@ -962,6 +970,7 @@ impl Document {
         // Only the EPUB generator emits chunk HTML without the layout settings
         // in it, which is what allows a relayout instead of a reopen.
         let layout_independent_sources = matches!(metadata.format, DocumentFormat::Epub);
+        let fixed_layouts = htmls.iter().map(|html| parse_fixed_layout(html)).collect();
         let mut document = Self {
             metadata,
             width: options.width,
@@ -976,6 +985,7 @@ impl Document {
             viewport_scale: options.viewport_scale,
             font_gamma: 1.0,
             sources: htmls,
+            fixed_layouts,
             base_url: base_url.to_string(),
             resources,
             cover_image,
@@ -1026,6 +1036,35 @@ impl Document {
         }
     }
 
+    fn layout_options_for_chunk(&self, chunk_index: usize) -> DocumentOptions {
+        let mut options = self.layout_options();
+        if let Some(fixed) = self.fixed_layouts.get(chunk_index).and_then(|fixed| *fixed) {
+            let scale = self.viewport_scale.max(0.1);
+            options.width = (fixed.width * scale).round().max(1.0) as u32;
+            options.height = (fixed.height * scale).round().max(1.0) as u32;
+            options.layout_height = options.height;
+            options.page_margin = 0.0;
+        }
+        options
+    }
+
+    /// CSS scale and center offsets for a pre-paginated page inside the reader
+    /// viewport. Offsets are in CSS pixels.
+    fn fixed_page_transform(&self, fixed: FixedLayout) -> (f32, f32, f32) {
+        let scale = self.viewport_scale.max(0.1);
+        let reader_width = self.width as f32 / scale;
+        let reader_height = self.height as f32 / scale;
+        let margin = (self.page_margin / scale).max(0.0);
+        let available_width = (reader_width - margin * 2.0).max(1.0);
+        let available_height = (reader_height - margin * 2.0).max(1.0);
+        let fit = (available_width / fixed.width)
+            .min(available_height / fixed.height)
+            .max(0.01);
+        let offset_x = (reader_width - fixed.width * fit) / 2.0;
+        let offset_y = (reader_height - fixed.height * fit) / 2.0;
+        (fit, offset_x, offset_y)
+    }
+
     fn apply_options(&mut self, options: &DocumentOptions) {
         self.width = options.width;
         self.height = options.height;
@@ -1074,7 +1113,8 @@ impl Document {
             .get(chunk_index)
             .context("document chunk is missing")?
             .clone();
-        let options = self.layout_options();
+        let fixed_layout = self.fixed_layouts.get(chunk_index).and_then(|fixed| *fixed);
+        let options = self.layout_options_for_chunk(chunk_index);
         let doc = create_document(
             &html,
             &self.base_url,
@@ -1096,20 +1136,32 @@ impl Document {
         collect_line_flows(root, 0, &mut max_flow, &line_indices, &mut line_flows);
         let forced_breaks = page_breaks::collect_forced_breaks(root);
         let boxes = collect_content_boxes(&doc, root);
-        let (page_height_css_u32, page_height_css, page_margin_css) = css_page_geometry(
-            options.width,
-            options.height,
-            options.viewport_scale,
-            options.page_margin,
-        );
-        let page_starts = paginate(
-            &lines,
-            &boxes,
-            &forced_breaks,
-            page_height_css,
-            page_margin_css,
-            page_margin_css,
-        );
+        let (page_height_css_u32, page_height_css, page_margin_css) =
+            if let Some(fixed) = fixed_layout {
+                (fixed.height.max(1.0) as u32, fixed.height.max(1.0), 0.0)
+            } else {
+                css_page_geometry(
+                    options.width,
+                    options.height,
+                    options.viewport_scale,
+                    options.page_margin,
+                )
+            };
+        let page_starts = if fixed_layout.is_some() {
+            vec![PageStart {
+                top: 0.0,
+                clip_top: 0.0,
+            }]
+        } else {
+            paginate(
+                &lines,
+                &boxes,
+                &forced_breaks,
+                page_height_css,
+                page_margin_css,
+                page_margin_css,
+            )
+        };
         // Every line's place in the book: the block that holds it and the byte
         // offset of its first character inside that block's text. Block ids
         // increase with document order, so `(block, offset)` orders positions the
@@ -1736,6 +1788,7 @@ impl Document {
         let page_bottom = (snapshot.local_clip_bottom - page_top).max(0.0);
 
         self.with_active_chunk(chunk_index, |active| {
+            let fixed_layout = self.fixed_layouts.get(chunk_index).and_then(|fixed| *fixed);
             // `get_client_bounding_rect` subtracts the document's current
             // viewport scroll. `render_page` leaves it at this page's top, but
             // image hit-testing may also run before the first render, so make
@@ -1744,7 +1797,11 @@ impl Document {
             // page and made long-press return the next page's image.
             active.doc.set_viewport_scroll(Point {
                 x: 0.0,
-                y: f64::from(page_top),
+                y: f64::from(if fixed_layout.is_some() {
+                    0.0
+                } else {
+                    page_top
+                }),
             });
             let root = active.doc.root_element();
             // `position` is in rendered (device) pixels, like `TextBox`; the
@@ -1753,12 +1810,21 @@ impl Document {
             // CSS rectangles: images from the next page appear to cover text on
             // this page, so long-press opens an image instead of selecting.
             let scale = self.viewport_scale.max(0.1);
+            let (position_x, position_y) = if let Some(fixed) = fixed_layout {
+                let (fit, offset_x, offset_y) = self.fixed_page_transform(fixed);
+                (
+                    (position.x / scale - offset_x) / fit,
+                    (position.y / scale - offset_y) / fit,
+                )
+            } else {
+                (position.x / scale, position.y / scale)
+            };
             Ok(find_image_data_at(
                 &active.doc,
                 root,
                 page_bottom,
-                position.x / scale,
-                position.y / scale,
+                position_x,
+                position_y,
                 &self.base_url,
                 &self.resources,
             ))
@@ -1855,33 +1921,60 @@ impl Document {
                 .as_mut()
                 .context("active document chunk is missing")?;
             let viewport_scale = self.viewport_scale;
-            active.doc.set_viewport_scroll(Point {
-                x: 0.0,
-                y: f64::from(start.top),
-            });
+            let fixed_layout = self.fixed_layouts.get(chunk_index).and_then(|fixed| *fixed);
             let mut scene = Scene::default();
-            blitz_paint::paint_scene(
-                &mut scene,
-                &mut active.doc,
-                viewport_scale as f64,
-                self.width,
-                self.height,
-                0,
-                0,
-            );
-            let local_top = clip_top * viewport_scale;
-            let local_bottom = clip_bottom * viewport_scale;
-            let (image_arc, paint_count, paint_surface) = paint_page(
-                &scene,
-                self.width,
-                self.height,
-                0.0,
-                local_top,
-                local_bottom,
-                self.background_color,
-                self.font_gamma,
-            );
-            (image_arc, paint_count, paint_surface)
+            if let Some(fixed) = fixed_layout {
+                active.doc.set_viewport_scroll(Point { x: 0.0, y: 0.0 });
+                let (fit, offset_x, offset_y) = self.fixed_page_transform(fixed);
+                let scale = viewport_scale * fit;
+                blitz_paint::paint_scene(
+                    &mut scene,
+                    &mut active.doc,
+                    scale as f64,
+                    self.width,
+                    self.height,
+                    (offset_x * viewport_scale).round().max(0.0) as u32,
+                    (offset_y * viewport_scale).round().max(0.0) as u32,
+                );
+                let (image_arc, paint_count, paint_surface) = paint_page(
+                    &scene,
+                    self.width,
+                    self.height,
+                    0.0,
+                    0.0,
+                    self.height as f32,
+                    self.background_color,
+                    self.font_gamma,
+                );
+                (image_arc, paint_count, paint_surface)
+            } else {
+                active.doc.set_viewport_scroll(Point {
+                    x: 0.0,
+                    y: f64::from(start.top),
+                });
+                blitz_paint::paint_scene(
+                    &mut scene,
+                    &mut active.doc,
+                    viewport_scale as f64,
+                    self.width,
+                    self.height,
+                    0,
+                    0,
+                );
+                let local_top = clip_top * viewport_scale;
+                let local_bottom = clip_bottom * viewport_scale;
+                let (image_arc, paint_count, paint_surface) = paint_page(
+                    &scene,
+                    self.width,
+                    self.height,
+                    0.0,
+                    local_top,
+                    local_bottom,
+                    self.background_color,
+                    self.font_gamma,
+                );
+                (image_arc, paint_count, paint_surface)
+            }
         };
         let image = PageImage {
             bitmap: bitmap.clone(),
@@ -1915,23 +2008,38 @@ impl Document {
             .as_mut()
             .context("active document chunk is missing")?;
         let viewport_scale = self.viewport_scale;
-        active.doc.set_viewport_scroll(Point {
-            x: 0.0,
-            y: f64::from(start.top),
-        });
+        let fixed_layout = self.fixed_layouts.get(chunk_index).and_then(|fixed| *fixed);
         let mut scene = Scene::default();
-        blitz_paint::paint_scene(
-            &mut scene,
-            &mut active.doc,
-            viewport_scale as f64,
-            self.width,
-            self.height,
-            0,
-            0,
-        );
-
-        let local_top = clip_top * viewport_scale;
-        let local_bottom = clip_bottom * viewport_scale;
+        let (local_top, local_bottom) = if let Some(fixed) = fixed_layout {
+            active.doc.set_viewport_scroll(Point { x: 0.0, y: 0.0 });
+            let (fit, offset_x, offset_y) = self.fixed_page_transform(fixed);
+            let scale = viewport_scale * fit;
+            blitz_paint::paint_scene(
+                &mut scene,
+                &mut active.doc,
+                scale as f64,
+                self.width,
+                self.height,
+                (offset_x * viewport_scale).round().max(0.0) as u32,
+                (offset_y * viewport_scale).round().max(0.0) as u32,
+            );
+            (0.0, self.height as f32)
+        } else {
+            active.doc.set_viewport_scroll(Point {
+                x: 0.0,
+                y: f64::from(start.top),
+            });
+            blitz_paint::paint_scene(
+                &mut scene,
+                &mut active.doc,
+                viewport_scale as f64,
+                self.width,
+                self.height,
+                0,
+                0,
+            );
+            (clip_top * viewport_scale, clip_bottom * viewport_scale)
+        };
         let (bitmap, image_count, image_surface) = paint_page_rgba(
             &scene,
             self.width,
@@ -2036,25 +2144,38 @@ impl Document {
             &self.base_url,
             self.net.clone(),
             self.font_context.clone(),
-            &self.layout_options(),
+            &self.layout_options_for_chunk(index),
         );
         let lines = collect_lines(doc.root_element());
         let forced_breaks = page_breaks::collect_forced_breaks(doc.root_element());
         let boxes = collect_content_boxes(&doc, doc.root_element());
-        let (_page_height_css_u32, page_height_css, page_margin_css) = css_page_geometry(
-            self.width,
-            self.height,
-            self.viewport_scale,
-            self.page_margin,
-        );
-        let page_starts = paginate(
-            &lines,
-            &boxes,
-            &forced_breaks,
-            page_height_css,
-            page_margin_css,
-            page_margin_css,
-        );
+        let fixed_layout = self.fixed_layouts.get(index).and_then(|fixed| *fixed);
+        let (_page_height_css_u32, page_height_css, page_margin_css) =
+            if let Some(fixed) = fixed_layout {
+                (fixed.height.max(1.0) as u32, fixed.height.max(1.0), 0.0)
+            } else {
+                css_page_geometry(
+                    self.width,
+                    self.height,
+                    self.viewport_scale,
+                    self.page_margin,
+                )
+            };
+        let page_starts = if fixed_layout.is_some() {
+            vec![PageStart {
+                top: 0.0,
+                clip_top: 0.0,
+            }]
+        } else {
+            paginate(
+                &lines,
+                &boxes,
+                &forced_breaks,
+                page_height_css,
+                page_margin_css,
+                page_margin_css,
+            )
+        };
         *self.active.borrow_mut() = Some(ActiveChunk {
             index,
             rendered_text_nodes: rendered_text_nodes(&doc, &lines),
@@ -2145,8 +2266,19 @@ impl Document {
             let layout = node.unrounded_layout();
             let inset = layout.padding + layout.border;
             let origin = node.absolute_position(inset.left, inset.top);
-            let local_x = position.x - origin.x;
-            let local_y = position.y + page_top - origin.y;
+            let (position_x, position_y) =
+                if let Some(fixed) = self.fixed_layouts.get(chunk_index).and_then(|fixed| *fixed) {
+                    let (fit, offset_x, offset_y) = self.fixed_page_transform(fixed);
+                    let scale = self.viewport_scale.max(0.1);
+                    (
+                        (position.x / scale - offset_x) / fit,
+                        (position.y / scale - offset_y) / fit,
+                    )
+                } else {
+                    (position.x, position.y)
+                };
+            let local_x = position_x - origin.x;
+            let local_y = position_y + page_top - origin.y;
 
             let byte_offset = node
                 .text_offset_at_point(local_x, local_y)
@@ -3598,18 +3730,33 @@ impl Document {
 
         let snapshot = self.page_snapshot_boxes(page)?;
         let scale = self.viewport_scale;
+        let fixed_layout = self
+            .fixed_layouts
+            .get(self.pages[index].chunk)
+            .and_then(|fixed| *fixed);
+        let fixed = fixed_layout.map(|fixed| self.fixed_page_transform(fixed));
         Ok(snapshot
             .iter()
             .map(|line| {
+                let (x, y, width, height) = if let Some((fit, offset_x, offset_y)) = fixed {
+                    (
+                        offset_x + line.x * fit,
+                        offset_y + line.y * fit,
+                        line.width * fit,
+                        line.height * fit,
+                    )
+                } else {
+                    (line.x, line.y, line.width, line.height)
+                };
                 (
                     line.global_line,
                     TextBox {
                         text: line.text.clone(),
                         page,
-                        x: line.x * scale,
-                        y: line.y * scale,
-                        width: line.width * scale,
-                        height: line.height * scale,
+                        x: x * scale,
+                        y: y * scale,
+                        width: width * scale,
+                        height: height * scale,
                     },
                 )
             })
@@ -4732,6 +4879,16 @@ fn strip_multi_column_styles(html: &str) -> String {
 }
 
 /// block's layout text.
+fn parse_fixed_layout(html: &str) -> Option<FixedLayout> {
+    const MARKER: &str = "data-cre-fixed-layout=\"";
+    let start = html.find(MARKER)? + MARKER.len();
+    let end = html[start..].find('"')?;
+    let (width, height) = html[start..start + end].split_once('x')?;
+    let width = width.parse::<f32>().ok()?;
+    let height = height.parse::<f32>().ok()?;
+    (width > 0.0 && height > 0.0).then_some(FixedLayout { width, height })
+}
+
 fn create_document(
     html: &str,
     base_url: &str,
@@ -4794,6 +4951,18 @@ fn create_document(
         "<style>img, svg, video, canvas, object, embed {{ max-width: 100%; \
          max-height: {max_image_height:.0}px; height: auto; }}</style>"
     ));
+    if parse_fixed_layout(&html_source).is_none() {
+        // Blitz applies fixed body dimensions and overflow from author CSS even
+        // in reflow mode. A reflowable spine item must use the reader viewport,
+        // not the fixed-layout template's width/height. This is especially
+        // visible in EPUBs whose fixed and reflowable spine items share a
+        // stylesheet (`body { width: 1200px; height: 600px; overflow: hidden }`).
+        html_source.push_str(
+            "<style>html, body { width: auto !important; height: auto !important; \
+             min-width: 0 !important; min-height: 0 !important; \
+             overflow: visible !important; }</style>",
+        );
+    }
     // An empty heading still reserves a full line box. Converters leave these
     // behind (the first page of zyj.epub is `<h1></h1>` followed by a
     // full-page image), which produced a blank first page. Only headings are
@@ -4971,6 +5140,17 @@ fn first_non_blank_line_flow(
 #[cfg(test)]
 mod layout_plan_tests {
     use super::*;
+
+    #[test]
+    fn parses_fixed_layout_chunk_marker() {
+        let fixed = parse_fixed_layout(
+            "<div class=\"cre-fxl-page\" data-cre-fixed-layout=\"900x600\">x</div>",
+        )
+        .unwrap();
+        assert_eq!(fixed.width, 900.0);
+        assert_eq!(fixed.height, 600.0);
+        assert!(parse_fixed_layout("<div>reflow</div>").is_none());
+    }
 
     #[test]
     fn strips_column_declarations_from_inline_and_block_styles() {

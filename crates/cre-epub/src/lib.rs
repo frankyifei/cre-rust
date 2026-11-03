@@ -16,11 +16,18 @@ pub struct ManifestItem {
     pub properties: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpineLayout {
+    Reflowable,
+    PrePaginated,
+}
+
 #[derive(Clone, Debug)]
 pub struct SpineItem {
     pub idref: String,
     pub href: String,
     pub media_type: String,
+    pub properties: String,
     pub linear: bool,
 }
 
@@ -34,6 +41,8 @@ pub struct SpineDocument {
     pub css_urls: Vec<String>,
     pub inline_styles: Vec<String>,
     pub nonlinear: bool,
+    pub layout: SpineLayout,
+    pub viewport: Option<(f32, f32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -318,6 +327,7 @@ pub struct EpubBook {
     pub page_map_source: String,
     pub page_map: Vec<PageMapItem>,
     pub resource_provider: LazyResource,
+    pub global_layout: SpineLayout,
 }
 
 impl EpubBook {
@@ -368,6 +378,15 @@ impl EpubBook {
         let description = first_child_text(root, "description");
         let keywords = element_texts(root, "subject");
         let identifiers = element_texts(root, "identifier");
+        let global_layout = match meta_property_text(root, "rendition:layout")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "pre-paginated" => SpineLayout::PrePaginated,
+            _ => SpineLayout::Reflowable,
+        };
 
         let manifest_node = root
             .children()
@@ -407,10 +426,13 @@ impl EpubBook {
             let Some(item) = manifest.iter().find(|item| item.id == idref) else {
                 continue;
             };
+            let itemref_props = itemref.attribute("properties").unwrap_or_default();
+            let properties = format!("{} {}", item.properties, itemref_props);
             spine.push(SpineItem {
                 idref: idref.to_string(),
                 href: item.href.clone(),
                 media_type: item.media_type.clone(),
+                properties,
                 linear,
             });
         }
@@ -439,6 +461,7 @@ impl EpubBook {
             page_map_source,
             page_map,
             resource_provider: provider,
+            global_layout,
         })
     }
 
@@ -559,6 +582,12 @@ impl EpubBook {
                 .get(&item.href)
                 .with_context(|| format!("spine document missing: {}", item.href))?;
             let text = decode_text(&bytes);
+            let layout = spine_layout(&item.properties, self.global_layout);
+            let viewport = if layout == SpineLayout::PrePaginated {
+                Some(parse_viewport_size(&text).unwrap_or((800.0, 600.0)))
+            } else {
+                None
+            };
             let html_body = extract_body(&text);
             // A spine item does not have to be an XHTML document. EPUB allows
             // SVG and raster images (and, rarely, foreign XML/JSON) directly in
@@ -567,7 +596,7 @@ impl EpubBook {
             // images as an image page, and fall back to a placeholder for
             // foreign resources so the rest of the publication remains
             // accessible.
-            let (body, has_html_body) = if let Some(body) = html_body {
+            let (mut body, has_html_body) = if let Some(body) = html_body {
                 (body, true)
             } else if is_image_resource(&item.media_type, &item.href) {
                 let file = item.href.rsplit('/').next().unwrap_or(&item.href);
@@ -589,6 +618,35 @@ impl EpubBook {
                     false,
                 )
             };
+            if let Some((width, height)) = viewport {
+                // The marker lets cre-lib give this chunk its own layout
+                // viewport. The page must remain a single chunk: mixing a
+                // pre-paginated page into a reflow chunk would make all its
+                // absolutely-positioned children share one containing block.
+                let attrs = body_attributes(&text);
+                let mut style = attrs.get("style").cloned().unwrap_or_default();
+                if !style.trim().is_empty() && !style.trim_end().ends_with(';') {
+                    style.push(';');
+                }
+                style.push_str(&format!(
+                    "position:absolute;left:0;top:0;width:{width:.0}px;height:{height:.0}px;overflow:hidden;"
+                ));
+                let mut class = String::from("cre-fxl-page");
+                if let Some(original) = attrs.get("class") {
+                    class.push(' ');
+                    class.push_str(original);
+                }
+                let id = attrs
+                    .get("id")
+                    .map(|id| format!(" id=\"{}\"", escape_attr(id)))
+                    .unwrap_or_default();
+                body = format!(
+                    "<div class=\"{}\"{} data-cre-fixed-layout=\"{width:.0}x{height:.0}\" style=\"{}\">{body}</div>",
+                    escape_attr(&class),
+                    id,
+                    escape_attr(&style)
+                );
+            }
             let (css_urls, inline_styles) = if has_html_body {
                 extract_styles(&text, &self.opf_dir, &item.href)
             } else {
@@ -603,6 +661,8 @@ impl EpubBook {
                 css_urls,
                 inline_styles,
                 nonlinear,
+                layout,
+                viewport,
             });
         }
         Ok(docs)
@@ -610,7 +670,8 @@ impl EpubBook {
 
     pub fn to_html(&self, options: &HtmlOptions) -> Result<String> {
         let docs = self.spine_documents()?;
-        let mut html = self.html_head(options, &docs);
+        let refs: Vec<&SpineDocument> = docs.iter().collect();
+        let mut html = self.html_head(options, &refs);
         for doc in &docs {
             push_section_html(&mut html, doc, doc.index as u32 + 1, &doc.body_html, false);
         }
@@ -637,7 +698,6 @@ impl EpubBook {
         image_budget: Option<usize>,
     ) -> Result<Vec<String>> {
         let docs = self.spine_documents()?;
-        let head = self.html_head(options, &docs);
 
         // One "piece" is a spine document, or one part of a document that is
         // larger than a chunk on its own.
@@ -651,7 +711,7 @@ impl EpubBook {
         let mut next_extra_slot = docs.len() as u32 + 1;
         for doc in &docs {
             let real_slot = doc.index as u32 + 1;
-            if doc.body_html.len() <= max_bytes {
+            if doc.body_html.len() <= max_bytes || doc.layout == SpineLayout::PrePaginated {
                 pieces.push(Piece {
                     doc,
                     body: std::borrow::Cow::Borrowed(doc.body_html.as_str()),
@@ -700,14 +760,23 @@ impl EpubBook {
         let mut chunks = Vec::new();
         let mut body = String::new();
         let mut body_images = 0usize;
-        let flush = |body: &mut String, chunks: &mut Vec<String>| {
-            let mut html = head.clone();
-            html.push_str(body);
-            html.push_str("</body></html>");
-            chunks.push(html);
-            body.clear();
-        };
+        let mut chunk_docs: Vec<&SpineDocument> = Vec::new();
+        let flush =
+            |body: &mut String, chunks: &mut Vec<String>, chunk_docs: &mut Vec<&SpineDocument>| {
+                let head = self.html_head(options, chunk_docs);
+                let mut html = head;
+                html.push_str(body);
+                html.push_str("</body></html>");
+                chunks.push(html);
+                body.clear();
+                chunk_docs.clear();
+            };
         for (index, piece) in pieces.iter().enumerate() {
+            let fixed_layout = piece.doc.layout == SpineLayout::PrePaginated;
+            if fixed_layout && !body.is_empty() {
+                flush(&mut body, &mut chunks, &mut chunk_docs);
+                body_images = 0;
+            }
             let mut section = String::new();
             push_section_html(
                 &mut section,
@@ -716,31 +785,34 @@ impl EpubBook {
                 &piece.body,
                 piece.continuation,
             );
+            if !chunk_docs.iter().any(|doc| std::ptr::eq(*doc, piece.doc)) {
+                chunk_docs.push(piece.doc);
+            }
             let images = piece_images.get(index).copied().unwrap_or(0);
             let over_text = !body.is_empty() && body.len() + section.len() > max_bytes;
             let over_images = image_budget.is_some_and(|budget| {
                 !body.is_empty() && body_images > 0 && body_images + images > budget
             });
             if over_text || over_images {
-                flush(&mut body, &mut chunks);
+                flush(&mut body, &mut chunks, &mut chunk_docs);
                 body_images = 0;
             }
             body.push_str(&section);
             body_images += images;
             // A part that was split out is already at the size limit; keep it
             // in its own chunk so the layout budget holds.
-            if piece.continuation || piece.body.len() >= max_bytes {
-                flush(&mut body, &mut chunks);
+            if fixed_layout || piece.continuation || piece.body.len() >= max_bytes {
+                flush(&mut body, &mut chunks, &mut chunk_docs);
                 body_images = 0;
             }
         }
         if !body.is_empty() || chunks.is_empty() {
-            flush(&mut body, &mut chunks);
+            flush(&mut body, &mut chunks, &mut chunk_docs);
         }
         Ok(chunks)
     }
 
-    fn html_head(&self, options: &HtmlOptions, docs: &[SpineDocument]) -> String {
+    fn html_head(&self, options: &HtmlOptions, docs: &[&SpineDocument]) -> String {
         let mut css_urls = Vec::new();
         let mut inline_styles = Vec::new();
         for doc in docs {
@@ -1222,6 +1294,65 @@ fn meta_content(root: roxmltree::Node<'_, '_>, name: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn meta_property_text(root: roxmltree::Node<'_, '_>, property: &str) -> Option<String> {
+    root.descendants()
+        .filter(|n| n.is_element() && n.tag_name().name() == "meta")
+        .find(|n| {
+            n.attribute("property")
+                .is_some_and(|value| value.eq_ignore_ascii_case(property))
+        })
+        .and_then(|n| n.text())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn parse_viewport_size(html: &str) -> Option<(f32, f32)> {
+    let lower = html.to_ascii_lowercase();
+    let mut search = 0usize;
+    while let Some(rel) = lower[search..].find('<') {
+        let start = search + rel;
+        let Some(rel_end) = lower[start..].find('>') else {
+            break;
+        };
+        let end = start + rel_end;
+        let tag = &html[start..=end];
+        search = end + 1;
+        if !tag.to_ascii_lowercase().starts_with("<meta") {
+            continue;
+        }
+        let attrs = parse_attrs(tag);
+        if !attrs
+            .get("name")
+            .is_some_and(|value| value.eq_ignore_ascii_case("viewport"))
+        {
+            continue;
+        }
+        let content = attrs.get("content")?;
+        let mut width = None;
+        let mut height = None;
+        for part in content.split([',', ';', ' ']) {
+            let Some((key, value)) = part.split_once('=') else {
+                continue;
+            };
+            let Ok(number) = value.trim().trim_end_matches("px").parse::<f32>() else {
+                continue;
+            };
+            match key.trim().to_ascii_lowercase().as_str() {
+                "width" => width = Some(number),
+                "height" => height = Some(number),
+                _ => {}
+            }
+        }
+        if let (Some(width), Some(height)) = (width, height)
+            && width > 0.0
+            && height > 0.0
+        {
+            return Some((width, height));
+        }
+    }
+    None
+}
+
 fn extract_body(html: &str) -> Option<String> {
     let lower = html.to_ascii_lowercase();
     let body_start = lower.find("<body")?;
@@ -1231,6 +1362,18 @@ fn extract_body(html: &str) -> Option<String> {
         return None;
     }
     Some(html[open_end..close_start].to_string())
+}
+
+fn body_attributes(html: &str) -> HashMap<String, String> {
+    let lower = html.to_ascii_lowercase();
+    let Some(body_start) = lower.find("<body") else {
+        return HashMap::new();
+    };
+    let Some(rel_end) = lower[body_start..].find('>') else {
+        return HashMap::new();
+    };
+    let end = body_start + rel_end;
+    parse_attrs(&html[body_start..=end])
 }
 
 fn extract_styles(html: &str, opf_dir: &str, doc_path: &str) -> (Vec<String>, Vec<String>) {
@@ -1512,6 +1655,22 @@ fn is_image_resource(media_type: &str, href: &str) -> bool {
         file_extension(href).as_str(),
         "svg" | "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
     )
+}
+
+fn spine_layout(properties: &str, global: SpineLayout) -> SpineLayout {
+    let properties = properties.to_ascii_lowercase();
+    if properties.split_whitespace().any(|p| {
+        p == "rendition:layout-pre-paginated" || p == "rendition:layout-pre-paginated-spreads"
+    }) {
+        SpineLayout::PrePaginated
+    } else if properties
+        .split_whitespace()
+        .any(|p| p == "rendition:layout-reflowable")
+    {
+        SpineLayout::Reflowable
+    } else {
+        global
+    }
 }
 
 fn file_extension(path: &str) -> String {
@@ -2655,6 +2814,53 @@ mod tests {
         let mut book = EpubBook::from_bytes(synthetic_normal_image_epub()).unwrap();
         assert_eq!(book.normalize_full_page_images(600.0, 800.0, 40.0, 32.0), 0);
         assert!(book.resource("cre-page-fit-1.svg").is_none());
+    }
+
+    #[test]
+    fn fixed_layout_spine_item_gets_its_own_viewport_marker() {
+        let container = r#"<?xml version="1.0"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+  <rootfiles>
+    <rootfile full-path="pkg.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#;
+        let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="id">urn:uuid:fixed-layout-test</dc:identifier>
+    <dc:title>Fixed Layout Test</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="s1" href="sec1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="s1" properties="rendition:layout-pre-paginated"/>
+  </spine>
+</package>"#;
+        let doc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head>
+    <title>Fixed</title>
+    <meta name="viewport" content="width=900, height=600"/>
+  </head>
+  <body><p>Fixed page.</p></body>
+</html>"#;
+        let book = EpubBook::from_bytes(synthetic_epub_fixture(
+            container,
+            opf,
+            doc,
+            &jpg_fixture_bytes(),
+        ))
+        .unwrap();
+        let docs = book.spine_documents().unwrap();
+        assert_eq!(docs[0].layout, SpineLayout::PrePaginated);
+        assert_eq!(docs[0].viewport, Some((900.0, 600.0)));
+        let chunks = book
+            .to_html_chunks(&HtmlOptions::default(), 1_000_000)
+            .unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].contains("data-cre-fixed-layout=\"900x600\""));
     }
 
     #[test]
