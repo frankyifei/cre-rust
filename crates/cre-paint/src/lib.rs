@@ -5,10 +5,11 @@ use std::sync::Arc;
 use anyrender::recording::RenderCommand;
 use anyrender::{Paint, Scene};
 use kurbo::{Affine, BezPath, PathEl, Point, Shape, Stroke};
-use peniko::{Color, Fill as AnyFill, ImageFormat};
+use peniko::{Color, Extend as PenikoExtend, Fill as AnyFill, Gradient, GradientKind, ImageFormat};
 use tiny_skia::{
-    FillRule, LineCap, LineJoin, Mask, Paint as SkPaint, PathBuilder, Pixmap, Shader,
-    Stroke as SkStroke, Transform,
+    FillRule, GradientStop as SkGradientStop, LineCap, LineJoin,
+    LinearGradient as SkLinearGradient, Mask, Paint as SkPaint, PathBuilder, Pixmap,
+    RadialGradient as SkRadialGradient, Shader, SpreadMode, Stroke as SkStroke, Transform,
 };
 
 /// Rasterized glyph cache. Rasterizing dominates first-page cost on slow
@@ -194,6 +195,21 @@ pub fn render_page(
                         cmd.fill,
                         clip_mask.as_ref(),
                     );
+                }
+                Paint::Gradient(gradient) => {
+                    let brush_transform = cmd.brush_transform.unwrap_or(Affine::IDENTITY);
+                    let shader =
+                        gradient_shader(gradient, page_transform * cmd.transform * brush_transform);
+                    if let Some(shader) = shader {
+                        draw_fill_shader(
+                            &mut pixmap,
+                            &cmd.shape,
+                            page_transform * cmd.transform,
+                            shader,
+                            cmd.fill,
+                            clip_mask.as_ref(),
+                        );
+                    }
                 }
                 Paint::Image(image_brush) => {
                     draw_image_fill(
@@ -638,6 +654,100 @@ fn skia_paint(color: Color) -> SkPaint<'static> {
     }
 }
 
+fn kurbo_to_skia(transform: Affine) -> Transform {
+    let c = transform.as_coeffs();
+    Transform::from_row(
+        c[0] as f32,
+        c[1] as f32,
+        c[2] as f32,
+        c[3] as f32,
+        c[4] as f32,
+        c[5] as f32,
+    )
+}
+
+/// Adapts a peniko gradient (the brush format Blitz records) to tiny-skia's
+/// shader. All coordinates are in the same space as the path before
+/// `transform`, so the transform is applied to the shader as well.
+fn gradient_shader(gradient: &Gradient, transform: Affine) -> Option<Shader<'static>> {
+    let stops: Vec<SkGradientStop> = gradient
+        .stops
+        .iter()
+        .map(|stop| {
+            let rgba = stop
+                .color
+                .to_alpha_color::<peniko::color::Srgb>()
+                .to_rgba8();
+            SkGradientStop::new(
+                stop.offset,
+                tiny_skia::Color::from_rgba8(rgba.r, rgba.g, rgba.b, rgba.a),
+            )
+        })
+        .collect();
+    if stops.is_empty() {
+        return None;
+    }
+    let spread = match gradient.extend {
+        PenikoExtend::Pad => SpreadMode::Pad,
+        PenikoExtend::Repeat => SpreadMode::Repeat,
+        PenikoExtend::Reflect => SpreadMode::Reflect,
+    };
+    let transform = kurbo_to_skia(transform);
+    match &gradient.kind {
+        GradientKind::Linear(position) => SkLinearGradient::new(
+            tiny_skia::Point::from_xy(position.start.x as f32, position.start.y as f32),
+            tiny_skia::Point::from_xy(position.end.x as f32, position.end.y as f32),
+            stops,
+            spread,
+            transform,
+        ),
+        GradientKind::Radial(position) => {
+            let start = tiny_skia::Point::from_xy(
+                position.start_center.x as f32,
+                position.start_center.y as f32,
+            );
+            let end = tiny_skia::Point::from_xy(
+                position.end_center.x as f32,
+                position.end_center.y as f32,
+            );
+            SkRadialGradient::new(
+                start,
+                end,
+                position.end_radius.max(0.0001),
+                stops,
+                spread,
+                transform,
+            )
+        }
+        // tiny-skia has no sweep shader; leave the fill unpainted rather than
+        // drawing a wrong color.
+        GradientKind::Sweep(_) => None,
+    }
+}
+
+fn draw_fill_shader(
+    pixmap: &mut Pixmap,
+    shape: &BezPath,
+    transform: Affine,
+    shader: Shader<'static>,
+    fill: AnyFill,
+    clip_mask: Option<&Mask>,
+) {
+    let Some(path) = to_skia_path(shape, transform) else {
+        return;
+    };
+    let paint = SkPaint {
+        shader,
+        anti_alias: true,
+        ..Default::default()
+    };
+    let rule = match fill {
+        AnyFill::NonZero => FillRule::Winding,
+        AnyFill::EvenOdd => FillRule::EvenOdd,
+    };
+    pixmap.fill_path(&path, &paint, rule, Transform::identity(), clip_mask);
+}
+
 fn to_skia_path(shape: &BezPath, transform: Affine) -> Option<tiny_skia::Path> {
     let mut builder = PathBuilder::new();
     for el in shape.elements() {
@@ -856,6 +966,21 @@ pub fn render_page_rgba(
                         clip_mask.as_ref(),
                     );
                 }
+                Paint::Gradient(gradient) => {
+                    let brush_transform = cmd.brush_transform.unwrap_or(Affine::IDENTITY);
+                    let shader =
+                        gradient_shader(gradient, page_transform * cmd.transform * brush_transform);
+                    if let Some(shader) = shader {
+                        draw_fill_shader(
+                            &mut pixmap,
+                            &cmd.shape,
+                            page_transform * cmd.transform,
+                            shader,
+                            cmd.fill,
+                            clip_mask.as_ref(),
+                        );
+                    }
+                }
                 Paint::Image(image_brush) => {
                     draw_image_fill(
                         &mut pixmap,
@@ -931,6 +1056,7 @@ pub fn render_page_rgba(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyrender::PaintScene;
 
     #[test]
     fn page_clip_mask_limits_both_axes() {
@@ -946,5 +1072,32 @@ mod tests {
     #[test]
     fn page_clip_mask_is_none_for_the_full_page() {
         assert!(page_clip_mask(10, 10, 0.0, 10.0, 0.0, 10.0).is_none());
+    }
+
+    #[test]
+    fn linear_gradient_fill_is_painted() {
+        let mut scene = Scene::default();
+        let gradient = Gradient::new_linear((0.0, 0.0), (16.0, 0.0)).with_stops([
+            (0.0, Color::from_rgba8(0, 0, 0, 255)),
+            (1.0, Color::from_rgba8(255, 255, 255, 255)),
+        ]);
+        scene.fill(
+            AnyFill::NonZero,
+            Affine::IDENTITY,
+            Paint::Gradient(&gradient),
+            None,
+            &kurbo::Rect::new(0.0, 0.0, 16.0, 8.0),
+        );
+        let (bitmap, _, _) = render_page(&scene, 16, 8, 0.0, 0.0, 16.0, 0.0, 8.0, 0xffffff, 1.0);
+        assert!(
+            bitmap.data[0] < 32,
+            "left pixel should be dark, got {}",
+            bitmap.data[0]
+        );
+        assert!(
+            bitmap.data[15] > 200,
+            "right pixel should be light, got {}",
+            bitmap.data[15]
+        );
     }
 }

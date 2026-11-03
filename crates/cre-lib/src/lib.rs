@@ -1059,6 +1059,16 @@ impl Document {
             options.height = (height * scale).round().max(1.0) as u32;
             options.layout_height = options.height;
             options.page_margin = 0.0;
+            if std::env::var_os("CRE_FXL_DEBUG").is_some() {
+                eprintln!(
+                    "cre-lib: fxl chunk={chunk_index} fixed={fixed:?} canvas={}x{} scale={scale} reader_css={:?} options={}x{}",
+                    self.width,
+                    self.height,
+                    self.reader_css_size(),
+                    options.width,
+                    options.height
+                );
+            }
         }
         options
     }
