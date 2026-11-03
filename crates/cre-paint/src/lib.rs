@@ -8,9 +8,11 @@ use kurbo::{Affine, BezPath, PathEl, Point, Shape, Stroke};
 use peniko::{Color, Extend as PenikoExtend, Fill as AnyFill, Gradient, GradientKind, ImageFormat};
 use tiny_skia::{
     FillRule, GradientStop as SkGradientStop, LineCap, LineJoin,
-    LinearGradient as SkLinearGradient, Mask, Paint as SkPaint, PathBuilder, Pixmap,
+    LinearGradient as SkLinearGradient, Mask, Paint as SkPaint, PathBuilder, Pixmap, PixmapRef,
     RadialGradient as SkRadialGradient, Shader, SpreadMode, Stroke as SkStroke, Transform,
 };
+
+mod raster;
 
 /// Rasterized glyph cache. Rasterizing dominates first-page cost on slow
 /// targets, so a glyph is turned into a coverage bitmap once per paint.
@@ -167,15 +169,6 @@ pub fn render_page(
             background,
         );
     }
-    let mut pixmap = Pixmap::new(width, height).expect("non-zero page bitmap");
-    let background_color = tiny_skia::Color::from_rgba8(
-        ((background >> 16) & 0xff) as u8,
-        ((background >> 8) & 0xff) as u8,
-        (background & 0xff) as u8,
-        0xff,
-    );
-    pixmap.fill(background_color);
-
     let page_transform = Affine::translate((0.0, -page_top as f64));
     let local_top = (clip_top - page_top).clamp(0.0, height as f32);
     let local_bottom = (clip_bottom - page_top).clamp(0.0, height as f32);
@@ -187,96 +180,18 @@ pub fn render_page(
         local_top,
         local_bottom,
     );
-    let (image_count, image_surface) = image_draw_stats(
+    let (rasterizer, image_count, image_surface) = raster::Rasterizer::new(
         scene,
         width,
         height,
         page_transform,
         local_top,
         local_bottom,
+        font_gamma,
+        background,
+        clip_mask,
     );
-    let mut faces: HashMap<usize, ttf_parser::Face<'_>> = HashMap::new();
-    let mut glyph_cache: HashMap<GlyphKey, GlyphBitmap> = HashMap::new();
-    for command in &scene.commands {
-        match command {
-            RenderCommand::Fill(cmd) => match &cmd.brush {
-                Paint::Solid(color) => {
-                    draw_fill(
-                        &mut pixmap,
-                        &cmd.shape,
-                        page_transform * cmd.transform,
-                        *color,
-                        cmd.fill,
-                        clip_mask.as_ref(),
-                    );
-                }
-                Paint::Gradient(gradient) => {
-                    let brush_transform = cmd.brush_transform.unwrap_or(Affine::IDENTITY);
-                    let shader =
-                        gradient_shader(gradient, page_transform * cmd.transform * brush_transform);
-                    if let Some(shader) = shader {
-                        draw_fill_shader(
-                            &mut pixmap,
-                            &cmd.shape,
-                            page_transform * cmd.transform,
-                            shader,
-                            cmd.fill,
-                            clip_mask.as_ref(),
-                        );
-                    }
-                }
-                Paint::Image(image_brush) => {
-                    draw_image_fill(
-                        &mut pixmap,
-                        &image_brush.image,
-                        image_brush.sampler.alpha,
-                        &cmd.shape,
-                        page_transform * cmd.transform,
-                        cmd.brush_transform,
-                        local_top,
-                        local_bottom,
-                        clip_mask.as_ref(),
-                    );
-                }
-                _ => {}
-            },
-            RenderCommand::Stroke(cmd) => {
-                if let Some(color) = solid_color(&cmd.brush) {
-                    draw_stroke(
-                        &mut pixmap,
-                        &cmd.shape,
-                        page_transform * cmd.transform,
-                        color,
-                        &cmd.style,
-                        clip_mask.as_ref(),
-                    );
-                }
-            }
-            RenderCommand::GlyphRun(cmd) => {
-                if let Some(color) = solid_color(&cmd.brush) {
-                    draw_glyphs(
-                        &mut pixmap,
-                        &cmd.font_data,
-                        cmd.font_size,
-                        &cmd.glyphs,
-                        page_transform * cmd.transform,
-                        cmd.glyph_transform,
-                        color,
-                        cmd.brush_alpha,
-                        local_top,
-                        local_bottom,
-                        font_gamma,
-                        &mut faces,
-                        &mut glyph_cache,
-                    );
-                }
-            }
-            RenderCommand::PushLayer(_)
-            | RenderCommand::PushClipLayer(_)
-            | RenderCommand::PopLayer
-            | RenderCommand::BoxShadow(_) => {}
-        }
-    }
+    let pixmap = rasterizer.run(scene);
 
     let mut data = Vec::with_capacity((width * height) as usize);
     for pixel in pixmap.pixels() {
@@ -498,13 +413,24 @@ fn draw_stroke(
     pixmap: &mut Pixmap,
     shape: &BezPath,
     transform: Affine,
-    color: Color,
+    brush: &Paint,
+    brush_transform: Option<Affine>,
     style: &Stroke,
     clip_mask: Option<&Mask>,
 ) {
-    let path = to_skia_path(shape, transform);
-    let Some(path) = path else { return };
-    let paint = skia_paint(color);
+    let Some(path) = to_skia_path(shape, transform) else {
+        return;
+    };
+    let dash = if style.dash_pattern.len() >= 2 {
+        let array: Vec<f32> = style
+            .dash_pattern
+            .iter()
+            .map(|value| *value as f32)
+            .collect();
+        tiny_skia::StrokeDash::new(array, style.dash_offset as f32)
+    } else {
+        None
+    };
     let stroke = SkStroke {
         width: style.width as f32,
         line_cap: match style.start_cap {
@@ -518,9 +444,53 @@ fn draw_stroke(
             kurbo::Join::Round => LineJoin::Round,
         },
         miter_limit: style.miter_limit as f32,
-        dash: None,
+        dash,
     };
-    pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), clip_mask);
+    match brush {
+        Paint::Solid(color) => {
+            let paint = skia_paint(*color);
+            pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), clip_mask);
+        }
+        Paint::Gradient(gradient) => {
+            let brush_transform = brush_transform.unwrap_or(Affine::IDENTITY);
+            if let Some(shader) = gradient_shader(gradient, transform * brush_transform) {
+                let paint = SkPaint {
+                    shader,
+                    anti_alias: true,
+                    ..Default::default()
+                };
+                pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), clip_mask);
+            }
+        }
+        Paint::Image(image) => {
+            let brush_transform = brush_transform.unwrap_or(Affine::IDENTITY);
+            let sampler = &image.sampler;
+            let Some(premultiplied) = premultiplied_rgba(&image.image) else {
+                return;
+            };
+            let Some(image_pixmap) = PixmapRef::from_bytes(
+                premultiplied.as_ref(),
+                image.image.width,
+                image.image.height,
+            ) else {
+                return;
+            };
+            let shader = tiny_skia::Pattern::new(
+                image_pixmap,
+                spread_mode(sampler.x_extend),
+                filter_quality(sampler.quality),
+                sampler.alpha,
+                kurbo_to_skia(transform * brush_transform),
+            );
+            let paint = SkPaint {
+                shader,
+                anti_alias: true,
+                ..Default::default()
+            };
+            pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), clip_mask);
+        }
+        _ => {}
+    }
 }
 
 /// Maps glyph coverage bytes through the font-contrast gamma in one place:
@@ -557,9 +527,169 @@ fn draw_glyphs<'a>(
     brush_alpha: f32,
     clip_top: f32,
     clip_bottom: f32,
+    clip_mask: Option<&Mask>,
     font_gamma: f32,
     faces: &mut HashMap<usize, ttf_parser::Face<'a>>,
     glyph_cache: &mut HashMap<GlyphKey, GlyphBitmap>,
+) {
+    let rgba = color.to_rgba8();
+    let alpha = (rgba.a as f32 / 255.0) * brush_alpha;
+    let width = pixmap.width();
+    for_each_glyph_pixel(
+        width,
+        pixmap.height(),
+        font_data,
+        font_size,
+        glyphs,
+        transform,
+        glyph_transform,
+        clip_top,
+        clip_bottom,
+        font_gamma,
+        faces,
+        glyph_cache,
+        |x, y, coverage| {
+            let mask_a = clip_mask.map_or(1.0, |mask| {
+                mask.data()[(y * width + x) as usize] as f32 / 255.0
+            });
+            if mask_a <= 0.0 {
+                return;
+            }
+            blend_pixel(
+                pixmap,
+                x,
+                y,
+                rgba.r,
+                rgba.g,
+                rgba.b,
+                coverage * alpha * mask_a,
+            );
+        },
+    );
+}
+
+/// Rasterises the glyph coverage once, then fills it with a gradient or image
+/// brush. Tiny-skia has no "glyph run with shader" primitive, so the coverage
+/// becomes a mask on a full-page rectangle.
+#[allow(clippy::too_many_arguments)]
+fn draw_glyphs_with_brush<'a>(
+    pixmap: &mut Pixmap,
+    font_data: &'a peniko::FontData,
+    font_size: f32,
+    glyphs: &[anyrender::Glyph],
+    transform: Affine,
+    glyph_transform: Option<Affine>,
+    brush: &Paint,
+    brush_transform: Option<Affine>,
+    brush_alpha: f32,
+    clip_top: f32,
+    clip_bottom: f32,
+    clip_mask: Option<&Mask>,
+    font_gamma: f32,
+    faces: &mut HashMap<usize, ttf_parser::Face<'a>>,
+    glyph_cache: &mut HashMap<GlyphKey, GlyphBitmap>,
+) {
+    let (width, height) = (pixmap.width(), pixmap.height());
+    let Some(mut mask) = Mask::new(width, height) else {
+        return;
+    };
+    for_each_glyph_pixel(
+        width,
+        height,
+        font_data,
+        font_size,
+        glyphs,
+        transform,
+        glyph_transform,
+        clip_top,
+        clip_bottom,
+        font_gamma,
+        faces,
+        glyph_cache,
+        |x, y, coverage| {
+            let alpha = (coverage * brush_alpha * 255.0).clamp(0.0, 255.0) as u8;
+            let slot = &mut mask.data_mut()[(y * width + x) as usize];
+            *slot = (*slot).max(alpha);
+        },
+    );
+    let mask = raster::intersect_optional(clip_mask, Some(mask));
+    let clip_mask = mask.as_ref();
+    let Some(page) = raster::full_page_path(width, height) else {
+        return;
+    };
+    let brush_transform = brush_transform.unwrap_or(Affine::IDENTITY);
+    match brush {
+        Paint::Gradient(gradient) => {
+            let Some(shader) = gradient_shader(gradient, transform * brush_transform) else {
+                return;
+            };
+            let paint = SkPaint {
+                shader,
+                anti_alias: false,
+                ..Default::default()
+            };
+            pixmap.fill_path(
+                &page,
+                &paint,
+                FillRule::Winding,
+                Transform::identity(),
+                clip_mask,
+            );
+        }
+        Paint::Image(image) => {
+            let sampler = &image.sampler;
+            let Some(premultiplied) = premultiplied_rgba(&image.image) else {
+                return;
+            };
+            let Some(image_pixmap) = PixmapRef::from_bytes(
+                premultiplied.as_ref(),
+                image.image.width,
+                image.image.height,
+            ) else {
+                return;
+            };
+            let shader = tiny_skia::Pattern::new(
+                image_pixmap,
+                spread_mode(sampler.x_extend),
+                filter_quality(sampler.quality),
+                sampler.alpha,
+                kurbo_to_skia(transform * brush_transform),
+            );
+            let paint = SkPaint {
+                shader,
+                anti_alias: false,
+                ..Default::default()
+            };
+            pixmap.fill_path(
+                &page,
+                &paint,
+                FillRule::Winding,
+                Transform::identity(),
+                clip_mask,
+            );
+        }
+        _ => {}
+    }
+}
+
+/// Walks every covered pixel of a glyph run, reporting the gamma-mapped
+/// coverage in `0..=1`. Shared by the solid and shader glyph paths so glyph
+/// placement and caching stay in one place.
+#[allow(clippy::too_many_arguments)]
+fn for_each_glyph_pixel<'a>(
+    width: u32,
+    height: u32,
+    font_data: &'a peniko::FontData,
+    font_size: f32,
+    glyphs: &[anyrender::Glyph],
+    transform: Affine,
+    glyph_transform: Option<Affine>,
+    clip_top: f32,
+    clip_bottom: f32,
+    font_gamma: f32,
+    faces: &mut HashMap<usize, ttf_parser::Face<'a>>,
+    glyph_cache: &mut HashMap<GlyphKey, GlyphBitmap>,
+    mut emit: impl FnMut(u32, u32, f32),
 ) {
     let coverage_lut = glyph_coverage_lut(font_gamma);
     let data = font_data.data.data();
@@ -575,9 +705,6 @@ fn draw_glyphs<'a>(
     if glyph_size <= 0.0 {
         return;
     }
-
-    let rgba = color.to_rgba8();
-    let alpha = (rgba.a as f32 / 255.0) * brush_alpha;
 
     for glyph in glyphs {
         if glyph.id == 0 {
@@ -615,34 +742,48 @@ fn draw_glyphs<'a>(
                 let coverage = coverage_lut[coverage_byte as usize] as f32 / 255.0;
                 let x = x0.round() as i32 + col as i32;
                 let y = y0.round() as i32 + row as i32;
-                if x < 0 || y < 0 || x >= pixmap.width() as i32 || y >= pixmap.height() as i32 {
+                if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
                     continue;
                 }
                 if (y as f32) < clip_top || (y as f32) >= clip_bottom {
                     continue;
                 }
-                blend_pixel(
-                    pixmap,
-                    x as u32,
-                    y as u32,
-                    rgba.r,
-                    rgba.g,
-                    rgba.b,
-                    coverage * alpha,
-                );
+                emit(x as u32, y as u32, coverage);
             }
         }
     }
 }
 
 fn blend_pixel(pixmap: &mut Pixmap, x: u32, y: u32, r: u8, g: u8, b: u8, alpha: f32) {
+    let width = pixmap.width();
+    blend_pixel_data(pixmap.data_mut(), width, x, y, r, g, b, alpha);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn blend_pixel_data(data: &mut [u8], width: u32, x: u32, y: u32, r: u8, g: u8, b: u8, alpha: f32) {
     if alpha <= 0.0 {
         return;
     }
-    let idx = ((y * pixmap.width() + x) * 4) as usize;
-    let data = pixmap.data_mut();
+    let idx = ((y * width + x) * 4) as usize;
     let src_a = alpha.clamp(0.0, 1.0);
+    if src_a >= 1.0 {
+        data[idx] = r;
+        data[idx + 1] = g;
+        data[idx + 2] = b;
+        data[idx + 3] = 255;
+        return;
+    }
     let dst_a = data[idx + 3] as f32 / 255.0;
+    if dst_a >= 1.0 {
+        // Opaque destination: source-over without the divide.
+        let inv = 1.0 - src_a;
+        for (offset, src) in [(0usize, r), (1, g), (2, b)] {
+            let dst = data[idx + offset] as f32;
+            let out = src as f32 * src_a + dst * inv;
+            data[idx + offset] = out.clamp(0.0, 255.0) as u8;
+        }
+        return;
+    }
     let out_a = src_a + dst_a * (1.0 - src_a);
     if out_a <= 0.0 {
         data[idx] = 255;
@@ -733,10 +874,163 @@ fn gradient_shader(gradient: &Gradient, transform: Affine) -> Option<Shader<'sta
                 transform,
             )
         }
-        // tiny-skia has no sweep shader; leave the fill unpainted rather than
-        // drawing a wrong color.
+        // tiny-skia has no sweep shader; the caller falls back to
+        // `draw_sweep_fill`, which evaluates the angle per pixel.
         GradientKind::Sweep(_) => None,
     }
+}
+
+/// Splits a peniko gradient into ordered `(offset, straight RGBA)` stops.
+fn gradient_stop_list(gradient: &Gradient) -> Vec<(f32, [u8; 4])> {
+    gradient
+        .stops
+        .iter()
+        .map(|stop| {
+            let rgba = stop
+                .color
+                .to_alpha_color::<peniko::color::Srgb>()
+                .to_rgba8();
+            (stop.offset, [rgba.r, rgba.g, rgba.b, rgba.a])
+        })
+        .collect()
+}
+
+fn interpolate_rgba(from: [u8; 4], to: [u8; 4], t: f32) -> [u8; 4] {
+    let lerp = |a: u8, b: u8| {
+        (f32::from(a) * (1.0 - t) + f32::from(b) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    [
+        lerp(from[0], to[0]),
+        lerp(from[1], to[1]),
+        lerp(from[2], to[2]),
+        lerp(from[3], to[3]),
+    ]
+}
+
+fn color_at_offset(stops: &[(f32, [u8; 4])], t: f32) -> [u8; 4] {
+    let Some(first) = stops.first().copied() else {
+        return [0, 0, 0, 0];
+    };
+    if t <= first.0 {
+        return first.1;
+    }
+    for pair in stops.windows(2) {
+        let (start, from) = pair[0];
+        let (end, to) = pair[1];
+        if t <= end {
+            if end <= start {
+                return to;
+            }
+            return interpolate_rgba(from, to, (t - start) / (end - start));
+        }
+    }
+    stops.last().map(|stop| stop.1).unwrap_or([0, 0, 0, 0])
+}
+
+/// tiny-skia has no sweep (conic) shader, so conic gradients are filled by
+/// evaluating the angle per pixel. Slower than a shader, but conic gradients
+/// are rare and the alternative is dropping the fill entirely.
+#[allow(clippy::too_many_arguments)]
+fn draw_sweep_fill(
+    pixmap: &mut Pixmap,
+    shape: &BezPath,
+    fill: AnyFill,
+    fill_transform: Affine,
+    gradient: &Gradient,
+    brush_transform: Option<Affine>,
+    clip_mask: Option<&Mask>,
+) {
+    let GradientKind::Sweep(sweep) = &gradient.kind else {
+        return;
+    };
+    let stops = gradient_stop_list(gradient);
+    if stops.is_empty() {
+        return;
+    }
+    let shape_mask =
+        raster::shape_mask(shape, fill_transform, fill, pixmap.width(), pixmap.height());
+    let mask = raster::intersect_optional(clip_mask, shape_mask);
+    let mask_data = mask.as_ref().map(|mask| mask.data());
+    let Some(bounds) = device_bounds(shape, fill_transform, pixmap.width(), pixmap.height()) else {
+        return;
+    };
+    let to_gradient = (fill_transform * brush_transform.unwrap_or(Affine::IDENTITY)).inverse();
+    let center = sweep.center;
+    let span = sweep.end_angle - sweep.start_angle;
+    if !span.is_finite() || span.abs() < 1e-6 {
+        return;
+    }
+    let page_width = pixmap.width();
+    let data = pixmap.data_mut();
+    for py in bounds.1..bounds.3 {
+        let mask_row = mask_data.map(|_| py as usize * page_width as usize);
+        for px in bounds.0..bounds.2 {
+            let mask_a = match (mask_data, mask_row) {
+                (Some(mask), Some(row_start)) => mask[row_start + px as usize] as f32 / 255.0,
+                _ => 1.0,
+            };
+            if mask_a <= 0.0 {
+                continue;
+            }
+            let p = to_gradient * Point::new(px as f64 + 0.5, py as f64 + 0.5);
+            let angle = (p.y - center.y).atan2(p.x - center.x) as f32;
+            let rel = (angle - sweep.start_angle).rem_euclid(std::f32::consts::TAU);
+            let t = rel / span.abs();
+            let t = match gradient.extend {
+                PenikoExtend::Pad => t,
+                PenikoExtend::Repeat => t.rem_euclid(1.0),
+                PenikoExtend::Reflect => {
+                    let t = t.rem_euclid(2.0);
+                    if t > 1.0 { 2.0 - t } else { t }
+                }
+            };
+            let rgba = color_at_offset(&stops, t);
+            let alpha = (f32::from(rgba[3]) / 255.0) * mask_a;
+            if alpha <= 0.0 {
+                continue;
+            }
+            blend_pixel_data(
+                data, page_width, px as u32, py as u32, rgba[0], rgba[1], rgba[2], alpha,
+            );
+        }
+    }
+}
+
+/// Device-space integer bounds `(x0, y0, x1, y1)` for a transformed shape,
+/// clipped to the page.
+fn device_bounds(
+    shape: &BezPath,
+    transform: Affine,
+    width: u32,
+    height: u32,
+) -> Option<(i32, i32, i32, i32)> {
+    let raw = shape.bounding_box();
+    let corners = [
+        transform * Point::new(raw.x0, raw.y0),
+        transform * Point::new(raw.x1, raw.y0),
+        transform * Point::new(raw.x0, raw.y1),
+        transform * Point::new(raw.x1, raw.y1),
+    ];
+    let x0 = corners.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
+    let y0 = corners.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
+    let x1 = corners
+        .iter()
+        .map(|p| p.x)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let y1 = corners
+        .iter()
+        .map(|p| p.y)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let x0 = x0.max(0.0).min(width as f64) as i32;
+    let x1 = x1.max(0.0).min(width as f64) as i32;
+    let y0 = y0.max(0.0).min(height as f64) as i32;
+    let y1 = y1.max(0.0).min(height as f64) as i32;
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+    Some((x0, y0, x1, y1))
 }
 
 fn draw_fill_shader(
@@ -801,25 +1095,71 @@ fn apply_el(el: PathEl, transform: Affine) -> PathEl {
 #[allow(clippy::too_many_arguments)]
 fn draw_image_fill(
     pixmap: &mut Pixmap,
-    image: &peniko::ImageData,
-    alpha: f32,
+    brush: &peniko::ImageBrush,
     shape: &BezPath,
+    fill: AnyFill,
     fill_transform: Affine,
     brush_transform: Option<Affine>,
-    clip_top: f32,
-    clip_bottom: f32,
     clip_mask: Option<&Mask>,
 ) {
-    if alpha <= 0.0 || image.width == 0 || image.height == 0 {
+    let image = &brush.image;
+    let sampler = &brush.sampler;
+    if sampler.alpha <= 0.0 || image.width == 0 || image.height == 0 {
         return;
     }
-    let img_data: &[u8] = image.data.data();
-    let bpp = 4usize;
+    let Some(fill_rect) = device_rect_path(shape, fill_transform, pixmap.width(), pixmap.height())
+    else {
+        return;
+    };
+    let shape_mask =
+        raster::shape_mask(shape, fill_transform, fill, pixmap.width(), pixmap.height());
+    let mask = raster::intersect_optional(clip_mask, shape_mask);
+    let brush_transform = brush_transform.unwrap_or(Affine::IDENTITY);
+    let transform = fill_transform * brush_transform;
 
-    let inv_fill = fill_transform.inverse();
-    let brush_inv = brush_transform.unwrap_or(Affine::IDENTITY).inverse();
-    let to_image = brush_inv * inv_fill;
+    // tiny-skia's pattern blitter is faster than a per-pixel loop, and covers
+    // sampling quality plus pad/repeat/reflect. It only has one spread mode
+    // for both axes, so unequal x/y extends fall back to the manual sampler.
+    let premultiplied = if sampler.x_extend == sampler.y_extend {
+        premultiplied_rgba(image)
+    } else {
+        None
+    };
+    if let Some(premultiplied) = premultiplied {
+        let Some(image_pixmap) =
+            PixmapRef::from_bytes(premultiplied.as_ref(), image.width, image.height)
+        else {
+            return;
+        };
+        let shader = tiny_skia::Pattern::new(
+            image_pixmap,
+            spread_mode(sampler.x_extend),
+            filter_quality(sampler.quality),
+            sampler.alpha,
+            kurbo_to_skia(transform),
+        );
+        let paint = SkPaint {
+            shader,
+            anti_alias: true,
+            ..Default::default()
+        };
+        pixmap.fill_path(
+            &fill_rect,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            mask.as_ref(),
+        );
+        return;
+    }
 
+    let Some(pixels) = straight_rgba(image) else {
+        return;
+    };
+    let inv_fill = transform.inverse();
+    let to_image = inv_fill;
+
+    let mask_data = mask.as_ref().map(|mask| mask.data());
     let raw = shape.bounding_box();
     let corners = [
         fill_transform * Point::new(raw.x0, raw.y0),
@@ -839,58 +1179,273 @@ fn draw_image_fill(
         .fold(f64::NEG_INFINITY, f64::max);
     let x0 = bx0.max(0.0).min(pixmap.width() as f64) as i32;
     let x1 = bx1.max(0.0).min(pixmap.width() as f64) as i32;
-    let y0 = by0
-        .max(clip_top as f64)
-        .max(0.0)
-        .min(pixmap.height() as f64) as i32;
-    let y1 = by1
-        .min(clip_bottom as f64)
-        .max(0.0)
-        .min(pixmap.height() as f64) as i32;
+    let y0 = by0.max(0.0).min(pixmap.height() as f64) as i32;
+    let y1 = by1.max(0.0).min(pixmap.height() as f64) as i32;
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
 
-    let mask_data = clip_mask.map(|m| m.data());
-
+    // Walk rows with an incremental inverse map: one add per pixel instead of
+    // a full affine transform.
+    let coeffs = to_image.as_coeffs();
+    let (image_width, image_height) = (image.width, image.height);
+    let page_width = pixmap.width();
+    let data = pixmap.data_mut();
     for py in y0..y1 {
+        let row = py as f64 + 0.5;
+        let mut ix = coeffs[0] * (x0 as f64 + 0.5) + coeffs[2] * row + coeffs[4];
+        let mut iy = coeffs[1] * (x0 as f64 + 0.5) + coeffs[3] * row + coeffs[5];
+        let mask_row = mask_data.map(|_| py as usize * page_width as usize);
         for px in x0..x1 {
-            if let Some(md) = mask_data {
-                let mi = (py as u32 * pixmap.width() + px as u32) as usize;
-                if md[mi] == 0 {
-                    continue;
-                }
-            }
-            let p = to_image * Point::new(px as f64 + 0.5, py as f64 + 0.5);
-            let sx = p.x.floor() as i32;
-            let sy = p.y.floor() as i32;
-            if sx < 0 || sy < 0 || sx >= image.width as i32 || sy >= image.height as i32 {
-                continue;
-            }
-            let si = ((sy as u32 * image.width + sx as u32) as usize) * bpp;
-            if si + 3 >= img_data.len() {
-                continue;
-            }
-            let (r, g, b, a) = match image.format {
-                ImageFormat::Rgba8 => (
-                    img_data[si],
-                    img_data[si + 1],
-                    img_data[si + 2],
-                    img_data[si + 3],
-                ),
-                ImageFormat::Bgra8 => (
-                    img_data[si + 2],
-                    img_data[si + 1],
-                    img_data[si],
-                    img_data[si + 3],
-                ),
-                _ => continue,
+            let mask_a = match (mask_data, mask_row) {
+                (Some(mask), Some(row_start)) => mask[row_start + px as usize] as f32 / 255.0,
+                _ => 1.0,
             };
-            let src_a = (a as f32 / 255.0) * alpha;
+            let (r, g, b, a) = sample_image(
+                pixels.as_ref(),
+                image_width,
+                image_height,
+                ix as f32,
+                iy as f32,
+                sampler,
+            );
+            ix += coeffs[0];
+            iy += coeffs[1];
+            let src_a = (f32::from(a) / 255.0) * sampler.alpha * mask_a;
             if src_a <= 0.0 {
                 continue;
             }
-            let mask_a = clip_mask.map_or(1.0, |m| {
-                m.data()[(py as u32 * pixmap.width() + px as u32) as usize] as f32 / 255.0
-            });
-            blend_pixel(pixmap, px as u32, py as u32, r, g, b, src_a * mask_a);
+            blend_pixel_data(data, page_width, px as u32, py as u32, r, g, b, src_a);
+        }
+    }
+}
+
+/// Converts an image to straight (non-premultiplied) RGBA8. Borrows when the
+/// source already matches, so the common RGBA upload avoids a copy.
+fn straight_rgba(image: &peniko::ImageData) -> Option<std::borrow::Cow<'_, [u8]>> {
+    let needed = (image.width as usize)
+        .checked_mul(image.height as usize)?
+        .checked_mul(4)?;
+    let raw = image.data.data();
+    if raw.len() < needed {
+        return None;
+    }
+    let raw = &raw[..needed];
+    let premultiplied = image.alpha_type == peniko::ImageAlphaType::AlphaPremultiplied;
+    match image.format {
+        ImageFormat::Rgba8 if !premultiplied => Some(std::borrow::Cow::Borrowed(raw)),
+        ImageFormat::Rgba8 => {
+            let mut out = raw.to_vec();
+            unpremultiply(&mut out);
+            Some(std::borrow::Cow::Owned(out))
+        }
+        ImageFormat::Bgra8 => {
+            let mut out = raw.to_vec();
+            for pixel in out.as_chunks_mut::<4>().0 {
+                pixel.swap(0, 2);
+            }
+            if premultiplied {
+                unpremultiply(&mut out);
+            }
+            Some(std::borrow::Cow::Owned(out))
+        }
+        _ => None,
+    }
+}
+
+fn unpremultiply(data: &mut [u8]) {
+    for pixel in data.as_chunks_mut::<4>().0 {
+        let alpha = u32::from(pixel[3]);
+        if alpha == 0 {
+            pixel[0] = 0;
+            pixel[1] = 0;
+            pixel[2] = 0;
+        } else if alpha != 255 {
+            for channel in &mut pixel[..3] {
+                *channel = (u32::from(*channel) * 255 / alpha).min(255) as u8;
+            }
+        }
+    }
+}
+
+fn sample_index(value: i32, len: u32, mode: PenikoExtend) -> u32 {
+    let len = len as i32;
+    match mode {
+        PenikoExtend::Pad => value.clamp(0, len - 1) as u32,
+        PenikoExtend::Repeat => value.rem_euclid(len) as u32,
+        PenikoExtend::Reflect => {
+            let value = value.rem_euclid(2 * len);
+            if value >= len {
+                (2 * len - 1 - value) as u32
+            } else {
+                value as u32
+            }
+        }
+    }
+}
+
+#[inline]
+fn sample_image(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    x: f32,
+    y: f32,
+    sampler: &peniko::ImageSampler,
+) -> (u8, u8, u8, u8) {
+    let read = |x: i32, y: i32| {
+        let ix = sample_index(x, width, sampler.x_extend);
+        let iy = sample_index(y, height, sampler.y_extend);
+        let index = ((iy * width + ix) as usize) * 4;
+        [
+            data[index],
+            data[index + 1],
+            data[index + 2],
+            data[index + 3],
+        ]
+    };
+    if sampler.quality == peniko::ImageQuality::Low {
+        let p = read(x.floor() as i32, y.floor() as i32);
+        return (p[0], p[1], p[2], p[3]);
+    }
+    let fx = x - 0.5;
+    let fy = y - 0.5;
+    let x0 = fx.floor() as i32;
+    let y0 = fy.floor() as i32;
+    let tx = fx - x0 as f32;
+    let ty = fy - y0 as f32;
+    let p00 = read(x0, y0);
+    let p10 = read(x0 + 1, y0);
+    let p01 = read(x0, y0 + 1);
+    let p11 = read(x0 + 1, y0 + 1);
+    let lerp = |a: u8, b: u8, t: f32| {
+        (f32::from(a) * (1.0 - t) + f32::from(b) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    let top = [
+        lerp(p00[0], p10[0], tx),
+        lerp(p00[1], p10[1], tx),
+        lerp(p00[2], p10[2], tx),
+        lerp(p00[3], p10[3], tx),
+    ];
+    let bottom = [
+        lerp(p01[0], p11[0], tx),
+        lerp(p01[1], p11[1], tx),
+        lerp(p01[2], p11[2], tx),
+        lerp(p01[3], p11[3], tx),
+    ];
+    (
+        lerp(top[0], bottom[0], ty),
+        lerp(top[1], bottom[1], ty),
+        lerp(top[2], bottom[2], ty),
+        lerp(top[3], bottom[3], ty),
+    )
+}
+
+/// Conservative device-space rectangle around a transformed shape. Used to
+/// restrict image fills to the area they can cover instead of the whole page.
+fn device_rect_path(
+    shape: &BezPath,
+    transform: Affine,
+    width: u32,
+    height: u32,
+) -> Option<tiny_skia::Path> {
+    let raw = shape.bounding_box();
+    let corners = [
+        transform * Point::new(raw.x0, raw.y0),
+        transform * Point::new(raw.x1, raw.y0),
+        transform * Point::new(raw.x0, raw.y1),
+        transform * Point::new(raw.x1, raw.y1),
+    ];
+    let mut x0 = corners.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
+    let mut y0 = corners.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
+    let mut x1 = corners
+        .iter()
+        .map(|p| p.x)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let mut y1 = corners
+        .iter()
+        .map(|p| p.y)
+        .fold(f64::NEG_INFINITY, f64::max);
+    x0 = x0.max(0.0);
+    y0 = y0.max(0.0);
+    x1 = x1.min(width as f64);
+    y1 = y1.min(height as f64);
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+    let mut builder = PathBuilder::new();
+    builder.push_rect(tiny_skia::Rect::from_ltrb(
+        x0 as f32, y0 as f32, x1 as f32, y1 as f32,
+    )?);
+    builder.finish()
+}
+
+/// Returns the image as premultiplied RGBA8. Borrows when the source already
+/// is (opaque straight alpha counts, since premultiplication is a no-op).
+fn premultiplied_rgba(image: &peniko::ImageData) -> Option<std::borrow::Cow<'_, [u8]>> {
+    let needed = (image.width as usize)
+        .checked_mul(image.height as usize)?
+        .checked_mul(4)?;
+    let raw = image.data.data();
+    if raw.len() < needed {
+        return None;
+    }
+    let raw = &raw[..needed];
+    let already_premultiplied = image.alpha_type == peniko::ImageAlphaType::AlphaPremultiplied;
+    match image.format {
+        ImageFormat::Rgba8 if already_premultiplied || is_opaque(raw) => {
+            Some(std::borrow::Cow::Borrowed(raw))
+        }
+        ImageFormat::Rgba8 => {
+            let mut out = raw.to_vec();
+            premultiply(&mut out);
+            Some(std::borrow::Cow::Owned(out))
+        }
+        ImageFormat::Bgra8 => {
+            let mut out = raw.to_vec();
+            for pixel in out.as_chunks_mut::<4>().0 {
+                pixel.swap(0, 2);
+            }
+            if !already_premultiplied {
+                premultiply(&mut out);
+            }
+            Some(std::borrow::Cow::Owned(out))
+        }
+        _ => None,
+    }
+}
+
+fn is_opaque(data: &[u8]) -> bool {
+    data.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 255)
+}
+
+fn premultiply(data: &mut [u8]) {
+    for pixel in data.as_chunks_mut::<4>().0 {
+        let alpha = u16::from(pixel[3]);
+        if alpha == 255 {
+            continue;
+        }
+        for channel in &mut pixel[..3] {
+            *channel = (u16::from(*channel) * alpha / 255) as u8;
+        }
+    }
+}
+
+fn spread_mode(mode: PenikoExtend) -> SpreadMode {
+    match mode {
+        PenikoExtend::Pad => SpreadMode::Pad,
+        PenikoExtend::Repeat => SpreadMode::Repeat,
+        PenikoExtend::Reflect => SpreadMode::Reflect,
+    }
+}
+
+fn filter_quality(quality: peniko::ImageQuality) -> tiny_skia::FilterQuality {
+    match quality {
+        peniko::ImageQuality::Low => tiny_skia::FilterQuality::Nearest,
+        peniko::ImageQuality::Medium | peniko::ImageQuality::High => {
+            tiny_skia::FilterQuality::Bilinear
         }
     }
 }
@@ -950,15 +1505,6 @@ pub fn render_page_rgba(
             background,
         );
     }
-    let mut pixmap = Pixmap::new(width, height).expect("non-zero page bitmap");
-    let background_color = tiny_skia::Color::from_rgba8(
-        ((background >> 16) & 0xff) as u8,
-        ((background >> 8) & 0xff) as u8,
-        (background & 0xff) as u8,
-        0xff,
-    );
-    pixmap.fill(background_color);
-
     let page_transform = Affine::translate((0.0, -page_top as f64));
     let local_top = (clip_top - page_top).clamp(0.0, height as f32);
     let local_bottom = (clip_bottom - page_top).clamp(0.0, height as f32);
@@ -970,97 +1516,18 @@ pub fn render_page_rgba(
         local_top,
         local_bottom,
     );
-    let (image_count, image_surface) = image_draw_stats(
+    let (rasterizer, image_count, image_surface) = raster::Rasterizer::new(
         scene,
         width,
         height,
         page_transform,
         local_top,
         local_bottom,
+        font_gamma,
+        background,
+        clip_mask,
     );
-    let mut fonts = HashMap::new();
-    let mut glyph_cache: HashMap<GlyphKey, GlyphBitmap> = HashMap::new();
-
-    for command in &scene.commands {
-        match command {
-            RenderCommand::Fill(cmd) => match &cmd.brush {
-                Paint::Solid(color) => {
-                    draw_fill(
-                        &mut pixmap,
-                        &cmd.shape,
-                        page_transform * cmd.transform,
-                        *color,
-                        cmd.fill,
-                        clip_mask.as_ref(),
-                    );
-                }
-                Paint::Gradient(gradient) => {
-                    let brush_transform = cmd.brush_transform.unwrap_or(Affine::IDENTITY);
-                    let shader =
-                        gradient_shader(gradient, page_transform * cmd.transform * brush_transform);
-                    if let Some(shader) = shader {
-                        draw_fill_shader(
-                            &mut pixmap,
-                            &cmd.shape,
-                            page_transform * cmd.transform,
-                            shader,
-                            cmd.fill,
-                            clip_mask.as_ref(),
-                        );
-                    }
-                }
-                Paint::Image(image_brush) => {
-                    draw_image_fill(
-                        &mut pixmap,
-                        &image_brush.image,
-                        image_brush.sampler.alpha,
-                        &cmd.shape,
-                        page_transform * cmd.transform,
-                        cmd.brush_transform,
-                        local_top,
-                        local_bottom,
-                        clip_mask.as_ref(),
-                    );
-                }
-                _ => {}
-            },
-            RenderCommand::Stroke(cmd) => {
-                if let Some(color) = solid_color(&cmd.brush) {
-                    draw_stroke(
-                        &mut pixmap,
-                        &cmd.shape,
-                        page_transform * cmd.transform,
-                        color,
-                        &cmd.style,
-                        clip_mask.as_ref(),
-                    );
-                }
-            }
-            RenderCommand::GlyphRun(cmd) => {
-                if let Some(color) = solid_color(&cmd.brush) {
-                    draw_glyphs(
-                        &mut pixmap,
-                        &cmd.font_data,
-                        cmd.font_size,
-                        &cmd.glyphs,
-                        page_transform * cmd.transform,
-                        cmd.glyph_transform,
-                        color,
-                        cmd.brush_alpha,
-                        local_top,
-                        local_bottom,
-                        font_gamma,
-                        &mut fonts,
-                        &mut glyph_cache,
-                    );
-                }
-            }
-            RenderCommand::PushLayer(_)
-            | RenderCommand::PushClipLayer(_)
-            | RenderCommand::PopLayer
-            | RenderCommand::BoxShadow(_) => {}
-        }
-    }
+    let pixmap = rasterizer.run(scene);
 
     let mut data: Vec<u8> = Vec::with_capacity((width * height * 4) as usize);
     for pixel in pixmap.pixels() {
@@ -1371,5 +1838,519 @@ mod tests {
             "right pixel should be light, got {}",
             bitmap.data[15]
         );
+    }
+
+    use anyrender::filters::{Filter, FilterEffect};
+    use std::sync::Arc;
+
+    fn render_tiny(scene: &Scene, width: u32, height: u32) -> Pixmap {
+        let (rasterizer, _, _) = raster::Rasterizer::new(
+            scene,
+            width,
+            height,
+            Affine::IDENTITY,
+            0.0,
+            height as f32,
+            1.0,
+            0xffffff,
+            None,
+        );
+        rasterizer.run(scene)
+    }
+
+    fn pixel(pixmap: &Pixmap, x: u32, y: u32) -> (u8, u8, u8, u8) {
+        let index = ((y * pixmap.width() + x) * 4) as usize;
+        let data = pixmap.data();
+        (
+            data[index],
+            data[index + 1],
+            data[index + 2],
+            data[index + 3],
+        )
+    }
+
+    #[test]
+    fn clip_layer_clips_fill() {
+        let mut scene = Scene::default();
+        scene.push_clip_layer(
+            AnyFill::NonZero,
+            Affine::IDENTITY,
+            &kurbo::Rect::new(0.0, 0.0, 4.0, 4.0),
+        );
+        scene.fill(
+            AnyFill::NonZero,
+            Affine::IDENTITY,
+            Color::from_rgba8(255, 0, 0, 255),
+            None,
+            &kurbo::Rect::new(0.0, 0.0, 10.0, 10.0),
+        );
+        scene.pop_layer();
+        let pixmap = render_tiny(&scene, 10, 10);
+        assert_eq!(pixel(&pixmap, 1, 1), (255, 0, 0, 255));
+        assert_eq!(pixel(&pixmap, 8, 8), (255, 255, 255, 255));
+    }
+
+    #[test]
+    fn layer_opacity_blends_over_background() {
+        let mut scene = Scene::default();
+        scene.push_layer(
+            AnyFill::NonZero,
+            peniko::Mix::Normal,
+            0.5,
+            Affine::IDENTITY,
+            &kurbo::Rect::new(0.0, 0.0, 10.0, 10.0),
+            None,
+            None,
+        );
+        scene.fill(
+            AnyFill::NonZero,
+            Affine::IDENTITY,
+            Color::from_rgba8(255, 0, 0, 255),
+            None,
+            &kurbo::Rect::new(0.0, 0.0, 10.0, 10.0),
+        );
+        scene.pop_layer();
+        let pixmap = render_tiny(&scene, 10, 10);
+        let (r, g, b, _) = pixel(&pixmap, 5, 5);
+        assert!(r > 200, "red should stay strong, got {r}");
+        assert!((80..=200).contains(&g), "green should be blended, got {g}");
+        assert!((80..=200).contains(&b), "blue should be blended, got {b}");
+    }
+
+    #[test]
+    fn box_shadow_blurs_outside_the_box() {
+        let mut scene = Scene::default();
+        scene.draw_box_shadow(
+            Affine::IDENTITY,
+            kurbo::Rect::new(3.0, 3.0, 13.0, 13.0),
+            Color::from_rgba8(0, 0, 0, 255),
+            0.0,
+            2.0,
+        );
+        let pixmap = render_tiny(&scene, 16, 16);
+        let inside = pixel(&pixmap, 8, 8);
+        let outside = pixel(&pixmap, 1, 8);
+        assert!(inside.0 < 80, "shadow center should be dark: {inside:?}");
+        assert!(
+            outside.0 < 250,
+            "shadow should spread outside the box: {outside:?}"
+        );
+        assert!(
+            outside.0 > inside.0,
+            "shadow should fade away from the box: {outside:?} vs {inside:?}"
+        );
+        assert!(
+            pixel(&pixmap, 15, 15).0 > 240,
+            "far corner should stay nearly white: {:?}",
+            pixel(&pixmap, 15, 15)
+        );
+    }
+
+    #[test]
+    fn dashed_stroke_has_gaps() {
+        let mut style = kurbo::Stroke::new(2.0);
+        style.dash_pattern = [2.0, 2.0].into_iter().collect();
+        let mut scene = Scene::default();
+        scene.stroke(
+            &style,
+            Affine::IDENTITY,
+            Color::from_rgba8(0, 0, 0, 255),
+            None,
+            &kurbo::Line::new((0.0, 6.0), (12.0, 6.0)),
+        );
+        let pixmap = render_tiny(&scene, 12, 12);
+        let dark = (0..12).filter(|x| pixel(&pixmap, *x, 6).0 < 100).count();
+        let light = (0..12).filter(|x| pixel(&pixmap, *x, 6).0 > 200).count();
+        assert!(dark > 0, "dash should paint some pixels");
+        assert!(light > 0, "dash should leave gaps");
+    }
+
+    #[test]
+    fn filter_brightness_changes_pixels() {
+        let filter = Filter::single(FilterEffect::brightness(2.0));
+        let mut scene = Scene::default();
+        scene.push_layer(
+            AnyFill::NonZero,
+            peniko::Mix::Normal,
+            1.0,
+            Affine::IDENTITY,
+            &kurbo::Rect::new(0.0, 0.0, 10.0, 10.0),
+            Some(Arc::new(filter)),
+            None,
+        );
+        scene.fill(
+            AnyFill::NonZero,
+            Affine::IDENTITY,
+            Color::from_rgba8(128, 128, 128, 255),
+            None,
+            &kurbo::Rect::new(0.0, 0.0, 10.0, 10.0),
+        );
+        scene.pop_layer();
+        let pixmap = render_tiny(&scene, 10, 10);
+        assert!(
+            pixel(&pixmap, 5, 5).0 > 160,
+            "brightness filter should lighten the gray: {:?}",
+            pixel(&pixmap, 5, 5)
+        );
+    }
+
+    #[test]
+    fn gradient_stroke_is_painted() {
+        let gradient = Gradient::new_linear((0.0, 0.0), (12.0, 0.0)).with_stops([
+            (0.0, Color::from_rgba8(0, 0, 0, 255)),
+            (1.0, Color::from_rgba8(255, 255, 255, 255)),
+        ]);
+        let mut scene = Scene::default();
+        scene.stroke(
+            &kurbo::Stroke::new(3.0),
+            Affine::IDENTITY,
+            Paint::Gradient(&gradient),
+            None,
+            &kurbo::Line::new((0.0, 5.0), (12.0, 5.0)),
+        );
+        let pixmap = render_tiny(&scene, 12, 12);
+        let left = pixel(&pixmap, 1, 5).0;
+        let right = pixel(&pixmap, 10, 5).0;
+        assert!(left < 120, "left of gradient stroke should be dark: {left}");
+        assert!(
+            right > 120,
+            "right of gradient stroke should be light: {right}"
+        );
+    }
+
+    fn half_red_blue_image() -> peniko::ImageData {
+        // 4x2 image: left half red, right half blue, in straight RGBA.
+        let mut data = Vec::new();
+        for _y in 0..2 {
+            for x in 0..4 {
+                if x < 2 {
+                    data.extend_from_slice(&[255, 0, 0, 255]);
+                } else {
+                    data.extend_from_slice(&[0, 0, 255, 255]);
+                }
+            }
+        }
+        peniko::ImageData {
+            data: data.into(),
+            format: ImageFormat::Rgba8,
+            alpha_type: peniko::ImageAlphaType::Alpha,
+            width: 4,
+            height: 2,
+        }
+    }
+
+    #[test]
+    fn sweep_gradient_fill_is_painted() {
+        let gradient = Gradient::new_sweep((8.0, 8.0), 0.0, std::f32::consts::TAU).with_stops([
+            (0.0, Color::from_rgba8(0, 0, 0, 255)),
+            (0.5, Color::from_rgba8(255, 255, 255, 255)),
+            (1.0, Color::from_rgba8(0, 0, 0, 255)),
+        ]);
+        let mut scene = Scene::default();
+        scene.fill(
+            AnyFill::NonZero,
+            Affine::IDENTITY,
+            Paint::Gradient(&gradient),
+            None,
+            &kurbo::Rect::new(0.0, 0.0, 16.0, 16.0),
+        );
+        let pixmap = render_tiny(&scene, 16, 16);
+        let right = pixel(&pixmap, 14, 8).0;
+        let left = pixel(&pixmap, 1, 8).0;
+        assert!(right < 80, "sweep start should be dark: {right}");
+        assert!(left > 200, "sweep midpoint should be light: {left}");
+    }
+
+    #[test]
+    fn image_fill_samples_pixels() {
+        let image = half_red_blue_image();
+        let brush = peniko::ImageBrush {
+            image: &image,
+            sampler: peniko::ImageSampler::default(),
+        };
+        let mut scene = Scene::default();
+        scene.fill(
+            AnyFill::NonZero,
+            Affine::IDENTITY,
+            Paint::Image(brush),
+            None,
+            &kurbo::Rect::new(0.0, 0.0, 4.0, 2.0),
+        );
+        let pixmap = render_tiny(&scene, 4, 2);
+        assert_eq!(pixel(&pixmap, 0, 0), (255, 0, 0, 255));
+        assert_eq!(pixel(&pixmap, 3, 0), (0, 0, 255, 255));
+    }
+
+    #[test]
+    fn image_fill_repeats_with_sampler_extend() {
+        let image = half_red_blue_image();
+        let sampler = peniko::ImageSampler {
+            x_extend: PenikoExtend::Repeat,
+            ..Default::default()
+        };
+        let brush = peniko::ImageBrush {
+            image: &image,
+            sampler,
+        };
+        let mut scene = Scene::default();
+        scene.fill(
+            AnyFill::NonZero,
+            Affine::IDENTITY,
+            Paint::Image(brush),
+            None,
+            &kurbo::Rect::new(0.0, 0.0, 8.0, 2.0),
+        );
+        let pixmap = render_tiny(&scene, 8, 2);
+        assert_eq!(pixel(&pixmap, 0, 0), (255, 0, 0, 255));
+        assert_eq!(pixel(&pixmap, 3, 0), (0, 0, 255, 255));
+        assert_eq!(pixel(&pixmap, 4, 0), (255, 0, 0, 255));
+        assert_eq!(pixel(&pixmap, 7, 0), (0, 0, 255, 255));
+    }
+
+    #[test]
+    fn image_fill_respects_shape_mask_and_clip() {
+        let image = half_red_blue_image();
+        let brush = peniko::ImageBrush {
+            image: &image,
+            sampler: peniko::ImageSampler::default(),
+        };
+        let mut scene = Scene::default();
+        scene.push_clip_layer(
+            AnyFill::NonZero,
+            Affine::IDENTITY,
+            &kurbo::Rect::new(0.0, 0.0, 2.0, 2.0),
+        );
+        scene.fill(
+            AnyFill::NonZero,
+            Affine::IDENTITY,
+            Paint::Image(brush),
+            None,
+            &kurbo::Rect::new(0.0, 0.0, 4.0, 2.0),
+        );
+        scene.pop_layer();
+        let pixmap = render_tiny(&scene, 4, 2);
+        assert_eq!(pixel(&pixmap, 0, 0), (255, 0, 0, 255));
+        assert_eq!(pixel(&pixmap, 3, 0), (255, 255, 255, 255));
+    }
+
+    #[test]
+    fn multiply_layer_blend_darkens() {
+        let mut scene = Scene::default();
+        scene.fill(
+            AnyFill::NonZero,
+            Affine::IDENTITY,
+            Color::from_rgba8(255, 0, 0, 255),
+            None,
+            &kurbo::Rect::new(0.0, 0.0, 10.0, 10.0),
+        );
+        scene.push_layer(
+            AnyFill::NonZero,
+            peniko::Mix::Multiply,
+            1.0,
+            Affine::IDENTITY,
+            &kurbo::Rect::new(0.0, 0.0, 10.0, 10.0),
+            None,
+            None,
+        );
+        scene.fill(
+            AnyFill::NonZero,
+            Affine::IDENTITY,
+            Color::from_rgba8(0, 0, 255, 255),
+            None,
+            &kurbo::Rect::new(0.0, 0.0, 10.0, 10.0),
+        );
+        scene.pop_layer();
+        let pixmap = render_tiny(&scene, 10, 10);
+        assert_eq!(pixel(&pixmap, 5, 5), (0, 0, 0, 255));
+    }
+
+    #[test]
+    fn nested_clip_layers_restore_outer_clip() {
+        let mut scene = Scene::default();
+        scene.push_clip_layer(
+            AnyFill::NonZero,
+            Affine::IDENTITY,
+            &kurbo::Rect::new(0.0, 0.0, 4.0, 4.0),
+        );
+        scene.fill(
+            AnyFill::NonZero,
+            Affine::IDENTITY,
+            Color::from_rgba8(255, 0, 0, 255),
+            None,
+            &kurbo::Rect::new(0.0, 0.0, 10.0, 10.0),
+        );
+        scene.push_clip_layer(
+            AnyFill::NonZero,
+            Affine::IDENTITY,
+            &kurbo::Rect::new(2.0, 2.0, 6.0, 6.0),
+        );
+        scene.fill(
+            AnyFill::NonZero,
+            Affine::IDENTITY,
+            Color::from_rgba8(0, 255, 0, 255),
+            None,
+            &kurbo::Rect::new(0.0, 0.0, 10.0, 10.0),
+        );
+        scene.pop_layer();
+        scene.fill(
+            AnyFill::NonZero,
+            Affine::IDENTITY,
+            Color::from_rgba8(0, 0, 255, 255),
+            None,
+            &kurbo::Rect::new(0.0, 0.0, 10.0, 10.0),
+        );
+        scene.pop_layer();
+        let pixmap = render_tiny(&scene, 10, 10);
+        assert_eq!(pixel(&pixmap, 1, 1), (0, 0, 255, 255));
+        assert_eq!(pixel(&pixmap, 3, 3), (0, 0, 255, 255));
+        assert_eq!(pixel(&pixmap, 5, 5), (255, 255, 255, 255));
+    }
+
+    #[test]
+    fn triangle_clip_is_not_treated_as_full_page() {
+        let mut triangle = kurbo::BezPath::new();
+        triangle.move_to((0.0, 0.0));
+        triangle.line_to((0.0, 10.0));
+        triangle.line_to((10.0, 10.0));
+        triangle.close_path();
+        let mut scene = Scene::default();
+        scene.push_clip_layer(AnyFill::NonZero, Affine::IDENTITY, &triangle);
+        scene.fill(
+            AnyFill::NonZero,
+            Affine::IDENTITY,
+            Color::from_rgba8(255, 0, 0, 255),
+            None,
+            &kurbo::Rect::new(0.0, 0.0, 10.0, 10.0),
+        );
+        scene.pop_layer();
+        let pixmap = render_tiny(&scene, 10, 10);
+        assert_eq!(pixel(&pixmap, 1, 8), (255, 0, 0, 255));
+        assert_eq!(pixel(&pixmap, 9, 0), (255, 255, 255, 255));
+    }
+
+    #[test]
+    fn full_page_clip_layer_is_a_noop() {
+        let mut scene = Scene::default();
+        scene.push_clip_layer(
+            AnyFill::NonZero,
+            Affine::IDENTITY,
+            &kurbo::Rect::new(0.0, 0.0, 10.0, 10.0),
+        );
+        scene.fill(
+            AnyFill::NonZero,
+            Affine::IDENTITY,
+            Color::from_rgba8(0, 128, 0, 255),
+            None,
+            &kurbo::Rect::new(2.0, 2.0, 8.0, 8.0),
+        );
+        scene.pop_layer();
+        let pixmap = render_tiny(&scene, 10, 10);
+        assert_eq!(pixel(&pixmap, 5, 5), (0, 128, 0, 255));
+        assert_eq!(pixel(&pixmap, 0, 0), (255, 255, 255, 255));
+    }
+
+    #[test]
+    fn bgra_premultiplied_image_is_unpremultiplied() {
+        // Straight (0, 0, 255, 128) stored as premultiplied BGRA.
+        let data = vec![128u8, 0, 0, 128];
+        let image = peniko::ImageData {
+            data: data.into(),
+            format: ImageFormat::Bgra8,
+            alpha_type: peniko::ImageAlphaType::AlphaPremultiplied,
+            width: 1,
+            height: 1,
+        };
+        let brush = peniko::ImageBrush {
+            image: &image,
+            sampler: peniko::ImageSampler {
+                quality: peniko::ImageQuality::Low,
+                ..Default::default()
+            },
+        };
+        let mut scene = Scene::default();
+        scene.fill(
+            AnyFill::NonZero,
+            Affine::IDENTITY,
+            Paint::Image(brush),
+            None,
+            &kurbo::Rect::new(0.0, 0.0, 1.0, 1.0),
+        );
+        let pixmap = render_tiny(&scene, 1, 1);
+        let (r, g, b, a) = pixel(&pixmap, 0, 0);
+        assert!(b > 240, "blue should stay saturated, got {b}");
+        assert!(
+            (100..=160).contains(&r),
+            "red should be half blended, got {r}"
+        );
+        assert_eq!(g, r);
+        assert_eq!(a, 255);
+    }
+
+    #[test]
+    fn drop_shadow_filter_offsets_the_shadow() {
+        let filter = Filter::single(FilterEffect::drop_shadow(
+            2.0,
+            2.0,
+            0.0,
+            Color::from_rgba8(0, 0, 0, 255),
+        ));
+        let mut scene = Scene::default();
+        scene.push_layer(
+            AnyFill::NonZero,
+            peniko::Mix::Normal,
+            1.0,
+            Affine::IDENTITY,
+            &kurbo::Rect::new(0.0, 0.0, 10.0, 10.0),
+            Some(Arc::new(filter)),
+            None,
+        );
+        scene.fill(
+            AnyFill::NonZero,
+            Affine::IDENTITY,
+            Color::from_rgba8(255, 0, 0, 255),
+            None,
+            &kurbo::Rect::new(1.0, 1.0, 3.0, 3.0),
+        );
+        scene.pop_layer();
+        let pixmap = render_tiny(&scene, 10, 10);
+        assert_eq!(pixel(&pixmap, 2, 2), (255, 0, 0, 255));
+        assert_eq!(pixel(&pixmap, 4, 4), (0, 0, 0, 255));
+        assert_eq!(pixel(&pixmap, 7, 7), (255, 255, 255, 255));
+    }
+
+    #[test]
+    fn gaussian_blur_filter_spreads_a_rect() {
+        let filter = Filter::single(FilterEffect::blur(1.5));
+        let mut scene = Scene::default();
+        scene.push_layer(
+            AnyFill::NonZero,
+            peniko::Mix::Normal,
+            1.0,
+            Affine::IDENTITY,
+            &kurbo::Rect::new(0.0, 0.0, 10.0, 10.0),
+            Some(Arc::new(filter)),
+            None,
+        );
+        scene.fill(
+            AnyFill::NonZero,
+            Affine::IDENTITY,
+            Color::from_rgba8(0, 0, 0, 255),
+            None,
+            &kurbo::Rect::new(3.0, 3.0, 7.0, 7.0),
+        );
+        scene.pop_layer();
+        let pixmap = render_tiny(&scene, 10, 10);
+        let center = pixel(&pixmap, 5, 5).0;
+        let near = pixel(&pixmap, 1, 5).0;
+        let far = pixel(&pixmap, 9, 9).0;
+        assert!(
+            center < 120,
+            "blurred rect center should stay dark: {center}"
+        );
+        assert!(
+            near > center,
+            "blur should fade from the rect: near={near} center={center}"
+        );
+        assert!(far > 240, "far pixels should stay white: {far}");
     }
 }
