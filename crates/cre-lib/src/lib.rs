@@ -396,10 +396,24 @@ struct ChunkMeta {
     line_base: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct FixedLayout {
-    width: f32,
-    height: f32,
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FixedLayout {
+    Pixel {
+        width: f32,
+        height: f32,
+    },
+    /// `width=device-width, height=device-height`: the initial containing block
+    /// is the reader viewport, resolved when the chunk is laid out.
+    Device,
+}
+
+impl FixedLayout {
+    fn size(self, reader_width: f32, reader_height: f32) -> (f32, f32) {
+        match self {
+            FixedLayout::Pixel { width, height } => (width, height),
+            FixedLayout::Device => (reader_width.max(1.0), reader_height.max(1.0)),
+        }
+    }
 }
 
 struct ActiveChunk {
@@ -1040,28 +1054,45 @@ impl Document {
         let mut options = self.layout_options();
         if let Some(fixed) = self.fixed_layouts.get(chunk_index).and_then(|fixed| *fixed) {
             let scale = self.viewport_scale.max(0.1);
-            options.width = (fixed.width * scale).round().max(1.0) as u32;
-            options.height = (fixed.height * scale).round().max(1.0) as u32;
+            let (width, height) = self.fixed_size(fixed);
+            options.width = (width * scale).round().max(1.0) as u32;
+            options.height = (height * scale).round().max(1.0) as u32;
             options.layout_height = options.height;
             options.page_margin = 0.0;
         }
         options
     }
 
+    fn reader_css_size(&self) -> (f32, f32) {
+        let scale = self.viewport_scale.max(0.1);
+        (self.width as f32 / scale, self.height as f32 / scale)
+    }
+
+    fn fixed_size(&self, fixed: FixedLayout) -> (f32, f32) {
+        let (reader_width, reader_height) = self.reader_css_size();
+        fixed.size(reader_width, reader_height)
+    }
+
     /// CSS scale and center offsets for a pre-paginated page inside the reader
     /// viewport. Offsets are in CSS pixels.
     fn fixed_page_transform(&self, fixed: FixedLayout) -> (f32, f32, f32) {
         let scale = self.viewport_scale.max(0.1);
-        let reader_width = self.width as f32 / scale;
-        let reader_height = self.height as f32 / scale;
-        let margin = (self.page_margin / scale).max(0.0);
+        let (reader_width, reader_height) = self.reader_css_size();
+        let (page_width, page_height) = self.fixed_size(fixed);
+        // A device-sized ICB is the whole reader viewport; page margins would
+        // leave a blank border, so they are not applied here.
+        let margin = if fixed == FixedLayout::Device {
+            0.0
+        } else {
+            (self.page_margin / scale).max(0.0)
+        };
         let available_width = (reader_width - margin * 2.0).max(1.0);
         let available_height = (reader_height - margin * 2.0).max(1.0);
-        let fit = (available_width / fixed.width)
-            .min(available_height / fixed.height)
+        let fit = (available_width / page_width)
+            .min(available_height / page_height)
             .max(0.01);
-        let offset_x = (reader_width - fixed.width * fit) / 2.0;
-        let offset_y = (reader_height - fixed.height * fit) / 2.0;
+        let offset_x = (reader_width - page_width * fit) / 2.0;
+        let offset_y = (reader_height - page_height * fit) / 2.0;
         (fit, offset_x, offset_y)
     }
 
@@ -1138,7 +1169,8 @@ impl Document {
         let boxes = collect_content_boxes(&doc, root);
         let (page_height_css_u32, page_height_css, page_margin_css) =
             if let Some(fixed) = fixed_layout {
-                (fixed.height.max(1.0) as u32, fixed.height.max(1.0), 0.0)
+                let height = self.fixed_size(fixed).1.max(1.0);
+                (height as u32, height, 0.0)
             } else {
                 css_page_geometry(
                     options.width,
@@ -2152,7 +2184,8 @@ impl Document {
         let fixed_layout = self.fixed_layouts.get(index).and_then(|fixed| *fixed);
         let (_page_height_css_u32, page_height_css, page_margin_css) =
             if let Some(fixed) = fixed_layout {
-                (fixed.height.max(1.0) as u32, fixed.height.max(1.0), 0.0)
+                let height = self.fixed_size(fixed).1.max(1.0);
+                (height as u32, height, 0.0)
             } else {
                 css_page_geometry(
                     self.width,
@@ -4883,10 +4916,14 @@ fn parse_fixed_layout(html: &str) -> Option<FixedLayout> {
     const MARKER: &str = "data-cre-fixed-layout=\"";
     let start = html.find(MARKER)? + MARKER.len();
     let end = html[start..].find('"')?;
-    let (width, height) = html[start..start + end].split_once('x')?;
+    let value = &html[start..start + end];
+    if value.eq_ignore_ascii_case("device") {
+        return Some(FixedLayout::Device);
+    }
+    let (width, height) = value.split_once('x')?;
     let width = width.parse::<f32>().ok()?;
     let height = height.parse::<f32>().ok()?;
-    (width > 0.0 && height > 0.0).then_some(FixedLayout { width, height })
+    (width > 0.0 && height > 0.0).then_some(FixedLayout::Pixel { width, height })
 }
 
 fn create_document(
@@ -5153,9 +5190,29 @@ mod layout_plan_tests {
             "<div class=\"cre-fxl-page\" data-cre-fixed-layout=\"900x600\">x</div>",
         )
         .unwrap();
-        assert_eq!(fixed.width, 900.0);
-        assert_eq!(fixed.height, 600.0);
+        assert_eq!(
+            fixed,
+            FixedLayout::Pixel {
+                width: 900.0,
+                height: 600.0
+            }
+        );
+        assert_eq!(
+            parse_fixed_layout("<div data-cre-fixed-layout=\"device\">x</div>"),
+            Some(FixedLayout::Device)
+        );
         assert!(parse_fixed_layout("<div>reflow</div>").is_none());
+    }
+
+    #[test]
+    fn device_fixed_layout_resolves_against_the_reader() {
+        let fixed = FixedLayout::Device;
+        assert_eq!(fixed.size(768.0, 1024.0), (768.0, 1024.0));
+        let pixel = FixedLayout::Pixel {
+            width: 900.0,
+            height: 600.0,
+        };
+        assert_eq!(pixel.size(768.0, 1024.0), (900.0, 600.0));
     }
 
     #[test]

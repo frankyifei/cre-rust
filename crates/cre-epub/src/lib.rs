@@ -22,6 +22,16 @@ pub enum SpineLayout {
     PrePaginated,
 }
 
+/// The initial containing block of a pre-paginated spine item.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FixedViewport {
+    /// The `width`/`height` from the viewport meta (in CSS pixels).
+    Size(f32, f32),
+    /// `width=device-width, height=device-height`: resolve against the reader
+    /// viewport, which cre-lib knows at layout time.
+    Device,
+}
+
 #[derive(Clone, Debug)]
 pub struct SpineItem {
     pub idref: String,
@@ -42,7 +52,7 @@ pub struct SpineDocument {
     pub inline_styles: Vec<String>,
     pub nonlinear: bool,
     pub layout: SpineLayout,
-    pub viewport: Option<(f32, f32)>,
+    pub viewport: Option<FixedViewport>,
 }
 
 #[derive(Clone, Debug)]
@@ -589,8 +599,20 @@ impl EpubBook {
                 .with_context(|| format!("spine document missing: {}", item.href))?;
             let text = decode_text(&bytes);
             let layout = spine_layout(&item.properties, self.global_layout);
+            // A pre-paginated XHTML page declares its initial containing block
+            // with `meta name=viewport`; an SVG page uses its `viewBox` (or its
+            // width/height) instead. A page with neither falls back to 800x600.
             let viewport = if layout == SpineLayout::PrePaginated {
-                Some(parse_viewport_size(&text).unwrap_or((800.0, 600.0)))
+                let svg_viewport = if is_svg_resource(&item.media_type, &item.href) {
+                    parse_svg_viewport(&text)
+                } else {
+                    None
+                };
+                Some(
+                    parse_viewport(&text)
+                        .or(svg_viewport)
+                        .unwrap_or(FixedViewport::Size(800.0, 600.0)),
+                )
             } else {
                 None
             };
@@ -606,9 +628,16 @@ impl EpubBook {
                 (body, true)
             } else if is_image_resource(&item.media_type, &item.href) {
                 let file = item.href.rsplit('/').next().unwrap_or(&item.href);
+                // A fixed-layout image page is its own viewport, so the image
+                // has to fill it. In reflow the existing fit behaviour is kept.
+                let style = if layout == SpineLayout::PrePaginated {
+                    " style=\"width:100%;height:auto\""
+                } else {
+                    ""
+                };
                 (
                     format!(
-                        "<div class=\"cre-image-spine\"><img src=\"{}\" alt=\"\"/></div>",
+                        "<div class=\"cre-image-spine\"><img src=\"{}\"{style} alt=\"\"/></div>",
                         escape_attr(file)
                     ),
                     false,
@@ -624,7 +653,7 @@ impl EpubBook {
                     false,
                 )
             };
-            if let Some((width, height)) = viewport {
+            if let Some(viewport) = viewport {
                 // The marker lets cre-lib give this chunk its own layout
                 // viewport. The page must remain a single chunk: mixing a
                 // pre-paginated page into a reflow chunk would make all its
@@ -634,8 +663,17 @@ impl EpubBook {
                 if !style.trim().is_empty() && !style.trim_end().ends_with(';') {
                     style.push(';');
                 }
+                let (marker, sizing) = match viewport {
+                    FixedViewport::Size(width, height) => (
+                        format!("{width:.0}x{height:.0}"),
+                        format!("width:{width:.0}px;height:{height:.0}px;"),
+                    ),
+                    FixedViewport::Device => {
+                        ("device".to_string(), "width:100%;height:100%;".into())
+                    }
+                };
                 style.push_str(&format!(
-                    "position:absolute;left:0;top:0;width:{width:.0}px;height:{height:.0}px;overflow:hidden;"
+                    "position:absolute;left:0;top:0;{sizing}overflow:hidden;"
                 ));
                 let mut class = String::from("cre-fxl-page");
                 if let Some(original) = attrs.get("class") {
@@ -647,7 +685,7 @@ impl EpubBook {
                     .map(|id| format!(" id=\"{}\"", escape_attr(id)))
                     .unwrap_or_default();
                 body = format!(
-                    "<div class=\"{}\"{} data-cre-fixed-layout=\"{width:.0}x{height:.0}\" style=\"{}\">{body}</div>",
+                    "<div class=\"{}\"{} data-cre-fixed-layout=\"{marker}\" style=\"{}\">{body}</div>",
                     escape_attr(&class),
                     id,
                     escape_attr(&style)
@@ -1312,7 +1350,7 @@ fn meta_property_text(root: roxmltree::Node<'_, '_>, property: &str) -> Option<S
         .filter(|s| !s.is_empty())
 }
 
-fn parse_viewport_size(html: &str) -> Option<(f32, f32)> {
+fn parse_viewport(html: &str) -> Option<FixedViewport> {
     let lower = html.to_ascii_lowercase();
     let mut search = 0usize;
     while let Some(rel) = lower[search..].find('<') {
@@ -1333,30 +1371,100 @@ fn parse_viewport_size(html: &str) -> Option<(f32, f32)> {
         {
             continue;
         }
+        // Only the first viewport declaration in the document is used, even if
+        // it is invalid; later declarations must be ignored.
         let content = attrs.get("content")?;
-        let mut width = None;
-        let mut height = None;
-        for part in content.split([',', ';', ' ']) {
-            let Some((key, value)) = part.split_once('=') else {
-                continue;
-            };
-            let Ok(number) = value.trim().trim_end_matches("px").parse::<f32>() else {
-                continue;
-            };
-            match key.trim().to_ascii_lowercase().as_str() {
-                "width" => width = Some(number),
-                "height" => height = Some(number),
-                _ => {}
-            }
-        }
-        if let (Some(width), Some(height)) = (width, height)
-            && width > 0.0
-            && height > 0.0
-        {
-            return Some((width, height));
-        }
+        return parse_viewport_content(content);
     }
     None
+}
+
+fn parse_viewport_content(content: &str) -> Option<FixedViewport> {
+    let mut width = None;
+    let mut height = None;
+    let mut has_device_width = false;
+    let mut has_device_height = false;
+    for part in content.split([',', ';', ' ']) {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim();
+        // The first occurrence of width/height wins; later duplicates are
+        // ignored (EPUB FXL allows repeating a declaration, and the first one
+        // is the effective value).
+        match key.as_str() {
+            "width" if width.is_none() && !has_device_width => {
+                if value.eq_ignore_ascii_case("device-width") {
+                    has_device_width = true;
+                } else {
+                    width = parse_css_number(value);
+                }
+            }
+            "height" if height.is_none() && !has_device_height => {
+                if value.eq_ignore_ascii_case("device-height") {
+                    has_device_height = true;
+                } else {
+                    height = parse_css_number(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    if has_device_width || has_device_height {
+        return Some(FixedViewport::Device);
+    }
+    if let (Some(width), Some(height)) = (width, height)
+        && width > 0.0
+        && height > 0.0
+    {
+        return Some(FixedViewport::Size(width, height));
+    }
+    None
+}
+
+/// Parses the leading numeric part of a CSS length, ignoring units. EPUB FXL
+/// viewport declarations are unitless pixels, but some books write `1000px` or
+/// even `600mm`; the numeric value is still the intended viewport dimension
+/// (`lay-fxl-xhtml-icb_units` expects both pages to look identical).
+fn parse_css_number(value: &str) -> Option<f32> {
+    let value = value.trim();
+    let end = value
+        .find(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '-' | '+')))
+        .unwrap_or(value.len());
+    let number = value[..end].parse::<f32>().ok()?;
+    (number.is_finite() && number > 0.0).then_some(number)
+}
+
+/// The initial containing block of a standalone SVG spine document is its
+/// `viewBox`, falling back to explicit width/height.
+fn parse_svg_viewport(svg: &str) -> Option<FixedViewport> {
+    let lower = svg.to_ascii_lowercase();
+    let start = lower.find("<svg")?;
+    let end = start + lower[start..].find('>')?;
+    let attrs = parse_attrs(&svg[start..=end]);
+    if let Some(view_box) = attrs.get("viewbox") {
+        let parts: Vec<f32> = view_box
+            .split([' ', ','])
+            .filter(|part| !part.trim().is_empty())
+            .filter_map(|part| part.trim().parse::<f32>().ok())
+            .collect();
+        if parts.len() == 4 {
+            let width = parts[2].abs();
+            let height = parts[3].abs();
+            if width > 0.0 && height > 0.0 {
+                return Some(FixedViewport::Size(width, height));
+            }
+        }
+    }
+    let width = attrs.get("width").and_then(|value| parse_css_number(value));
+    let height = attrs
+        .get("height")
+        .and_then(|value| parse_css_number(value));
+    match (width, height) {
+        (Some(width), Some(height)) => Some(FixedViewport::Size(width, height)),
+        _ => None,
+    }
 }
 
 fn extract_body(html: &str) -> Option<String> {
@@ -1663,20 +1771,24 @@ fn is_image_resource(media_type: &str, href: &str) -> bool {
     )
 }
 
+fn is_svg_resource(media_type: &str, href: &str) -> bool {
+    media_type.eq_ignore_ascii_case("image/svg+xml") || file_extension(href) == "svg"
+}
+
 fn spine_layout(properties: &str, global: SpineLayout) -> SpineLayout {
-    let properties = properties.to_ascii_lowercase();
-    if properties.split_whitespace().any(|p| {
-        p == "rendition:layout-pre-paginated" || p == "rendition:layout-pre-paginated-spreads"
-    }) {
-        SpineLayout::PrePaginated
-    } else if properties
-        .split_whitespace()
-        .any(|p| p == "rendition:layout-reflowable")
-    {
-        SpineLayout::Reflowable
-    } else {
-        global
+    // When a spine item repeats the layout property, the first occurrence wins
+    // (`fxl-spine-overrides_duplicate` overrides to reflowable and then writes
+    // pre-paginated again; the document must stay reflowable).
+    for property in properties.split_whitespace() {
+        match property.to_ascii_lowercase().as_str() {
+            "rendition:layout-pre-paginated" | "rendition:layout-pre-paginated-spreads" => {
+                return SpineLayout::PrePaginated;
+            }
+            "rendition:layout-reflowable" => return SpineLayout::Reflowable,
+            _ => {}
+        }
     }
+    global
 }
 
 fn file_extension(path: &str) -> String {
@@ -2914,12 +3026,139 @@ mod tests {
         .unwrap();
         let docs = book.spine_documents().unwrap();
         assert_eq!(docs[0].layout, SpineLayout::PrePaginated);
-        assert_eq!(docs[0].viewport, Some((900.0, 600.0)));
+        assert_eq!(docs[0].viewport, Some(FixedViewport::Size(900.0, 600.0)));
         let chunks = book
             .to_html_chunks(&HtmlOptions::default(), 1_000_000)
             .unwrap();
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].contains("data-cre-fixed-layout=\"900x600\""));
+    }
+
+    #[test]
+    fn viewport_meta_uses_the_first_declaration_and_ignores_units() {
+        assert_eq!(
+            parse_viewport_content("width=900, height=600, width=1000, height=1000"),
+            Some(FixedViewport::Size(900.0, 600.0))
+        );
+        assert_eq!(
+            parse_viewport_content("width=1000px, height=600mm"),
+            Some(FixedViewport::Size(1000.0, 600.0))
+        );
+        assert_eq!(
+            parse_viewport_content("width=900, height=600, something, foo"),
+            Some(FixedViewport::Size(900.0, 600.0))
+        );
+        assert_eq!(
+            parse_viewport_content("width=device-width, height=device-height"),
+            Some(FixedViewport::Device)
+        );
+        assert_eq!(parse_viewport_content("user-scalable=no"), None);
+    }
+
+    #[test]
+    fn only_the_first_viewport_meta_is_used() {
+        let html = r#"<html><head>
+            <meta name="viewport" content="width=1000, height=600"/>
+            <meta name="viewport" content="width=500, height=300"/>
+        </head><body></body></html>"#;
+        assert_eq!(
+            parse_viewport(html),
+            Some(FixedViewport::Size(1000.0, 600.0))
+        );
+    }
+
+    #[test]
+    fn svg_viewbox_is_the_fixed_layout_viewport() {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 600"></svg>"#;
+        assert_eq!(
+            parse_svg_viewport(svg),
+            Some(FixedViewport::Size(1200.0, 600.0))
+        );
+    }
+
+    #[test]
+    fn first_spine_layout_override_wins() {
+        assert_eq!(
+            spine_layout(
+                "rendition:layout-reflowable rendition:layout-pre-paginated",
+                SpineLayout::PrePaginated
+            ),
+            SpineLayout::Reflowable
+        );
+        assert_eq!(
+            spine_layout(
+                "rendition:layout-pre-paginated rendition:layout-reflowable",
+                SpineLayout::Reflowable
+            ),
+            SpineLayout::PrePaginated
+        );
+        assert_eq!(
+            spine_layout("", SpineLayout::PrePaginated),
+            SpineLayout::PrePaginated
+        );
+    }
+
+    #[test]
+    fn svg_spine_item_uses_its_viewbox_as_the_fixed_viewport() {
+        let container = r#"<?xml version="1.0"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+  <rootfiles>
+    <rootfile full-path="pkg.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#;
+        let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="id">urn:uuid:svg-fxl-test</dc:identifier>
+    <dc:title>SVG Fixed Layout Test</dc:title>
+    <dc:language>en</dc:language>
+    <meta property="rendition:layout">pre-paginated</meta>
+  </metadata>
+  <manifest>
+    <item id="s1" href="page_001.xhtml" media-type="application/xhtml+xml"/>
+    <item id="s2" href="page_002.svg" media-type="image/svg+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="s1"/>
+    <itemref idref="s2"/>
+  </spine>
+</package>"#;
+        let page = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head>
+    <title>Fixed</title>
+    <meta name="viewport" content="width=900, height=600"/>
+  </head>
+  <body><p>Fixed page.</p></body>
+</html>"#;
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 600"><rect width="1200" height="600" fill="red"/></svg>"#;
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buf);
+            let options = zip::write::SimpleFileOptions::default();
+            write_zip_bytes(&mut writer, options, "mimetype", b"application/epub+zip");
+            write_zip_bytes(
+                &mut writer,
+                options,
+                "META-INF/container.xml",
+                container.as_bytes(),
+            );
+            write_zip_bytes(&mut writer, options, "pkg.opf", opf.as_bytes());
+            write_zip_bytes(&mut writer, options, "page_001.xhtml", page.as_bytes());
+            write_zip_bytes(&mut writer, options, "page_002.svg", svg.as_bytes());
+            writer.finish().unwrap();
+        }
+        let book = EpubBook::from_bytes(buf.into_inner()).unwrap();
+        let docs = book.spine_documents().unwrap();
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[1].layout, SpineLayout::PrePaginated);
+        assert_eq!(docs[1].viewport, Some(FixedViewport::Size(1200.0, 600.0)));
+        let chunks = book
+            .to_html_chunks(&HtmlOptions::default(), 1_000_000)
+            .unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[1].contains("data-cre-fixed-layout=\"1200x600\""));
+        assert!(chunks[1].contains("width:100%;height:auto"));
     }
 
     #[test]
