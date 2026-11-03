@@ -423,10 +423,12 @@ fn page_clip_mask(
     top: f32,
     bottom: f32,
 ) -> Option<Mask> {
-    let left = left.max(0.0);
-    let right = right.min(width as f32);
-    let top = top.max(0.0);
-    let bottom = bottom.min(height as f32);
+    // Clip slightly inward so a fractional page edge cannot expose the layer
+    // behind it (for example the red solid under a white pattern).
+    let left = left.ceil().max(0.0);
+    let right = right.floor().min(width as f32);
+    let top = top.ceil().max(0.0);
+    let bottom = bottom.floor().min(height as f32);
     if left <= 0.0 && right >= width as f32 && top <= 0.0 && bottom >= height as f32 {
         return None;
     }
@@ -436,7 +438,10 @@ fn page_clip_mask(
     if let Some(rect) = tiny_skia::Rect::from_ltrb(left, top, right, bottom) {
         builder.push_rect(rect);
         let path = builder.finish()?;
-        mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
+        // A hard edge is important: with anti-aliasing, two stacked layers
+        // (a red background and a white pattern) each blend with the page
+        // background at the clip boundary, leaving a coloured fringe.
+        mask.fill_path(&path, FillRule::Winding, false, Transform::identity());
     }
     Some(mask)
 }
