@@ -531,6 +531,12 @@ impl EpubBook {
             if !is_html_resource(&item.media_type, &item.href) {
                 continue;
             }
+            // A pre-paginated page is already laid out in its own viewport and
+            // is scaled by the renderer. Applying the reflow image cap here
+            // would scale the image a second time.
+            if spine_layout(&item.properties, self.global_layout) == SpineLayout::PrePaginated {
+                continue;
+            }
             let doc_key = normalize_path(&item.href);
             let Some(doc_bytes) = self.resource_provider.get(&doc_key) else {
                 continue;
@@ -2814,6 +2820,59 @@ mod tests {
         let mut book = EpubBook::from_bytes(synthetic_normal_image_epub()).unwrap();
         assert_eq!(book.normalize_full_page_images(600.0, 800.0, 40.0, 32.0), 0);
         assert!(book.resource("cre-page-fit-1.svg").is_none());
+    }
+
+    #[test]
+    fn pre_paginated_images_are_not_rescaled_by_the_reflow_cap() {
+        // A pre-paginated page already carries its own viewport and the
+        // renderer scales the whole page into the reader. Applying the reflow
+        // full-page-image fit here would scale the image a second time (the
+        // `15.epub` cover rendered as a small centered picture).
+        let container = r#"<?xml version="1.0"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+  <rootfiles>
+    <rootfile full-path="pkg.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#;
+        let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="id">urn:uuid:fixed-image-test</dc:identifier>
+    <dc:title>Fixed Image Test</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="s1" href="sec1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="img" href="images/one.jpg" media-type="image/jpeg"/>
+  </manifest>
+  <spine>
+    <itemref idref="s1" properties="rendition:layout-pre-paginated"/>
+  </spine>
+</package>"#;
+        let doc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head>
+    <title>Fixed</title>
+    <meta name="viewport" content="width=600, height=800"/>
+  </head>
+  <body>
+    <img src="images/one.jpg" alt="Cover" style="height: 100%; max-width: 100%;" />
+  </body>
+</html>"#;
+        let mut book = EpubBook::from_bytes(synthetic_epub_fixture(
+            container,
+            opf,
+            doc,
+            &jpg_fixture_bytes(),
+        ))
+        .unwrap();
+        assert_eq!(book.normalize_full_page_images(600.0, 800.0, 40.0, 32.0), 0);
+        assert!(book.resource("cre-page-fit-1.svg").is_none());
+        let chunks = book
+            .to_html_chunks(&HtmlOptions::default(), 1_000_000)
+            .unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].contains("data-cre-fixed-layout=\"600x800\""));
     }
 
     #[test]
