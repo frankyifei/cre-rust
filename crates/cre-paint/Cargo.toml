@@ -5,8 +5,14 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Optional CPU backend with clip layers, opacity/blend and box shadows.
+vello-cpu = ["dep:anyrender_vello_cpu", "dep:vello_cpu"]
+
 [dependencies]
 anyrender = "0.14"
+anyrender_vello_cpu = { version = "0.18", features = ["filters"], optional = true }
+vello_cpu = { version = "0.3", optional = true }
 ttf-parser = "0.25"
 kurbo = "0.13"
 peniko = "0.6"

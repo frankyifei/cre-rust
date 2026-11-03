@@ -10,6 +10,13 @@ crate-type = ["cdylib"]
 test = false
 doctest = false
 
+[features]
+vello-cpu = ["cre-lib/vello-cpu"]
+# Build-time compatibility for old glibc devices (Kindle PW2, glibc 2.12).
+# Provides a hidden getauxval fallback because Rust std calls getauxval for
+# the signal-stack size on every thread and glibc < 2.16 does not export it.
+old-glibc = []
+
 [dependencies]
 anyhow = "1"
 cre-lib = { path = "../cre-lib" }
@@ -17,9 +24,3 @@ libc = "0.2"
 mlua = { version = "0.11", features = ["luajit", "module"] }
 read-fonts = "0.41.0"
 regex = "1.13.1"
-
-[features]
-# Build-time compatibility for old glibc devices (Kindle PW2, glibc 2.12).
-# Provides a hidden getauxval fallback because Rust std calls getauxval for
-# the signal-stack size on every thread and glibc < 2.16 does not export it.
-old-glibc = []

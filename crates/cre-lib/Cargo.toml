@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+vello-cpu = ["cre-paint/vello-cpu"]
+
 [dependencies]
 anyhow = "1"
 anyrender = "0.14"

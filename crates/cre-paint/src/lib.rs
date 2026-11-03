@@ -153,6 +153,20 @@ pub fn render_page(
     background: u32,
     font_gamma: f32,
 ) -> (Arc<PageBitmap>, usize, usize) {
+    #[cfg(feature = "vello-cpu")]
+    if vello_backend_requested() {
+        return render_page_vello(
+            scene,
+            width,
+            height,
+            page_top,
+            clip_left,
+            clip_right,
+            clip_top,
+            clip_bottom,
+            background,
+        );
+    }
     let mut pixmap = Pixmap::new(width, height).expect("non-zero page bitmap");
     let background_color = tiny_skia::Color::from_rgba8(
         ((background >> 16) & 0xff) as u8,
@@ -922,6 +936,20 @@ pub fn render_page_rgba(
     background: u32,
     font_gamma: f32,
 ) -> (Arc<ColorPageBitmap>, usize, usize) {
+    #[cfg(feature = "vello-cpu")]
+    if vello_backend_requested() {
+        return render_page_rgba_vello(
+            scene,
+            width,
+            height,
+            page_top,
+            clip_left,
+            clip_right,
+            clip_top,
+            clip_bottom,
+            background,
+        );
+    }
     let mut pixmap = Pixmap::new(width, height).expect("non-zero page bitmap");
     let background_color = tiny_skia::Color::from_rgba8(
         ((background >> 16) & 0xff) as u8,
@@ -1053,6 +1081,222 @@ pub fn render_page_rgba(
     )
 }
 
+#[cfg(feature = "vello-cpu")]
+fn vello_backend_requested() -> bool {
+    // A build with the `vello-cpu` feature defaults to the vello backend, so a
+    // dedicated device module works without setting an environment variable.
+    // Set `CRE_PAINT_BACKEND=tiny` to fall back to tiny-skia at runtime.
+    match std::env::var("CRE_PAINT_BACKEND") {
+        Ok(value) => value.eq_ignore_ascii_case("vello"),
+        Err(_) => true,
+    }
+}
+
+#[cfg(feature = "vello-cpu")]
+fn vello_paint_ref(paint: &Paint) -> anyrender::PaintRef<'_> {
+    match paint {
+        Paint::Solid(color) => anyrender::Paint::Solid(*color),
+        Paint::Gradient(gradient) => anyrender::Paint::Gradient(gradient),
+        Paint::Image(image) => anyrender::Paint::Image(image.as_ref()),
+        Paint::Resource(id) => anyrender::Paint::Resource(*id),
+        Paint::Custom(custom) => anyrender::Paint::Custom(custom.as_ref()),
+    }
+}
+
+#[cfg(feature = "vello-cpu")]
+fn replay_scene(
+    painter: &mut anyrender_vello_cpu::VelloCpuScenePainter,
+    scene: &Scene,
+    scene_transform: Affine,
+) {
+    use anyrender::PaintScene as _;
+    for command in &scene.commands {
+        match command {
+            RenderCommand::PushLayer(cmd) => painter.push_layer(
+                cmd.fill,
+                cmd.blend,
+                cmd.alpha,
+                scene_transform * cmd.transform,
+                &cmd.clip,
+                cmd.filter.clone(),
+                cmd.backdrop_filter.clone(),
+            ),
+            RenderCommand::PushClipLayer(cmd) => {
+                painter.push_clip_layer(cmd.fill, scene_transform * cmd.transform, &cmd.clip);
+            }
+            RenderCommand::PopLayer => painter.pop_layer(),
+            RenderCommand::Stroke(cmd) => painter.stroke(
+                &cmd.style,
+                scene_transform * cmd.transform,
+                vello_paint_ref(&cmd.brush),
+                cmd.brush_transform,
+                &cmd.shape,
+            ),
+            RenderCommand::Fill(cmd) => painter.fill(
+                cmd.fill,
+                scene_transform * cmd.transform,
+                vello_paint_ref(&cmd.brush),
+                cmd.brush_transform,
+                &cmd.shape,
+            ),
+            RenderCommand::GlyphRun(cmd) => painter.draw_glyphs(
+                &cmd.font_data,
+                cmd.font_size,
+                cmd.hint,
+                &cmd.normalized_coords,
+                cmd.embolden,
+                &cmd.style,
+                vello_paint_ref(&cmd.brush),
+                cmd.brush_alpha,
+                scene_transform * cmd.transform,
+                cmd.glyph_transform,
+                cmd.glyphs.iter().copied(),
+            ),
+            RenderCommand::BoxShadow(cmd) => painter.draw_box_shadow(
+                scene_transform * cmd.transform,
+                cmd.rect,
+                cmd.brush,
+                cmd.radius,
+                cmd.std_dev,
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "vello-cpu")]
+#[allow(clippy::too_many_arguments)]
+fn prepare_vello_scene(
+    scene: &Scene,
+    width: u32,
+    height: u32,
+    page_top: f32,
+    clip_left: f32,
+    clip_right: f32,
+    clip_top: f32,
+    clip_bottom: f32,
+    background: u32,
+) -> (vello_cpu::Pixmap, usize, usize) {
+    use anyrender::PaintScene as _;
+    let mut painter = anyrender_vello_cpu::VelloCpuScenePainter::new(width as u16, height as u16);
+    let bg = peniko::Color::from_rgba8(
+        ((background >> 16) & 0xff) as u8,
+        ((background >> 8) & 0xff) as u8,
+        (background & 0xff) as u8,
+        0xff,
+    );
+    painter.fill(
+        AnyFill::NonZero,
+        Affine::IDENTITY,
+        bg,
+        None,
+        &kurbo::Rect::new(0.0, 0.0, width as f64, height as f64),
+    );
+    let page_transform = Affine::translate((0.0, -page_top as f64));
+    let local_top = (clip_top - page_top).clamp(0.0, height as f32);
+    let local_bottom = (clip_bottom - page_top).clamp(0.0, height as f32);
+    let clip = kurbo::Rect::new(
+        clip_left as f64,
+        local_top as f64,
+        clip_right as f64,
+        local_bottom as f64,
+    );
+    painter.push_clip_layer(AnyFill::NonZero, Affine::IDENTITY, &clip);
+    replay_scene(&mut painter, scene, page_transform);
+    painter.pop_layer();
+    let (image_count, image_surface) = image_draw_stats(
+        scene,
+        width,
+        height,
+        page_transform,
+        local_top,
+        local_bottom,
+    );
+    (painter.finish(), image_count, image_surface)
+}
+
+#[cfg(feature = "vello-cpu")]
+#[allow(clippy::too_many_arguments)]
+fn render_page_vello(
+    scene: &Scene,
+    width: u32,
+    height: u32,
+    page_top: f32,
+    clip_left: f32,
+    clip_right: f32,
+    clip_top: f32,
+    clip_bottom: f32,
+    background: u32,
+) -> (Arc<PageBitmap>, usize, usize) {
+    let (pixmap, image_count, image_surface) = prepare_vello_scene(
+        scene,
+        width,
+        height,
+        page_top,
+        clip_left,
+        clip_right,
+        clip_top,
+        clip_bottom,
+        background,
+    );
+    let mut data = Vec::with_capacity((width * height) as usize);
+    for pixel in pixmap.data() {
+        let a = pixel.a as u32;
+        let r = pixel.r as u32;
+        let g = pixel.g as u32;
+        let b = pixel.b as u32;
+        let luma = (r * 299 + g * 587 + b * 114) / 1000;
+        data.push(((luma * a + 255 * (255 - a)) / 255) as u8);
+    }
+    (
+        Arc::new(PageBitmap {
+            width,
+            height,
+            data,
+        }),
+        image_count,
+        image_surface,
+    )
+}
+
+#[cfg(feature = "vello-cpu")]
+#[allow(clippy::too_many_arguments)]
+fn render_page_rgba_vello(
+    scene: &Scene,
+    width: u32,
+    height: u32,
+    page_top: f32,
+    clip_left: f32,
+    clip_right: f32,
+    clip_top: f32,
+    clip_bottom: f32,
+    background: u32,
+) -> (Arc<ColorPageBitmap>, usize, usize) {
+    let (pixmap, image_count, image_surface) = prepare_vello_scene(
+        scene,
+        width,
+        height,
+        page_top,
+        clip_left,
+        clip_right,
+        clip_top,
+        clip_bottom,
+        background,
+    );
+    let mut data = Vec::with_capacity((width * height * 4) as usize);
+    for pixel in pixmap.data() {
+        data.extend_from_slice(&[pixel.r, pixel.g, pixel.b, pixel.a]);
+    }
+    (
+        Arc::new(ColorPageBitmap {
+            width,
+            height,
+            data,
+        }),
+        image_count,
+        image_surface,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1089,6 +1333,34 @@ mod tests {
             &kurbo::Rect::new(0.0, 0.0, 16.0, 8.0),
         );
         let (bitmap, _, _) = render_page(&scene, 16, 8, 0.0, 0.0, 16.0, 0.0, 8.0, 0xffffff, 1.0);
+        assert!(
+            bitmap.data[0] < 32,
+            "left pixel should be dark, got {}",
+            bitmap.data[0]
+        );
+        assert!(
+            bitmap.data[15] > 200,
+            "right pixel should be light, got {}",
+            bitmap.data[15]
+        );
+    }
+
+    #[cfg(feature = "vello-cpu")]
+    #[test]
+    fn vello_linear_gradient_fill_is_painted() {
+        let mut scene = Scene::default();
+        let gradient = Gradient::new_linear((0.0, 0.0), (16.0, 0.0)).with_stops([
+            (0.0, Color::from_rgba8(0, 0, 0, 255)),
+            (1.0, Color::from_rgba8(255, 255, 255, 255)),
+        ]);
+        scene.fill(
+            AnyFill::NonZero,
+            Affine::IDENTITY,
+            Paint::Gradient(&gradient),
+            None,
+            &kurbo::Rect::new(0.0, 0.0, 16.0, 8.0),
+        );
+        let (bitmap, _, _) = render_page_vello(&scene, 16, 8, 0.0, 0.0, 16.0, 0.0, 8.0, 0xffffff);
         assert!(
             bitmap.data[0] < 32,
             "left pixel should be dark, got {}",
