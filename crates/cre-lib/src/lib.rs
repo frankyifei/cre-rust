@@ -4926,6 +4926,12 @@ fn create_document(
     // the overflowing text in Juliet's home page). Remove the declarations
     // before layout so both engines behave the same.
     let mut html_source = strip_multi_column_styles(base_html);
+    if html_source.to_ascii_lowercase().contains("<math") {
+        html_source = cre_mathml::rewrite_mathml(&html_source);
+        html_source.push_str("<style>");
+        html_source.push_str(cre_mathml::CSS);
+        html_source.push_str("</style>");
+    }
     if let Some(stylesheet) = options
         .stylesheet
         .as_deref()

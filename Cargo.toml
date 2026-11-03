@@ -7,6 +7,7 @@ members = [
     "crates/cre-pdb",
     "crates/cre-lib",
     "crates/cre-lua",
+    "crates/cre-mathml",
     "crates/cre-paint",
     "crates/cre-render", "crates/cre-text",
 ]

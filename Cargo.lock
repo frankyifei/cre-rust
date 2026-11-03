@@ -394,6 +394,7 @@ dependencies = [
  "cre-epub",
  "cre-fb2",
  "cre-kf8",
+ "cre-mathml",
  "cre-mobi",
  "cre-paint",
  "cre-text",
@@ -418,6 +419,13 @@ dependencies = [
  "mlua",
  "read-fonts",
  "regex",
+]
+
+[[package]]
+name = "cre-mathml"
+version = "0.1.0"
+dependencies = [
+ "roxmltree 0.21.1",
 ]
 
 [[package]]

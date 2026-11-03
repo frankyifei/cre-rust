@@ -22,6 +22,7 @@ blitz-traits = "=0.3.0-beta.4"
 cre-epub = { path = "../cre-epub" }
 cre-fb2 = { path = "../cre-fb2" }
 cre-kf8 = { path = "../cre-kf8" }
+cre-mathml = { path = "../cre-mathml" }
 cre-mobi = { path = "../cre-mobi" }
 cre-paint = { path = "../cre-paint" }
 cre-text = { path = "../cre-text" }
