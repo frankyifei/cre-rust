@@ -1096,6 +1096,24 @@ impl Document {
         (fit, offset_x, offset_y)
     }
 
+    /// The FXL page box in device pixels: `(left, top, right, bottom)`.
+    ///
+    /// Blitz does not clip descendants of `overflow:hidden` boxes that are
+    /// absolutely positioned, so a pre-paginated page whose content is larger
+    /// than its ICB would otherwise paint outside the fixed page (the red
+    /// rectangle in `lay-fxl-xhtml-icb_repeated-in-meta`). The renderer clips
+    /// the scene to this rectangle instead.
+    fn fixed_page_rect(&self, fixed: FixedLayout) -> (f32, f32, f32, f32) {
+        let (fit, offset_x, offset_y) = self.fixed_page_transform(fixed);
+        let (page_width, page_height) = self.fixed_size(fixed);
+        let scale = self.viewport_scale.max(0.1);
+        let left = offset_x * scale;
+        let top = offset_y * scale;
+        let right = left + page_width * fit * scale;
+        let bottom = top + page_height * fit * scale;
+        (left, top, right, bottom)
+    }
+
     fn apply_options(&mut self, options: &DocumentOptions) {
         self.width = options.width;
         self.height = options.height;
@@ -1968,13 +1986,16 @@ impl Document {
                     (offset_x * viewport_scale).round().max(0.0) as u32,
                     (offset_y * viewport_scale).round().max(0.0) as u32,
                 );
+                let (clip_left, clip_top, clip_right, clip_bottom) = self.fixed_page_rect(fixed);
                 let (image_arc, paint_count, paint_surface) = paint_page(
                     &scene,
                     self.width,
                     self.height,
                     0.0,
-                    0.0,
-                    self.height as f32,
+                    clip_left,
+                    clip_right,
+                    clip_top,
+                    clip_bottom,
                     self.background_color,
                     self.font_gamma,
                 );
@@ -2000,6 +2021,8 @@ impl Document {
                     self.width,
                     self.height,
                     0.0,
+                    0.0,
+                    self.width as f32,
                     local_top,
                     local_bottom,
                     self.background_color,
@@ -2042,7 +2065,7 @@ impl Document {
         let viewport_scale = self.viewport_scale;
         let fixed_layout = self.fixed_layouts.get(chunk_index).and_then(|fixed| *fixed);
         let mut scene = Scene::default();
-        let (local_top, local_bottom) = if let Some(fixed) = fixed_layout {
+        let (clip_left, clip_right, local_top, local_bottom) = if let Some(fixed) = fixed_layout {
             active.doc.set_viewport_scroll(Point { x: 0.0, y: 0.0 });
             let (fit, offset_x, offset_y) = self.fixed_page_transform(fixed);
             let scale = viewport_scale * fit;
@@ -2055,7 +2078,8 @@ impl Document {
                 (offset_x * viewport_scale).round().max(0.0) as u32,
                 (offset_y * viewport_scale).round().max(0.0) as u32,
             );
-            (0.0, self.height as f32)
+            let (left, top, right, bottom) = self.fixed_page_rect(fixed);
+            (left, right, top, bottom)
         } else {
             active.doc.set_viewport_scroll(Point {
                 x: 0.0,
@@ -2070,13 +2094,20 @@ impl Document {
                 0,
                 0,
             );
-            (clip_top * viewport_scale, clip_bottom * viewport_scale)
+            (
+                0.0,
+                self.width as f32,
+                clip_top * viewport_scale,
+                clip_bottom * viewport_scale,
+            )
         };
         let (bitmap, image_count, image_surface) = paint_page_rgba(
             &scene,
             self.width,
             self.height,
             0.0,
+            clip_left,
+            clip_right,
             local_top,
             local_bottom,
             self.background_color,

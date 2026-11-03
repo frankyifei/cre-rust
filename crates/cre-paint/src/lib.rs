@@ -145,6 +145,8 @@ pub fn render_page(
     width: u32,
     height: u32,
     page_top: f32,
+    clip_left: f32,
+    clip_right: f32,
     clip_top: f32,
     clip_bottom: f32,
     background: u32,
@@ -162,7 +164,14 @@ pub fn render_page(
     let page_transform = Affine::translate((0.0, -page_top as f64));
     let local_top = (clip_top - page_top).clamp(0.0, height as f32);
     let local_bottom = (clip_bottom - page_top).clamp(0.0, height as f32);
-    let clip_mask = page_clip_mask(width, height, local_top, local_bottom);
+    let clip_mask = page_clip_mask(
+        width,
+        height,
+        clip_left,
+        clip_right,
+        local_top,
+        local_bottom,
+    );
     let (image_count, image_surface) = image_draw_stats(
         scene,
         width,
@@ -406,20 +415,29 @@ fn solid_color(paint: &Paint) -> Option<Color> {
     }
 }
 
-fn page_clip_mask(width: u32, height: u32, top: f32, bottom: f32) -> Option<Mask> {
-    if top <= 0.0 && bottom >= height as f32 {
+fn page_clip_mask(
+    width: u32,
+    height: u32,
+    left: f32,
+    right: f32,
+    top: f32,
+    bottom: f32,
+) -> Option<Mask> {
+    let left = left.max(0.0);
+    let right = right.min(width as f32);
+    let top = top.max(0.0);
+    let bottom = bottom.min(height as f32);
+    if left <= 0.0 && right >= width as f32 && top <= 0.0 && bottom >= height as f32 {
         return None;
     }
     let mut mask = Mask::new(width, height)?;
     let mut builder = PathBuilder::new();
-    builder.push_rect(tiny_skia::Rect::from_ltrb(
-        0.0,
-        top.max(0.0),
-        width as f32,
-        bottom.min(height as f32),
-    )?);
-    let path = builder.finish()?;
-    mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
+    // An empty rectangle leaves the mask zeroed, which clips everything.
+    if let Some(rect) = tiny_skia::Rect::from_ltrb(left, top, right, bottom) {
+        builder.push_rect(rect);
+        let path = builder.finish()?;
+        mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
+    }
     Some(mask)
 }
 
@@ -782,6 +800,8 @@ pub fn render_page_rgba(
     width: u32,
     height: u32,
     page_top: f32,
+    clip_left: f32,
+    clip_right: f32,
     clip_top: f32,
     clip_bottom: f32,
     background: u32,
@@ -799,7 +819,14 @@ pub fn render_page_rgba(
     let page_transform = Affine::translate((0.0, -page_top as f64));
     let local_top = (clip_top - page_top).clamp(0.0, height as f32);
     let local_bottom = (clip_bottom - page_top).clamp(0.0, height as f32);
-    let clip_mask = page_clip_mask(width, height, local_top, local_bottom);
+    let clip_mask = page_clip_mask(
+        width,
+        height,
+        clip_left,
+        clip_right,
+        local_top,
+        local_bottom,
+    );
     let (image_count, image_surface) = image_draw_stats(
         scene,
         width,
@@ -894,4 +921,25 @@ pub fn render_page_rgba(
         image_count,
         image_surface,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_clip_mask_limits_both_axes() {
+        let mask = page_clip_mask(10, 10, 2.0, 8.0, 3.0, 7.0).expect("partial clip");
+        let data = mask.data();
+        let at = |x: usize, y: usize| data[y * 10 + x];
+        assert_eq!(at(1, 1), 0);
+        assert_eq!(at(2, 3), 255);
+        assert_eq!(at(7, 6), 255);
+        assert_eq!(at(8, 7), 0);
+    }
+
+    #[test]
+    fn page_clip_mask_is_none_for_the_full_page() {
+        assert!(page_clip_mask(10, 10, 0.0, 10.0, 0.0, 10.0).is_none());
+    }
 }
