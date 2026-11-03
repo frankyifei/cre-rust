@@ -18,7 +18,7 @@ use tiny_skia::{
 };
 
 use super::{
-    AnyFill, Scene, draw_fill, draw_fill_shader, draw_glyphs, draw_glyphs_with_brush,
+    AnyFill, ImageCache, Scene, draw_fill, draw_fill_shader, draw_glyphs, draw_glyphs_with_brush,
     draw_image_fill, draw_stroke, draw_sweep_fill, gradient_shader, image_draw_stats, skia_paint,
     solid_color, to_skia_path,
 };
@@ -49,6 +49,7 @@ pub(crate) struct Rasterizer<'a> {
     layers: Vec<LayerFrame>,
     faces: std::collections::HashMap<usize, ttf_parser::Face<'a>>,
     glyph_cache: std::collections::HashMap<super::GlyphKey, super::GlyphBitmap>,
+    image_cache: ImageCache,
 }
 
 impl<'a> Rasterizer<'a> {
@@ -92,6 +93,7 @@ impl<'a> Rasterizer<'a> {
                 layers: Vec::new(),
                 faces: std::collections::HashMap::new(),
                 glyph_cache: std::collections::HashMap::new(),
+                image_cache: ImageCache::default(),
             },
             image_count,
             image_surface,
@@ -170,7 +172,16 @@ impl<'a> Rasterizer<'a> {
                 }
             }
             Paint::Image(image) => {
-                draw_image_fill(pixmap, image, &cmd.shape, cmd.fill, transform, None, clip);
+                draw_image_fill(
+                    pixmap,
+                    image,
+                    &cmd.shape,
+                    cmd.fill,
+                    transform,
+                    cmd.brush_transform,
+                    clip,
+                    &mut self.image_cache,
+                );
             }
             _ => {}
         }

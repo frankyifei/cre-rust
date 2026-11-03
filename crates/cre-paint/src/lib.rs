@@ -20,6 +20,63 @@ mod raster;
 type GlyphKey = (usize, u16, u32);
 type GlyphBitmap = Arc<Option<GlyphRaster>>;
 
+/// Per-page cache of premultiplied images pre-scaled to a device size.
+/// Keyed by the source blob and target size, so repeating an image (or
+/// re-painting a page) reuses one downscale.
+#[derive(Default)]
+pub(crate) struct ImageCache {
+    scaled: HashMap<ScaledKey, Arc<Vec<u8>>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct ScaledKey {
+    ptr: usize,
+    len: usize,
+    width: u32,
+    height: u32,
+    format: u8,
+    premultiplied: bool,
+}
+
+impl ImageCache {
+    /// Returns the image pre-scaled to `dw x dh` as premultiplied RGBA8,
+    /// downscaling on first use.
+    fn scaled(&mut self, image: &peniko::ImageData, dw: u32, dh: u32) -> Option<Arc<Vec<u8>>> {
+        let data = image.data.data();
+        let key = ScaledKey {
+            ptr: data.as_ptr() as usize,
+            len: data.len(),
+            width: dw,
+            height: dh,
+            format: image.format as u8,
+            premultiplied: image.alpha_type == peniko::ImageAlphaType::AlphaPremultiplied,
+        };
+        if let Some(bytes) = self.scaled.get(&key) {
+            return Some(bytes.clone());
+        }
+        let premultiplied = premultiplied_rgba(image)?;
+        let started = std::env::var_os("CRE_RASTER_STATS")
+            .is_some()
+            .then(std::time::Instant::now);
+        let bytes =
+            downscale_premultiplied(premultiplied.as_ref(), image.width, image.height, dw, dh);
+        if let Some(started) = started {
+            eprintln!(
+                "downscale {}x{} -> {dw}x{dh} {:.2} ms",
+                image.width,
+                image.height,
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        let bytes = Arc::new(bytes);
+        if self.scaled.len() >= 8 {
+            self.scaled.clear();
+        }
+        self.scaled.insert(key, bytes.clone());
+        Some(bytes)
+    }
+}
+
 /// One rasterized glyph as an 8-bit coverage bitmap, placed relative to the
 /// pen position on the baseline. `top` is negative for pixels above it, so
 /// both offsets can simply be added to the text origin.
@@ -1101,6 +1158,7 @@ fn draw_image_fill(
     fill_transform: Affine,
     brush_transform: Option<Affine>,
     clip_mask: Option<&Mask>,
+    cache: &mut ImageCache,
 ) {
     let image = &brush.image;
     let sampler = &brush.sampler;
@@ -1116,79 +1174,340 @@ fn draw_image_fill(
     let mask = raster::intersect_optional(clip_mask, shape_mask);
     let brush_transform = brush_transform.unwrap_or(Affine::IDENTITY);
     let transform = fill_transform * brush_transform;
+    let requested_quality = filter_quality(sampler.quality);
 
-    // tiny-skia's pattern blitter is faster than a per-pixel loop, and covers
-    // sampling quality plus pad/repeat/reflect. It only has one spread mode
-    // for both axes, so unequal x/y extends fall back to the manual sampler.
-    let premultiplied = if sampler.x_extend == sampler.y_extend {
-        premultiplied_rgba(image)
-    } else {
-        None
-    };
-    if let Some(premultiplied) = premultiplied {
-        let Some(image_pixmap) =
-            PixmapRef::from_bytes(premultiplied.as_ref(), image.width, image.height)
-        else {
-            return;
-        };
-        let shader = tiny_skia::Pattern::new(
-            image_pixmap,
-            spread_mode(sampler.x_extend),
-            filter_quality(sampler.quality),
-            sampler.alpha,
-            kurbo_to_skia(transform),
-        );
-        let paint = SkPaint {
-            shader,
-            anti_alias: true,
-            ..Default::default()
-        };
-        pixmap.fill_path(
-            &fill_rect,
-            &paint,
-            FillRule::Winding,
-            Transform::identity(),
-            mask.as_ref(),
-        );
+    // Minified, axis-aligned images are pre-scaled once to their device size
+    // with a box filter and then blitted 1:1. That removes downscale aliasing
+    // and skips tiny-skia's per-pixel filtering entirely, which matters most on
+    // 32-bit ARM where its shader pipeline has no SIMD.
+    let coeffs = transform.as_coeffs();
+    let axis_aligned =
+        coeffs[1].abs() < 1e-6 && coeffs[2].abs() < 1e-6 && coeffs[0] > 0.0 && coeffs[3] > 0.0;
+    if axis_aligned {
+        let (scale_x, scale_y) = device_scale(transform);
+        let dw = minified_length(image.width, scale_x);
+        let dh = minified_length(image.height, scale_y);
+        if (dw < image.width || dh < image.height)
+            && let Some(bytes) = cache.scaled(image, dw, dh)
+        {
+            let draw_transform = transform
+                * Affine::scale_non_uniform(
+                    image.width as f64 / dw as f64,
+                    image.height as f64 / dh as f64,
+                );
+            if let Some(bounds) =
+                device_bounds(shape, fill_transform, pixmap.width(), pixmap.height())
+            {
+                blit_scaled_nearest(
+                    pixmap,
+                    bytes.as_ref(),
+                    dw,
+                    dh,
+                    draw_transform,
+                    sampler,
+                    mask.as_ref().map(|mask| mask.data()),
+                    bounds,
+                );
+                return;
+            }
+        }
+    }
+
+    // tiny-skia's pattern blitter is faster than a per-pixel loop on x86 and
+    // covers sampling quality plus pad/repeat/reflect. On 32-bit ARM its
+    // bilinear path is scalar and very slow, so those fills use the
+    // fixed-point sampler instead.
+    if sampler.x_extend == sampler.y_extend
+        && (requested_quality != tiny_skia::FilterQuality::Bilinear || !cfg!(target_arch = "arm"))
+    {
+        if let Some(premultiplied) = premultiplied_rgba(image)
+            && let Some(image_pixmap) =
+                PixmapRef::from_bytes(premultiplied.as_ref(), image.width, image.height)
+        {
+            fill_with_pattern(
+                pixmap,
+                &fill_rect,
+                image_pixmap,
+                requested_quality,
+                sampler,
+                kurbo_to_skia(transform),
+                mask.as_ref(),
+            );
+        }
         return;
     }
 
     let Some(pixels) = straight_rgba(image) else {
         return;
     };
-    let inv_fill = transform.inverse();
-    let to_image = inv_fill;
-
     let mask_data = mask.as_ref().map(|mask| mask.data());
-    let raw = shape.bounding_box();
-    let corners = [
-        fill_transform * Point::new(raw.x0, raw.y0),
-        fill_transform * Point::new(raw.x1, raw.y0),
-        fill_transform * Point::new(raw.x0, raw.y1),
-        fill_transform * Point::new(raw.x1, raw.y1),
-    ];
-    let bx0 = corners.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
-    let by0 = corners.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
-    let bx1 = corners
-        .iter()
-        .map(|p| p.x)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let by1 = corners
-        .iter()
-        .map(|p| p.y)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let x0 = bx0.max(0.0).min(pixmap.width() as f64) as i32;
-    let x1 = bx1.max(0.0).min(pixmap.width() as f64) as i32;
-    let y0 = by0.max(0.0).min(pixmap.height() as f64) as i32;
-    let y1 = by1.max(0.0).min(pixmap.height() as f64) as i32;
-    if x0 >= x1 || y0 >= y1 {
+    let Some(bounds) = device_bounds(shape, fill_transform, pixmap.width(), pixmap.height()) else {
+        return;
+    };
+    if cfg!(target_arch = "arm") && requested_quality == tiny_skia::FilterQuality::Bilinear {
+        draw_image_fill_fixed(
+            pixmap,
+            pixels.as_ref(),
+            image.width,
+            image.height,
+            sampler,
+            mask_data,
+            transform,
+            bounds,
+        );
+    } else {
+        draw_image_fill_scalar(
+            pixmap,
+            pixels.as_ref(),
+            image.width,
+            image.height,
+            sampler,
+            mask_data,
+            transform,
+            bounds,
+        );
+    }
+}
+
+fn fill_with_pattern(
+    pixmap: &mut Pixmap,
+    fill_rect: &tiny_skia::Path,
+    image: PixmapRef<'_>,
+    quality: tiny_skia::FilterQuality,
+    sampler: &peniko::ImageSampler,
+    transform: Transform,
+    mask: Option<&Mask>,
+) {
+    let shader = tiny_skia::Pattern::new(
+        image,
+        spread_mode(sampler.x_extend),
+        quality,
+        sampler.alpha,
+        transform,
+    );
+    let paint = SkPaint {
+        shader,
+        anti_alias: true,
+        ..Default::default()
+    };
+    pixmap.fill_path(
+        fill_rect,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        mask,
+    );
+}
+
+/// Draws a pre-scaled image with nearest sampling. `transform` maps the
+/// pre-scaled image to the page; it is a translation up to the rounding of the
+/// target size, so the inverse map is walked incrementally and each device
+/// pixel picks one source texel.
+#[allow(clippy::too_many_arguments)]
+fn blit_scaled_nearest(
+    pixmap: &mut Pixmap,
+    pixels: &[u8],
+    image_width: u32,
+    image_height: u32,
+    transform: Affine,
+    sampler: &peniko::ImageSampler,
+    mask_data: Option<&[u8]>,
+    bounds: (i32, i32, i32, i32),
+) {
+    let sampler_scale = (sampler.alpha.clamp(0.0, 1.0) * 255.0).round() as u32;
+    if sampler_scale == 0 {
         return;
     }
+    let coeffs = transform.inverse().as_coeffs();
+    let source = pixels.as_chunks::<4>().0;
+    let (x0, y0, x1, y1) = bounds;
+    let page_width = pixmap.width();
+    let target = pixmap.data_mut().as_chunks_mut::<4>().0;
+    for py in y0..y1 {
+        let row = py as f64 + 0.5;
+        let mut sx_f = coeffs[0] * (x0 as f64 + 0.5) + coeffs[2] * row + coeffs[4];
+        let sy = sample_index(
+            (coeffs[1] * (x0 as f64 + 0.5) + coeffs[3] * row + coeffs[5]).floor() as i32,
+            image_height,
+            sampler.y_extend,
+        );
+        let mask_row = mask_data.map(|_| py as usize * page_width as usize);
+        let row_start = sy as usize * image_width as usize;
+        for px in x0..x1 {
+            let sx_raw = sx_f.floor() as i32;
+            sx_f += coeffs[0];
+            let mask_a = match (mask_data, mask_row) {
+                (Some(mask), Some(row_start)) => u32::from(mask[row_start + px as usize]),
+                _ => 255,
+            };
+            if mask_a == 0 {
+                continue;
+            }
+            let sx = sample_index(sx_raw, image_width, sampler.x_extend);
+            let scale = (mask_a * sampler_scale / 255) as u8;
+            let src = source[row_start + sx as usize];
+            blend_premul_pixel(target, page_width, px as u32, py as u32, src, scale);
+        }
+    }
+}
 
-    // Walk rows with an incremental inverse map: one add per pixel instead of
-    // a full affine transform.
-    let coeffs = to_image.as_coeffs();
-    let (image_width, image_height) = (image.width, image.height);
+/// Source-over with a premultiplied 8-bit source. `scale` multiplies the
+/// source coverage (mask and brush alpha) without unpremultiplying.
+#[inline]
+fn blend_premul_pixel(target: &mut [[u8; 4]], width: u32, x: u32, y: u32, src: [u8; 4], scale: u8) {
+    if scale == 0 || src[3] == 0 {
+        return;
+    }
+    let pixel = &mut target[(y * width + x) as usize];
+    let (sr, sg, sb, sa) = if scale == 255 {
+        (
+            u32::from(src[0]),
+            u32::from(src[1]),
+            u32::from(src[2]),
+            u32::from(src[3]),
+        )
+    } else {
+        let s = u32::from(scale);
+        (
+            u32::from(src[0]) * s / 255,
+            u32::from(src[1]) * s / 255,
+            u32::from(src[2]) * s / 255,
+            u32::from(src[3]) * s / 255,
+        )
+    };
+    if sa == 0 {
+        return;
+    }
+    if sa == 255 {
+        *pixel = [sr as u8, sg as u8, sb as u8, 255];
+        return;
+    }
+    let inverse = 255 - sa;
+    let blend = |src_channel: u32, dst_channel: u8| {
+        (src_channel + (u32::from(dst_channel) * inverse + 127) / 255).min(255) as u8
+    };
+    pixel[0] = blend(sr, pixel[0]);
+    pixel[1] = blend(sg, pixel[1]);
+    pixel[2] = blend(sb, pixel[2]);
+    pixel[3] = (sa + (u32::from(pixel[3]) * inverse + 127) / 255).min(255) as u8;
+}
+
+/// Device size of one source-image pixel along each axis.
+fn device_scale(transform: Affine) -> (f64, f64) {
+    let c = transform.as_coeffs();
+    (
+        (c[0] * c[0] + c[1] * c[1]).sqrt(),
+        (c[2] * c[2] + c[3] * c[3]).sqrt(),
+    )
+}
+
+/// Target length when the image axis is minified. Axes that are not meaningfully
+/// minified keep their original length.
+fn minified_length(length: u32, scale: f64) -> u32 {
+    if !scale.is_finite() || scale >= 0.95 || scale <= 0.0 {
+        return length;
+    }
+    ((length as f64 * scale).round() as u32).clamp(1, length)
+}
+
+/// Box-filters premultiplied RGBA8 down to `dw x dh`. Averaging in
+/// premultiplied space avoids halos around transparent pixels, and box
+/// filtering avoids the aliasing that bilinear minification produces.
+///
+/// Source rows are walked in order; each row's pixels are accumulated into a
+/// small destination row buffer, so memory access stays sequential.
+fn downscale_premultiplied(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    let (sw, sh, dw, dh) = (sw as usize, sh as usize, dw as usize, dh as usize);
+    if dw == sw && dh == sh {
+        return src.to_vec();
+    }
+    // Destination source ranges. Boundaries are rounded so the ranges
+    // partition the source exactly: otherwise neighbouring cells overlap and
+    // the per-cell divisor no longer matches the accumulated pixels.
+    let box_range = |index: usize, length: usize, cells: usize| {
+        let start = (index * length + cells / 2) / cells;
+        let end = (((index + 1) * length + cells / 2) / cells)
+            .max(start + 1)
+            .min(length);
+        (start.min(length - 1), end)
+    };
+    let mut col_ranges = Vec::with_capacity(dw);
+    for dx in 0..dw {
+        col_ranges.push(box_range(dx, sw, dw));
+    }
+    let mut row_map = vec![0u32; sh];
+    let mut counts = vec![0u32; dw * dh];
+    for dy in 0..dh {
+        let (sy0, sy1) = box_range(dy, sh, dh);
+        for slot in &mut row_map[sy0..sy1] {
+            *slot = dy as u32;
+        }
+        for (dx, &(sx0, sx1)) in col_ranges.iter().enumerate() {
+            counts[dy * dw + dx] = ((sy1 - sy0) * (sx1 - sx0)) as u32;
+        }
+    }
+
+    let source = src.as_chunks::<4>().0;
+    let mut sums = vec![[0u32; 4]; dw];
+    let mut out = vec![0u8; dw * dh * 4];
+    let mut current = usize::MAX;
+    for sy in 0..sh {
+        let dy = row_map[sy] as usize;
+        if dy != current {
+            if current != usize::MAX {
+                flush_downscaled_row(current, &sums, &counts, dw, &mut out);
+                sums.fill([0; 4]);
+            }
+            current = dy;
+        }
+        let row = &source[sy * sw..(sy + 1) * sw];
+        for (dx, &(sx0, sx1)) in col_ranges.iter().enumerate() {
+            let mut sum = [0u32; 4];
+            for pixel in &row[sx0..sx1] {
+                sum[0] += u32::from(pixel[0]);
+                sum[1] += u32::from(pixel[1]);
+                sum[2] += u32::from(pixel[2]);
+                sum[3] += u32::from(pixel[3]);
+            }
+            let total = &mut sums[dx];
+            total[0] += sum[0];
+            total[1] += sum[1];
+            total[2] += sum[2];
+            total[3] += sum[3];
+        }
+    }
+    if current != usize::MAX {
+        flush_downscaled_row(current, &sums, &counts, dw, &mut out);
+    }
+    out
+}
+
+fn flush_downscaled_row(dy: usize, sums: &[[u32; 4]], counts: &[u32], dw: usize, out: &mut [u8]) {
+    for dx in 0..dw {
+        let count = counts[dy * dw + dx].max(1);
+        let sum = &sums[dx];
+        let out_index = (dy * dw + dx) * 4;
+        for channel in 0..4 {
+            out[out_index + channel] = ((sum[channel] + count / 2) / count) as u8;
+        }
+    }
+}
+
+/// Scalar f32 bilinear fallback: used for unequal x/y extend modes and for
+/// bilinear fills on non-ARM targets.
+#[allow(clippy::too_many_arguments)]
+fn draw_image_fill_scalar(
+    pixmap: &mut Pixmap,
+    pixels: &[u8],
+    image_width: u32,
+    image_height: u32,
+    sampler: &peniko::ImageSampler,
+    mask_data: Option<&[u8]>,
+    transform: Affine,
+    bounds: (i32, i32, i32, i32),
+) {
+    let coeffs = transform.inverse().as_coeffs();
+    let (x0, y0, x1, y1) = bounds;
     let page_width = pixmap.width();
     let data = pixmap.data_mut();
     for py in y0..y1 {
@@ -1202,7 +1521,7 @@ fn draw_image_fill(
                 _ => 1.0,
             };
             let (r, g, b, a) = sample_image(
-                pixels.as_ref(),
+                pixels,
                 image_width,
                 image_height,
                 ix as f32,
@@ -1218,6 +1537,130 @@ fn draw_image_fill(
             blend_pixel_data(data, page_width, px as u32, py as u32, r, g, b, src_a);
         }
     }
+}
+
+/// 16.16 fixed-point bilinear fill, used on 32-bit ARM where tiny-skia's
+/// shader pipeline has no SIMD and its f32 bilinear path dominates paint
+/// time. Integer interpolation is visually equivalent at 8-bit output.
+#[allow(clippy::too_many_arguments)]
+fn draw_image_fill_fixed(
+    pixmap: &mut Pixmap,
+    pixels: &[u8],
+    image_width: u32,
+    image_height: u32,
+    sampler: &peniko::ImageSampler,
+    mask_data: Option<&[u8]>,
+    transform: Affine,
+    bounds: (i32, i32, i32, i32),
+) {
+    let coeffs = transform.inverse().as_coeffs();
+    let fixed_one = 65536.0;
+    let half = 32768.0;
+    let step_x = (coeffs[0] * fixed_one).round() as i64;
+    let step_y = (coeffs[1] * fixed_one).round() as i64;
+    let (x0, y0, x1, y1) = bounds;
+    let page_width = pixmap.width();
+    let data = pixmap.data_mut();
+    for py in y0..y1 {
+        let row = py as f64 + 0.5;
+        let mut ix = ((coeffs[0] * (x0 as f64 + 0.5) + coeffs[2] * row + coeffs[4]) * fixed_one)
+            .round() as i64
+            - half as i64;
+        let mut iy = ((coeffs[1] * (x0 as f64 + 0.5) + coeffs[3] * row + coeffs[5]) * fixed_one)
+            .round() as i64
+            - half as i64;
+        let mask_row = mask_data.map(|_| py as usize * page_width as usize);
+        for px in x0..x1 {
+            let mask_a = match (mask_data, mask_row) {
+                (Some(mask), Some(row_start)) => mask[row_start + px as usize],
+                _ => 255,
+            };
+            let (r, g, b, a) =
+                sample_image_fixed(pixels, image_width, image_height, ix, iy, sampler);
+            ix += step_x;
+            iy += step_y;
+            if mask_a == 0 || a == 0 || sampler.alpha <= 0.0 {
+                continue;
+            }
+            let alpha = (f32::from(a) * sampler.alpha * (f32::from(mask_a) / 255.0))
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            if alpha == 0 {
+                continue;
+            }
+            blend_pixel_u8(data, page_width, px as u32, py as u32, r, g, b, alpha);
+        }
+    }
+}
+
+#[inline]
+fn sample_image_fixed(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    x_fixed: i64,
+    y_fixed: i64,
+    sampler: &peniko::ImageSampler,
+) -> (u8, u8, u8, u8) {
+    let xi = (x_fixed >> 16) as i32;
+    let yi = (y_fixed >> 16) as i32;
+    let tx = ((x_fixed >> 8) & 0xff) as u32;
+    let ty = ((y_fixed >> 8) & 0xff) as u32;
+    let x0 = sample_index(xi, width, sampler.x_extend);
+    let x1 = sample_index(xi + 1, width, sampler.x_extend);
+    let y0 = sample_index(yi, height, sampler.y_extend);
+    let y1 = sample_index(yi + 1, height, sampler.y_extend);
+    let read = |x: u32, y: u32| {
+        let index = ((y * width + x) as usize) * 4;
+        [
+            data[index],
+            data[index + 1],
+            data[index + 2],
+            data[index + 3],
+        ]
+    };
+    let p00 = read(x0, y0);
+    let p10 = read(x1, y0);
+    let p01 = read(x0, y1);
+    let p11 = read(x1, y1);
+    let lerp = |a: u8, b: u8, t: u32| -> u32 { (u32::from(a) * (256 - t) + u32::from(b) * t) >> 8 };
+    let mut out = [0u8; 4];
+    for channel in 0..4 {
+        let top = lerp(p00[channel], p10[channel], tx);
+        let bottom = lerp(p01[channel], p11[channel], tx);
+        out[channel] = ((top * (256 - ty) + bottom * ty) >> 8) as u8;
+    }
+    (out[0], out[1], out[2], out[3])
+}
+
+/// Integer source-over for an 8-bit straight source. Opaque destinations take
+/// the cheap path; other cases defer to the f32 blend to keep the same result
+/// as the general path.
+#[allow(clippy::too_many_arguments)]
+fn blend_pixel_u8(data: &mut [u8], width: u32, x: u32, y: u32, r: u8, g: u8, b: u8, alpha: u8) {
+    if alpha == 0 {
+        return;
+    }
+    let index = ((y * width + x) * 4) as usize;
+    if alpha == 255 {
+        data[index] = r;
+        data[index + 1] = g;
+        data[index + 2] = b;
+        data[index + 3] = 255;
+        return;
+    }
+    if data[index + 3] == 255 {
+        let src = u32::from(alpha);
+        let inverse = 255 - src;
+        let blend = |src_channel: u8, dst_channel: u8| {
+            ((u32::from(src_channel) * src + u32::from(dst_channel) * inverse + 127) / 255) as u8
+        };
+        data[index] = blend(r, data[index]);
+        data[index + 1] = blend(g, data[index + 1]);
+        data[index + 2] = blend(b, data[index + 2]);
+        return;
+    }
+    blend_pixel_data(data, width, x, y, r, g, b, f32::from(alpha) / 255.0);
 }
 
 /// Converts an image to straight (non-premultiplied) RGBA8. Borrows when the
@@ -2247,6 +2690,125 @@ mod tests {
         let pixmap = render_tiny(&scene, 10, 10);
         assert_eq!(pixel(&pixmap, 5, 5), (0, 128, 0, 255));
         assert_eq!(pixel(&pixmap, 0, 0), (255, 255, 255, 255));
+    }
+
+    #[test]
+    fn downscale_premultiplied_averages_source_blocks() {
+        // 4x4 image with solid 2x2 quadrants, downscaled to 2x2.
+        let quadrants = [
+            [255u8, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 255, 255, 255],
+        ];
+        let mut src = Vec::new();
+        for y in 0..4 {
+            for x in 0..4 {
+                let q = (y / 2) * 2 + (x / 2);
+                src.extend_from_slice(&quadrants[q]);
+            }
+        }
+        let out = downscale_premultiplied(&src, 4, 4, 2, 2);
+        assert_eq!(&out[0..4], &quadrants[0]);
+        assert_eq!(&out[4..8], &quadrants[1]);
+        assert_eq!(&out[8..12], &quadrants[2]);
+        assert_eq!(&out[12..16], &quadrants[3]);
+    }
+
+    #[test]
+    fn minified_image_fill_matches_box_filter() {
+        let quadrants = [
+            [255u8, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 255, 255, 255],
+        ];
+        let mut data = Vec::new();
+        for y in 0..4 {
+            for x in 0..4 {
+                data.extend_from_slice(&quadrants[(y / 2) * 2 + (x / 2)]);
+            }
+        }
+        let image = peniko::ImageData {
+            data: data.into(),
+            format: ImageFormat::Rgba8,
+            alpha_type: peniko::ImageAlphaType::Alpha,
+            width: 4,
+            height: 4,
+        };
+        let brush = peniko::ImageBrush {
+            image: &image,
+            sampler: peniko::ImageSampler::default(),
+        };
+        let mut scene = Scene::default();
+        // Shape covers the image; the fill transform halves it into 2x2 device
+        // pixels, so the pre-scaled path must average each 2x2 quadrant.
+        scene.fill(
+            AnyFill::NonZero,
+            Affine::scale(0.5),
+            Paint::Image(brush),
+            None,
+            &kurbo::Rect::new(0.0, 0.0, 4.0, 4.0),
+        );
+        let pixmap = render_tiny(&scene, 2, 2);
+        assert_eq!(pixel(&pixmap, 0, 0), (255, 0, 0, 255));
+        assert_eq!(pixel(&pixmap, 1, 0), (0, 255, 0, 255));
+        assert_eq!(pixel(&pixmap, 0, 1), (0, 0, 255, 255));
+        assert_eq!(pixel(&pixmap, 1, 1), (255, 255, 255, 255));
+    }
+
+    #[test]
+    fn fixed_point_bilinear_matches_float_sampler() {
+        let mut data = Vec::new();
+        for y in 0..3u32 {
+            for x in 0..5u32 {
+                data.extend_from_slice(&[
+                    (x * 47 + y * 13) as u8,
+                    (x * 19 + y * 71) as u8,
+                    (x * 89 + y * 29) as u8,
+                    255,
+                ]);
+            }
+        }
+        let sampler = peniko::ImageSampler::default();
+        for extend in [
+            PenikoExtend::Pad,
+            PenikoExtend::Repeat,
+            PenikoExtend::Reflect,
+        ] {
+            let sampler = peniko::ImageSampler {
+                x_extend: extend,
+                y_extend: extend,
+                ..sampler
+            };
+            for (x, y) in [
+                (0.3f32, 0.4f32),
+                (1.7, 2.2),
+                (2.5, 1.5),
+                (4.2, 2.8),
+                (-0.6, 1.4),
+                (5.3, -0.2),
+            ] {
+                let float = sample_image(&data, 5, 3, x, y, &sampler);
+                let fixed = sample_image_fixed(
+                    &data,
+                    5,
+                    3,
+                    (((x - 0.5) * 65536.0).round()) as i64,
+                    (((y - 0.5) * 65536.0).round()) as i64,
+                    &sampler,
+                );
+                let float = [float.0, float.1, float.2, float.3];
+                let fixed = [fixed.0, fixed.1, fixed.2, fixed.3];
+                for channel in 0..4 {
+                    let diff = (i16::from(float[channel]) - i16::from(fixed[channel])).abs();
+                    assert!(
+                        diff <= 2,
+                        "channel {channel} differs by {diff} at ({x},{y}) {extend:?}: float={float:?} fixed={fixed:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
