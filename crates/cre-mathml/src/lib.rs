@@ -687,6 +687,97 @@ fn is_empty_math(node: Node<'_, '_>) -> bool {
     true
 }
 
+/// MathML's `movablelimits`: an operator's scripts stack above/below in display
+/// style and sit at the side otherwise. `∑`/`∏`/`lim` default to true and the
+/// integrals to false; the attribute overrides either way.
+fn movable_limits(node: Node<'_, '_>) -> bool {
+    if !node.is_element() || !node.tag_name().name().eq_ignore_ascii_case("mo") {
+        return false;
+    }
+    if let Some(attribute) = node.attribute("movablelimits") {
+        return attribute.trim().eq_ignore_ascii_case("true");
+    }
+    is_movable_operator(&token_text(node))
+}
+
+fn is_movable_operator(text: &str) -> bool {
+    matches!(
+        text.trim(),
+        "∑" | "∏"
+            | "∐"
+            | "⋃"
+            | "⋂"
+            | "⋁"
+            | "⋀"
+            | "⨁"
+            | "⨂"
+            | "⨀"
+            | "⨄"
+            | "⨆"
+            | "lim"
+            | "liminf"
+            | "limsup"
+            | "max"
+            | "min"
+            | "sup"
+            | "inf"
+            | "det"
+            | "gcd"
+    )
+}
+
+/// One base with its two scripts at the side (the non-display-style case for a
+/// large operator, and the normal case for everything else).
+fn side_scripts(
+    base_node: Node<'_, '_>,
+    base: String,
+    sub: String,
+    sup: String,
+    has_sub: bool,
+    has_sup: bool,
+    ctx: Ctx,
+) -> String {
+    // Large operators keep their side scripts, but the pair is dropped towards
+    // the operator's foot and spread out, so `∫_a^b` flanks the sign instead
+    // of hugging its middle.
+    if is_large_operator_node(base_node) {
+        let size = large_operator_size(ctx);
+        let line_height = 1.2 * size;
+        let mut lines = String::new();
+        if has_sup {
+            lines.push_str(&format!("<span>{sup}</span>"));
+        }
+        if has_sub {
+            lines.push_str(&format!("<span>{sub}</span>"));
+        }
+        return format!(
+            "<span class=\"cre-script\">{base}<span class=\"cre-script-stack\" \
+             style=\"margin-left:0.05em;line-height:{line_height:.2}\">{lines}</span></span>"
+        );
+    }
+
+    // A lone script on a tall base climbs to the top or drops to the foot
+    // instead of sitting on the axis.
+    let (sup_shift, sub_shift) =
+        script_shifts(estimate_height(base_node, ctx.display), ctx.metrics);
+
+    match (has_sup, has_sub) {
+        (true, true) => format!(
+            "<span class=\"cre-script\">{base}<span class=\"cre-script-stack\">\
+             <span>{sup}</span><span>{sub}</span></span></span>"
+        ),
+        (true, false) => format!(
+            "<span class=\"cre-script\">{base}\
+             <span class=\"cre-sup\" style=\"vertical-align:{sup_shift:.2}em\">{sup}</span></span>"
+        ),
+        (false, true) => format!(
+            "<span class=\"cre-script\">{base}\
+             <span class=\"cre-sub\" style=\"vertical-align:-{sub_shift:.2}em\">{sub}</span></span>"
+        ),
+        (false, false) => format!("<span class=\"cre-script\">{base}</span>"),
+    }
+}
+
 fn render_scripts(node: Node<'_, '_>, ctx: Ctx) -> String {
     let mut children = element_children(node);
     let Some(base_node) = children.next() else {
@@ -708,9 +799,9 @@ fn render_scripts(node: Node<'_, '_>, ctx: Ctx) -> String {
     let has_sub = sub_node.is_some_and(|child| !is_empty_math(child));
     let has_sup = sup_node.is_some_and(|child| !is_empty_math(child));
 
-    // Display-style limits on large operators go above and below the operator;
-    // integrals keep their limits at the side, like Chrome's MathML rendering.
-    if ctx.display && is_large_operator_node(base_node) && !is_integral(&token_text(base_node)) {
+    // Display-style limits on movable-limit operators go above and below the
+    // operator; everything else keeps its scripts at the side.
+    if ctx.display && movable_limits(base_node) {
         return format!(
             "<span class=\"cre-limits\">\
              <span class=\"cre-limits-over\">{}</span>\
@@ -721,48 +812,7 @@ fn render_scripts(node: Node<'_, '_>, ctx: Ctx) -> String {
         );
     }
 
-    // Large operators keep their side scripts, but the pair is dropped towards
-    // the operator's foot and spread out, so `∫_a^b` flanks the sign instead
-    // of hugging its middle.
-    if is_large_operator_node(base_node) {
-        let size = large_operator_size(ctx);
-        // Keep the pair centred on the operator's axis (Blitz's
-        // `vertical-align: middle`) but spread the two lines apart so the
-        // superscript reaches the operator's top and the subscript its foot.
-        let line_height = 1.2 * size;
-        let mut lines = String::new();
-        if has_sup {
-            lines.push_str(&format!("<span>{sup}</span>"));
-        }
-        if has_sub {
-            lines.push_str(&format!("<span>{sub}</span>"));
-        }
-        return format!(
-            "<span class=\"cre-script\">{base}<span class=\"cre-script-stack\" \
-             style=\"margin-left:0.05em;line-height:{line_height:.2}\">{lines}</span></span>"
-        );
-    }
-
-    // As in `render_script`, a lone script on a tall base climbs to the top or
-    // drops to the foot instead of sitting on the axis.
-    let (sup_shift, sub_shift) =
-        script_shifts(estimate_height(base_node, ctx.display), ctx.metrics);
-
-    match (has_sup, has_sub) {
-        (true, true) => format!(
-            "<span class=\"cre-script\">{base}<span class=\"cre-script-stack\">\
-             <span>{sup}</span><span>{sub}</span></span></span>"
-        ),
-        (true, false) => format!(
-            "<span class=\"cre-script\">{base}\
-             <span class=\"cre-sup\" style=\"vertical-align:{sup_shift:.2}em\">{sup}</span></span>"
-        ),
-        (false, true) => format!(
-            "<span class=\"cre-script\">{base}\
-             <span class=\"cre-sub\" style=\"vertical-align:-{sub_shift:.2}em\">{sub}</span></span>"
-        ),
-        (false, false) => format!("<span class=\"cre-script\">{base}</span>"),
-    }
+    side_scripts(base_node, base, sub, sup, has_sub, has_sup, ctx)
 }
 
 /// Vertical scale that makes a fence's ink cover `content` em.
@@ -803,10 +853,10 @@ fn large_operator_size(ctx: Ctx) -> f32 {
 
 fn render_limits(node: Node<'_, '_>, ctx: Ctx, over: bool, under: bool) -> String {
     let mut children = element_children(node);
-    let base = children
-        .next()
-        .map(|child| render_node(child, ctx))
-        .unwrap_or_default();
+    let Some(base_node) = children.next() else {
+        return String::new();
+    };
+    let base = render_node(base_node, ctx);
     // MathML orders the scripts as base, underscript, overscript (unlike
     // `msubsup`, where the subscript comes first too, but `mover`/`munder`
     // carry only one of them).
@@ -824,6 +874,17 @@ fn render_limits(node: Node<'_, '_>, ctx: Ctx, over: bool, under: bool) -> Strin
             .map(|child| render_node(child, ctx))
             .unwrap_or_default();
     }
+    // Outside display style a `movablelimits` operator moves its limits back to
+    // the side (MathML core), so `∑` inside a paragraph keeps side scripts even
+    // when the author wrote `munderover`.
+    if !ctx.display && movable_limits(base_node) {
+        let has_under = !under_html.is_empty();
+        let has_over = !over_html.is_empty();
+        return side_scripts(
+            base_node, base, under_html, over_html, has_under, has_over, ctx,
+        );
+    }
+
     let mut out = String::from("<span class=\"cre-limits\">");
     if !over_html.is_empty() {
         out.push_str(&format!(
@@ -1532,7 +1593,7 @@ mod tests {
 
     #[test]
     fn scripts_stack_under_and_over() {
-        let html = r#"<math><msubsup><mi>x</mi><mi>i</mi><mn>2</mn></msubsup><munder><mo>lim</mo><mi>x</mi></munder></math>"#;
+        let html = r#"<math display="block"><msubsup><mi>x</mi><mi>i</mi><mn>2</mn></msubsup><munder><mo>lim</mo><mi>x</mi></munder></math>"#;
         let out = rewrite_mathml(html);
         assert!(out.contains("cre-script-stack"), "{out}");
         assert!(out.contains("cre-limits-under"), "{out}");
@@ -1633,6 +1694,35 @@ mod tests {
             .and_then(|value| value.parse::<f32>().ok())
             .expect("bar height");
         assert!(height >= 4.5, "bar height {height} in {matrix}");
+    }
+
+    #[test]
+    fn movable_limits_follow_the_display_style() {
+        // `∑` has movablelimits=true: display style stacks the scripts, inline
+        // keeps them at the side — for `msubsup` and `munderover` alike.
+        let display = rewrite_mathml(
+            r#"<math display="block"><msubsup><mo>∑</mo><mrow><mi>i</mi></mrow><mi>n</mi></msubsup></math>"#,
+        );
+        assert!(display.contains("cre-limits"), "{display}");
+        let inline = rewrite_mathml(
+            r#"<math><msubsup><mo>∑</mo><mrow><mi>i</mi></mrow><mi>n</mi></msubsup></math>"#,
+        );
+        assert!(!inline.contains("cre-limits"), "{inline}");
+        assert!(inline.contains("cre-script-stack"), "{inline}");
+        let inline_under = rewrite_mathml(
+            r#"<math><munderover><mo>∑</mo><mi>i</mi><mi>n</mi></munderover></math>"#,
+        );
+        assert!(!inline_under.contains("cre-limits"), "{inline_under}");
+
+        // The attribute overrides the operator's default in both directions.
+        let fixed = rewrite_mathml(
+            r#"<math display="block"><msubsup><mo movablelimits="false">∑</mo><mi>i</mi><mi>n</mi></msubsup></math>"#,
+        );
+        assert!(!fixed.contains("cre-limits"), "{fixed}");
+        let integral = rewrite_mathml(
+            r#"<math><munderover><mo>∫</mo><mi>a</mi><mi>b</mi></munderover></math>"#,
+        );
+        assert!(integral.contains("cre-limits"), "{integral}");
     }
 
     #[test]
