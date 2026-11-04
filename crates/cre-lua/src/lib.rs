@@ -242,6 +242,7 @@ impl Doc {
         // change re-parsed and re-paginated the book for nothing.
         const LAYOUT_PROPERTIES: &[&str] = &[
             "crengine.font.fallback.faces",
+            "crengine.font.family.faces",
             "font.face.base.weight",
             "font.face.weight.embolden",
             "window.pages.two.visible.as.one.page.number",
@@ -334,15 +335,38 @@ impl Doc {
         Ok(())
     }
 
+    /// Font assigned to the CSS `math` family. KOReader sends the per-family
+    /// font names in `crengine.font.family.faces`; the math slot is 7th
+    /// (ignore|serif|sans-serif|cursive|fantasy|monospace|math|emoji|fangsong).
+    fn math_font_path(&self) -> Option<PathBuf> {
+        let value = self.properties.get("crengine.font.family.faces")?;
+        let name = value.split('|').nth(6)?.trim();
+        if name.is_empty() {
+            return None;
+        }
+        find_font_face(name, false, false).map(|face| face.path)
+    }
+
     fn fallback_font_paths(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = Vec::new();
+        // KOReader always assigns the `math` family (FreeSerif by default, or
+        // whatever the user picked in the font-family menu). Put it first so
+        // the MATH-capable font is found before other fallbacks and used for
+        // math content, like Chromium's `math { font-family: math }`.
+        if let Some(math_path) = self.math_font_path()
+            && !paths.iter().any(|path| path == &math_path)
+        {
+            paths.push(math_path);
+        }
         let value = self
             .properties
             .get("crengine.font.fallback.faces")
             .cloned()
             .unwrap_or(String::new());
-        let mut paths: Vec<PathBuf> = Vec::new();
         for name in value.split('|') {
-            if let Some(face) = find_font_face(name, false, false) {
+            if let Some(face) = find_font_face(name, false, false)
+                && !paths.iter().any(|path| path == &face.path)
+            {
                 paths.push(face.path.clone());
             }
         }
@@ -3274,7 +3298,9 @@ unsafe extern "C-unwind" fn doc_set_string_property(l: *mut lua_State) -> c_int 
                 }
             }
             "crengine.highlight.selection.color" => {}
-            "crengine.font.fallback.faces" if previous != value && doc.inner.is_some() => {
+            "crengine.font.fallback.faces" | "crengine.font.family.faces"
+                if previous != value && doc.inner.is_some() =>
+            {
                 doc.relayout();
             }
             "font.face.base.weight" | "font.face.weight.embolden"

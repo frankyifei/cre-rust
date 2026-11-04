@@ -45,7 +45,7 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf"));
     let font_family = std::env::var("FONT_FAMILY").ok();
-    let fallback_font_paths = std::env::var("FALLBACK_FONTS")
+    let mut fallback_font_paths = std::env::var("FALLBACK_FONTS")
         .map(|value| {
             value
                 .split(':')
@@ -54,6 +54,9 @@ fn main() {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    if let Ok(math_font) = std::env::var("MATH_FONT") {
+        fallback_font_paths.insert(0, PathBuf::from(math_font));
+    }
     let options = DocumentOptions {
         width,
         height,

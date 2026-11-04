@@ -88,26 +88,35 @@ pub struct MathFont {
 }
 
 impl MathFont {
-    /// Finds the first font with an OpenType MATH table.
-    pub fn from_font_datas<'a>(datas: impl IntoIterator<Item = &'a [u8]>) -> Option<Self> {
-        for data in datas {
-            let face_count = ttf_parser::fonts_in_collection(data).unwrap_or(1);
-            for index in 0..face_count {
-                let Ok(face) = ttf_parser::Face::parse(data, index) else {
-                    continue;
-                };
-                if face.tables().math.is_none() {
-                    continue;
-                }
-                let Some(family) = font_family_name(&face) else {
-                    continue;
-                };
-                if let Some(metrics) = metrics_for_face(&face) {
-                    return Some(Self { family, metrics });
-                }
+    /// Loads a font file (or TTC face) and returns it if it has a MATH table.
+    pub fn from_font_path(path: &std::path::Path) -> Option<Self> {
+        let data = std::fs::read(path).ok()?;
+        Self::from_font_data(&data)
+    }
+
+    /// Finds the first face of one font blob with an OpenType MATH table.
+    pub fn from_font_data(data: &[u8]) -> Option<Self> {
+        let face_count = ttf_parser::fonts_in_collection(data).unwrap_or(1);
+        for index in 0..face_count {
+            let Ok(face) = ttf_parser::Face::parse(data, index) else {
+                continue;
+            };
+            if face.tables().math.is_none() {
+                continue;
+            }
+            let Some(family) = font_family_name(&face) else {
+                continue;
+            };
+            if let Some(metrics) = metrics_for_face(&face) {
+                return Some(Self { family, metrics });
             }
         }
         None
+    }
+
+    /// Finds the first font with an OpenType MATH table.
+    pub fn from_font_datas<'a>(datas: impl IntoIterator<Item = &'a [u8]>) -> Option<Self> {
+        datas.into_iter().find_map(Self::from_font_data)
     }
 }
 
