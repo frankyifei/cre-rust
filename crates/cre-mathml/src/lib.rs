@@ -442,17 +442,6 @@ fn is_close_fence(text: &str) -> bool {
     matches!(text, ")" | "]" | "}" | "⟩" | "⌉" | "⌋" | "⟧")
 }
 
-/// CSS transform for a stretched fence glyph.
-///
-/// Scaling only in Y keeps the glyph's advance but makes its curved parts
-/// (which are horizontal near the ends) read as bold: a sans-serif `(` at 3x
-/// looks like a thick blob. Narrowing the glyph a little with `scaleX` thins
-/// the stroke back out while keeping the stretched height.
-fn fence_transform(scale: f32) -> String {
-    let horizontal = 1.0 / scale.powf(0.4);
-    format!("transform:scaleY({scale:.3}) scaleX({horizontal:.3})")
-}
-
 fn render_mi(node: Node<'_, '_>, _ctx: Ctx) -> String {
     let text = token_text(node);
     let variant = node.attribute("mathvariant").unwrap_or("");
@@ -497,9 +486,8 @@ fn render_mo(node: Node<'_, '_>, ctx: Ctx, stretch: f32, unary: bool) -> String 
         // about forcing an unscaled fence taller.
         let scale = stretch.clamp(1.0, 4.5);
         if scale > 1.05 {
-            let transform = fence_transform(scale);
             return format!(
-                "<span class=\"cre-mo cre-fence\" style=\"{transform}\">{}</span>",
+                "<span class=\"cre-mo cre-fence\" style=\"transform:scaleY({scale:.3})\">{}</span>",
                 escape_html(&text)
             );
         }
@@ -633,8 +621,7 @@ fn render_sqrt(node: Node<'_, '_>, ctx: Ctx) -> String {
     let height = estimate_height(node);
     let scale = (height / 1.0).clamp(1.0, 4.0);
     let radical = if scale > 1.15 {
-        let transform = fence_transform(scale);
-        format!("<span class=\"cre-radical\" style=\"{transform}\">√</span>")
+        format!("<span class=\"cre-radical\" style=\"transform:scaleY({scale:.3})\">√</span>")
     } else {
         String::from("<span class=\"cre-radical\">√</span>")
     };
@@ -675,7 +662,7 @@ fn render_fenced(node: Node<'_, '_>, ctx: Ctx) -> String {
         .fold(1.0_f32, f32::max);
     let scale = height.clamp(1.0, 4.5);
     let fence_style = if scale > 1.05 {
-        format!(" style=\"{}\"", fence_transform(scale))
+        format!(" style=\"transform:scaleY({scale:.3})\"")
     } else {
         String::new()
     };
