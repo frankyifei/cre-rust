@@ -1183,7 +1183,9 @@ impl Document {
             &options,
         );
         let root = doc.root_element();
-        let lines = collect_lines(root);
+        let mut lines = collect_lines(root);
+        let math_boxes = collect_math_boxes(&doc, root);
+        extend_lines_for_math(&mut lines, &math_boxes);
         let mut line_indices: HashMap<NodeId, Vec<usize>> = HashMap::new();
         for (local_line, line) in lines.iter().enumerate() {
             line_indices
@@ -1195,7 +1197,16 @@ impl Document {
         let mut line_flows = lines.iter().map(|_| 0i64).collect::<Vec<i64>>();
         collect_line_flows(root, 0, &mut max_flow, &line_indices, &mut line_flows);
         let forced_breaks = page_breaks::collect_forced_breaks(root);
-        let boxes = collect_content_boxes(&doc, root);
+        let mut boxes = collect_content_boxes(&doc, root);
+        for (top, bottom, display) in &math_boxes {
+            if *display {
+                boxes.push(ContentBox {
+                    top: *top,
+                    bottom: *bottom,
+                });
+            }
+        }
+        boxes.sort_by(|left, right| left.top.total_cmp(&right.top));
         let (page_height_css_u32, page_height_css, page_margin_css) =
             if let Some(fixed) = fixed_layout {
                 let height = self.fixed_size(fixed).1.max(1.0);
@@ -2221,9 +2232,20 @@ impl Document {
             &self.font_blobs,
             &self.layout_options_for_chunk(index),
         );
-        let lines = collect_lines(doc.root_element());
+        let mut lines = collect_lines(doc.root_element());
+        let math_boxes = collect_math_boxes(&doc, doc.root_element());
+        extend_lines_for_math(&mut lines, &math_boxes);
         let forced_breaks = page_breaks::collect_forced_breaks(doc.root_element());
-        let boxes = collect_content_boxes(&doc, doc.root_element());
+        let mut boxes = collect_content_boxes(&doc, doc.root_element());
+        for (top, bottom, display) in &math_boxes {
+            if *display {
+                boxes.push(ContentBox {
+                    top: *top,
+                    bottom: *bottom,
+                });
+            }
+        }
+        boxes.sort_by(|left, right| left.top.total_cmp(&right.top));
         let fixed_layout = self.fixed_layouts.get(index).and_then(|fixed| *fixed);
         let (_page_height_css_u32, page_height_css, page_margin_css) =
             if let Some(fixed) = fixed_layout {
@@ -5319,6 +5341,52 @@ mod layout_plan_tests {
     #[test]
     fn unknown_memory_keeps_the_whole_book() {
         assert_eq!(plan_chunk_bytes(4 * MB, None), usize::MAX);
+    }
+}
+
+/// Rects of the generated math spans, with a flag for block-level formulas.
+///
+/// Blitz measures a line from the text metrics, so a line that holds a tall
+/// formula (fraction, radical, matrix) is reported shorter than it paints.
+/// Pagination then believes the line fits and cuts the formula at the page
+/// boundary — part of it above, the rest on the next page. The rects collected
+/// here let `paginate` see the real extent: block formulas become atomic boxes
+/// and the line holding an inline formula grows to cover it.
+fn collect_math_boxes(doc: &HtmlDocument, root: &Node) -> Vec<(f32, f32, bool)> {
+    let mut boxes = Vec::new();
+    collect_math_boxes_into(doc, root, &mut boxes);
+    boxes.sort_by(|left, right| left.0.total_cmp(&right.0));
+    boxes
+}
+
+fn collect_math_boxes_into(doc: &HtmlDocument, node: &Node, out: &mut Vec<(f32, f32, bool)>) {
+    if let Some(element) = node.element_data()
+        && node_attr(node, "class")
+            .is_some_and(|class| class.split_whitespace().any(|name| name == "cre-math"))
+        && element.name.local.to_string() == "span"
+        && let Some(rect) = doc.get_client_bounding_rect(node.id)
+        && rect.height > 0.0
+    {
+        let display = node_attr(node, "data-display") == Some("block");
+        out.push((rect.y as f32, (rect.y + rect.height) as f32, display));
+        // A math block can contain nested rows; its rect covers them.
+        return;
+    }
+    for child in &node.children {
+        collect_math_boxes_into(doc, node.with(*child), out);
+    }
+}
+
+/// Grows lines so they cover the formulas drawn on them.
+fn extend_lines_for_math(lines: &mut [LineBox], math: &[(f32, f32, bool)]) {
+    for (top, bottom, _) in math {
+        for line in lines.iter_mut() {
+            if line.top < *bottom && line.bottom > *top {
+                line.top = line.top.min(*top);
+                line.visual_top = line.visual_top.min(*top);
+                line.bottom = line.bottom.max(*bottom);
+            }
+        }
     }
 }
 
