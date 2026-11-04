@@ -5015,6 +5015,13 @@ fn create_document(
         let math_font = cre_mathml::MathFont::from_font_datas(
             font_datas.iter().map(|blob| blob.as_ref().as_ref()),
         );
+        if std::env::var_os("CRE_MATH_DEBUG").is_some() {
+            eprintln!(
+                "cre-math: fonts={} math_font={:?}",
+                font_datas.len(),
+                math_font.as_ref().map(|font| font.family.clone())
+            );
+        }
         html_source = cre_mathml::rewrite_mathml_with(&html_source, math_font.as_ref());
         html_source.push_str("<style>");
         html_source.push_str(&cre_mathml::css(math_font.as_ref()));

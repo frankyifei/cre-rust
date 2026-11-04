@@ -65,6 +65,7 @@ fn main() {
         font_path: Some(font_path),
         font_family,
         fallback_font_paths,
+        stylesheet: std::env::var("EXTRA_CSS").ok(),
         viewport_scale: scale,
         ..Default::default()
     };

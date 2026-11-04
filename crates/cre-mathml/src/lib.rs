@@ -227,7 +227,7 @@ pub fn css(font: Option<&MathFont>) -> String {
     let mut out = String::from(CSS);
     if let Some(font) = font {
         out.push_str(&format!(
-            "\n.cre-math {{ font-family: \"{}\", serif; }}\n",
+            "\n.cre-math {{ font-family: \"{}\", serif !important; }}\n",
             css_string(&font.family)
         ));
     }

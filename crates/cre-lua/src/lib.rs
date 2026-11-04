@@ -344,7 +344,14 @@ impl Doc {
         if name.is_empty() {
             return None;
         }
-        find_font_face(name, false, false).map(|face| face.path)
+        let face = find_font_face(name, false, false);
+        if std::env::var_os("CRE_MATH_DEBUG").is_some() {
+            eprintln!(
+                "cre-math: family.faces={value:?} math_name={name:?} path={:?}",
+                face.as_ref().map(|face| face.path.clone())
+            );
+        }
+        face.map(|face| face.path)
     }
 
     fn fallback_font_paths(&self) -> Vec<PathBuf> {
