@@ -8,11 +8,11 @@
 //! This is deliberately a presentation subset: tokens, `mrow`, `mfenced`,
 //! `msup`/`msub`/`msubsup`, `munder`/`mover`/`munderover`, `mfrac`,
 //! `msqrt`/`mroot`, `mtable`, `mspace`, `mstyle`, `merror`, `mphantom` and
-//! `menclose`. Scripts are positioned with CSS baseline shifts; fences and
-//! radicals are stretched with CSS transforms (which the tiny-skia painter
-//! applies as glyph/box transforms); large operators use display-style
-//! limits. OpenType MATH metrics and the finer mtable/multiscript rules remain
-//! future work.
+//! `menclose`. Scripts are positioned with CSS baseline shifts, fences are
+//! stretched with CSS transforms (which the tiny-skia painter applies as glyph
+//! transforms) and radical signs are drawn from strokes plus the wrapper's top
+//! border; large operators use display-style limits. OpenType MATH metrics and
+//! the finer mtable/multiscript rules remain future work.
 
 use roxmltree::{Document, Node};
 
@@ -46,13 +46,18 @@ pub const CSS: &str = r#"
 .cre-limits-under { padding-top: 0.08em; }
 .cre-limits-over { padding-bottom: 0.04em; }
 .cre-mfrac { display: inline-block; vertical-align: middle; text-align: center; margin: 0 0.15em; }
-.cre-mfrac-num { display: block; padding: 0 0.15em; border-bottom: 1px solid currentColor; line-height: 1.1; }
-.cre-mfrac-den { display: block; padding: 0 0.15em; line-height: 1.1; }
-.cre-msqrt { display: inline-block; vertical-align: middle; white-space: nowrap; }
-.cre-radical { display: inline-block; line-height: 1; vertical-align: middle; transform-origin: center; }
-.cre-msqrt-body { display: inline-block; border-top: 1px solid currentColor; padding: 0.02em 0.12em 0 0.08em; }
-.cre-mroot { display: inline-block; vertical-align: middle; }
-.cre-mroot-index { font-size: 0.6em; line-height: 1; vertical-align: 0.9em; }
+.cre-mfrac-num { display: block; padding: 0 0.15em 0.06em 0.15em; border-bottom: 1px solid currentColor; line-height: 1.1; }
+.cre-mfrac-den { display: block; padding: 0.12em 0.15em 0 0.15em; line-height: 1.1; }
+/* A radical is drawn, not scaled: the vinculum is the wrapper's top border and
+   the surd is two thin strokes, so the sign keeps its stroke weight at any
+   height and always meets the bar. A stretched `√` glyph cannot do either
+   (scaling thickens its strokes and its ink does not line up with the bar). */
+.cre-msqrt { display: inline-block; position: relative; vertical-align: middle; white-space: nowrap; border-top: 1px solid currentColor; padding: 0.12em 0.12em 0 0; }
+.cre-surd { position: absolute; left: 0; top: 0; width: 0.62em; }
+.cre-surd-stroke { position: absolute; background: currentColor; }
+.cre-msqrt-body { display: inline-block; }
+.cre-mroot { display: inline-block; }
+.cre-mroot-index { position: absolute; left: 0.02em; top: 0.08em; width: 0.34em; font-size: 0.55em; line-height: 1; text-align: right; }
 .cre-mtable-wrap { display: inline-block; vertical-align: middle; }
 /* Book stylesheets commonly style every table (`width: 90%`, cell borders,
    sans-serif 80% cells). Math tables are layout scaffolds: reset those. */
@@ -61,11 +66,10 @@ pub const CSS: &str = r#"
 .cre-mtable td { border: none !important; background: transparent !important; padding: 0.12em 0.5em !important; text-align: center; vertical-align: middle; line-height: 1.15 !important; font-family: inherit !important; font-size: 1em !important; }
 .cre-mphantom { visibility: hidden; }
 .cre-menclose { display: inline-block; line-height: 1.2; }
-.cre-strike-h, .cre-strike-v, .cre-strike-up, .cre-strike-down { position: absolute; border-top: 1px solid currentColor; }
-.cre-strike-h { left: 0; right: 0; top: 50%; }
-.cre-strike-v { left: 50%; top: 0; bottom: 0; border-top: none; border-left: 1px solid currentColor; }
-.cre-strike-up { left: -20%; right: -20%; top: 50%; transform: rotate(-45deg); transform-origin: center; }
-.cre-strike-down { left: -20%; right: -20%; top: 50%; transform: rotate(45deg); transform-origin: center; }
+.cre-strike-h, .cre-strike-v, .cre-strike-diag { position: absolute; background: currentColor; }
+.cre-strike-h { left: 0; right: 0; height: 1px; top: 50%; }
+.cre-strike-v { top: 0; bottom: 0; width: 1px; left: 50%; }
+.cre-strike-diag { left: 50%; top: 50%; height: 1px; transform-origin: center; }
 .cre-mmultiscripts { white-space: nowrap; }
 .cre-ms-pre { margin-right: 0.05em; }
 .cre-merror { color: #b00000; }
@@ -236,7 +240,7 @@ pub fn css(font: Option<&MathFont>) -> String {
          .cre-sub {{ vertical-align: -{:.3}em; }}\n\
          .cre-sup, .cre-sub, .cre-script-stack {{ font-size: {:.3}em; }}\n\
          .cre-mfrac-num {{ border-bottom-width: {:.3}em; }}\n\
-         .cre-msqrt-body {{ border-top-width: {:.3}em; }}\n",
+         .cre-msqrt {{ border-top-width: {:.3}em; }}\n",
         metrics.sup_shift_up,
         metrics.sub_shift_down,
         metrics.script_scale,
@@ -697,14 +701,61 @@ fn render_fraction(node: Node<'_, '_>, ctx: Ctx) -> String {
 fn render_sqrt(node: Node<'_, '_>, ctx: Ctx) -> String {
     let body = render_children(node, ctx);
     let height = estimate_height(node);
-    let scale = (height / 1.0).clamp(1.0, 4.0);
-    let radical = if scale > 1.15 {
-        format!("<span class=\"cre-radical\" style=\"transform:scaleY({scale:.3})\">√</span>")
-    } else {
-        String::from("<span class=\"cre-radical\">√</span>")
-    };
+    let (width, surd) = surd_markup(height);
     format!(
-        "<span class=\"cre-msqrt\">{radical}<span class=\"cre-msqrt-body\">{body}</span></span>"
+        "<span class=\"cre-msqrt\" style=\"padding-left:{width:.3}em\">{surd}\
+         <span class=\"cre-msqrt-body\">{body}</span></span>"
+    )
+}
+
+/// Width of the drawn radical sign in `em`; also the wrapper's left padding.
+const SURD_WIDTH: f32 = 0.62;
+/// How far the surd's tail reaches below the radicand, in `em`.
+const SURD_DEPTH: f32 = 0.22;
+/// Stroke thickness of the surd, in `em`.
+const SURD_RULE: f32 = 0.062;
+/// Height of the short up-stroke at the bottom left of the sign, in `em`.
+const SURD_TICK: f32 = 0.52;
+
+/// Draws the radical sign for content that is `height` em tall.
+///
+/// The sign sits in an absolutely positioned box anchored to the wrapper's
+/// content top, so its top-right tip always meets the vinculum (the wrapper's
+/// top border). Only its length depends on the estimated content height; if
+/// the estimate is slightly off the tail simply ends a little above or below
+/// the radicand, which is how a radical sign's tail behaves anyway.
+fn surd_markup(height: f32) -> (f32, String) {
+    let h = height.max(1.0) + SURD_DEPTH;
+    // The sign grows a little wider as it grows taller, like a font's radical
+    // size variants, instead of turning into a nearly vertical stroke.
+    let w = (SURD_WIDTH + 0.07 * (h - 1.2).max(0.0)).min(0.92);
+    // The tick keeps its size; the long stroke grows with the radicand.
+    let tick = SURD_TICK.min(h * 0.6);
+    let vertex = (0.62 * w, h);
+    let tick_top = (0.04 * w, h - tick);
+    let tip = (w, 0.0);
+    (
+        w,
+        format!(
+            "<span class=\"cre-surd\" style=\"height:{h:.3}em;width:{w:.3}em\">{}{}</span>",
+            surd_stroke(tick_top, vertex),
+            surd_stroke(vertex, tip)
+        ),
+    )
+}
+
+fn surd_stroke(from: (f32, f32), to: (f32, f32)) -> String {
+    let dx = to.0 - from.0;
+    let dy = to.1 - from.1;
+    let length = (dx * dx + dy * dy).sqrt();
+    let angle = dy.atan2(dx).to_degrees();
+    let center_x = (from.0 + to.0) / 2.0;
+    let center_y = (from.1 + to.1) / 2.0;
+    format!(
+        "<span class=\"cre-surd-stroke\" style=\"left:{:.3}em;top:{:.3}em;\
+         width:{length:.3}em;height:{SURD_RULE:.3}em;transform:rotate({angle:.2}deg)\"></span>",
+        center_x - length / 2.0,
+        center_y - SURD_RULE / 2.0
     )
 }
 
@@ -718,10 +769,12 @@ fn render_root(node: Node<'_, '_>, ctx: Ctx) -> String {
         .next()
         .map(|child| render_node(child, ctx))
         .unwrap_or_default();
+    let height = estimate_height(node);
+    let (width, surd) = surd_markup(height);
     format!(
-        "<span class=\"cre-mroot\"><span class=\"cre-radical\">√</span>\
-         <span class=\"cre-msqrt-body\">{base}</span>\
-         <span class=\"cre-mroot-index\">{index}</span></span>"
+        "<span class=\"cre-msqrt cre-mroot\" style=\"padding-left:{width:.3}em\">{surd}\
+         <span class=\"cre-mroot-index\">{index}</span>\
+         <span class=\"cre-msqrt-body\">{base}</span></span>"
     )
 }
 
@@ -847,15 +900,38 @@ fn render_menclose(node: Node<'_, '_>, ctx: Ctx) -> String {
             }
             "horizontalstrike" => strikes.push_str("<span class=\"cre-strike-h\"></span>"),
             "verticalstrike" => strikes.push_str("<span class=\"cre-strike-v\"></span>"),
-            "updiagonalstrike" => strikes.push_str("<span class=\"cre-strike-up\"></span>"),
-            "downdiagonalstrike" => strikes.push_str("<span class=\"cre-strike-down\"></span>"),
+            "updiagonalstrike" | "downdiagonalstrike" => {}
             _ => {}
         }
     }
-    format!(
-        "<span class=\"cre-menclose\" style=\"{style}\">{strikes}{}</span>",
-        render_children(node, ctx)
-    )
+    // The diagonal strikes run corner to corner, so their angle follows the
+    // content's estimated aspect ratio instead of a fixed 45 degrees (which
+    // overshoots badly for a wide fraction).
+    let body = render_children(node, ctx);
+    let boxed = notation
+        .split_whitespace()
+        .any(|token| matches!(token, "box" | "roundedbox" | "circle"));
+    let width = estimate_width(node) + if boxed { 0.24 } else { 0.0 };
+    let height = estimate_height(node) + if boxed { 0.16 } else { 0.0 };
+    let has_up = notation.split_whitespace().any(|t| t == "updiagonalstrike");
+    let has_down = notation
+        .split_whitespace()
+        .any(|t| t == "downdiagonalstrike");
+    if has_up || has_down {
+        let length = (width * width + height * height).sqrt();
+        let angle = height.atan2(width).to_degrees();
+        for (wanted, degrees) in [(has_up, -angle), (has_down, angle)] {
+            if !wanted {
+                continue;
+            }
+            strikes.push_str(&format!(
+                "<span class=\"cre-strike-diag\" style=\"width:{length:.3}em;\
+                 margin-left:{:.3}em;margin-top:-0.5px;transform:rotate({degrees:.2}deg)\"></span>",
+                -length / 2.0
+            ));
+        }
+    }
+    format!("<span class=\"cre-menclose\" style=\"{style}\">{strikes}{body}</span>")
 }
 
 /// `mmultiscripts`: a base with stacked sub/sup pairs after it and, after
@@ -965,7 +1041,10 @@ fn estimate_height(node: Node<'_, '_>) -> f32 {
         "mfrac" => {
             let numerator = children.first().map(|c| estimate_height(*c)).unwrap_or(1.0);
             let denominator = children.get(1).map(|c| estimate_height(*c)).unwrap_or(1.0);
-            (numerator + denominator + 0.5).max(1.7)
+            // A stacked fraction adds the rule and the gaps around it, but its
+            // two lines overlap for the part that straddles the baseline, so
+            // adding both heights overestimates tall nests badly.
+            (numerator.max(denominator) + 0.9).max(1.7)
         }
         "msup" | "msub" => {
             let base = children.first().map(|c| estimate_height(*c)).unwrap_or(1.0);
@@ -980,7 +1059,7 @@ fn estimate_height(node: Node<'_, '_>) -> f32 {
             let base = children.first().map(|c| estimate_height(*c)).unwrap_or(1.0);
             base + 0.55
         }
-        "msqrt" | "mroot" => max_child(&children) + 0.2,
+        "msqrt" | "mroot" => max_child(&children) + 0.05,
         "mfenced" => max_child(&children),
         "mtable" => {
             let mut total = 0.0;
@@ -992,6 +1071,90 @@ fn estimate_height(node: Node<'_, '_>) -> f32 {
         }
         "mtr" | "mtd" | "mth" => max_child(&children),
         _ => max_child(&children),
+    }
+}
+
+/// Rough content width in `em`. Only used to angle `menclose` diagonal strikes
+/// corner to corner, so a coarse token-width model is enough.
+fn estimate_width(node: Node<'_, '_>) -> f32 {
+    if node.is_text() {
+        return 0.5;
+    }
+    if !node.is_element() {
+        return 0.5;
+    }
+    let name = node.tag_name().name().to_ascii_lowercase();
+    let children: Vec<Node> = element_children(node).collect();
+    let sum = |children: &[Node]| -> f32 {
+        children
+            .iter()
+            .map(|child| estimate_width(*child))
+            .sum::<f32>()
+    };
+    let max = |children: &[Node]| -> f32 {
+        children
+            .iter()
+            .map(|child| estimate_width(*child))
+            .fold(0.0_f32, f32::max)
+    };
+    match name.as_str() {
+        "math" | "mrow" | "mstyle" | "merror" | "mphantom" | "semantics" | "mtr" | "mtd"
+        | "mth" => sum(&children),
+        "menclose" => sum(&children) + 0.24,
+        "mfrac" => max(&children) + 0.3,
+        "msup" | "msub" => {
+            let base = children.first().map(|c| estimate_width(*c)).unwrap_or(0.5);
+            let script = children.get(1).map(|c| estimate_width(*c)).unwrap_or(0.5);
+            base + script * 0.6
+        }
+        "msubsup" | "munderover" | "mmultiscripts" => {
+            let base = children.first().map(|c| estimate_width(*c)).unwrap_or(0.5);
+            base + children
+                .iter()
+                .skip(1)
+                .map(|c| estimate_width(*c))
+                .fold(0.0_f32, f32::max)
+                * 0.7
+        }
+        "munder" | "mover" => {
+            let base = children.first().map(|c| estimate_width(*c)).unwrap_or(0.5);
+            let script = children.get(1).map(|c| estimate_width(*c)).unwrap_or(0.5);
+            base.max(script)
+        }
+        "msqrt" => sum(&children) + 0.86,
+        "mroot" => sum(&children) + 1.12,
+        "mfenced" => sum(&children) + 0.6,
+        "mtable" => {
+            // Column widths are not tracked; approximate a row's width by the
+            // widest row's summed cells.
+            let mut widest = 0.0_f32;
+            for row in &children {
+                let cells: Vec<Node> = element_children(*row).collect();
+                widest = widest.max(
+                    cells
+                        .iter()
+                        .map(|cell| estimate_width(*cell) + 0.5)
+                        .sum::<f32>(),
+                );
+            }
+            widest
+        }
+        _ => {
+            let text = token_text(node);
+            let chars = text.chars().count();
+            if chars == 0 {
+                sum(&children).max(0.5)
+            } else {
+                // Digits and letters are around half an em wide; punctuation
+                // and operators a little less.
+                let wide = text
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || *c > '\u{2000}')
+                    .count();
+                let narrow = chars - wide;
+                (wide as f32 * 0.55 + narrow as f32 * 0.4).max(0.45)
+            }
+        }
     }
 }
 
@@ -1236,11 +1399,30 @@ mod tests {
             r#"<math><menclose notation="box updiagonalstrike"><mi>x</mi></menclose></math>"#,
         );
         assert!(out.contains("border:1px solid currentColor"), "{out}");
-        assert!(out.contains("cre-strike-up"), "{out}");
+        assert!(out.contains("cre-strike-diag"), "{out}");
+        // The strike rises left to right.
+        assert!(out.contains("transform:rotate(-"), "{out}");
         let diag = rewrite_mathml(
             r#"<math><menclose notation="downdiagonalstrike"><mi>x</mi></menclose></math>"#,
         );
-        assert!(diag.contains("cre-strike-down"), "{diag}");
+        assert!(diag.contains("transform:rotate("), "{diag}");
+        assert!(diag.contains("cre-strike-diag"), "{diag}");
+    }
+
+    #[test]
+    fn menclose_diagonal_follows_the_content_aspect() {
+        // A wide radicand inside a fraction gives a shallow strike, not 45
+        // degrees, so it lands on the corners of the box.
+        let out = rewrite_mathml(
+            r#"<math><menclose notation="updiagonalstrike"><mfrac><msup><mi>x</mi><mn>2</mn></msup><msqrt><mrow><mn>1</mn><mo>+</mo><msup><mi>x</mi><mn>4</mn></msup></mrow></msqrt></mfrac></menclose></math>"#,
+        );
+        let angle = out
+            .split("transform:rotate(-")
+            .nth(1)
+            .and_then(|rest| rest.split("deg").next())
+            .and_then(|value| value.parse::<f32>().ok())
+            .expect("strike angle");
+        assert!(angle < 42.0, "angle {angle} in {out}");
     }
 
     #[test]

@@ -784,31 +784,136 @@ fn for_each_glyph_pixel<'a>(
             continue;
         };
 
-        let x0 = origin.x as f32 + raster.left;
-        let y0 = origin.y as f32 + raster.top;
-        if (y0 + raster.height as f32) < clip_top || y0 > clip_bottom {
+        // The raster holds the glyph at `glyph_size`, i.e. `font_size` times
+        // the largest axis scale of the transform. With a uniform transform
+        // that is exactly the device size, so the bitmap can be blitted as is
+        // (the common case: plain text). Any other transform (stretched
+        // fences/radicals, synthetic oblique, skew) needs the bitmap mapped
+        // through the transform instead, otherwise the glyph is rasterised at
+        // the larger size and painted unscaled, which both oversizes it and
+        // multiplies its stroke weight along the other axis.
+        let linear = glyph_transform.as_coeffs();
+        let uniform = linear[1].abs() < 1e-6
+            && linear[2].abs() < 1e-6
+            && (linear[0] - linear[3]).abs() < 1e-6;
+
+        if uniform {
+            let x0 = origin.x as f32 + raster.left;
+            let y0 = origin.y as f32 + raster.top;
+            if (y0 + raster.height as f32) < clip_top || y0 > clip_bottom {
+                continue;
+            }
+
+            for row in 0..raster.height {
+                for col in 0..raster.width {
+                    let coverage_byte = raster.data[(row * raster.width + col) as usize];
+                    if coverage_byte == 0 {
+                        continue;
+                    }
+                    let coverage = coverage_lut[coverage_byte as usize] as f32 / 255.0;
+                    let x = x0.round() as i32 + col as i32;
+                    let y = y0.round() as i32 + row as i32;
+                    if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+                        continue;
+                    }
+                    if (y as f32) < clip_top || (y as f32) >= clip_bottom {
+                        continue;
+                    }
+                    emit(x as u32, y as u32, coverage);
+                }
+            }
             continue;
         }
 
-        for row in 0..raster.height {
-            for col in 0..raster.width {
-                let coverage_byte = raster.data[(row * raster.width + col) as usize];
+        // Raster pixel -> page affine. `scale_factor` converts the glyph's
+        // font-size units to raster pixels.
+        let scale_factor = if font_size > 0.0 {
+            glyph_size / font_size
+        } else {
+            1.0
+        };
+        let s = f64::from(scale_factor);
+        let left = f64::from(raster.left);
+        let top = f64::from(raster.top);
+        let map = Affine::new([
+            linear[0] / s,
+            linear[1] / s,
+            linear[2] / s,
+            linear[3] / s,
+            origin.x + (linear[0] * left + linear[2] * top) / s,
+            origin.y + (linear[1] * left + linear[3] * top) / s,
+        ]);
+        let inverse = map.inverse();
+        let (rx0, ry0) = (0.0, 0.0);
+        let (rx1, ry1) = (f64::from(raster.width), f64::from(raster.height));
+        let corners = [
+            map * Point::new(rx0, ry0),
+            map * Point::new(rx1, ry0),
+            map * Point::new(rx0, ry1),
+            map * Point::new(rx1, ry1),
+        ];
+        let min_x = corners
+            .iter()
+            .map(|p| p.x)
+            .fold(f64::INFINITY, f64::min)
+            .floor() as i64;
+        let max_x = corners
+            .iter()
+            .map(|p| p.x)
+            .fold(f64::NEG_INFINITY, f64::max)
+            .ceil() as i64;
+        let min_y = corners
+            .iter()
+            .map(|p| p.y)
+            .fold(f64::INFINITY, f64::min)
+            .floor() as i64;
+        let max_y = corners
+            .iter()
+            .map(|p| p.y)
+            .fold(f64::NEG_INFINITY, f64::max)
+            .ceil() as i64;
+        let x_start = min_x.max(0);
+        let x_end = max_x.min(i64::from(width));
+        let y_start = min_y.max(clip_top.floor() as i64).max(0);
+        let y_end = max_y.min(i64::from(height)).min(clip_bottom.ceil() as i64);
+        for y in y_start..y_end {
+            for x in x_start..x_end {
+                let source = inverse * Point::new(x as f64 + 0.5, y as f64 + 0.5);
+                let coverage_byte = sample_bilinear(raster, source.x as f32, source.y as f32);
                 if coverage_byte == 0 {
                     continue;
                 }
                 let coverage = coverage_lut[coverage_byte as usize] as f32 / 255.0;
-                let x = x0.round() as i32 + col as i32;
-                let y = y0.round() as i32 + row as i32;
-                if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
-                    continue;
-                }
-                if (y as f32) < clip_top || (y as f32) >= clip_bottom {
-                    continue;
-                }
                 emit(x as u32, y as u32, coverage);
             }
         }
     }
+}
+
+/// Bilinear lookup of a glyph mask at continuous pixel coordinates, where
+/// `(0.0, 0.0)` is the top-left corner of the first pixel.
+fn sample_bilinear(raster: &GlyphRaster, x: f32, y: f32) -> u8 {
+    if x < 0.0 || y < 0.0 || x >= raster.width as f32 || y >= raster.height as f32 {
+        return 0;
+    }
+    let fx = x - 0.5;
+    let fy = y - 0.5;
+    let x0 = fx.floor();
+    let y0 = fy.floor();
+    let tx = fx - x0;
+    let ty = fy - y0;
+    let x0 = x0 as i32;
+    let y0 = y0 as i32;
+    let at = |col: i32, row: i32| -> f32 {
+        if col < 0 || row < 0 || col >= raster.width as i32 || row >= raster.height as i32 {
+            return 0.0;
+        }
+        f32::from(raster.data[(row as u32 * raster.width + col as u32) as usize])
+    };
+    let top = at(x0, y0) * (1.0 - tx) + at(x0 + 1, y0) * tx;
+    let bottom = at(x0, y0 + 1) * (1.0 - tx) + at(x0 + 1, y0 + 1) * tx;
+    let value = top * (1.0 - ty) + bottom * ty;
+    value.clamp(0.0, 255.0) as u8
 }
 
 fn blend_pixel(pixmap: &mut Pixmap, x: u32, y: u32, r: u8, g: u8, b: u8, alpha: f32) {
