@@ -652,16 +652,19 @@ fn render_limits(node: Node<'_, '_>, ctx: Ctx, over: bool, under: bool) -> Strin
         .next()
         .map(|child| render_node(child, ctx))
         .unwrap_or_default();
+    // MathML orders the scripts as base, underscript, overscript (unlike
+    // `msubsup`, where the subscript comes first too, but `mover`/`munder`
+    // carry only one of them).
     let mut over_html = String::new();
     let mut under_html = String::new();
-    if over {
-        over_html = children
+    if under {
+        under_html = children
             .next()
             .map(|child| render_node(child, ctx))
             .unwrap_or_default();
     }
-    if under {
-        under_html = children
+    if over {
+        over_html = children
             .next()
             .map(|child| render_node(child, ctx))
             .unwrap_or_default();
@@ -1332,6 +1335,30 @@ mod tests {
         assert!(out.contains("cre-script-stack"), "{out}");
         assert!(out.contains("cre-limits-under"), "{out}");
         assert!(out.contains("cre-mo-large"), "{out}");
+    }
+
+    #[test]
+    fn munderover_keeps_the_mathml_script_order() {
+        // MathML orders the scripts as base, underscript, overscript.
+        let out = rewrite_mathml(
+            r#"<math display="block"><munderover><mo>∑</mo><mrow><mi>k</mi><mo>=</mo><mn>1</mn></mrow><mi>∞</mi></munderover></math>"#,
+        );
+        let over = out
+            .split("cre-limits-over")
+            .nth(1)
+            .expect("over limit")
+            .split("cre-limits-base")
+            .next()
+            .expect("base");
+        let under = out.split("cre-limits-under").nth(1).expect("under limit");
+        assert!(
+            over.contains("cre-mi\">∞<"),
+            "the overscript must be above: {out}"
+        );
+        assert!(
+            under.contains("cre-mi\">k<"),
+            "the underscript must be below: {out}"
+        );
     }
 
     #[test]
