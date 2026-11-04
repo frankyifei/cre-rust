@@ -5491,11 +5491,16 @@ fn collect_spine_chunks(
     if let Some(index) =
         node_attr(node, "data-spine-index").and_then(|value| value.parse::<u32>().ok())
     {
-        out.entry(index).or_insert(chunk_index);
+        // XPointers number sections with `data-spine-index + 1` (see
+        // `xpointer::spine_index_for_node`), so key the chunks the same way:
+        // mixing the two numbering schemes sent lookups for the last section
+        // of a chunk to the *next* chunk, where the section does not exist.
+        let slot = index + 1;
+        out.entry(slot).or_insert(chunk_index);
         let real_index = node_attr(node, "data-spine-real-index")
             .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(index);
-        real.entry(index).or_insert(real_index);
+            .unwrap_or(slot);
+        real.entry(slot).or_insert(real_index);
     }
     for child in &node.children {
         collect_spine_chunks(node.with(*child), chunk_index, out, real);
