@@ -6,34 +6,59 @@
 //! borders), instead of implementing a separate math layout engine.
 //!
 //! This is deliberately a presentation subset: tokens, `mrow`, `mfenced`,
-//! `msup`/`msub`/`msubsup`, `mfrac`, `msqrt`/`mroot`, `mtable`, `mspace`,
-//! `mstyle`, `merror`, `mphantom` and `menclose`. Stretchy-operator shaping,
-//! OpenType MATH metrics and the finer mtable/multiscript rules remain future
-//! work.
+//! `msup`/`msub`/`msubsup`, `munder`/`mover`/`munderover`, `mfrac`,
+//! `msqrt`/`mroot`, `mtable`, `mspace`, `mstyle`, `merror`, `mphantom` and
+//! `menclose`. Scripts are positioned with CSS baseline shifts; fences and
+//! radicals are stretched with CSS transforms (which the tiny-skia painter
+//! applies as glyph/box transforms); large operators use display-style
+//! limits. OpenType MATH metrics and the finer mtable/multiscript rules remain
+//! future work.
 
 use roxmltree::{Document, Node};
 
 /// CSS needed by the generated HTML. The engine appends this once per chunk.
 pub const CSS: &str = r#"
-.cre-math { font-family: serif; line-height: normal; white-space: nowrap; }
-.cre-math[data-display="block"] { display: block; text-align: center; margin: 0.5em 0; }
-.cre-mi { font-style: italic; }
+.cre-math { font-family: serif; line-height: 1.15; white-space: nowrap; }
+.cre-math[data-display="block"] { display: block; text-align: center; margin: 0.6em 0; }
+/* Blitz computes the advance of italic runs from the upright face, which
+   makes the following glyph overlap. Skewing an inline-block token paints the
+   same oblique shape without touching the measured advance. */
+.cre-mi { display: inline-block; transform: skewX(-10deg); transform-origin: center; }
+.cre-mi-upright { display: inline-block; }
 .cre-mn, .cre-mo, .cre-mtext { font-style: normal; }
-.cre-mo { margin: 0 0.12em; }
-.cre-fence { margin: 0; }
 .cre-mrow, .cre-mstyle, .cre-merror, .cre-mphantom, .cre-menclose { display: inline; }
-.cre-msup > sup, .cre-msubsup > sup { font-size: 0.72em; line-height: 0; vertical-align: super; }
-.cre-msub > sub, .cre-msubsup > sub { font-size: 0.72em; line-height: 0; vertical-align: sub; }
-.cre-mfrac { display: inline-block; vertical-align: middle; text-align: center; margin: 0 0.18em; }
-.cre-mfrac-num { display: block; border-bottom: 1px solid currentColor; padding: 0 0.15em; }
-.cre-mfrac-den { display: block; padding: 0 0.15em; }
-.cre-msqrt { display: inline-block; vertical-align: middle; }
-.cre-radical { padding-right: 0.04em; }
-.cre-msqrt-body { border-top: 1px solid currentColor; padding: 0 0.12em; }
-.cre-mroot { display: inline-block; vertical-align: middle; position: relative; }
-.cre-mroot-index { font-size: 0.6em; line-height: 0; vertical-align: super; }
-.cre-mtable { display: inline-table; border-collapse: collapse; vertical-align: middle; }
-.cre-mtable td, .cre-mtable th { padding: 0.05em 0.2em; text-align: center; }
+.cre-mo { display: inline-block; margin: 0 0.05em; }
+.cre-mo-bin { margin: 0 0.22em; }
+.cre-mo-unary { margin: 0 0.05em; }
+.cre-mo-rel { margin: 0 0.28em; }
+.cre-mo-invisible { margin: 0; }
+.cre-mo-large { font-size: 1.35em; line-height: 1; vertical-align: middle; margin: 0 0.08em; }
+.cre-fence { margin: 0; display: inline-block; line-height: 1; vertical-align: middle; transform-origin: center; }
+.cre-script { white-space: nowrap; }
+.cre-sup, .cre-sub { display: inline-block; font-size: 0.7em; line-height: 1; }
+.cre-sup { vertical-align: 0.55em; }
+.cre-sub { vertical-align: -0.25em; }
+.cre-script-stack { display: inline-block; vertical-align: middle; font-size: 0.7em; line-height: 0.95; }
+.cre-script-stack > span { display: block; }
+.cre-limits { display: inline-block; text-align: center; vertical-align: middle; }
+.cre-limits-base { display: block; line-height: 1.1; }
+.cre-limits-over, .cre-limits-under { display: block; font-size: 0.7em; line-height: 1; }
+.cre-limits-under { padding-top: 0.08em; }
+.cre-limits-over { padding-bottom: 0.04em; }
+.cre-mfrac { display: inline-block; vertical-align: middle; text-align: center; margin: 0 0.15em; }
+.cre-mfrac-num { display: block; padding: 0 0.15em; border-bottom: 1px solid currentColor; line-height: 1.1; }
+.cre-mfrac-den { display: block; padding: 0 0.15em; line-height: 1.1; }
+.cre-msqrt { display: inline-block; vertical-align: middle; white-space: nowrap; }
+.cre-radical { display: inline-block; line-height: 1; vertical-align: middle; transform-origin: center; }
+.cre-msqrt-body { display: inline-block; border-top: 1px solid currentColor; padding: 0.02em 0.12em 0 0.08em; }
+.cre-mroot { display: inline-block; vertical-align: middle; }
+.cre-mroot-index { font-size: 0.6em; line-height: 1; vertical-align: 0.9em; }
+.cre-mtable-wrap { display: inline-block; vertical-align: middle; }
+/* Book stylesheets commonly style every table (`width: 90%`, cell borders,
+   sans-serif 80% cells). Math tables are layout scaffolds: reset those. */
+.cre-mtable { border-collapse: collapse !important; border-spacing: 0 !important; margin: 0 !important; border: none !important; width: auto !important; }
+.cre-mtable tbody { background: transparent !important; }
+.cre-mtable td { border: none !important; background: transparent !important; padding: 0.12em 0.5em !important; text-align: center; vertical-align: middle; line-height: 1.15 !important; font-family: inherit !important; font-size: 1em !important; }
 .cre-mphantom { visibility: hidden; }
 .cre-menclose { border: 1px solid currentColor; padding: 0.08em 0.12em; }
 .cre-merror { color: #b00000; }
@@ -111,48 +136,49 @@ fn rewrite_fragment(fragment: &str) -> Option<String> {
         .replace("&ensp;", "&#8194;");
     let doc = Document::parse(&normalized).ok()?;
     let node = doc.root_element();
-    Some(render_node(node))
+    Some(render_node(node, Ctx::default()))
 }
 
-fn render_node(node: Node<'_, '_>) -> String {
+/// Display mode changes large-operator limits and the size of fences.
+#[derive(Clone, Copy, Default)]
+struct Ctx {
+    display: bool,
+}
+
+fn render_node(node: Node<'_, '_>, ctx: Ctx) -> String {
     if node.is_text() {
         return escape_html(node.text().unwrap_or_default());
     }
     if !node.is_element() {
-        return render_children(node);
+        return render_children(node, ctx);
     }
     let name = node.tag_name().name().to_ascii_lowercase();
     match name.as_str() {
         "math" => {
-            let display = node.attribute("display").unwrap_or("inline");
+            let display = node.attribute("display").unwrap_or("inline") == "block";
+            let ctx = Ctx { display };
             format!(
                 "<span class=\"cre-math\" data-display=\"{}\">{}</span>",
-                escape_attr(display),
-                render_children(node)
+                if display { "block" } else { "inline" },
+                render_row(node, ctx)
             )
         }
         "semantics" => node
             .children()
             .find(|child| child.is_element())
-            .map(render_node)
+            .map(|child| render_node(child, ctx))
             .unwrap_or_default(),
         "annotation" | "annotation-xml" | "none" | "mprescripts" => String::new(),
-        "mrow" => format!("<span class=\"cre-mrow\">{}</span>", render_children(node)),
-        "mi" => format!(
-            "<span class=\"cre-mi\">{}</span>",
-            escape_html(node.text().unwrap_or_default())
-        ),
+        "mrow" => render_row(node, ctx),
+        "mi" => render_mi(node, ctx),
         "mn" => format!(
             "<span class=\"cre-mn\">{}</span>",
-            escape_html(node.text().unwrap_or_default())
+            escape_html(&token_text(node))
         ),
-        "mo" => format!(
-            "<span class=\"cre-mo\">{}</span>",
-            escape_html(node.text().unwrap_or_default())
-        ),
+        "mo" => render_mo(node, ctx, 1.0, false),
         "mtext" | "ms" => format!(
-            "<span class=\"cre-mtext\">{}</span>",
-            escape_html(node.text().unwrap_or_default())
+            "<span class=\"cre-mtext\" style=\"white-space:pre\">{}</span>",
+            escape_html(&token_text(node))
         ),
         "mspace" => {
             let width = node.attribute("width").unwrap_or("0.5em");
@@ -161,139 +187,653 @@ fn render_node(node: Node<'_, '_>) -> String {
                 escape_attr(width)
             )
         }
-        "msup" => scripted(node, "sup"),
-        "msub" => scripted(node, "sub"),
-        "msubsup" => msubsup(node),
-        "mfrac" => {
-            let mut children = node.children().filter(|child| child.is_element());
-            let numerator = children.next().map(render_node).unwrap_or_default();
-            let denominator = children.next().map(render_node).unwrap_or_default();
-            format!(
-                "<span class=\"cre-mfrac\"><span class=\"cre-mfrac-num\">{numerator}</span><span class=\"cre-mfrac-den\">{denominator}</span></span>"
-            )
-        }
-        "msqrt" => format!(
-            "<span class=\"cre-msqrt\"><span class=\"cre-radical\">√</span><span class=\"cre-msqrt-body\">{}</span></span>",
-            render_children(node)
-        ),
-        "mroot" => {
-            let mut children = node.children().filter(|child| child.is_element());
-            let base = children.next().map(render_node).unwrap_or_default();
-            let index = children.next().map(render_node).unwrap_or_default();
-            format!(
-                "<span class=\"cre-mroot\"><span class=\"cre-radical\">√</span><span class=\"cre-msqrt-body\">{base}</span><sup class=\"cre-mroot-index\">{index}</sup></span>"
-            )
-        }
-        "mfenced" => mfenced(node),
-        "mtable" => format!(
-            "<table class=\"cre-mtable\"><tbody>{}</tbody></table>",
-            render_children(node)
-        ),
-        "mtr" => format!("<tr>{}</tr>", render_children(node)),
-        "mtd" | "mth" => format!("<td>{}</td>", render_children(node)),
-        "mstyle" => {
-            let mut style = String::new();
-            for (attribute, property) in [
-                ("mathcolor", "color"),
-                ("mathbackground", "background-color"),
-                ("mathsize", "font-size"),
-            ] {
-                if let Some(value) = node.attribute(attribute) {
-                    if !style.is_empty() {
-                        style.push(';');
-                    }
-                    style.push_str(property);
-                    style.push(':');
-                    style.push_str(value);
-                }
-            }
-            if style.is_empty() {
-                format!(
-                    "<span class=\"cre-mstyle\">{}</span>",
-                    render_children(node)
-                )
-            } else {
-                format!(
-                    "<span class=\"cre-mstyle\" style=\"{}\">{}</span>",
-                    escape_attr(&style),
-                    render_children(node)
-                )
-            }
-        }
+        "msup" => render_script(node, ctx, ScriptKind::Sup),
+        "msub" => render_script(node, ctx, ScriptKind::Sub),
+        "msubsup" => render_scripts(node, ctx),
+        "munder" => render_limits(node, ctx, false, true),
+        "mover" => render_limits(node, ctx, true, false),
+        "munderover" => render_limits(node, ctx, true, true),
+        "mfrac" => render_fraction(node, ctx),
+        "msqrt" => render_sqrt(node, ctx),
+        "mroot" => render_root(node, ctx),
+        "mfenced" => render_fenced(node, ctx),
+        "mtable" => render_table(node, ctx),
+        "mtr" | "mtd" | "mth" => render_children(node, ctx),
+        "mstyle" => render_style(node, ctx),
         "merror" => format!(
             "<span class=\"cre-merror\">{}</span>",
-            render_children(node)
+            render_children(node, ctx)
         ),
         "mphantom" => format!(
             "<span class=\"cre-mphantom\">{}</span>",
-            render_children(node)
+            render_children(node, ctx)
         ),
         "menclose" => format!(
             "<span class=\"cre-menclose\">{}</span>",
-            render_children(node)
+            render_children(node, ctx)
         ),
-        "munder" => scripted(node, "sub"),
-        "mover" => scripted(node, "sup"),
-        "munderover" => msubsup(node),
-        "mmultiscripts" => render_children(node),
-        _ => render_children(node),
+        "mmultiscripts" => render_children(node, ctx),
+        _ => render_children(node, ctx),
     }
 }
 
-fn render_children(node: Node<'_, '_>) -> String {
+fn render_children(node: Node<'_, '_>, ctx: Ctx) -> String {
     let mut out = String::new();
-    for child in node.children() {
-        if child.is_text() && child.text().is_some_and(|text| text.trim().is_empty()) {
-            continue;
-        }
-        out.push_str(&render_node(child));
+    for child in element_children(node) {
+        out.push_str(&render_node(child, ctx));
     }
     out
 }
 
-fn scripted(node: Node<'_, '_>, tag: &str) -> String {
-    let mut children = node.children().filter(|child| child.is_element());
-    let base = children.next().map(render_node).unwrap_or_default();
-    let script = children.next().map(render_node).unwrap_or_default();
-    let class = if tag == "sup" { "cre-msup" } else { "cre-msub" };
-    format!("<span class=\"{class}\">{base}<{tag}>{script}</{tag}></span>")
+/// Row-like container. Fences stretch to the content they enclose: either a
+/// matching fence in the same row or, for unmatched fences, the adjacent
+/// item (the tall table after a piecewise brace, for example).
+fn render_row(node: Node<'_, '_>, ctx: Ctx) -> String {
+    let children: Vec<Node> = element_children(node).collect();
+    let heights: Vec<f32> = children
+        .iter()
+        .map(|child| estimate_height(*child))
+        .collect();
+    let mut out = String::from("<span class=\"cre-mrow\">");
+    let mut operator_context = true;
+    for (index, child) in children.iter().enumerate() {
+        if child.is_element() && child.tag_name().name().eq_ignore_ascii_case("mo") {
+            let stretch = fence_stretch(&children, &heights, index);
+            let text = token_text(*child);
+            let unary = operator_class(&text) == "cre-mo-bin" && operator_context;
+            out.push_str(&render_mo(*child, ctx, stretch, unary));
+            operator_context = matches!(
+                operator_class(&text),
+                "cre-mo-bin" | "cre-mo-rel" | "cre-mo-invisible"
+            ) || is_open_fence(&text);
+        } else {
+            out.push_str(&render_node(*child, ctx));
+            operator_context = false;
+        }
+    }
+    out.push_str("</span>");
+    out
 }
 
-fn msubsup(node: Node<'_, '_>) -> String {
-    let mut children = node.children().filter(|child| child.is_element());
-    let base = children.next().map(render_node).unwrap_or_default();
-    let sub = children.next().map(render_node).unwrap_or_default();
-    let sup = children.next().map(render_node).unwrap_or_default();
-    format!("<span class=\"cre-msubsup\">{base}<sub>{sub}</sub><sup>{sup}</sup></span>")
+fn mo_fence_text(node: Node<'_, '_>) -> Option<String> {
+    if !node.is_element() || !node.tag_name().name().eq_ignore_ascii_case("mo") {
+        return None;
+    }
+    let text = token_text(node);
+    if is_fence(&text) { Some(text) } else { None }
 }
 
-fn mfenced(node: Node<'_, '_>) -> String {
+fn fence_stretch(children: &[Node<'_, '_>], heights: &[f32], index: usize) -> f32 {
+    let Some(text) = mo_fence_text(children[index]) else {
+        return 1.0;
+    };
+    let max_range =
+        |from: usize, to: usize| heights[from..to].iter().copied().fold(1.0_f32, f32::max);
+    if text == "|" || text == "‖" {
+        let previous = if index > 0 { heights[index - 1] } else { 1.0 };
+        let next = heights.get(index + 1).copied().unwrap_or(1.0);
+        return previous.max(next);
+    }
+    if is_open_fence(&text) {
+        let mut depth = 0i32;
+        for (next, child) in children.iter().enumerate().skip(index + 1) {
+            let Some(other) = mo_fence_text(*child) else {
+                continue;
+            };
+            if is_open_fence(&other) {
+                depth += 1;
+            } else if is_close_fence(&other) {
+                if depth == 0 {
+                    return max_range(index + 1, next);
+                }
+                depth -= 1;
+            }
+        }
+        // Unmatched: a piecewise brace applies to the item that follows it.
+        return heights.get(index + 1).copied().unwrap_or(1.0).max(1.0);
+    }
+    if is_close_fence(&text) {
+        let mut depth = 0i32;
+        for (previous, child) in children.iter().enumerate().take(index).rev() {
+            let Some(other) = mo_fence_text(*child) else {
+                continue;
+            };
+            if is_close_fence(&other) {
+                depth += 1;
+            } else if is_open_fence(&other) {
+                if depth == 0 {
+                    return max_range(previous + 1, index);
+                }
+                depth -= 1;
+            }
+        }
+        return if index > 0 { heights[index - 1] } else { 1.0 };
+    }
+    1.0
+}
+
+fn is_open_fence(text: &str) -> bool {
+    matches!(text, "(" | "[" | "{" | "⟨" | "⌈" | "⌊" | "⟦")
+}
+
+fn is_close_fence(text: &str) -> bool {
+    matches!(text, ")" | "]" | "}" | "⟩" | "⌉" | "⌋" | "⟧")
+}
+
+fn render_mi(node: Node<'_, '_>, _ctx: Ctx) -> String {
+    let text = token_text(node);
+    let variant = node.attribute("mathvariant").unwrap_or("");
+    let italic = match variant {
+        "normal" | "upright" | "bold" | "sans-serif" => false,
+        "italic" | "bold-italic" => true,
+        _ => text.chars().count() == 1,
+    };
+    let class = if italic { "cre-mi" } else { "cre-mi-upright" };
+    if variant.contains("bold") {
+        let skew = if italic {
+            "transform:skewX(-10deg);"
+        } else {
+            ""
+        };
+        format!(
+            "<span class=\"{class}\" style=\"font-weight:bold;{skew}\">{}</span>",
+            escape_html(&text)
+        )
+    } else {
+        format!("<span class=\"{class}\">{}</span>", escape_html(&text))
+    }
+}
+
+fn render_mo(node: Node<'_, '_>, ctx: Ctx, stretch: f32, unary: bool) -> String {
+    let text = token_text(node);
+    let class = if unary {
+        "cre-mo-unary"
+    } else {
+        operator_class(&text)
+    };
+    if is_large_operator(&text) {
+        let size = if ctx.display { 1.5 } else { 1.2 };
+        return format!(
+            "<span class=\"cre-mo cre-mo-large\" style=\"font-size:{size}em\">{}</span>",
+            escape_html(&text)
+        );
+    }
+    if is_fence(&text) {
+        let scale = (stretch / 1.0).clamp(1.0, 4.5);
+        if scale > 1.05 {
+            return format!(
+                "<span class=\"cre-mo cre-fence\" style=\"transform:scaleY({scale:.3})\">{}</span>",
+                escape_html(&text)
+            );
+        }
+        return format!(
+            "<span class=\"cre-mo cre-fence\">{}</span>",
+            escape_html(&text)
+        );
+    }
+    format!(
+        "<span class=\"cre-mo {class}\">{}</span>",
+        escape_html(&text)
+    )
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ScriptKind {
+    Sup,
+    Sub,
+}
+
+fn render_script(node: Node<'_, '_>, ctx: Ctx, kind: ScriptKind) -> String {
+    let mut children = element_children(node);
+    let base = children
+        .next()
+        .map(|child| render_node(child, ctx))
+        .unwrap_or_default();
+    let script = children
+        .next()
+        .map(|child| render_node(child, ctx))
+        .unwrap_or_default();
+    let class = match kind {
+        ScriptKind::Sup => "cre-sup",
+        ScriptKind::Sub => "cre-sub",
+    };
+    format!("<span class=\"cre-script\">{base}<span class=\"{class}\">{script}</span></span>")
+}
+
+fn render_scripts(node: Node<'_, '_>, ctx: Ctx) -> String {
+    let mut children = element_children(node);
+    let Some(base_node) = children.next() else {
+        return String::new();
+    };
+    let base = render_node(base_node, ctx);
+    let sub = children
+        .next()
+        .map(|child| render_node(child, ctx))
+        .unwrap_or_default();
+    let sup = children
+        .next()
+        .map(|child| render_node(child, ctx))
+        .unwrap_or_default();
+
+    // Display-style limits on large operators go above and below the operator;
+    // integrals keep their limits at the side, like Chrome's MathML rendering.
+    if ctx.display && is_large_operator_node(base_node) && !is_integral(&token_text(base_node)) {
+        return format!(
+            "<span class=\"cre-limits\"><span class=\"cre-limits-over\">{sup}</span>\
+             <span class=\"cre-limits-base\">{base}</span>\
+             <span class=\"cre-limits-under\">{sub}</span></span>"
+        );
+    }
+
+    // Large operators keep their limits at the side; give the stack a little
+    // breathing room because the operator glyph's ink is narrower than its em
+    // box (the integral especially).
+    let stack_style = if is_large_operator_node(base_node) {
+        " style=\"margin-left:0.1em\""
+    } else {
+        ""
+    };
+    format!(
+        "<span class=\"cre-script\">{base}<span class=\"cre-script-stack\"{stack_style}>\
+         <span>{sup}</span><span>{sub}</span></span></span>"
+    )
+}
+
+fn render_limits(node: Node<'_, '_>, ctx: Ctx, over: bool, under: bool) -> String {
+    let mut children = element_children(node);
+    let base = children
+        .next()
+        .map(|child| render_node(child, ctx))
+        .unwrap_or_default();
+    let mut over_html = String::new();
+    let mut under_html = String::new();
+    if over {
+        over_html = children
+            .next()
+            .map(|child| render_node(child, ctx))
+            .unwrap_or_default();
+    }
+    if under {
+        under_html = children
+            .next()
+            .map(|child| render_node(child, ctx))
+            .unwrap_or_default();
+    }
+    let mut out = String::from("<span class=\"cre-limits\">");
+    if !over_html.is_empty() {
+        out.push_str(&format!(
+            "<span class=\"cre-limits-over\">{over_html}</span>"
+        ));
+    }
+    out.push_str(&format!("<span class=\"cre-limits-base\">{base}</span>"));
+    if !under_html.is_empty() {
+        out.push_str(&format!(
+            "<span class=\"cre-limits-under\">{under_html}</span>"
+        ));
+    }
+    out.push_str("</span>");
+    out
+}
+
+fn render_fraction(node: Node<'_, '_>, ctx: Ctx) -> String {
+    let mut children = element_children(node);
+    let numerator = children
+        .next()
+        .map(|child| render_node(child, ctx))
+        .unwrap_or_default();
+    let denominator = children
+        .next()
+        .map(|child| render_node(child, ctx))
+        .unwrap_or_default();
+    format!(
+        "<span class=\"cre-mfrac\"><span class=\"cre-mfrac-num\">{numerator}</span>\
+         <span class=\"cre-mfrac-den\">{denominator}</span></span>"
+    )
+}
+
+fn render_sqrt(node: Node<'_, '_>, ctx: Ctx) -> String {
+    let body = render_children(node, ctx);
+    let height = estimate_height(node);
+    let scale = (height / 1.0).clamp(1.0, 4.0);
+    let radical = if scale > 1.15 {
+        format!("<span class=\"cre-radical\" style=\"transform:scaleY({scale:.3})\">√</span>")
+    } else {
+        String::from("<span class=\"cre-radical\">√</span>")
+    };
+    format!(
+        "<span class=\"cre-msqrt\">{radical}<span class=\"cre-msqrt-body\">{body}</span></span>"
+    )
+}
+
+fn render_root(node: Node<'_, '_>, ctx: Ctx) -> String {
+    let mut children = element_children(node);
+    let base = children
+        .next()
+        .map(|child| render_node(child, ctx))
+        .unwrap_or_default();
+    let index = children
+        .next()
+        .map(|child| render_node(child, ctx))
+        .unwrap_or_default();
+    format!(
+        "<span class=\"cre-mroot\"><span class=\"cre-radical\">√</span>\
+         <span class=\"cre-msqrt-body\">{base}</span>\
+         <span class=\"cre-mroot-index\">{index}</span></span>"
+    )
+}
+
+fn render_fenced(node: Node<'_, '_>, ctx: Ctx) -> String {
     let open = node.attribute("open").unwrap_or("(");
     let close = node.attribute("close").unwrap_or(")");
-    let separators = node.attribute("separators").unwrap_or(",");
-    let separator = separators.chars().next().unwrap_or(',');
-    let mut out = String::from("<span class=\"cre-mfenced\">");
+    let separators: Vec<char> = node
+        .attribute("separators")
+        .unwrap_or(",")
+        .chars()
+        .collect();
+    let children: Vec<Node> = element_children(node).collect();
+    let height = children
+        .iter()
+        .map(|child| estimate_height(*child))
+        .fold(1.0_f32, f32::max);
+    let scale = (height / 1.0).clamp(1.0, 4.5);
+    let fence_style = if scale > 1.05 {
+        format!(" style=\"transform:scaleY({scale:.3})\"")
+    } else {
+        String::new()
+    };
+    let mut out = String::from("<span class=\"cre-mrow\">");
     out.push_str(&format!(
-        "<span class=\"cre-fence\">{}</span>",
+        "<span class=\"cre-mo cre-fence\"{fence_style}>{}</span>",
         escape_html(open)
     ));
-    let mut first = true;
-    for child in node.children().filter(|child| child.is_element()) {
-        if !first {
+    for (index, child) in children.iter().enumerate() {
+        if index > 0 {
+            let separator = separators
+                .get(index - 1)
+                .or_else(|| separators.last())
+                .copied()
+                .unwrap_or(',');
             out.push_str(&format!(
-                "<span class=\"cre-fence\">{}</span>",
+                "<span class=\"cre-mo cre-fence\">{}</span>",
                 escape_html(&separator.to_string())
             ));
         }
-        first = false;
-        out.push_str(&render_node(child));
+        out.push_str(&render_node(*child, ctx));
     }
     out.push_str(&format!(
-        "<span class=\"cre-fence\">{}</span>",
+        "<span class=\"cre-mo cre-fence\"{fence_style}>{}</span>",
         escape_html(close)
     ));
     out.push_str("</span>");
     out
+}
+
+fn render_table(node: Node<'_, '_>, ctx: Ctx) -> String {
+    let alignments: Vec<String> = node
+        .attribute("columnalign")
+        .unwrap_or("")
+        .split_whitespace()
+        .map(|value| value.to_string())
+        .collect();
+    let row_spacing = node.attribute("rowspacing");
+    let column_spacing = node.attribute("columnspacing");
+    let mut out =
+        String::from("<span class=\"cre-mtable-wrap\"><table class=\"cre-mtable\"><tbody>");
+    for row in node
+        .children()
+        .filter(|child| child.is_element())
+        .filter(|child| child.tag_name().name().eq_ignore_ascii_case("mtr"))
+    {
+        out.push_str("<tr>");
+        for (column, cell) in row
+            .children()
+            .filter(|child| child.is_element())
+            .filter(|child| {
+                let name = child.tag_name().name();
+                name.eq_ignore_ascii_case("mtd") || name.eq_ignore_ascii_case("mth")
+            })
+            .enumerate()
+        {
+            let align = alignments
+                .get(column)
+                .or_else(|| alignments.last())
+                .map(|value| match value.as_str() {
+                    "left" => "left",
+                    "right" => "right",
+                    _ => "center",
+                })
+                .unwrap_or("center");
+            let mut style = format!("text-align:{align}");
+            if let Some(spacing) = column_spacing {
+                style.push_str(&format!(";padding-left:{spacing};padding-right:{spacing}"));
+            }
+            if let Some(spacing) = row_spacing {
+                style.push_str(&format!(";padding-top:{spacing};padding-bottom:{spacing}"));
+            }
+            out.push_str(&format!(
+                "<td style=\"{style}\">{}</td>",
+                render_children(cell, ctx)
+            ));
+        }
+        out.push_str("</tr>");
+    }
+    out.push_str("</tbody></table></span>");
+    out
+}
+
+fn render_style(node: Node<'_, '_>, ctx: Ctx) -> String {
+    let mut style = String::new();
+    for (attribute, property) in [
+        ("mathcolor", "color"),
+        ("mathbackground", "background-color"),
+        ("mathsize", "font-size"),
+    ] {
+        if let Some(value) = node.attribute(attribute) {
+            if !style.is_empty() {
+                style.push(';');
+            }
+            style.push_str(property);
+            style.push(':');
+            style.push_str(value);
+        }
+    }
+    if style.is_empty() {
+        format!(
+            "<span class=\"cre-mstyle\">{}</span>",
+            render_children(node, ctx)
+        )
+    } else {
+        format!(
+            "<span class=\"cre-mstyle\" style=\"{}\">{}</span>",
+            escape_attr(&style),
+            render_children(node, ctx)
+        )
+    }
+}
+
+/// Rough content height in `em`, used to stretch fences and radicals. It only
+/// needs to be close enough: Chrome/crengine use real font metrics, but the
+/// heights here differ by a fraction of an em.
+fn estimate_height(node: Node<'_, '_>) -> f32 {
+    if node.is_text() {
+        return 1.0;
+    }
+    if !node.is_element() {
+        return 1.0;
+    }
+    let name = node.tag_name().name().to_ascii_lowercase();
+    let children: Vec<Node> = element_children(node).collect();
+    let max_child = |children: &[Node]| {
+        children
+            .iter()
+            .map(|child| estimate_height(*child))
+            .fold(1.0_f32, f32::max)
+    };
+    match name.as_str() {
+        "math" | "mrow" | "mstyle" | "merror" | "mphantom" | "menclose" | "semantics" => {
+            max_child(&children)
+        }
+        "mfrac" => {
+            let numerator = children.first().map(|c| estimate_height(*c)).unwrap_or(1.0);
+            let denominator = children.get(1).map(|c| estimate_height(*c)).unwrap_or(1.0);
+            (numerator + denominator + 0.5).max(1.7)
+        }
+        "msup" | "msub" => {
+            let base = children.first().map(|c| estimate_height(*c)).unwrap_or(1.0);
+            let script = children.get(1).map(|c| estimate_height(*c)).unwrap_or(1.0);
+            base.max(script * 0.7 + 0.55)
+        }
+        "msubsup" | "munderover" => {
+            let base = children.first().map(|c| estimate_height(*c)).unwrap_or(1.0);
+            base.max(1.2)
+        }
+        "munder" | "mover" => {
+            let base = children.first().map(|c| estimate_height(*c)).unwrap_or(1.0);
+            base + 0.55
+        }
+        "msqrt" | "mroot" => max_child(&children) + 0.2,
+        "mfenced" => max_child(&children),
+        "mtable" => {
+            let mut total = 0.0;
+            for row in &children {
+                let cells: Vec<Node> = element_children(*row).collect();
+                total += max_child(&cells) + 0.22;
+            }
+            total.max(1.0)
+        }
+        "mtr" | "mtd" | "mth" => max_child(&children),
+        _ => max_child(&children),
+    }
+}
+
+fn element_children<'a, 'input>(node: Node<'a, 'input>) -> impl Iterator<Item = Node<'a, 'input>> {
+    node.children().filter(|child| child.is_element())
+}
+
+fn token_text(node: Node<'_, '_>) -> String {
+    let mut out = String::new();
+    for child in node.children() {
+        if child.is_text() {
+            out.push_str(child.text().unwrap_or_default());
+        }
+    }
+    out
+}
+
+fn is_large_operator_node(node: Node<'_, '_>) -> bool {
+    node.is_element() && node.tag_name().name().eq_ignore_ascii_case("mo") && {
+        let text = token_text(node);
+        is_large_operator(&text)
+    }
+}
+
+fn is_large_operator(text: &str) -> bool {
+    matches!(
+        text,
+        "∫" | "∬"
+            | "∭"
+            | "∮"
+            | "∯"
+            | "∰"
+            | "∑"
+            | "∏"
+            | "∐"
+            | "⋃"
+            | "⋂"
+            | "⋁"
+            | "⋀"
+            | "⨁"
+            | "⨂"
+            | "⨀"
+            | "⨄"
+            | "⨆"
+    )
+}
+
+fn is_integral(text: &str) -> bool {
+    matches!(text, "∫" | "∬" | "∭" | "∮" | "∯" | "∰")
+}
+
+fn is_fence(text: &str) -> bool {
+    matches!(
+        text,
+        "(" | ")"
+            | "["
+            | "]"
+            | "{"
+            | "}"
+            | "|"
+            | "‖"
+            | "⟨"
+            | "⟩"
+            | "⌈"
+            | "⌉"
+            | "⌊"
+            | "⌋"
+            | "⟦"
+            | "⟧"
+    )
+}
+
+fn operator_class(text: &str) -> &'static str {
+    if text == "\u{2062}" || text == "\u{2063}" || text.trim().is_empty() {
+        return "cre-mo-invisible";
+    }
+    if matches!(
+        text,
+        "+" | "−"
+            | "-"
+            | "±"
+            | "∓"
+            | "×"
+            | "⋅"
+            | "·"
+            | "*"
+            | "∗"
+            | "/"
+            | "÷"
+            | "∪"
+            | "∩"
+            | "∧"
+            | "∨"
+            | "⊕"
+            | "⊗"
+            | "⊙"
+    ) {
+        return "cre-mo-bin";
+    }
+    if matches!(
+        text,
+        "=" | "≠"
+            | "≈"
+            | "≡"
+            | "<"
+            | ">"
+            | "≤"
+            | "≥"
+            | "→"
+            | "←"
+            | "↔"
+            | "⇒"
+            | "⇐"
+            | "⇔"
+            | "∈"
+            | "∉"
+            | "⊂"
+            | "⊃"
+            | "⊆"
+            | "⊇"
+            | "∼"
+            | "≃"
+            | "≅"
+            | "∝"
+    ) {
+        return "cre-mo-rel";
+    }
+    if matches!(text, "," | ";" | ":") {
+        return "cre-mo-punct";
+    }
+    "cre-mo-op"
 }
 
 fn escape_html(value: &str) -> String {
@@ -317,9 +857,9 @@ mod tests {
     fn rewrites_superscript_and_fenced_expression() {
         let html = r#"<p>x<math xmlns="http://www.w3.org/1998/Math/MathML"><mrow><mi>x</mi><mo>=</mo><msup><mfenced><mrow><mi>a</mi><mo>+</mo><mi>b</mi></mrow></mfenced><mn>2</mn></msup></mrow></math></p>"#;
         let out = rewrite_mathml(html);
-        assert!(out.contains("<sup>"), "{out}");
+        assert!(out.contains("cre-sup"), "{out}");
         assert!(out.contains("cre-mn\">2"), "{out}");
-        assert!(out.contains("cre-mfenced"), "{out}");
+        assert!(out.contains("cre-fence"), "{out}");
         assert!(out.contains("<span class=\"cre-mi\">x</span>"), "{out}");
         assert!(!out.contains("<math"), "{out}");
     }
@@ -331,5 +871,73 @@ mod tests {
         assert!(out.contains("cre-mfrac-num"), "{out}");
         assert!(out.contains("cre-mfrac-den"), "{out}");
         assert!(out.contains("cre-msqrt"), "{out}");
+    }
+
+    #[test]
+    fn scripts_stack_under_and_over() {
+        let html = r#"<math><msubsup><mo>∫</mo><mi>a</mi><mi>b</mi></msubsup><munder><mo>lim</mo><mi>x</mi></munder></math>"#;
+        let out = rewrite_mathml(html);
+        assert!(out.contains("cre-script-stack"), "{out}");
+        assert!(out.contains("cre-limits-under"), "{out}");
+        assert!(out.contains("cre-mo-large"), "{out}");
+    }
+
+    #[test]
+    fn fences_stretch_to_tall_content() {
+        let html = r#"<math><mfenced open="[" close="]"><mtable><mtr><mtd><mi>x</mi></mtd></mtr><mtr><mtd><mi>y</mi></mtd></mtr></mtable></mfenced></math>"#;
+        let out = rewrite_mathml(html);
+        assert!(out.contains("scaleY("), "{out}");
+        assert!(out.contains("cre-mtable"), "{out}");
+    }
+
+    #[test]
+    fn multi_character_identifiers_are_upright() {
+        let single = rewrite_mathml(r#"<math><mi>x</mi></math>"#);
+        let multi = rewrite_mathml(r#"<math><mi>lim</mi></math>"#);
+        assert!(single.contains("class=\"cre-mi\""), "{single}");
+        assert!(multi.contains("cre-mi-upright"), "{multi}");
+    }
+
+    #[test]
+    fn unary_minus_uses_tight_spacing() {
+        let unary = rewrite_mathml(
+            r#"<math><mrow><mo>−</mo><msup><mi>x</mi><mn>2</mn></msup></mrow></math>"#,
+        );
+        assert!(unary.contains("cre-mo-unary"), "{unary}");
+        let binary = rewrite_mathml(r#"<math><mrow><mi>x</mi><mo>+</mo><mn>4</mn></mrow></math>"#);
+        assert!(binary.contains("cre-mo-bin"), "{binary}");
+    }
+
+    #[test]
+    fn display_limits_differ_for_integrals_and_sums() {
+        let integral = rewrite_mathml(
+            r#"<math display="block"><msubsup><mo>∫</mo><mi>a</mi><mi>b</mi></msubsup></math>"#,
+        );
+        assert!(integral.contains("cre-script-stack"), "{integral}");
+        assert!(!integral.contains("cre-limits"), "{integral}");
+        let sum = rewrite_mathml(
+            r#"<math display="block"><msubsup><mo>∑</mo><mi>i</mi><mi>n</mi></msubsup></math>"#,
+        );
+        assert!(sum.contains("cre-limits"), "{sum}");
+    }
+
+    #[test]
+    fn fences_stretch_only_to_their_content() {
+        let out = rewrite_mathml(
+            r#"<math><mrow><mi>f</mi><mo>(</mo><mi>x</mi><mo>)</mo><mo>=</mo><mo>(</mo><mfrac><mn>1</mn><mn>2</mn></mfrac><mo>)</mo></mrow></math>"#,
+        );
+        // The first pair encloses a single `x`, so it stays at normal size.
+        let first_open = out.find("cre-fence").unwrap();
+        let first_end = out[first_open..].find('>').unwrap() + first_open;
+        assert!(!out[first_open..first_end].contains("scaleY"), "{out}");
+        // The second pair encloses the fraction and stretches.
+        assert!(out.contains("scaleY("), "{out}");
+    }
+
+    #[test]
+    fn table_css_resets_book_table_styles() {
+        assert!(CSS.contains("width: auto !important"), "{CSS}");
+        assert!(CSS.contains(".cre-mtable td"), "{CSS}");
+        assert!(CSS.contains("border: none !important"), "{CSS}");
     }
 }
