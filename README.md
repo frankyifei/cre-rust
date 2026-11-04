@@ -1,13 +1,17 @@
 # cre-rust
 
-A Rust implementation of the KOReader `cre` Lua module.
+**cre-rust is a rewrite of crengine in Rust, built on Blitz.**
 
-`cre-rust` builds `libkoreader-cre.so`. KOReader loads this module to open a
-book, make pages, draw text and images, and answer questions about positions
-and links. The module keeps the Lua API that KOReader already uses.
+It implements KOReader's `cre` module (`libkoreader-cre.so`) from scratch on
+top of the [Blitz](https://github.com/DioxusLabs/blitz) HTML/CSS engine —
+Stylo for CSS, Taffy for boxes, Parley for text — instead of the crengine C++
+engine. KOReader keeps its Lua API and does not change: drop the resulting
+module into `koreader/libs/` and the reader opens EPUB, FB2, MOBI, KF8 and
+plain text exactly as before.
 
-The project is a working prototype. It is not a complete crengine replacement
-yet. See [TODO.md](TODO.md) for the remaining work.
+This is not a port of crengine. No crengine code is reused; the layout model,
+the pagination, the painter and the MathML translator are new code written
+against Rust libraries.
 
 ## Status
 
@@ -17,78 +21,128 @@ Tested with KOReader v2026.07.1:
 - in the QEMU harness in this repository,
 - with an x86_64 desktop KOReader build.
 
-The module has about 125 document methods and 24 module functions.
+The module exposes about 124 document methods and 24 module functions, and the
+workspace has 32 test targets.
 
-## Features
+## Highlights
 
-### Book formats
+The interesting work is the part Blitz does not provide. These pieces are
+ours.
 
-| Format | Notes |
-|---|---|
-| EPUB 2 and EPUB 3 | OPF, spine, TOC, page map, CSS, images, fonts |
-| FB2 | Base64 binaries, inline images |
-| TXT and HTML | Plain text, standalone HTML with local resources |
-| MOBI 6 (`.mobi`, `.prc`, `.azw`) | PalmDOC decompression, EXTH, `filepos` links, images |
-| KF8 / AZW3 | Separate crate, shared PalmDB container |
+### MathML rendering (`cre-mathml`)
 
-The reader detects the format from the file content. It does not use the file
-name extension.
+Blitz has no MathML support. `cre-mathml` translates a MathML presentation
+subset into plain HTML boxes that the normal layout engine understands:
+tokens, `mrow`, `mfenced`, scripts, `mfrac`, `msqrt`/`mroot`, `mtable`,
+`mspace`, `mstyle`, `merror`, `mphantom`, `menclose`, `mmultiscripts` and
+`maction`.
 
-### Layout and rendering
+The parts that took real work:
 
-- HTML and CSS layout with Blitz, Stylo, Taffy, and Parley.
-- Block and inline layout, floats, tables (through CSS Grid), images, and SVG.
-- Grayscale page bitmaps for e-ink screens. Color page bitmaps for color
-  devices.
-- Page breaks, margins, line spacing, font size, font weight, and gamma.
-- Chunked layout with a memory budget. Large books do not need one DOM for the
-  whole book.
-- Partial relayout. A font or margin change lays out the current chunk first,
-  not the whole book.
-- Image-only `<svg><image .../></svg>` blocks are treated as images.
-- JPEG, PNG, GIF, WebP, BMP, and SVG images.
-- Bounded caches for resources and page images.
+- radical signs are **drawn**, not scaled glyphs: the vinculum is its own
+  element that starts exactly where the surd's tip ends, and the surd is two
+  thin strokes, so the sign keeps its stroke weight at any height and works
+  with any font;
+- stretched fences read the **glyph's ink height from the font's MATH table**
+  and grow their box to the content height, so a parenthesis, brace or matrix
+  bar always covers what it encloses;
+- `movablelimits` and `displaystyle` are honoured: `∑`/`∏` stack their limits
+  in display style and move them to the side inline, integrals never stack, and
+  `mstyle displaystyle`/`scriptlevel` work per formula (as the W3C test suite
+  relies on);
+- scripts climb to the top or foot of a tall base (a stretched parenthesis, a
+  fraction), instead of hanging around the middle;
+- empty script slots (`<mrow/>`) are ignored, so `a_k` written as
+  `<msubsup>a k <mrow/></msubsup>` does not push its subscript onto the axis;
+- `maction` renders only the selected child, so tooltip text from the test
+  suites stays out of the formula;
+- OpenType MATH constants (script scale, shifts, rule thickness, axis height)
+  are read from the selected math font; KOReader's `font-family: math` choice
+  is honoured, and the math font survives the "ignore publisher fonts" tweak.
 
-### Reading features
+### Painting (`cre-paint`)
 
-- TOC, page map, and page labels.
-- XPointer V2 strings and page/XPointer conversion.
-- Internal links, footnotes, and link rectangles.
-- Text search and word selection.
-- Highlight rectangles and highlight drawing.
-- Word and sentence lookup at a screen position.
-- Header, footer, and progress data for the KOReader UI.
-- EPUB CFI output (simplified).
+Rendering is our own scene rasterizer on `tiny-skia`, with an optional
+`vello_cpu` backend:
 
-### Fonts
+- glyph runs with **arbitrary affine transforms**: stretched fences, synthetic
+  oblique, skew and rotated text are resampled per glyph instead of being
+  rasterized at their largest axis scale (which used to thicken strokes);
+- layers with opacity, blend modes, `filter: blur()`, `filter: drop-shadow()`
+  and color-matrix filters, plus backdrop filters;
+- `box-shadow` (outset and inset), border radius, gradients, image brushes and
+  clip layers;
+- grayscale and color page bitmaps with a font-contrast gamma curve for e-ink;
+- bounded caches for decoded resources and page images.
 
-- TTF, OTF, TTC, and OTC files.
-- Face selection inside a font collection, for example Noto Serif CJK
-  JP/KR/SC/TC/HK.
-- Fallback fonts and font bias.
-- Bold and italic synthesis.
-- CJK text and vertical punctuation metrics as provided by the font.
+### Pagination that understands the content
 
-### Measured speed
+Pages are built from line boxes and content boxes rather than by slicing a tall
+canvas:
 
-These numbers come from the QEMU harness, not from a device. They show the
-effect of partial relayout:
+- forced breaks (chapters), margins, page flows and page maps;
+- images and display formulas are kept whole: an image or a formula that does
+  not fit moves to the next page instead of being cut;
+- inline formulas grow their line, so a line holding a tall formula moves as a
+  unit;
+- page starts are recorded so page ↔ XPointer conversion and the header/footer
+  flow data are exact.
+
+### Positions, selection and search
+
+- XPointer V2 strings in both directions, page ↔ XPointer, simplified CFI;
+- word and sentence lookup at a screen position, including CJK;
+- highlight and selection rectangles per line segment, with the source block
+  and byte offset tracked through the chunked layout;
+- full-text search that returns per-page rectangles.
+
+### Chunked layout with partial relayout
+
+A book is laid out in chunks sized from a memory budget, one DOM at a time.
+Changing a font, margin or font-family lays out only the current chunk, and
+the page list is rebased around it. Measured in the QEMU harness:
 
 | Book | Full relayout | Partial relayout |
 |---|---|---|
 | `juliet.epub` | 4.1 s | 0.47 s |
 | `zyj.epub` | 7.3 s | 0.71 s |
 
+### Fonts
+
+- TTF, OTF, TTC and OTC files, with face selection inside a collection (Noto
+  Serif CJK JP/KR/SC/TC/HK and similar);
+- generic family lists, fallback chains, font bias, and the reader's
+  `font-family: math` slot;
+- bold and italic synthesis;
+- CJK metrics and vertical punctuation data from the font.
+
+### Formats
+
+| Format | Notes |
+|---|---|
+| EPUB 2 and EPUB 3 | OPF, spine, TOC, page map, CSS, images, fonts, SVG |
+| FB2 | Base64 binaries, inline images |
+| TXT and HTML | Plain text, standalone HTML with local resources |
+| MOBI 6 (`.mobi`, `.prc`, `.azw`) | PalmDOC decompression, EXTH, `filepos` links, images |
+| KF8 / AZW3 | Separate crate, shared PalmDB container |
+
+The format is detected from the file content, not from the extension.
+
 ## Limits
 
-- Vertical writing (`writing-mode: vertical-rl`) is not supported. Blitz
-  supports only block-level `writing-mode`, and its inline layout is
-  horizontal. See [Blitz status](https://blitz.is/status/css).
+- Vertical writing (`writing-mode: vertical-rl`) is not supported. Blitz lays
+  out horizontal text only.
 - RTL text uses Parley bidi reordering. `direction` is partial and
   `unicode-bidi` is not supported.
 - Text hyphenation is not applied. The module stores the dictionary name only.
 - Embedded `@font-face` fonts are not used. KOReader must register the font
   files.
+- `text-shadow` is not painted: Blitz does not parse it, so the paint stream
+  carries no shadow for glyph runs. `box-shadow`, filters, `opacity` and
+  `clip-path` (on block boxes) do work.
+- MathML is a presentation subset. A matrix (`mtable`) is kept on one page
+  rather than split between rows; huge formulas are clipped, as an inline
+  table would be in crengine.
 - MOBI and KF8: no DRM, no embedded fonts, and limited CSS.
 - EPUB CFI output is simplified.
 - Two-page view, scroll view, and some page-flow APIs are partial.
@@ -99,13 +153,14 @@ effect of partial relayout:
 
 | Path | Content |
 |---|---|
-| `crates/cre-lib` | Engine core: open, layout, pagination, page lookup, images, fonts |
+| `crates/cre-lib` | Engine core: open, layout, pagination, page lookup, positions, images, fonts |
 | `crates/cre-epub` | EPUB container, OPF, spine, TOC, HTML chunks |
 | `crates/cre-fb2` | FB2 reader |
 | `crates/cre-text` | TXT and standalone HTML reader |
 | `crates/cre-pdb` | PalmDB container, MOBI header, INDX index |
 | `crates/cre-mobi` | MOBI 6 reader |
 | `crates/cre-kf8` | KF8 / AZW3 reader |
+| `crates/cre-mathml` | MathML to HTML translation and the math stylesheet |
 | `crates/cre-paint` | Paint commands, page bitmaps, color bitmaps |
 | `crates/cre-lua` | LuaJIT binding (`libkoreader-cre.so`) |
 | `crates/cre-render` | Command-line renderer for tests and debugging |
@@ -215,8 +270,8 @@ Reference sizes:
 
 | Variant | Size |
 |---|---|
-| VFP, strict align | about 18.7 MB |
-| Software float | about 19.2 MB |
+| VFP, strict align | about 18.9 MB |
+| Software float | about 18.9 MB |
 
 ### Deploy to the device
 
@@ -246,7 +301,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-The test suite has about 30 test targets.
+The test suite has 32 targets.
 
 Some tests need the DejaVu fonts. Some tests use the books in
 `fixtures/koreader-test-data/`. Install the fonts and keep the books before you
@@ -276,6 +331,8 @@ convert /tmp/pages/page-001.pgm /tmp/page-001.png
 | `CRE_LUA_TRACE_PATH=FILE` | Write a trace of the Lua API calls |
 | `CRE_SNAPSHOT_DEBUG=1` | Log settings that cause a relayout |
 | `CRE_XP_POINT_DEBUG=1` | Log XPointer positions that have no line |
+| `CRE_MATH_DEBUG=1` | Log the math font that was picked for math content |
+| `CRE_PAINT_BACKEND=tiny\|vello` | Choose the paint backend in a build with `vello-cpu` |
 
 ## Run KOReader with QEMU
 

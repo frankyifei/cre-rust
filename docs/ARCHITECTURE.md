@@ -47,7 +47,8 @@ spine item. The chunk size comes from a memory budget.
 | `cre-mobi` | MOBI 6 links, images, chapter split |
 | `cre-kf8` | KF8/AZW3 flows, CSS, links, images |
 | `cre-lib` | The engine. Open, layout, paginate, page lookup, fonts, images, paint |
-| `cre-paint` | Scene to pixmap, page bitmaps, halftone and gamma |
+| `cre-mathml` | MathML to HTML translation and the generated math stylesheet |
+| `cre-paint` | Scene to pixmap, page bitmaps, font gamma |
 | `cre-lua` | LuaJIT C API, document userdata, module functions |
 | `cre-render` | Small CLI that renders pages to PGM |
 
@@ -97,6 +98,30 @@ break starts a new page. A chunk always starts on a new page.
 
 The total page count is known after the first layout. KOReader needs the total
 count right after `renderDocument`.
+
+Two content kinds are kept whole even when they would straddle a page
+boundary: images and display formulas. `cre-lib` collects their absolute rects
+and hands them to the paginator as content boxes (inline formulas instead grow
+their line), because Blitz measures a line from the text metrics and reports a
+line holding a tall box as much shorter than it paints.
+
+## MathML
+
+Blitz has no MathML layout. `cre-mathml` rewrites each `<math>` subtree into
+ordinary HTML for the presentation subset KOReader books use, and `cre-lib`
+appends the generated stylesheet once per chunk:
+
+- fences stretch by scaling the glyph, with the box sized to the content height
+  and the scale divided by the glyph's ink height from the font's MATH table;
+- radicals are drawn (two strokes plus a separate vinculum element), so they do
+  not depend on a `√` glyph and keep a constant stroke weight;
+- `movablelimits` plus the display style decide whether `msubsup`/`munderover`
+  limits stack or stay at the side;
+- `mstyle displaystyle` and `scriptlevel` are evaluated per subtree;
+- `maction` renders only its selected child.
+
+A formula stays inside one line. Display formulas are atomic for pagination; a
+matrix is currently not split between rows.
 
 ## Chunking and memory
 
