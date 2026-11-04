@@ -60,14 +60,128 @@ pub const CSS: &str = r#"
 .cre-mtable tbody { background: transparent !important; }
 .cre-mtable td { border: none !important; background: transparent !important; padding: 0.12em 0.5em !important; text-align: center; vertical-align: middle; line-height: 1.15 !important; font-family: inherit !important; font-size: 1em !important; }
 .cre-mphantom { visibility: hidden; }
-.cre-menclose { border: 1px solid currentColor; padding: 0.08em 0.12em; }
+.cre-menclose { display: inline-block; line-height: 1.2; }
+.cre-strike-h, .cre-strike-v, .cre-strike-up, .cre-strike-down { position: absolute; border-top: 1px solid currentColor; }
+.cre-strike-h { left: 0; right: 0; top: 50%; }
+.cre-strike-v { left: 50%; top: 0; bottom: 0; border-top: none; border-left: 1px solid currentColor; }
+.cre-strike-up { left: -20%; right: -20%; top: 50%; transform: rotate(-45deg); transform-origin: center; }
+.cre-strike-down { left: -20%; right: -20%; top: 50%; transform: rotate(45deg); transform-origin: center; }
+.cre-mmultiscripts { white-space: nowrap; }
+.cre-ms-pre { margin-right: 0.05em; }
 .cre-merror { color: #b00000; }
 .cre-mspace { display: inline-block; }
 "#;
 
+/// Typographic constants, in `em`, read from the font's OpenType MATH table.
+///
+/// Falls back to the values crengine and Chrome's default math layout use when
+/// the reader's font has no MATH table (most text fonts do not; DejaVu does).
+#[derive(Clone, Copy, Debug)]
+pub struct MathMetrics {
+    /// Superscript baseline shift up.
+    pub sup_shift_up: f32,
+    /// Subscript baseline shift down.
+    pub sub_shift_down: f32,
+    /// Script font size as a fraction of the base size.
+    pub script_scale: f32,
+    /// Fraction rule thickness.
+    pub fraction_rule: f32,
+    /// Radical/overbar rule thickness.
+    pub radical_rule: f32,
+    /// Minimum height of a delimited sub-formula (the smallest fence).
+    pub delimited_min_height: f32,
+    /// Axial height of the math axis.
+    pub axis_height: f32,
+}
+
+impl Default for MathMetrics {
+    fn default() -> Self {
+        Self {
+            sup_shift_up: 0.55,
+            sub_shift_down: 0.25,
+            script_scale: 0.7,
+            fraction_rule: 0.05,
+            radical_rule: 0.05,
+            delimited_min_height: 1.15,
+            axis_height: 0.25,
+        }
+    }
+}
+
+impl MathMetrics {
+    /// Reads the MATH constants from the first font that has them.
+    pub fn from_font_datas<'a>(datas: impl IntoIterator<Item = &'a [u8]>) -> Option<Self> {
+        datas.into_iter().find_map(Self::from_font_data)
+    }
+
+    /// Reads the MATH constants from one font file.
+    pub fn from_font_data(data: &[u8]) -> Option<Self> {
+        let face = ttf_parser::Face::parse(data, 0).ok()?;
+        let units_per_em = f32::from(face.units_per_em());
+        if units_per_em <= 0.0 {
+            return None;
+        }
+        let constants = face.tables().math?.constants?;
+        let em = |value: i16| value as f32 / units_per_em;
+        let script_scale = f32::from(constants.script_percent_scale_down()) / 100.0;
+        let mut metrics = Self::default();
+        let sup = em(constants.superscript_shift_up().value);
+        if sup > 0.0 {
+            metrics.sup_shift_up = sup;
+        }
+        let sub = em(constants.subscript_shift_down().value);
+        if sub > 0.0 {
+            metrics.sub_shift_down = sub;
+        }
+        if (0.5..0.9).contains(&script_scale) {
+            metrics.script_scale = script_scale;
+        }
+        let rule = em(constants.fraction_rule_thickness().value);
+        if rule > 0.0 {
+            metrics.fraction_rule = rule;
+        }
+        let radical_rule = em(constants.radical_rule_thickness().value);
+        if radical_rule > 0.0 {
+            metrics.radical_rule = radical_rule;
+        }
+        let min_height = f32::from(constants.delimited_sub_formula_min_height()) / units_per_em;
+        if min_height >= 0.5 {
+            metrics.delimited_min_height = min_height;
+        }
+        let axis = em(constants.axis_height().value);
+        if axis > 0.0 {
+            metrics.axis_height = axis;
+        }
+        Some(metrics)
+    }
+}
+
+/// The math stylesheet. `metrics` refines script shifts, rule thickness and the
+/// minimum fence height; pass `None` to use the built-in defaults.
+pub fn css(metrics: Option<MathMetrics>) -> String {
+    let metrics = metrics.unwrap_or_default();
+    let mut out = String::from(CSS);
+    out.push_str(&format!(
+        "\n.cre-sup {{ vertical-align: {:.3}em; }}\n         .cre-sub {{ vertical-align: -{:.3}em; }}\n         .cre-sup, .cre-sub, .cre-script-stack {{ font-size: {:.3}em; }}\n         .cre-mfrac-num {{ border-bottom-width: {:.3}em; }}\n         .cre-msqrt-body {{ border-top-width: {:.3}em; }}\n",
+        metrics.sup_shift_up,
+        metrics.sub_shift_down,
+        metrics.script_scale,
+        metrics.fraction_rule,
+        metrics.radical_rule,
+    ));
+    out
+}
+
 /// Rewrite every `<math>...</math>` subtree in an HTML document into ordinary
 /// HTML elements. If a fragment cannot be parsed as XML it is left untouched.
 pub fn rewrite_mathml(html: &str) -> String {
+    rewrite_mathml_with(html, None)
+}
+
+/// Like [`rewrite_mathml`], but uses font metrics for script placement and
+/// fence sizing.
+pub fn rewrite_mathml_with(html: &str, metrics: Option<MathMetrics>) -> String {
+    let metrics = metrics.unwrap_or_default();
     let lower = html.to_ascii_lowercase();
     let mut out = String::with_capacity(html.len());
     let mut cursor = 0usize;
@@ -78,7 +192,7 @@ pub fn rewrite_mathml(html: &str) -> String {
         };
         out.push_str(&html[cursor..start]);
         let fragment = &html[start..end];
-        match rewrite_fragment(fragment) {
+        match rewrite_fragment(fragment, metrics) {
             Some(rewritten) => out.push_str(&rewritten),
             None => out.push_str(fragment),
         }
@@ -129,20 +243,28 @@ fn find_math_end(lower: &str, start: usize) -> Option<usize> {
     None
 }
 
-fn rewrite_fragment(fragment: &str) -> Option<String> {
+fn rewrite_fragment(fragment: &str, metrics: MathMetrics) -> Option<String> {
     let normalized = fragment
         .replace("&nbsp;", "&#160;")
         .replace("&thinsp;", "&#8201;")
         .replace("&ensp;", "&#8194;");
     let doc = Document::parse(&normalized).ok()?;
     let node = doc.root_element();
-    Some(render_node(node, Ctx::default()))
+    Some(render_node(
+        node,
+        Ctx {
+            display: false,
+            metrics,
+        },
+    ))
 }
 
-/// Display mode changes large-operator limits and the size of fences.
-#[derive(Clone, Copy, Default)]
+/// Display mode changes large-operator limits and the size of fences; metrics
+/// refine script and rule sizes.
+#[derive(Clone, Copy)]
 struct Ctx {
     display: bool,
+    metrics: MathMetrics,
 }
 
 fn render_node(node: Node<'_, '_>, ctx: Ctx) -> String {
@@ -156,7 +278,10 @@ fn render_node(node: Node<'_, '_>, ctx: Ctx) -> String {
     match name.as_str() {
         "math" => {
             let display = node.attribute("display").unwrap_or("inline") == "block";
-            let ctx = Ctx { display };
+            let ctx = Ctx {
+                display,
+                metrics: ctx.metrics,
+            };
             format!(
                 "<span class=\"cre-math\" data-display=\"{}\">{}</span>",
                 if display { "block" } else { "inline" },
@@ -208,11 +333,8 @@ fn render_node(node: Node<'_, '_>, ctx: Ctx) -> String {
             "<span class=\"cre-mphantom\">{}</span>",
             render_children(node, ctx)
         ),
-        "menclose" => format!(
-            "<span class=\"cre-menclose\">{}</span>",
-            render_children(node, ctx)
-        ),
-        "mmultiscripts" => render_children(node, ctx),
+        "menclose" => render_menclose(node, ctx),
+        "mmultiscripts" => render_multiscripts(node, ctx),
         _ => render_children(node, ctx),
     }
 }
@@ -359,7 +481,10 @@ fn render_mo(node: Node<'_, '_>, ctx: Ctx, stretch: f32, unary: bool) -> String 
         );
     }
     if is_fence(&text) {
-        let scale = (stretch / 1.0).clamp(1.0, 4.5);
+        // Fence height follows the enclosed content; the MATH
+        // `delimited_sub_formula_min_height` constant is about spacing, not
+        // about forcing an unscaled fence taller.
+        let scale = stretch.clamp(1.0, 4.5);
         if scale > 1.05 {
             return format!(
                 "<span class=\"cre-mo cre-fence\" style=\"transform:scaleY({scale:.3})\">{}</span>",
@@ -535,7 +660,7 @@ fn render_fenced(node: Node<'_, '_>, ctx: Ctx) -> String {
         .iter()
         .map(|child| estimate_height(*child))
         .fold(1.0_f32, f32::max);
-    let scale = (height / 1.0).clamp(1.0, 4.5);
+    let scale = height.clamp(1.0, 4.5);
     let fence_style = if scale > 1.05 {
         format!(" style=\"transform:scaleY({scale:.3})\"")
     } else {
@@ -618,6 +743,92 @@ fn render_table(node: Node<'_, '_>, ctx: Ctx) -> String {
         out.push_str("</tr>");
     }
     out.push_str("</tbody></table></span>");
+    out
+}
+
+/// `menclose` with the common notations: box/roundedbox/circle, individual
+/// sides, and the horizontal/vertical/diagonal strikes. Other notations
+/// (`longdiv`, `phasorangle`, ...) keep the box.
+fn render_menclose(node: Node<'_, '_>, ctx: Ctx) -> String {
+    let notation = node.attribute("notation").unwrap_or("box");
+    let mut style = String::from("position:relative;");
+    let mut strikes = String::new();
+    for token in notation.split_whitespace() {
+        match token {
+            "box" => style.push_str("border:1px solid currentColor;padding:0.08em 0.12em;"),
+            "roundedbox" => style.push_str(
+                "border:1px solid currentColor;border-radius:0.3em;padding:0.08em 0.12em;",
+            ),
+            "circle" => style
+                .push_str("border:1px solid currentColor;border-radius:50%;padding:0.18em 0.35em;"),
+            "left" => style.push_str("border-left:1px solid currentColor;padding-left:0.12em;"),
+            "right" => style.push_str("border-right:1px solid currentColor;padding-right:0.12em;"),
+            "top" => style.push_str("border-top:1px solid currentColor;padding-top:0.08em;"),
+            "bottom" => {
+                style.push_str("border-bottom:1px solid currentColor;padding-bottom:0.08em;")
+            }
+            "horizontalstrike" => strikes.push_str("<span class=\"cre-strike-h\"></span>"),
+            "verticalstrike" => strikes.push_str("<span class=\"cre-strike-v\"></span>"),
+            "updiagonalstrike" => strikes.push_str("<span class=\"cre-strike-up\"></span>"),
+            "downdiagonalstrike" => strikes.push_str("<span class=\"cre-strike-down\"></span>"),
+            _ => {}
+        }
+    }
+    format!(
+        "<span class=\"cre-menclose\" style=\"{style}\">{strikes}{}</span>",
+        render_children(node, ctx)
+    )
+}
+
+/// `mmultiscripts`: a base with stacked sub/sup pairs after it and, after
+/// `mprescripts`, stacked pairs before it. `<none/>` leaves a slot empty.
+fn render_multiscripts(node: Node<'_, '_>, ctx: Ctx) -> String {
+    let children: Vec<Node> = element_children(node).collect();
+    let Some(base_node) = children.first().copied() else {
+        return String::new();
+    };
+    let base = render_node(base_node, ctx);
+    let mut post: Vec<(String, String)> = Vec::new();
+    let mut pre: Vec<(String, String)> = Vec::new();
+    let mut prescripts = false;
+    let mut index = 1;
+    while index < children.len() {
+        let child = children[index];
+        if child.tag_name().name().eq_ignore_ascii_case("mprescripts") {
+            prescripts = true;
+            index += 1;
+            continue;
+        }
+        let sub = render_node(child, ctx);
+        let mut sup = String::new();
+        if let Some(next) = children.get(index + 1)
+            && !next.tag_name().name().eq_ignore_ascii_case("mprescripts")
+        {
+            sup = render_node(*next, ctx);
+            index += 1;
+        }
+        if prescripts {
+            pre.push((sub, sup));
+        } else {
+            post.push((sub, sup));
+        }
+        index += 1;
+    }
+    let stack = |pair: &(String, String), extra: &str| {
+        format!(
+            "<span class=\"cre-script-stack{extra}\"><span>{}</span><span>{}</span></span>",
+            pair.1, pair.0
+        )
+    };
+    let mut out = String::from("<span class=\"cre-mmultiscripts\">");
+    for pair in pre.iter().rev() {
+        out.push_str(&stack(pair, " cre-ms-pre"));
+    }
+    out.push_str(&base);
+    for pair in &post {
+        out.push_str(&stack(pair, ""));
+    }
+    out.push_str("</span>");
     out
 }
 
@@ -939,5 +1150,46 @@ mod tests {
         assert!(CSS.contains("width: auto !important"), "{CSS}");
         assert!(CSS.contains(".cre-mtable td"), "{CSS}");
         assert!(CSS.contains("border: none !important"), "{CSS}");
+    }
+
+    #[test]
+    fn menclose_notations_add_sides_and_strikes() {
+        let out = rewrite_mathml(
+            r#"<math><menclose notation="box updiagonalstrike"><mi>x</mi></menclose></math>"#,
+        );
+        assert!(out.contains("border:1px solid currentColor"), "{out}");
+        assert!(out.contains("cre-strike-up"), "{out}");
+        let diag = rewrite_mathml(
+            r#"<math><menclose notation="downdiagonalstrike"><mi>x</mi></menclose></math>"#,
+        );
+        assert!(diag.contains("cre-strike-down"), "{diag}");
+    }
+
+    #[test]
+    fn multiscripts_render_pre_and_post_pairs() {
+        let out = rewrite_mathml(
+            r#"<math><mmultiscripts><mi>X</mi><mn>1</mn><mn>2</mn><mprescripts/><mn>3</mn><mn>4</mn></mmultiscripts></math>"#,
+        );
+        assert!(out.contains("cre-mmultiscripts"), "{out}");
+        assert!(out.contains("cre-ms-pre"), "{out}");
+        // post pair 1/2 and pre pair 3/4 both appear as stacked columns.
+        assert_eq!(out.matches("cre-script-stack").count(), 2, "{out}");
+        let pre = out.find("cre-ms-pre").unwrap();
+        let base = out.find(">X<").unwrap();
+        assert!(pre < base, "pre-scripts must come before the base: {out}");
+    }
+
+    #[test]
+    fn metrics_override_script_size_and_rules() {
+        let metrics = MathMetrics {
+            script_scale: 0.8,
+            fraction_rule: 0.04,
+            sup_shift_up: 0.6,
+            ..MathMetrics::default()
+        };
+        let css = css(Some(metrics));
+        assert!(css.contains("font-size: 0.800em"), "{css}");
+        assert!(css.contains("vertical-align: 0.600em"), "{css}");
+        assert!(css.contains("border-bottom-width: 0.040em"), "{css}");
     }
 }

@@ -1179,6 +1179,7 @@ impl Document {
             &self.base_url,
             self.net.clone(),
             self.font_context.clone(),
+            &self.font_blobs,
             &options,
         );
         let root = doc.root_element();
@@ -2217,6 +2218,7 @@ impl Document {
             &self.base_url,
             self.net.clone(),
             self.font_context.clone(),
+            &self.font_blobs,
             &self.layout_options_for_chunk(index),
         );
         let lines = collect_lines(doc.root_element());
@@ -4972,6 +4974,7 @@ fn create_document(
     base_url: &str,
     net: Arc<dyn NetProvider>,
     font_context: Arc<FontContext>,
+    font_datas: &[FontBlob],
     options: &DocumentOptions,
 ) -> HtmlDocument {
     let config = DocumentConfig {
@@ -5005,9 +5008,14 @@ fn create_document(
     // before layout so both engines behave the same.
     let mut html_source = strip_multi_column_styles(base_html);
     if html_source.to_ascii_lowercase().contains("<math") {
-        html_source = cre_mathml::rewrite_mathml(&html_source);
+        // Script size, rule thickness and baseline shifts come from the
+        // reader font's OpenType MATH table when it has one.
+        let metrics = cre_mathml::MathMetrics::from_font_datas(
+            font_datas.iter().map(|blob| blob.as_ref().as_ref()),
+        );
+        html_source = cre_mathml::rewrite_mathml_with(&html_source, metrics);
         html_source.push_str("<style>");
-        html_source.push_str(cre_mathml::CSS);
+        html_source.push_str(&cre_mathml::css(metrics));
         html_source.push_str("</style>");
     }
     if let Some(stylesheet) = options
