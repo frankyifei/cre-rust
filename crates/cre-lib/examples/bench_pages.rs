@@ -40,14 +40,16 @@ fn main() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(22.0);
+    let font_path = std::env::var("FONT_PATH")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf"));
     let options = DocumentOptions {
         width,
         height,
         font_size,
         page_margin: 10.0,
-        font_path: Some(PathBuf::from(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
-        )),
+        font_path: Some(font_path),
         viewport_scale: scale,
         ..Default::default()
     };
