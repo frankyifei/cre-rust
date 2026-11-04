@@ -172,6 +172,21 @@ fn metrics_for_face(face: &ttf_parser::Face<'_>) -> Option<MathMetrics> {
     if axis > 0.0 {
         metrics.axis_height = axis;
     }
+    // How tall each fence glyph's ink actually is, in `em`: a stretched fence
+    // must not be scaled by the content height alone, or it ends up short by
+    // the glyph's own side bearings.
+    for (slot, ch) in FENCE_CHARS.iter().enumerate() {
+        let Some(glyph) = face.glyph_index(*ch) else {
+            continue;
+        };
+        let Some(bounds) = face.glyph_bounding_box(glyph) else {
+            continue;
+        };
+        let ink = (f32::from(bounds.y_max) - f32::from(bounds.y_min)) / units_per_em;
+        if ink > 0.3 && ink < 2.0 {
+            metrics.fence_ink[slot] = ink;
+        }
+    }
     Some(metrics)
 }
 
@@ -195,7 +210,13 @@ pub struct MathMetrics {
     pub delimited_min_height: f32,
     /// Axial height of the math axis.
     pub axis_height: f32,
+    /// Ink height of each fence glyph (see [`FENCE_CHARS`]), in `em`.
+    pub fence_ink: [f32; FENCE_CHARS.len()],
 }
+
+/// Fence glyphs whose ink height is read from the MATH font, in the order of
+/// [`MathMetrics::fence_ink`].
+pub const FENCE_CHARS: [char; 12] = ['(', ')', '[', ']', '{', '}', '|', '‖', '⟨', '⟩', '⌈', '⌊'];
 
 impl Default for MathMetrics {
     fn default() -> Self {
@@ -207,6 +228,7 @@ impl Default for MathMetrics {
             radical_rule: 0.05,
             delimited_min_height: 1.15,
             axis_height: 0.25,
+            fence_ink: [0.78; FENCE_CHARS.len()],
         }
     }
 }
@@ -566,10 +588,13 @@ fn render_mo(node: Node<'_, '_>, ctx: Ctx, stretch: f32, unary: bool) -> String 
         // Fence height follows the enclosed content; the MATH
         // `delimited_sub_formula_min_height` constant is about spacing, not
         // about forcing an unscaled fence taller.
-        let scale = stretch.clamp(1.0, 4.5);
-        if scale > 1.05 {
+        let content = stretch.clamp(1.0, 4.5);
+        if content > 1.05 {
+            let scale = fence_scale(&text, content, ctx.metrics);
             return format!(
-                "<span class=\"cre-mo cre-fence\" style=\"transform:scaleY({scale:.3})\">{}</span>",
+                "<span class=\"cre-mo cre-fence\" \
+                 style=\"height:{content:.3}em;line-height:{content:.3}em;\
+                 transform:scaleY({scale:.3})\">{}</span>",
                 escape_html(&text)
             );
         }
@@ -668,6 +693,24 @@ fn render_scripts(node: Node<'_, '_>, ctx: Ctx) -> String {
         "<span class=\"cre-script\">{base}<span class=\"cre-script-stack\">\
          <span>{sup}</span><span>{sub}</span></span></span>"
     )
+}
+
+/// Vertical scale that makes a fence's ink cover `content` em.
+///
+/// The fence box is given the content's height (and line-height), so the two
+/// boxes always line up whatever the engine does with inline-block
+/// `vertical-align`. The glyph sits centred in that box, and its ink only
+/// fills about 0.86 em per em of font size, so the transform has to make up
+/// the difference: scaling by the content height alone leaves every stretched
+/// fence short of the material it is supposed to enclose.
+fn fence_scale(text: &str, content: f32, metrics: MathMetrics) -> f32 {
+    let ink = FENCE_CHARS
+        .iter()
+        .position(|ch| ch.to_string() == text)
+        .map(|slot| metrics.fence_ink[slot])
+        .filter(|ink| *ink > 0.3)
+        .unwrap_or(0.86);
+    (content / ink).max(1.0)
 }
 
 /// The font-size multiplier `render_mo` gives a large operator.
@@ -823,15 +866,22 @@ fn render_fenced(node: Node<'_, '_>, ctx: Ctx) -> String {
         .iter()
         .map(|child| estimate_height(*child))
         .fold(1.0_f32, f32::max);
-    let scale = height.clamp(1.0, 4.5);
-    let fence_style = if scale > 1.05 {
-        format!(" style=\"transform:scaleY({scale:.3})\"")
-    } else {
-        String::new()
+    let content = height.clamp(1.0, 4.5);
+    let fence_style = |text: &str| -> String {
+        if content <= 1.05 || text.is_empty() {
+            return String::new();
+        }
+        let scale = fence_scale(text, content, ctx.metrics);
+        format!(
+            " style=\"height:{content:.3}em;line-height:{content:.3}em;\
+             transform:scaleY({scale:.3})\""
+        )
     };
+    let open_style = fence_style(open);
+    let close_style = fence_style(close);
     let mut out = String::from("<span class=\"cre-mrow\">");
     out.push_str(&format!(
-        "<span class=\"cre-mo cre-fence\"{fence_style}>{}</span>",
+        "<span class=\"cre-mo cre-fence\"{open_style}>{}</span>",
         escape_html(open)
     ));
     for (index, child) in children.iter().enumerate() {
@@ -849,7 +899,7 @@ fn render_fenced(node: Node<'_, '_>, ctx: Ctx) -> String {
         out.push_str(&render_node(*child, ctx));
     }
     out.push_str(&format!(
-        "<span class=\"cre-mo cre-fence\"{fence_style}>{}</span>",
+        "<span class=\"cre-mo cre-fence\"{close_style}>{}</span>",
         escape_html(close)
     ));
     out.push_str("</span>");
@@ -1094,10 +1144,13 @@ fn estimate_height(node: Node<'_, '_>) -> f32 {
         "msqrt" | "mroot" => max_child(&children) + 0.05,
         "mfenced" => max_child(&children),
         "mtable" => {
+            // A row is its content's line box plus the cell padding
+            // (`.cre-mtable td` uses 0.12em top and bottom); summing only the
+            // content heights left fences around matrices short.
             let mut total = 0.0;
             for row in &children {
                 let cells: Vec<Node> = element_children(*row).collect();
-                total += max_child(&cells) + 0.22;
+                total += max_child(&cells) * 1.15 + 0.24;
             }
             total.max(1.0)
         }
@@ -1427,6 +1480,24 @@ mod tests {
         let out = rewrite_mathml(html);
         assert!(out.contains("scaleY("), "{out}");
         assert!(out.contains("cre-mtable"), "{out}");
+        // The fence box takes the content height, so the stretched glyph has
+        // something to line up with, and the scale makes up for the glyph's
+        // own ink height.
+        assert!(out.contains("height:"), "{out}");
+        assert!(out.contains("line-height:"), "{out}");
+    }
+
+    #[test]
+    fn fence_scale_makes_up_for_the_glyph_ink_height() {
+        // A `(` paints about 0.86 em of ink, so a 2 em fence needs ~2.3x.
+        let mut metrics = MathMetrics::default();
+        let slot = FENCE_CHARS.iter().position(|ch| *ch == '(').unwrap();
+        metrics.fence_ink[slot] = 0.86;
+        let scale = fence_scale("(", 2.0, metrics);
+        assert!((scale - 2.326).abs() < 0.01, "scale {scale}");
+        // A glyph with full-height ink needs no correction.
+        metrics.fence_ink[slot] = 1.0;
+        assert!((fence_scale("(", 2.0, metrics) - 2.0).abs() < 0.001);
     }
 
     #[test]
