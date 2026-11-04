@@ -592,18 +592,34 @@ enum ScriptKind {
 
 fn render_script(node: Node<'_, '_>, ctx: Ctx, kind: ScriptKind) -> String {
     let mut children = element_children(node);
-    let base = children
-        .next()
-        .map(|child| render_node(child, ctx))
-        .unwrap_or_default();
-    let script = children
-        .next()
+    let Some(base_node) = children.next() else {
+        return String::new();
+    };
+    let script_node = children.next();
+    let base = render_node(base_node, ctx);
+    let script = script_node
         .map(|child| render_node(child, ctx))
         .unwrap_or_default();
     let class = match kind {
         ScriptKind::Sup => "cre-sup",
         ScriptKind::Sub => "cre-sub",
     };
+    // A script on a large operator sits at that operator's lower (or upper)
+    // end instead of around its middle, so `∫_ℝᴺ` hangs off the foot of the
+    // sign.
+    if is_large_operator_node(base_node) {
+        let size = large_operator_size(ctx);
+        let shift = if matches!(kind, ScriptKind::Sub) {
+            -(0.55 * size - 0.30)
+        } else {
+            0.5 * size - 0.25
+        };
+        return format!(
+            "<span class=\"cre-script\">{base}<span class=\"cre-script-stack\" \
+             style=\"margin-left:0.05em;vertical-align:{shift:.2}em\"><span>{script}</span>\
+             </span></span>"
+        );
+    }
     format!("<span class=\"cre-script\">{base}<span class=\"{class}\">{script}</span></span>")
 }
 
@@ -612,13 +628,13 @@ fn render_scripts(node: Node<'_, '_>, ctx: Ctx) -> String {
     let Some(base_node) = children.next() else {
         return String::new();
     };
+    let sub_node = children.next();
+    let sup_node = children.next();
     let base = render_node(base_node, ctx);
-    let sub = children
-        .next()
+    let sub = sub_node
         .map(|child| render_node(child, ctx))
         .unwrap_or_default();
-    let sup = children
-        .next()
+    let sup = sup_node
         .map(|child| render_node(child, ctx))
         .unwrap_or_default();
 
@@ -632,18 +648,31 @@ fn render_scripts(node: Node<'_, '_>, ctx: Ctx) -> String {
         );
     }
 
-    // Large operators keep their limits at the side; give the stack a little
-    // breathing room because the operator glyph's ink is narrower than its em
-    // box (the integral especially).
-    let stack_style = if is_large_operator_node(base_node) {
-        " style=\"margin-left:0.1em\""
-    } else {
-        ""
-    };
+    // Large operators keep their side scripts, but the pair is dropped towards
+    // the operator's foot and spread out, so `∫_a^b` flanks the sign instead
+    // of hugging its middle.
+    if is_large_operator_node(base_node) {
+        let size = large_operator_size(ctx);
+        // Keep the pair centred on the operator's axis (Blitz's
+        // `vertical-align: middle`) but spread the two lines apart so the
+        // superscript reaches the operator's top and the subscript its foot.
+        let line_height = 1.2 * size;
+        return format!(
+            "<span class=\"cre-script\">{base}<span class=\"cre-script-stack\" \
+             style=\"margin-left:0.05em;line-height:{line_height:.2}\">\
+             <span>{sup}</span><span>{sub}</span></span></span>"
+        );
+    }
+
     format!(
-        "<span class=\"cre-script\">{base}<span class=\"cre-script-stack\"{stack_style}>\
+        "<span class=\"cre-script\">{base}<span class=\"cre-script-stack\">\
          <span>{sup}</span><span>{sub}</span></span></span>"
     )
+}
+
+/// The font-size multiplier `render_mo` gives a large operator.
+fn large_operator_size(ctx: Ctx) -> f32 {
+    if ctx.display { 1.5 } else { 1.2 }
 }
 
 fn render_limits(node: Node<'_, '_>, ctx: Ctx, over: bool, under: bool) -> String {
@@ -1330,11 +1359,42 @@ mod tests {
 
     #[test]
     fn scripts_stack_under_and_over() {
-        let html = r#"<math><msubsup><mo>∫</mo><mi>a</mi><mi>b</mi></msubsup><munder><mo>lim</mo><mi>x</mi></munder></math>"#;
+        let html = r#"<math><msubsup><mi>x</mi><mi>i</mi><mn>2</mn></msubsup><munder><mo>lim</mo><mi>x</mi></munder></math>"#;
         let out = rewrite_mathml(html);
         assert!(out.contains("cre-script-stack"), "{out}");
         assert!(out.contains("cre-limits-under"), "{out}");
-        assert!(out.contains("cre-mo-large"), "{out}");
+    }
+
+    #[test]
+    fn large_operator_scripts_hang_off_the_operator_ends() {
+        // A lone script on `∫` is shifted off the middle of the sign: down for
+        // a subscript, up for a superscript.
+        let sub = rewrite_mathml(
+            r#"<math><msub><mo>∫</mo><msup><mi>ℝ</mi><mi>N</mi></msup></msub></math>"#,
+        );
+        assert!(sub.contains("cre-script-stack"), "{sub}");
+        assert!(sub.contains("vertical-align:-"), "{sub}");
+        let sup = rewrite_mathml(r#"<math><msup><mo>∫</mo><mi>b</mi></msup></math>"#);
+        assert!(sup.contains("vertical-align:"), "{sup}");
+        assert!(!sup.contains("vertical-align:-"), "{sup}");
+
+        // A pair is spread apart so the superscript reaches the top of the
+        // operator and the subscript its foot.
+        let both =
+            rewrite_mathml(r#"<math><msubsup><mo>∫</mo><mi>a</mi><mi>b</mi></msubsup></math>"#);
+        assert!(both.contains("line-height:"), "{both}");
+        assert!(both.contains("cre-script-stack"), "{both}");
+    }
+
+    #[test]
+    fn ordinary_scripts_keep_glyph_relative_offsets() {
+        let sub = rewrite_mathml(r#"<math><msub><mi>x</mi><mi>i</mi></msub></math>"#);
+        assert!(sub.contains("cre-sub"), "{sub}");
+        assert!(!sub.contains("cre-op-scripts"), "{sub}");
+        let pair =
+            rewrite_mathml(r#"<math><msubsup><mi>x</mi><mi>i</mi><mn>2</mn></msubsup></math>"#);
+        assert!(pair.contains("cre-script-stack"), "{pair}");
+        assert!(!pair.contains("cre-op-scripts"), "{pair}");
     }
 
     #[test]
