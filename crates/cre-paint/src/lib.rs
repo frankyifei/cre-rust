@@ -17,6 +17,8 @@ mod raster;
 /// Rasterized glyph cache. Rasterizing dominates first-page cost on slow
 /// targets, so a glyph is turned into a coverage bitmap once per paint.
 /// Key: font pointer, glyph id, and the raster size quantized to 1/4 px.
+use std::collections::VecDeque;
+
 type GlyphKey = (usize, u16, u32);
 type GlyphBitmap = Arc<Option<GlyphRaster>>;
 
@@ -86,6 +88,109 @@ struct GlyphRaster {
     left: f32,
     top: f32,
     data: Vec<u8>,
+}
+
+/// Caches that survive between page renders of the same document.
+///
+/// Glyph masks are the expensive part of painting a text page: the same
+/// few hundred glyphs come back on every page turn, and each mask costs a
+/// path build plus a rasterisation. Keeping them here takes a page render from
+/// "rasterise every glyph again" to "blit cached masks". The caller owns one
+/// cache per document and clears it when the font context changes.
+#[derive(Default)]
+pub struct PaintCache {
+    glyphs: HashMap<GlyphKey, GlyphBitmap>,
+    bytes: usize,
+    order: VecDeque<GlyphKey>,
+    /// Page bitmap kept between renders: `Pixmap::new` zeroes several
+    /// megabytes and the rasteriser fills it with the background anyway.
+    scratch: Option<Pixmap>,
+}
+
+impl PaintCache {
+    /// Byte budget for cached glyph masks (stretched fences and big radicals
+    /// make large masks, so this is bounded).
+    const BUDGET: usize = 8 * 1024 * 1024;
+    /// Approximate per-entry overhead on top of the mask bytes.
+    const ENTRY_OVERHEAD: usize = 64;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn clear(&mut self) {
+        self.glyphs.clear();
+        self.order.clear();
+        self.bytes = 0;
+    }
+
+    /// A page-sized pixmap to draw into, reused across renders.
+    fn take_scratch(&mut self, width: u32, height: u32) -> Pixmap {
+        match self.scratch.take() {
+            Some(pixmap) if pixmap.width() == width && pixmap.height() == height => pixmap,
+            _ => Pixmap::new(width, height).expect("non-zero page bitmap"),
+        }
+    }
+
+    fn put_scratch(&mut self, pixmap: Pixmap) {
+        self.scratch = Some(pixmap);
+    }
+
+    pub fn cached_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Number of cached glyph masks (profiling).
+    pub fn glyph_entries(&self) -> usize {
+        self.glyphs.len()
+    }
+
+    /// `CRE_PAINT_GLYPH_CACHE=0` disables reuse, for A/B measurements.
+    fn enabled() -> bool {
+        !matches!(
+            std::env::var("CRE_PAINT_GLYPH_CACHE").as_deref(),
+            Ok("0") | Ok("false")
+        )
+    }
+
+    fn get(&self, key: &GlyphKey) -> Option<GlyphBitmap> {
+        if !Self::enabled() {
+            return None;
+        }
+        self.glyphs.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: GlyphKey, value: GlyphBitmap) {
+        if !Self::enabled() {
+            return;
+        }
+        let weight = value
+            .as_ref()
+            .as_ref()
+            .map_or(Self::ENTRY_OVERHEAD, |raster| {
+                raster.data.len() + Self::ENTRY_OVERHEAD
+            });
+        if self.glyphs.insert(key, value).is_some() {
+            // Replaced an entry; keep the accounting right and skip the push.
+            return;
+        }
+        self.order.push_back(key);
+        self.bytes += weight;
+        while self.bytes > Self::BUDGET {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(old_value) = self.glyphs.remove(&old) {
+                let old_weight = old_value
+                    .as_ref()
+                    .as_ref()
+                    .map_or(Self::ENTRY_OVERHEAD, |raster| {
+                        raster.data.len() + Self::ENTRY_OVERHEAD
+                    });
+                self.bytes = self.bytes.saturating_sub(old_weight);
+            }
+        }
+    }
 }
 
 /// Collects a glyph outline into a `tiny-skia` path, flipping y (fonts grow
@@ -212,6 +317,38 @@ pub fn render_page(
     background: u32,
     font_gamma: f32,
 ) -> (Arc<PageBitmap>, usize, usize) {
+    let mut cache = PaintCache::new();
+    render_page_cached(
+        scene,
+        width,
+        height,
+        page_top,
+        clip_left,
+        clip_right,
+        clip_top,
+        clip_bottom,
+        background,
+        font_gamma,
+        &mut cache,
+    )
+}
+
+/// `render_page` with a caller-owned glyph cache, so page turns reuse the
+/// masks painted for the previous page.
+#[allow(clippy::too_many_arguments)]
+pub fn render_page_cached(
+    scene: &Scene,
+    width: u32,
+    height: u32,
+    page_top: f32,
+    clip_left: f32,
+    clip_right: f32,
+    clip_top: f32,
+    clip_bottom: f32,
+    background: u32,
+    font_gamma: f32,
+    cache: &mut PaintCache,
+) -> (Arc<PageBitmap>, usize, usize) {
     #[cfg(feature = "vello-cpu")]
     if vello_backend_requested() {
         return render_page_vello(
@@ -226,6 +363,8 @@ pub fn render_page(
             background,
         );
     }
+    let profile = std::env::var_os("CRE_RENDER_PROFILE").is_some();
+    let started = std::time::Instant::now();
     let page_transform = Affine::translate((0.0, -page_top as f64));
     let local_top = (clip_top - page_top).clamp(0.0, height as f32);
     let local_bottom = (clip_bottom - page_top).clamp(0.0, height as f32);
@@ -247,18 +386,24 @@ pub fn render_page(
         font_gamma,
         background,
         clip_mask,
+        cache,
     );
+    let raster_started = std::time::Instant::now();
     let pixmap = rasterizer.run(scene);
+    let raster_ms = raster_started.elapsed().as_secs_f64() * 1000.0;
 
-    let mut data = Vec::with_capacity((width * height) as usize);
-    for pixel in pixmap.pixels() {
-        let r = pixel.red() as u32;
-        let g = pixel.green() as u32;
-        let b = pixel.blue() as u32;
-        let a = pixel.alpha() as u32;
-        let luma = (r * 299 + g * 587 + b * 114) / 1000;
-        let value = ((luma * a + 255 * (255 - a)) / 255) as u8;
-        data.push(value);
+    let convert_started = std::time::Instant::now();
+    let data = rgba_to_gray(pixmap.data(), (width * height) as usize);
+    // Park the page bitmap for the next render instead of freeing it.
+    cache.put_scratch(pixmap);
+    if profile {
+        eprintln!(
+            "  paint parts: setup={:.2}ms raster={raster_ms:.2}ms convert={:.2}ms glyphs={} bytes={}",
+            (raster_started - started).as_secs_f64() * 1000.0,
+            convert_started.elapsed().as_secs_f64() * 1000.0,
+            cache.glyph_entries(),
+            cache.cached_bytes()
+        );
     }
 
     (
@@ -448,6 +593,31 @@ fn page_clip_mask(
     Some(mask)
 }
 
+/// Converts premultiplied RGBA pixels to the 8-bit gray page bitmap.
+///
+/// The formula matches the per-pixel version this replaces (Rec. 601 luma,
+/// composited over white), but reads the pixmap as `u32` words and writes into
+/// a preallocated buffer, which is a third of the cost on a full page.
+fn rgba_to_gray(rgba: &[u8], pixels: usize) -> Vec<u8> {
+    let mut out = vec![0u8; pixels];
+    let words = rgba.as_chunks::<4>().0;
+    for (slot, pixel) in out.iter_mut().zip(words.iter().take(pixels)) {
+        let r = u32::from(pixel[0]);
+        let g = u32::from(pixel[1]);
+        let b = u32::from(pixel[2]);
+        let luma = (r * 299 + g * 587 + b * 114) / 1000;
+        let a = u32::from(pixel[3]);
+        // Most page pixels are opaque (the background and solid glyph cores);
+        // only anti-aliased edges need the composite over white.
+        *slot = if a == 255 {
+            luma as u8
+        } else {
+            ((luma * a + 255 * (255 - a)) / 255) as u8
+        };
+    }
+    out
+}
+
 fn draw_fill(
     pixmap: &mut Pixmap,
     shape: &BezPath,
@@ -456,14 +626,88 @@ fn draw_fill(
     fill: AnyFill,
     clip_mask: Option<&Mask>,
 ) {
+    let paint = skia_paint(color);
+    // A page is mostly backgrounds and boxes: axis-aligned, pixel-aligned
+    // rectangles. `fill_rect` blends rows directly instead of running the
+    // coverage rasterizer, and for integral edges the result is identical.
+    if fill == AnyFill::NonZero
+        && let Some(rect) = axis_aligned_rect(shape, transform)
+    {
+        pixmap.fill_rect(rect, &paint, Transform::identity(), clip_mask);
+        return;
+    }
     let path = to_skia_path(shape, transform);
     let Some(path) = path else { return };
-    let paint = skia_paint(color);
     let rule = match fill {
         AnyFill::NonZero => FillRule::Winding,
         AnyFill::EvenOdd => FillRule::EvenOdd,
     };
     pixmap.fill_path(&path, &paint, rule, Transform::identity(), clip_mask);
+}
+
+/// True when the shape's transformed bounds cover the whole page bitmap.
+pub(crate) fn covers_page(shape: &BezPath, transform: Affine, width: u32, height: u32) -> bool {
+    let bounds = shape.bounding_box();
+    let top_left = transform * kurbo::Point::new(bounds.x0, bounds.y0);
+    let bottom_right = transform * kurbo::Point::new(bounds.x1, bounds.y1);
+    top_left.x <= 0.0
+        && top_left.y <= 0.0
+        && bottom_right.x >= f64::from(width)
+        && bottom_right.y >= f64::from(height)
+}
+
+/// The transformed rectangle of a four-corner axis-aligned path whose edges
+/// land on whole pixels, or `None` when the shape needs the coverage
+/// rasterizer (rotated, curved, sub-pixel edges).
+fn axis_aligned_rect(shape: &BezPath, transform: Affine) -> Option<tiny_skia::Rect> {
+    let mut points = [(0.0f64, 0.0f64); 4];
+    let mut count = 0usize;
+    for element in shape.elements() {
+        match *element {
+            kurbo::PathEl::MoveTo(point) | kurbo::PathEl::LineTo(point) => {
+                if count == 4 {
+                    return None;
+                }
+                points[count] = (point.x, point.y);
+                count += 1;
+            }
+            kurbo::PathEl::ClosePath => {}
+            _ => return None,
+        }
+    }
+    if count != 4 {
+        return None;
+    }
+    let mut xs = [0.0f64; 4];
+    let mut ys = [0.0f64; 4];
+    for (index, (x, y)) in points.iter().enumerate() {
+        let point = transform * kurbo::Point::new(*x, *y);
+        xs[index] = point.x;
+        ys[index] = point.y;
+    }
+    let x0 = xs.iter().copied().fold(f64::INFINITY, f64::min);
+    let x1 = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let y0 = ys.iter().copied().fold(f64::INFINITY, f64::min);
+    let y1 = ys.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    // Only rectangles: every corner must sit on one of the two edges, and the
+    // four corners must be the distinct (x0|x1, y0|y1) pairs.
+    for (x, y) in xs.iter().zip(ys.iter()) {
+        if (*x - x0).abs() > 0.01 && (*x - x1).abs() > 0.01 {
+            return None;
+        }
+        if (*y - y0).abs() > 0.01 && (*y - y1).abs() > 0.01 {
+            return None;
+        }
+    }
+    // Whole-pixel edges keep the raster identical to `fill_path`.
+    let aligned = |value: f64| (value - value.round()).abs() < 0.01;
+    if !(aligned(x0) && aligned(x1) && aligned(y0) && aligned(y1)) {
+        return None;
+    }
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    tiny_skia::Rect::from_ltrb(x0 as f32, y0 as f32, x1 as f32, y1 as f32)
 }
 
 fn draw_stroke(
@@ -587,7 +831,7 @@ fn draw_glyphs<'a>(
     clip_mask: Option<&Mask>,
     font_gamma: f32,
     faces: &mut HashMap<usize, ttf_parser::Face<'a>>,
-    glyph_cache: &mut HashMap<GlyphKey, GlyphBitmap>,
+    glyph_cache: &mut PaintCache,
 ) {
     let rgba = color.to_rgba8();
     let alpha = (rgba.a as f32 / 255.0) * brush_alpha;
@@ -644,7 +888,7 @@ fn draw_glyphs_with_brush<'a>(
     clip_mask: Option<&Mask>,
     font_gamma: f32,
     faces: &mut HashMap<usize, ttf_parser::Face<'a>>,
-    glyph_cache: &mut HashMap<GlyphKey, GlyphBitmap>,
+    glyph_cache: &mut PaintCache,
 ) {
     let (width, height) = (pixmap.width(), pixmap.height());
     let Some(mut mask) = Mask::new(width, height) else {
@@ -745,7 +989,7 @@ fn for_each_glyph_pixel<'a>(
     clip_bottom: f32,
     font_gamma: f32,
     faces: &mut HashMap<usize, ttf_parser::Face<'a>>,
-    glyph_cache: &mut HashMap<GlyphKey, GlyphBitmap>,
+    glyph_cache: &mut PaintCache,
     mut emit: impl FnMut(u32, u32, f32),
 ) {
     let coverage_lut = glyph_coverage_lut(font_gamma);
@@ -776,10 +1020,14 @@ fn for_each_glyph_pixel<'a>(
         }
 
         let cache_key: GlyphKey = (key, glyph.id as u16, (glyph_size * 4.0) as u32);
-        let raster = glyph_cache
-            .entry(cache_key)
-            .or_insert_with(|| Arc::new(rasterize_glyph(face, glyph.id as u16, glyph_size)))
-            .clone();
+        let raster = match glyph_cache.get(&cache_key) {
+            Some(raster) => raster,
+            None => {
+                let raster = Arc::new(rasterize_glyph(face, glyph.id as u16, glyph_size));
+                glyph_cache.insert(cache_key, raster.clone());
+                raster
+            }
+        };
         let Some(raster) = raster.as_ref() else {
             continue;
         };
@@ -2064,6 +2312,7 @@ pub fn render_page_rgba(
         local_top,
         local_bottom,
     );
+    let mut cache = PaintCache::new();
     let (rasterizer, image_count, image_surface) = raster::Rasterizer::new(
         scene,
         width,
@@ -2074,6 +2323,7 @@ pub fn render_page_rgba(
         font_gamma,
         background,
         clip_mask,
+        &mut cache,
     );
     let pixmap = rasterizer.run(scene);
 
@@ -2392,6 +2642,7 @@ mod tests {
     use std::sync::Arc;
 
     fn render_tiny(scene: &Scene, width: u32, height: u32) -> Pixmap {
+        let mut cache = PaintCache::new();
         let (rasterizer, _, _) = raster::Rasterizer::new(
             scene,
             width,
@@ -2402,6 +2653,7 @@ mod tests {
             1.0,
             0xffffff,
             None,
+            &mut cache,
         );
         rasterizer.run(scene)
     }

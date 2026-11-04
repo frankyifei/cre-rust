@@ -73,7 +73,13 @@ fn test_collection() -> Option<PathBuf> {
     }
     let directory = std::env::temp_dir().join("cre-font-collection-test");
     std::fs::create_dir_all(&directory).unwrap();
-    let collection = directory.join("collection.ttc");
+    // Cargo runs the tests in this file on separate threads, and each of them
+    // builds the collection. A shared path meant one test could read the file
+    // while the other was still writing it, which intermittently registered a
+    // truncated font.
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let index = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let collection = directory.join(format!("collection-{}-{index}.ttc", std::process::id()));
     build_collection(&[SERIF, SANS], &collection);
     Some(collection)
 }

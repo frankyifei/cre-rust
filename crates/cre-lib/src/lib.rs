@@ -17,6 +17,7 @@ use cre_fb2::{Fb2Book, Fb2HtmlOptions};
 use cre_kf8::{Kf8Book, Kf8HtmlOptions};
 use cre_mobi::{MobiBook, MobiHtmlOptions};
 use cre_paint::render_page as paint_page;
+use cre_paint::render_page_cached as paint_page_cached;
 use cre_paint::render_page_rgba as paint_page_rgba;
 
 pub use cre_paint::ColorPageBitmap;
@@ -389,6 +390,235 @@ fn trim_memory() {
     }
 }
 
+/// Resident set size in bytes, where the platform makes it cheap to read.
+fn resident_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let pages: u64 = std::fs::read_to_string("/proc/self/statm")
+            .ok()?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()?;
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let page_size = if page_size > 0 {
+            page_size as u64
+        } else {
+            4096
+        };
+        Some(pages * page_size)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Trims freed heap pages back to the OS, but only once the resident set has
+/// grown by `TRIM_GROWTH_BYTES` since the last trim.
+///
+/// `malloc_trim` walks the heap and madvises every free span; on a 70-chunk
+/// book that cost ~3 ms per chunk, and the trim between two chunks is mostly
+/// pointless because the next chunk reallocates the same pages. The guard keeps
+/// the slack bounded by one chunk's working set plus `TRIM_GROWTH_BYTES`
+/// instead of trimming unconditionally, and peak memory is unaffected.
+struct TrimGuard {
+    last_rss: Option<u64>,
+}
+
+impl TrimGuard {
+    /// Slack allowed to build up between trims.
+    const TRIM_GROWTH_BYTES: u64 = 8 * 1024 * 1024;
+
+    fn new() -> Self {
+        Self {
+            last_rss: resident_bytes(),
+        }
+    }
+
+    fn maybe_trim(&mut self) {
+        let Some(rss) = resident_bytes() else {
+            // No resident size to compare against: keep the old behaviour.
+            trim_memory();
+            return;
+        };
+        let grew = match self.last_rss {
+            Some(last) => rss.saturating_sub(last) >= Self::TRIM_GROWTH_BYTES,
+            None => true,
+        };
+        if grew {
+            trim_memory();
+            self.last_rss = resident_bytes();
+        }
+    }
+}
+
+/// Shared state of the parallel layout pass, so every worker runs the same
+/// pull loop and the opening chunk can be laid out by the main thread.
+struct ChunkLayoutWork<'a> {
+    sources: &'a [String],
+    base_url: &'a str,
+    net: Arc<dyn NetProvider>,
+    font_context: Arc<FontContext>,
+    font_blobs: &'a [FontBlob],
+    options: &'a [DocumentOptions],
+    fixed_heights: &'a [Option<f32>],
+    results: &'a std::sync::Mutex<Vec<Option<ChunkLayout>>>,
+    failure: &'a std::sync::Mutex<Option<anyhow::Error>>,
+    stop: &'a std::sync::atomic::AtomicBool,
+    next: &'a std::sync::atomic::AtomicUsize,
+    gate: &'a LayoutMemoryGate,
+    probe_index: usize,
+    count: usize,
+}
+
+impl ChunkLayoutWork<'_> {
+    fn layout(
+        &self,
+        index: usize,
+    ) -> Result<(ChunkLayout, HtmlDocument, Vec<LineBox>, Vec<PageStart>)> {
+        layout_chunk_html(
+            &self.sources[index],
+            index,
+            self.base_url,
+            self.net.clone(),
+            self.font_context.clone(),
+            self.font_blobs,
+            &self.options[index],
+            self.fixed_heights[index],
+        )
+    }
+
+    fn run(&self) {
+        let mut trim_guard = TrimGuard::new();
+        loop {
+            if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            let index = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if index >= self.count {
+                break;
+            }
+            if index == self.probe_index {
+                continue;
+            }
+            self.gate.enter();
+            let laid_out = self.layout(index);
+            self.gate.leave();
+            match laid_out {
+                Ok((layout, doc, lines, page_starts)) => {
+                    // The DOM belongs to the worker; only the page metadata
+                    // has to survive.
+                    drop(doc);
+                    drop(lines);
+                    drop(page_starts);
+                    self.results.lock().unwrap()[index] = Some(layout);
+                }
+                Err(error) => {
+                    *self.failure.lock().unwrap() = Some(error);
+                    self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+            }
+            trim_guard.maybe_trim();
+        }
+    }
+}
+
+/// Keeps the parallel layout pass inside the memory the chunk planner assumed.
+///
+/// One chunk's layout is planned to fit in the available budget, so running
+/// several at once could reach a multiple of it: image-heavy chunks in
+/// particular decode tens of megabytes while they lay out. A worker waits
+/// before starting a chunk while the resident set is above half of the memory
+/// the planner saw, and trims the freed arenas so the pass can resume. The
+/// thread that lays out the opening chunk never waits, so the pass always makes
+/// progress.
+struct LayoutMemoryGate {
+    limit: Option<u64>,
+    active: std::sync::atomic::AtomicUsize,
+}
+
+impl LayoutMemoryGate {
+    fn new() -> Self {
+        Self {
+            // The chunk planner sizes a chunk so its layout fits in
+            // `available - LAYOUT_MEMORY_RESERVE`; running several at once must
+            // not spend the reserve KOReader keeps for its own widgets.
+            limit: available_memory_bytes()
+                .map(|bytes| bytes.saturating_sub(LAYOUT_MEMORY_RESERVE) as u64),
+            active: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Waits until this worker may start a chunk, then counts it as active.
+    fn enter(&self) {
+        let Some(limit) = self.limit else {
+            self.active
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        };
+        let started = std::time::Instant::now();
+        loop {
+            // Whoever is already laying a chunk out may be holding the memory
+            // that pushes the set over the limit, so one layout is always
+            // allowed through; otherwise a pass could stall for good.
+            let busy = self.active.load(std::sync::atomic::Ordering::Relaxed) > 0;
+            let over = resident_bytes().is_some_and(|rss| rss > limit);
+            if !over || !busy || started.elapsed() > std::time::Duration::from_millis(500) {
+                self.active
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            trim_memory();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    fn leave(&self) {
+        self.active
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// How many chunk layouts to run at once during the open-time pass.
+///
+/// One chunk's layout costs roughly `LAYOUT_BYTES_PER_HTML_BYTE` per byte of its
+/// generated HTML, and the pass now holds that many DOMs at the same time, so
+/// the count is bounded by the free memory the chunk planner saw (half of it,
+/// leaving room for the page bitmap and the reader). It is also capped at four:
+/// past that the pass is bound by memory bandwidth, not cores.
+fn layout_worker_count(
+    remaining: usize,
+    largest_html: usize,
+    rss_before: Option<u64>,
+    rss_after: Option<u64>,
+) -> usize {
+    if let Ok(value) = std::env::var("CRE_LAYOUT_WORKERS")
+        && let Ok(workers) = value.trim().parse::<usize>()
+        && workers > 0
+    {
+        return workers.min(remaining.max(1));
+    }
+    let cores = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    if cores < 2 || remaining < 1 {
+        return 1;
+    }
+    let (Some(available), Some(rss_after)) = (available_memory_bytes(), rss_after) else {
+        return 1;
+    };
+    // One chunk's layout is planned to fit in what is left after the reserve
+    // the reader keeps; running several at once must not eat into it.
+    let usable = available.saturating_sub(LAYOUT_MEMORY_RESERVE);
+    let estimated = largest_html.saturating_mul(LAYOUT_BYTES_PER_HTML_BYTE);
+    let observed = rss_after.saturating_sub(rss_before.unwrap_or(rss_after)) as usize;
+    let per_chunk = estimated.max(observed).max(1);
+    let headroom = usable.saturating_sub(rss_after as usize);
+    (headroom / per_chunk).clamp(1, cores.min(4)) as usize
+}
+
 const PAGE_IMAGE_CACHE_CAPACITY: usize = 2usize;
 
 struct ChunkMeta {
@@ -605,6 +835,9 @@ pub struct Document {
     page_image_cache: RefCell<HashMap<usize, PageImage>>,
     page_cache_order: RefCell<Vec<usize>>,
     page_boxes_cache: RefCell<Option<(usize, Vec<SnapshotLine>)>>,
+    /// Glyph masks reused across page renders. Cleared when the font context
+    /// changes, because the masks carry the face's outlines.
+    paint_cache: RefCell<cre_paint::PaintCache>,
 }
 
 impl Document {
@@ -661,8 +894,11 @@ impl Document {
         let svg_raster = Arc::new(SvgRaster::new(content_width, content_height));
         match format {
             DocumentFormat::Epub => {
+                let t0 = std::time::Instant::now();
                 let mut book = EpubBook::open(path)?;
+                let t1 = std::time::Instant::now();
                 let _ = book.normalize_inline_svg_images();
+                let t2 = std::time::Instant::now();
                 let raw_toc = std::mem::take(&mut book.toc);
                 let raw_page_map_source = std::mem::take(&mut book.page_map_source);
                 let raw_page_map = std::mem::take(&mut book.page_map);
@@ -687,6 +923,7 @@ impl Document {
                     html_options.margin_x,
                     html_options.margin_y,
                 );
+                let t3 = std::time::Instant::now();
                 let htmls = match chunk_target_override() {
                     Some(target) => book.to_html_chunks(&html_options, target)?,
                     None => {
@@ -694,6 +931,19 @@ impl Document {
                         book.to_html_chunks_budgeted(&html_options, text_budget, image_budget)?
                     }
                 };
+                let t4 = std::time::Instant::now();
+                if std::env::var_os("CRE_OPEN_PROFILE").is_some() {
+                    let ms = |a: std::time::Instant, b: std::time::Instant| {
+                        b.duration_since(a).as_secs_f64() * 1000.0
+                    };
+                    eprintln!(
+                        "  open: epub={:.1} svg={:.1} images={:.1} chunk={:.1}",
+                        ms(t0, t1),
+                        ms(t1, t2),
+                        ms(t2, t3),
+                        ms(t3, t4)
+                    );
+                }
                 let cover_image = epub_cover_image(&book);
                 let has_non_linear_flows = book.spine.iter().any(|item| !item.linear);
                 let resource_provider = Arc::new(book.resource_provider);
@@ -1026,6 +1276,7 @@ impl Document {
             page_image_cache: RefCell::new(HashMap::new()),
             page_cache_order: RefCell::new(Vec::new()),
             page_boxes_cache: RefCell::new(None),
+            paint_cache: RefCell::new(cre_paint::PaintCache::new()),
         };
         if !defer_layout {
             document.ensure_layout()?;
@@ -1155,6 +1406,8 @@ impl Document {
             self.font_family.as_deref(),
         ));
         *self.active.borrow_mut() = None;
+        // The cached glyph masks came from the previous faces.
+        self.paint_cache.borrow_mut().clear();
     }
 
     /// Lays out one chunk with the current settings.
@@ -1166,26 +1419,57 @@ impl Document {
         &self,
         chunk_index: usize,
     ) -> Result<(ChunkLayout, HtmlDocument, Vec<LineBox>, Vec<PageStart>)> {
-        let started = std::time::Instant::now();
         let html = self
             .sources
             .get(chunk_index)
-            .context("document chunk is missing")?
-            .clone();
-        let fixed_layout = self.fixed_layouts.get(chunk_index).and_then(|fixed| *fixed);
-        let options = self.layout_options_for_chunk(chunk_index);
-        let doc = create_document(
-            &html,
+            .context("document chunk is missing")?;
+        let fixed_height = self
+            .fixed_layouts
+            .get(chunk_index)
+            .and_then(|fixed| *fixed)
+            .map(|fixed| self.fixed_size(fixed).1);
+        layout_chunk_html(
+            html,
+            chunk_index,
             &self.base_url,
             self.net.clone(),
             self.font_context.clone(),
             &self.font_blobs,
-            &options,
-        );
+            &self.layout_options_for_chunk(chunk_index),
+            fixed_height,
+        )
+    }
+}
+
+/// Lays out one chunk's HTML with the given settings.
+///
+/// Free-standing so the open-time pass can run several chunks at once: the
+/// per-chunk work is independent, and only the parsed DOM is not `Send`, so the
+/// parallel caller uses the returned layout and lets the worker drop the DOM.
+#[allow(clippy::too_many_arguments)]
+fn layout_chunk_html(
+    html: &str,
+    chunk_index: usize,
+    base_url: &str,
+    net: Arc<dyn NetProvider>,
+    font_context: Arc<FontContext>,
+    font_blobs: &[FontBlob],
+    options: &DocumentOptions,
+    fixed_height: Option<f32>,
+) -> Result<(ChunkLayout, HtmlDocument, Vec<LineBox>, Vec<PageStart>)> {
+    {
+        let started = std::time::Instant::now();
+        let mut timer = StageTimer::new();
+        timer.last = std::time::Instant::now();
+        let fixed_layout = fixed_height.map(|_| true);
+        let doc = create_document(html, base_url, net, font_context, font_blobs, options);
+        timer.mark("parse");
         let root = doc.root_element();
         let mut lines = collect_lines(root);
+        timer.mark("lines");
         let math_boxes = collect_math_boxes(&doc, root);
         extend_lines_for_math(&mut lines, &math_boxes);
+        timer.mark("math");
         let mut line_indices: HashMap<NodeId, Vec<usize>> = HashMap::new();
         for (local_line, line) in lines.iter().enumerate() {
             line_indices
@@ -1196,8 +1480,10 @@ impl Document {
         let mut max_flow = 0i64;
         let mut line_flows = lines.iter().map(|_| 0i64).collect::<Vec<i64>>();
         collect_line_flows(root, 0, &mut max_flow, &line_indices, &mut line_flows);
+        timer.mark("flows");
         let forced_breaks = page_breaks::collect_forced_breaks(root);
         let mut boxes = collect_content_boxes(&doc, root);
+        timer.mark("boxes");
         for (top, bottom, display) in &math_boxes {
             if *display {
                 boxes.push(ContentBox {
@@ -1208,8 +1494,8 @@ impl Document {
         }
         boxes.sort_by(|left, right| left.top.total_cmp(&right.top));
         let (page_height_css_u32, page_height_css, page_margin_css) =
-            if let Some(fixed) = fixed_layout {
-                let height = self.fixed_size(fixed).1.max(1.0);
+            if let Some(height) = fixed_height {
+                let height = height.max(1.0);
                 (height as u32, height, 0.0)
             } else {
                 css_page_geometry(
@@ -1234,6 +1520,7 @@ impl Document {
                 page_margin_css,
             )
         };
+        timer.mark("paginate");
         // Every line's place in the book: the block that holds it and the byte
         // offset of its first character inside that block's text. Block ids
         // increase with document order, so `(block, offset)` orders positions the
@@ -1299,6 +1586,7 @@ impl Document {
                 *slot = Some(xpointer);
             }
         }
+        timer.mark("linepos");
         let xpointers = page_positions;
         for (index, xpointer) in xpointers.iter().enumerate() {
             if let Some(xpointer) = xpointer {
@@ -1320,6 +1608,7 @@ impl Document {
                 href_pages.entry(key).or_insert(local_page - 1);
             }
         }
+        timer.mark("hrefs");
         let mut spine_slots = Vec::new();
         {
             let mut spine_to_chunk = HashMap::new();
@@ -1369,6 +1658,8 @@ impl Document {
             line_count: lines.len(),
             max_flow,
         };
+        timer.mark("tail");
+        timer.report(chunk_index);
         if std::env::var_os("CRE_LAYOUT_TIMING").is_some() {
             eprintln!(
                 "cre-lib: chunk {chunk_index} laid out in {:.0} ms ({} pages, {} lines)",
@@ -1379,7 +1670,9 @@ impl Document {
         }
         Ok((layout, doc, lines, page_starts))
     }
+}
 
+impl Document {
     /// Lays out `chunk_index` and keeps its DOM active, ready to draw.
     fn lay_out_chunk_now(&mut self, chunk_index: usize) -> Result<()> {
         let (layout, doc, lines, page_starts) = self.layout_chunk(chunk_index)?;
@@ -1694,7 +1987,150 @@ impl Document {
                 stale: false,
             })
             .collect();
-        for chunk_index in 0..self.sources.len() {
+        let count = self.sources.len();
+        let mut trim_guard = TrimGuard::new();
+        if count == 0 {
+            self.rebuild_view();
+            return Ok(());
+        }
+        // Chunk 0 is the page the reader opens on, and it is laid out last so
+        // its DOM becomes the first active chunk without being parsed twice.
+        // Page numbering only depends on chunk indices, so the order the chunks
+        // are laid out in is free.
+        //
+        // The last chunk goes first, as a probe: how much memory one chunk's
+        // layout costs is only known once one has run, and that decides how
+        // many chunks can be laid out at once on this device.
+        // The probe is the chunk that looks most expensive to lay out: the one
+        // with the most embedded images, then the largest HTML. That chunk has
+        // to be laid out anyway, so measuring it costs nothing, and it keeps
+        // the worker count from being decided by a cheap text chunk while an
+        // image-heavy one waits behind it.
+        let probe_index = (0..count)
+            .max_by_key(|&index| {
+                let html = &self.sources[index];
+                let images = html
+                    .match_indices("<img")
+                    .count()
+                    .saturating_add(html.match_indices("<image").count());
+                (images, html.len())
+            })
+            .unwrap_or(0);
+        let rss_before = resident_bytes();
+        let (probe_layout, doc, lines, page_starts) = self.layout_chunk(probe_index)?;
+        // Measured before the DOM is released: this is what one chunk's layout
+        // costs while it is resident.
+        let rss_after = resident_bytes();
+        self.entries[probe_index] = ChunkEntry {
+            layout: Some(probe_layout),
+            stale: false,
+        };
+        // When the probe is the opening chunk (a cover, usually the most
+        // image-heavy chunk of all) its DOM is what the first page needs, so
+        // keep it instead of dropping it and parsing it again.
+        let mut opening = if probe_index == 0 {
+            Some((doc, lines, page_starts))
+        } else {
+            drop(doc);
+            drop(lines);
+            drop(page_starts);
+            None
+        };
+        trim_memory();
+        let workers = layout_worker_count(
+            count.saturating_sub(2),
+            self.sources.iter().map(String::len).max().unwrap_or(0),
+            rss_before,
+            rss_after,
+        );
+        if std::env::var_os("CRE_LAYOUT_PROFILE").is_some() {
+            eprintln!(
+                "profile workers={workers} probe_chunk={probe_index} rss_before={}MB rss_after={}MB",
+                rss_before.map(|bytes| bytes / (1024 * 1024)).unwrap_or(0),
+                rss_after.map(|bytes| bytes / (1024 * 1024)).unwrap_or(0)
+            );
+        }
+        if workers > 1 {
+            // Several chunks at once: the per-chunk work is independent, so
+            // this is what the open-time pass otherwise leaves on the table.
+            // Options are cheap to build here because `Document` itself is not
+            // `Send` (it holds `RefCell` caches), so the workers only get the
+            // pieces they need.
+            let options: Vec<DocumentOptions> = (0..count)
+                .map(|index| self.layout_options_for_chunk(index))
+                .collect();
+            let fixed_heights: Vec<Option<f32>> = (0..count)
+                .map(|index| {
+                    self.fixed_layouts
+                        .get(index)
+                        .and_then(|fixed| *fixed)
+                        .map(|fixed| self.fixed_size(fixed).1)
+                })
+                .collect();
+            let results: std::sync::Mutex<Vec<Option<ChunkLayout>>> =
+                std::sync::Mutex::new((0..count).map(|_| None).collect());
+            let failure: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            // Workers take every chunk except the probe and the opening one.
+            let next = std::sync::atomic::AtomicUsize::new(1);
+            let gate = LayoutMemoryGate::new();
+            let work = ChunkLayoutWork {
+                sources: &self.sources,
+                base_url: &self.base_url,
+                net: self.net.clone(),
+                font_context: self.font_context.clone(),
+                font_blobs: &self.font_blobs,
+                options: &options,
+                fixed_heights: &fixed_heights,
+                results: &results,
+                failure: &failure,
+                stop: &stop,
+                next: &next,
+                gate: &gate,
+                probe_index,
+                count,
+            };
+            std::thread::scope(|scope| {
+                for _ in 1..workers {
+                    scope.spawn(|| work.run());
+                }
+                work.run();
+            });
+            // The opening chunk is laid out afterwards, on this thread: its DOM
+            // stays resident for the first page, so laying it out while the
+            // workers are still running would hold it next to theirs.
+            let opening = match opening.take() {
+                Some(active) => active,
+                None => {
+                    let (layout, doc, lines, page_starts) = work.layout(0)?;
+                    self.entries[0] = ChunkEntry {
+                        layout: Some(layout),
+                        stale: false,
+                    };
+                    (doc, lines, page_starts)
+                }
+            };
+            if let Some(error) = failure.into_inner().unwrap() {
+                return Err(error);
+            }
+            for (index, layout) in results.into_inner().unwrap().into_iter().enumerate() {
+                if let Some(layout) = layout {
+                    self.entries[index] = ChunkEntry {
+                        layout: Some(layout),
+                        stale: false,
+                    };
+                }
+            }
+            let (doc, lines, page_starts) = opening;
+            self.rebuild_view();
+            trim_memory();
+            self.install_active(0, doc, lines, page_starts);
+            return Ok(());
+        }
+        for chunk_index in 1..count {
+            if chunk_index == probe_index {
+                continue;
+            }
             let (layout, doc, lines, page_starts) = self.layout_chunk(chunk_index)?;
             self.entries[chunk_index] = ChunkEntry {
                 layout: Some(layout),
@@ -1706,11 +2142,22 @@ impl Document {
             drop(doc);
             drop(lines);
             drop(page_starts);
-            trim_memory();
+            trim_guard.maybe_trim();
         }
+        let (doc, lines, page_starts) = match opening.take() {
+            Some(active) => active,
+            None => {
+                let (layout, doc, lines, page_starts) = self.layout_chunk(0)?;
+                self.entries[0] = ChunkEntry {
+                    layout: Some(layout),
+                    stale: false,
+                };
+                (doc, lines, page_starts)
+            }
+        };
         self.rebuild_view();
         trim_memory();
-        self.ensure_chunk(0)?;
+        self.install_active(0, doc, lines, page_starts);
         Ok(())
     }
 
@@ -1963,6 +2410,8 @@ impl Document {
         &mut self,
         page: usize,
     ) -> Result<(Arc<PageBitmap>, usize, usize)> {
+        let profile = std::env::var_os("CRE_RENDER_PROFILE").is_some();
+        let call_started = std::time::Instant::now();
         // A chunk that has not been laid out since the last settings change only
         // has provisional pages; lay it out before trusting its geometry.
         let page = self.ensure_page_layout(page)?;
@@ -2023,6 +2472,7 @@ impl Document {
                 );
                 (image_arc, paint_count, paint_surface)
             } else {
+                let record_started = std::time::Instant::now();
                 active.doc.set_viewport_scroll(Point {
                     x: 0.0,
                     y: f64::from(start.top),
@@ -2036,9 +2486,17 @@ impl Document {
                     0,
                     0,
                 );
+                if std::env::var_os("CRE_RENDER_PROFILE").is_some() {
+                    eprintln!(
+                        "render profile page {page}: record={:.2}ms commands={}",
+                        record_started.elapsed().as_secs_f64() * 1000.0,
+                        scene.commands.len()
+                    );
+                }
                 let local_top = clip_top * viewport_scale;
                 let local_bottom = clip_bottom * viewport_scale;
-                let (image_arc, paint_count, paint_surface) = paint_page(
+                let paint_started = std::time::Instant::now();
+                let (image_arc, paint_count, paint_surface) = paint_page_cached(
                     &scene,
                     self.width,
                     self.height,
@@ -2049,7 +2507,14 @@ impl Document {
                     local_bottom,
                     self.background_color,
                     self.font_gamma,
+                    &mut self.paint_cache.borrow_mut(),
                 );
+                if std::env::var_os("CRE_RENDER_PROFILE").is_some() {
+                    eprintln!(
+                        "render profile page {page}: paint={:.2}ms",
+                        paint_started.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
                 (image_arc, paint_count, paint_surface)
             }
         };
@@ -2060,6 +2525,12 @@ impl Document {
         };
         let out = (bitmap.clone(), image_count, image_surface);
         self.cache_page_image(page, image);
+        if profile {
+            eprintln!(
+                "  render total page {page}: {:.2}ms",
+                call_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         Ok(out)
     }
 
@@ -2200,6 +2671,25 @@ impl Document {
     fn clear_page_image_cache(&self) {
         self.page_image_cache.borrow_mut().clear();
         self.page_cache_order.borrow_mut().clear();
+    }
+
+    /// Installs an already parsed chunk as the active one, skipping the second
+    /// parse `ensure_chunk` would do.
+    fn install_active(
+        &self,
+        index: usize,
+        doc: HtmlDocument,
+        lines: Vec<LineBox>,
+        page_starts: Vec<PageStart>,
+    ) {
+        let rendered_text_nodes = rendered_text_nodes(&doc, &lines);
+        *self.active.borrow_mut() = Some(ActiveChunk {
+            index,
+            rendered_text_nodes,
+            doc,
+            lines,
+            page_starts,
+        });
     }
 
     fn ensure_chunk(&self, index: usize) -> Result<()> {
@@ -4072,6 +4562,44 @@ fn collect_lines_inner(node: &Node, out: &mut Vec<LineBox>) {
     }
 }
 
+/// Dev-only stage timer for `layout_chunk`, enabled by `CRE_LAYOUT_PROFILE=1`.
+struct StageTimer {
+    enabled: bool,
+    stages: Vec<(&'static str, f64)>,
+    last: std::time::Instant,
+}
+
+impl StageTimer {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var_os("CRE_LAYOUT_PROFILE").is_some(),
+            stages: Vec::new(),
+            last: std::time::Instant::now(),
+        }
+    }
+
+    fn mark(&mut self, stage: &'static str) {
+        if !self.enabled {
+            return;
+        }
+        let now = std::time::Instant::now();
+        self.stages
+            .push((stage, now.duration_since(self.last).as_secs_f64() * 1000.0));
+        self.last = now;
+    }
+
+    fn report(&self, chunk: usize) {
+        if !self.enabled {
+            return;
+        }
+        let mut line = format!("profile chunk {chunk}:");
+        for (stage, ms) in &self.stages {
+            line.push_str(&format!(" {stage}={ms:.1}"));
+        }
+        eprintln!("{line}");
+    }
+}
+
 fn paginate(
     lines: &[LineBox],
     boxes: &[ContentBox],
@@ -4866,7 +5394,10 @@ fn build_font_ctx_with_fallbacks(
     let mut ctx = FontContext {
         source_cache: SourceCache::new_shared(),
         collection: Collection::new(CollectionOptions {
-            shared: false,
+            // A layout clones the context once per chunk; sharing the inner
+            // collection turns that into an Arc bump instead of copying the
+            // registry of every registered face.
+            shared: true,
             system_fonts: false,
         }),
     };
@@ -4933,11 +5464,32 @@ fn column_declaration_regex() -> &'static regex::Regex {
     })
 }
 
+/// ASCII case-insensitive substring search, for quick "can this rule match at
+/// all" checks.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    if needle.is_empty() {
+        return true;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
 fn strip_multi_column_declarations(css: &str) -> String {
+    if !contains_ignore_ascii_case(css, "column") {
+        return css.to_string();
+    }
     column_declaration_regex().replace_all(css, "").into_owned()
 }
 
 fn strip_multi_column_styles(html: &str) -> String {
+    // These regexes run over every chunk's HTML; a chunk without a
+    // `column-*`/`columns` declaration cannot match and is skipped entirely.
+    if !contains_ignore_ascii_case(html, "column") {
+        return html.to_string();
+    }
     static STYLE_BLOCK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static STYLE_ATTR: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let style_block = STYLE_BLOCK.get_or_init(|| {
@@ -4999,6 +5551,8 @@ fn create_document(
     font_datas: &[FontBlob],
     options: &DocumentOptions,
 ) -> HtmlDocument {
+    let profile = std::env::var_os("CRE_LAYOUT_PROFILE").is_some();
+    let started = std::time::Instant::now();
     let config = DocumentConfig {
         viewport: Some(Viewport::new(
             options.width,
@@ -5018,6 +5572,7 @@ fn create_document(
     } else {
         strip_author_styles(html)
     };
+    let preprocessed_at = started.elapsed().as_secs_f64() * 1000.0;
     let base_html = if options.embedded_styles_enabled {
         html
     } else {
@@ -5029,6 +5584,7 @@ fn create_document(
     // the overflowing text in Juliet's home page). Remove the declarations
     // before layout so both engines behave the same.
     let mut html_source = strip_multi_column_styles(base_html);
+    let stripped_at = started.elapsed().as_secs_f64() * 1000.0;
     if html_source.to_ascii_lowercase().contains("<math") {
         // Prefer a loaded font with an OpenType MATH table for math content,
         // the way Chromium's `math { font-family: math }` picks the platform
@@ -5106,11 +5662,26 @@ fn create_document(
     } else {
         html_source
     };
+    let from_html_at = started.elapsed().as_secs_f64() * 1000.0;
     let mut doc = HtmlDocument::from_html(html_source.as_str(), config);
+    let parsed_at = started.elapsed().as_secs_f64() * 1000.0;
     doc.resolve(0.0);
+    let first_resolve_at = started.elapsed().as_secs_f64() * 1000.0;
     for _ in 0..4 {
         doc.handle_messages();
         doc.resolve(0.0);
+    }
+    if profile {
+        eprintln!(
+            "  create_document: preprocess={:.2}ms strip={:.2}ms setup={:.2}ms from_html={:.2}ms \
+             resolve1={:.2}ms loop={:.2}ms",
+            preprocessed_at,
+            stripped_at - preprocessed_at,
+            from_html_at - stripped_at,
+            parsed_at - from_html_at,
+            first_resolve_at - parsed_at,
+            started.elapsed().as_secs_f64() * 1000.0 - first_resolve_at
+        );
     }
     doc
 }

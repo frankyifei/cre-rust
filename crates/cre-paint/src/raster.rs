@@ -18,9 +18,9 @@ use tiny_skia::{
 };
 
 use super::{
-    AnyFill, ImageCache, Scene, draw_fill, draw_fill_shader, draw_glyphs, draw_glyphs_with_brush,
-    draw_image_fill, draw_stroke, draw_sweep_fill, gradient_shader, image_draw_stats, skia_paint,
-    solid_color, to_skia_path,
+    AnyFill, ImageCache, Scene, covers_page, draw_fill, draw_fill_shader, draw_glyphs,
+    draw_glyphs_with_brush, draw_image_fill, draw_stroke, draw_sweep_fill, gradient_shader,
+    image_draw_stats, skia_paint, solid_color, to_skia_path,
 };
 
 struct LayerFrame {
@@ -45,10 +45,13 @@ pub(crate) struct Rasterizer<'a> {
     local_bottom: f32,
     font_gamma: f32,
     base: Pixmap,
+    /// Colour the base pixmap was filled with, so a full-page background fill
+    /// of the same colour can be skipped (it repaints what is already there).
+    base_color: [u8; 4],
     clip: Option<Arc<Mask>>,
     layers: Vec<LayerFrame>,
     faces: std::collections::HashMap<usize, ttf_parser::Face<'a>>,
-    glyph_cache: std::collections::HashMap<super::GlyphKey, super::GlyphBitmap>,
+    glyph_cache: &'a mut super::PaintCache,
     image_cache: ImageCache,
 }
 
@@ -64,13 +67,20 @@ impl<'a> Rasterizer<'a> {
         font_gamma: f32,
         background: u32,
         initial_clip: Option<Mask>,
+        glyph_cache: &'a mut super::PaintCache,
     ) -> (Self, usize, usize) {
-        let mut base = Pixmap::new(width, height).expect("non-zero page bitmap");
-        base.fill(tiny_skia::Color::from_rgba8(
+        let mut base = glyph_cache.take_scratch(width, height);
+        let base_color = [
             ((background >> 16) & 0xff) as u8,
             ((background >> 8) & 0xff) as u8,
             (background & 0xff) as u8,
             0xff,
+        ];
+        base.fill(tiny_skia::Color::from_rgba8(
+            base_color[0],
+            base_color[1],
+            base_color[2],
+            base_color[3],
         ));
         let (image_count, image_surface) = image_draw_stats(
             scene,
@@ -89,10 +99,11 @@ impl<'a> Rasterizer<'a> {
                 local_bottom,
                 font_gamma,
                 base,
+                base_color,
                 clip: initial_clip.map(Arc::new),
                 layers: Vec::new(),
                 faces: std::collections::HashMap::new(),
-                glyph_cache: std::collections::HashMap::new(),
+                glyph_cache,
                 image_cache: ImageCache::default(),
             },
             image_count,
@@ -150,6 +161,22 @@ impl<'a> Rasterizer<'a> {
     fn fill(&mut self, cmd: &anyrender::recording::FillCommand) {
         let transform = self.page_transform * cmd.transform;
         let clip = self.clip.as_deref();
+        if let Paint::Solid(color) = &cmd.brush {
+            let rgba = color.to_rgba8().to_u8_array();
+            // A fully transparent fill paints nothing (the paint tree emits one
+            // for the root block), but tiny-skia still walks every scanline —
+            // and that rect spans the whole chunk.
+            if rgba[3] == 0 {
+                return;
+            }
+            if rgba == self.base_color
+                && self.layers.is_empty()
+                && covers_page(&cmd.shape, transform, self.width, self.height)
+            {
+                // A page background equal to the base colour: already there.
+                return;
+            }
+        }
         let pixmap = pixmap_mut(&mut self.base, &mut self.layers);
         match &cmd.brush {
             Paint::Solid(color) => {
@@ -218,7 +245,7 @@ impl<'a> Rasterizer<'a> {
                 clip,
                 font_gamma,
                 &mut self.faces,
-                &mut self.glyph_cache,
+                self.glyph_cache,
             );
             return;
         }
@@ -237,7 +264,7 @@ impl<'a> Rasterizer<'a> {
             clip,
             font_gamma,
             &mut self.faces,
-            &mut self.glyph_cache,
+            self.glyph_cache,
         );
     }
 
