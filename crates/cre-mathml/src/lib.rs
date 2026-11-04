@@ -648,6 +648,28 @@ fn render_script(node: Node<'_, '_>, ctx: Ctx, kind: ScriptKind) -> String {
     format!("<span class=\"cre-script\">{base}<span class=\"{class}\">{script}</span></span>")
 }
 
+/// True when a script slot holds nothing that paints: `<mrow/>`, `<none/>` and
+/// whitespace-only text are common placeholders in hand-written MathML.
+fn is_empty_math(node: Node<'_, '_>) -> bool {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        for child in current.children() {
+            if child.is_text() {
+                if !child.text().unwrap_or_default().trim().is_empty() {
+                    return false;
+                }
+            } else if child.is_element() {
+                let name = child.tag_name().name().to_ascii_lowercase();
+                if name == "mspace" || name == "mglyph" {
+                    return false;
+                }
+                stack.push(child);
+            }
+        }
+    }
+    true
+}
+
 fn render_scripts(node: Node<'_, '_>, ctx: Ctx) -> String {
     let mut children = element_children(node);
     let Some(base_node) = children.next() else {
@@ -662,14 +684,23 @@ fn render_scripts(node: Node<'_, '_>, ctx: Ctx) -> String {
     let sup = sup_node
         .map(|child| render_node(child, ctx))
         .unwrap_or_default();
+    // `msqrt`-style empty slots are common in hand-written MathML
+    // (`<msubsup><mi>a</mi><mi>k</mi><mrow/></msubsup>` means `a_k`): they must
+    // not take part in the stacked pair, or the remaining script ends up
+    // hanging on the math axis instead of above/below the base.
+    let has_sub = sub_node.is_some_and(|child| !is_empty_math(child));
+    let has_sup = sup_node.is_some_and(|child| !is_empty_math(child));
 
     // Display-style limits on large operators go above and below the operator;
     // integrals keep their limits at the side, like Chrome's MathML rendering.
     if ctx.display && is_large_operator_node(base_node) && !is_integral(&token_text(base_node)) {
         return format!(
-            "<span class=\"cre-limits\"><span class=\"cre-limits-over\">{sup}</span>\
+            "<span class=\"cre-limits\">\
+             <span class=\"cre-limits-over\">{}</span>\
              <span class=\"cre-limits-base\">{base}</span>\
-             <span class=\"cre-limits-under\">{sub}</span></span>"
+             <span class=\"cre-limits-under\">{}</span></span>",
+            if has_sup { sup.as_str() } else { "" },
+            if has_sub { sub.as_str() } else { "" }
         );
     }
 
@@ -682,17 +713,32 @@ fn render_scripts(node: Node<'_, '_>, ctx: Ctx) -> String {
         // `vertical-align: middle`) but spread the two lines apart so the
         // superscript reaches the operator's top and the subscript its foot.
         let line_height = 1.2 * size;
+        let mut lines = String::new();
+        if has_sup {
+            lines.push_str(&format!("<span>{sup}</span>"));
+        }
+        if has_sub {
+            lines.push_str(&format!("<span>{sub}</span>"));
+        }
         return format!(
             "<span class=\"cre-script\">{base}<span class=\"cre-script-stack\" \
-             style=\"margin-left:0.05em;line-height:{line_height:.2}\">\
-             <span>{sup}</span><span>{sub}</span></span></span>"
+             style=\"margin-left:0.05em;line-height:{line_height:.2}\">{lines}</span></span>"
         );
     }
 
-    format!(
-        "<span class=\"cre-script\">{base}<span class=\"cre-script-stack\">\
-         <span>{sup}</span><span>{sub}</span></span></span>"
-    )
+    match (has_sup, has_sub) {
+        (true, true) => format!(
+            "<span class=\"cre-script\">{base}<span class=\"cre-script-stack\">\
+             <span>{sup}</span><span>{sub}</span></span></span>"
+        ),
+        (true, false) => {
+            format!("<span class=\"cre-script\">{base}<span class=\"cre-sup\">{sup}</span></span>")
+        }
+        (false, true) => {
+            format!("<span class=\"cre-script\">{base}<span class=\"cre-sub\">{sub}</span></span>")
+        }
+        (false, false) => format!("<span class=\"cre-script\">{base}</span>"),
+    }
 }
 
 /// Vertical scale that makes a fence's ink cover `content` em.
@@ -1550,6 +1596,27 @@ mod tests {
             .and_then(|value| value.parse::<f32>().ok())
             .expect("bar height");
         assert!(height >= 4.5, "bar height {height} in {matrix}");
+    }
+
+    #[test]
+    fn empty_script_slots_do_not_shift_the_other_script() {
+        // `<msubsup><mi>a</mi><mi>k</mi><mrow/></msubsup>` is `a_k`: the empty
+        // superscript must not make the subscript hang on the axis.
+        let sub =
+            rewrite_mathml(r#"<math><msubsup><mi>a</mi><mi>k</mi><mrow></mrow></msubsup></math>"#);
+        assert!(sub.contains("cre-sub"), "{sub}");
+        assert!(!sub.contains("cre-script-stack"), "{sub}");
+
+        // ...and `<mrow/><mn>2</mn>` leaves a superscript.
+        let sup =
+            rewrite_mathml(r#"<math><msubsup><mi>x</mi><mrow></mrow><mn>2</mn></msubsup></math>"#);
+        assert!(sup.contains("cre-sup"), "{sup}");
+        assert!(!sup.contains("cre-script-stack"), "{sup}");
+
+        // Both present keeps the stacked pair.
+        let both =
+            rewrite_mathml(r#"<math><msubsup><mi>x</mi><mi>i</mi><mn>2</mn></msubsup></math>"#);
+        assert!(both.contains("cre-script-stack"), "{both}");
     }
 
     #[test]
