@@ -588,8 +588,8 @@ fn render_mo(node: Node<'_, '_>, ctx: Ctx, stretch: f32, unary: bool) -> String 
         // Fence height follows the enclosed content; the MATH
         // `delimited_sub_formula_min_height` constant is about spacing, not
         // about forcing an unscaled fence taller.
-        let content = stretch.clamp(1.0, 4.5);
-        if content > 1.05 {
+        let content = stretch.clamp(1.0, 12.0);
+        if content > 1.25 {
             let scale = fence_scale(&text, content, ctx.metrics);
             return format!(
                 "<span class=\"cre-mo cre-fence\" \
@@ -866,9 +866,9 @@ fn render_fenced(node: Node<'_, '_>, ctx: Ctx) -> String {
         .iter()
         .map(|child| estimate_height(*child, ctx.display))
         .fold(1.0_f32, f32::max);
-    let content = height.clamp(1.0, 4.5);
+    let content = height.clamp(1.0, 12.0);
     let fence_style = |text: &str| -> String {
-        if content <= 1.05 || text.is_empty() {
+        if content <= 1.25 || text.is_empty() {
             return String::new();
         }
         let scale = fence_scale(text, content, ctx.metrics);
@@ -1110,6 +1110,10 @@ fn estimate_height(node: Node<'_, '_>, display: bool) -> f32 {
     }
     let name = node.tag_name().name().to_ascii_lowercase();
     let children: Vec<Node> = element_children(node).collect();
+    // `render_mo` enlarges a large operator, so it is taller than a token.
+    if name == "mo" && is_large_operator(&token_text(node)) {
+        return if display { 1.5 } else { 1.2 };
+    }
     let max_child = |children: &[Node]| {
         children
             .iter()
@@ -1183,7 +1187,7 @@ fn estimate_height(node: Node<'_, '_>, display: bool) -> f32 {
             let mut total = 0.0;
             for row in &children {
                 let cells: Vec<Node> = element_children(*row).collect();
-                total += max_child(&cells) * 1.2 + 0.3;
+                total += max_child(&cells) + 0.4;
             }
             total.max(1.0)
         }
@@ -1546,6 +1550,17 @@ mod tests {
             .and_then(|value| value.parse::<f32>().ok())
             .expect("bar height");
         assert!(height >= 4.5, "bar height {height} in {matrix}");
+    }
+
+    #[test]
+    fn short_fences_stay_on_the_baseline() {
+        // `(v_j - v_i)` next to a tall `∏`: a token-high fence must not be
+        // stretched (and pinned to the line top), or it drifts away from the
+        // expression it belongs to.
+        let out = rewrite_mathml(
+            r#"<math><mrow><munder><mo>∏</mo><mrow><mi>i</mi></mrow></munder><mo>(</mo><msub><mi>v</mi><mi>j</mi></msub><mo>)</mo></mrow></math>"#,
+        );
+        assert!(!out.contains("scaleY("), "{out}");
     }
 
     #[test]
