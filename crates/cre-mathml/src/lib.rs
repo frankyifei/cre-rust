@@ -458,7 +458,7 @@ fn render_row(node: Node<'_, '_>, ctx: Ctx) -> String {
     let children: Vec<Node> = element_children(node).collect();
     let heights: Vec<f32> = children
         .iter()
-        .map(|child| estimate_height(*child))
+        .map(|child| estimate_height(*child, ctx.display))
         .collect();
     let mut out = String::from("<span class=\"cre-mrow\">");
     let mut operator_context = true;
@@ -594,7 +594,7 @@ fn render_mo(node: Node<'_, '_>, ctx: Ctx, stretch: f32, unary: bool) -> String 
             return format!(
                 "<span class=\"cre-mo cre-fence\" \
                  style=\"height:{content:.3}em;line-height:{content:.3}em;\
-                 transform:scaleY({scale:.3})\">{}</span>",
+                 vertical-align:top;transform:scaleY({scale:.3})\">{}</span>",
                 escape_html(&text)
             );
         }
@@ -775,7 +775,7 @@ fn render_fraction(node: Node<'_, '_>, ctx: Ctx) -> String {
 
 fn render_sqrt(node: Node<'_, '_>, ctx: Ctx) -> String {
     let body = render_children(node, ctx);
-    let height = estimate_height(node);
+    let height = estimate_height(node, ctx.display);
     let (width, surd) = surd_markup(height);
     format!(
         "<span class=\"cre-msqrt\" style=\"padding-left:{width:.3}em\">{surd}\
@@ -844,7 +844,7 @@ fn render_root(node: Node<'_, '_>, ctx: Ctx) -> String {
         .next()
         .map(|child| render_node(child, ctx))
         .unwrap_or_default();
-    let height = estimate_height(node);
+    let height = estimate_height(node, ctx.display);
     let (width, surd) = surd_markup(height);
     format!(
         "<span class=\"cre-msqrt cre-mroot\" style=\"padding-left:{width:.3}em\">{surd}\
@@ -864,7 +864,7 @@ fn render_fenced(node: Node<'_, '_>, ctx: Ctx) -> String {
     let children: Vec<Node> = element_children(node).collect();
     let height = children
         .iter()
-        .map(|child| estimate_height(*child))
+        .map(|child| estimate_height(*child, ctx.display))
         .fold(1.0_f32, f32::max);
     let content = height.clamp(1.0, 4.5);
     let fence_style = |text: &str| -> String {
@@ -874,7 +874,7 @@ fn render_fenced(node: Node<'_, '_>, ctx: Ctx) -> String {
         let scale = fence_scale(text, content, ctx.metrics);
         format!(
             " style=\"height:{content:.3}em;line-height:{content:.3}em;\
-             transform:scaleY({scale:.3})\""
+             vertical-align:top;transform:scaleY({scale:.3})\""
         )
     };
     let open_style = fence_style(open);
@@ -994,7 +994,7 @@ fn render_menclose(node: Node<'_, '_>, ctx: Ctx) -> String {
         .split_whitespace()
         .any(|token| matches!(token, "box" | "roundedbox" | "circle"));
     let width = estimate_width(node) + if boxed { 0.24 } else { 0.0 };
-    let height = estimate_height(node) + if boxed { 0.16 } else { 0.0 };
+    let height = estimate_height(node, ctx.display) + if boxed { 0.16 } else { 0.0 };
     let has_up = notation.split_whitespace().any(|t| t == "updiagonalstrike");
     let has_down = notation
         .split_whitespace()
@@ -1101,7 +1101,7 @@ fn render_style(node: Node<'_, '_>, ctx: Ctx) -> String {
 /// Rough content height in `em`, used to stretch fences and radicals. It only
 /// needs to be close enough: Chrome/crengine use real font metrics, but the
 /// heights here differ by a fraction of an em.
-fn estimate_height(node: Node<'_, '_>) -> f32 {
+fn estimate_height(node: Node<'_, '_>, display: bool) -> f32 {
     if node.is_text() {
         return 1.0;
     }
@@ -1113,7 +1113,7 @@ fn estimate_height(node: Node<'_, '_>) -> f32 {
     let max_child = |children: &[Node]| {
         children
             .iter()
-            .map(|child| estimate_height(*child))
+            .map(|child| estimate_height(*child, display))
             .fold(1.0_f32, f32::max)
     };
     match name.as_str() {
@@ -1121,24 +1121,57 @@ fn estimate_height(node: Node<'_, '_>) -> f32 {
             max_child(&children)
         }
         "mfrac" => {
-            let numerator = children.first().map(|c| estimate_height(*c)).unwrap_or(1.0);
-            let denominator = children.get(1).map(|c| estimate_height(*c)).unwrap_or(1.0);
+            let numerator = children
+                .first()
+                .map(|c| estimate_height(*c, display))
+                .unwrap_or(1.0);
+            let denominator = children
+                .get(1)
+                .map(|c| estimate_height(*c, display))
+                .unwrap_or(1.0);
             // A stacked fraction adds the rule and the gaps around it, but its
             // two lines overlap for the part that straddles the baseline, so
             // adding both heights overestimates tall nests badly.
             (numerator.max(denominator) + 0.9).max(1.7)
         }
         "msup" | "msub" => {
-            let base = children.first().map(|c| estimate_height(*c)).unwrap_or(1.0);
-            let script = children.get(1).map(|c| estimate_height(*c)).unwrap_or(1.0);
+            let base = children
+                .first()
+                .map(|c| estimate_height(*c, display))
+                .unwrap_or(1.0);
+            let script = children
+                .get(1)
+                .map(|c| estimate_height(*c, display))
+                .unwrap_or(1.0);
             base.max(script * 0.7 + 0.55)
         }
-        "msubsup" | "munderover" => {
-            let base = children.first().map(|c| estimate_height(*c)).unwrap_or(1.0);
-            base.max(1.2)
+        "msubsup" => {
+            let base_node = children.first();
+            let base = base_node
+                .map(|c| estimate_height(*c, display))
+                .unwrap_or(1.0);
+            // Display style stacks the limits of a large operator above and
+            // below it (see `render_scripts`); otherwise the scripts sit at the
+            // side and only stick out a little.
+            let stacked = display
+                && base_node.is_some_and(|node| {
+                    is_large_operator_node(*node) && !is_integral(&token_text(*node))
+                });
+            if stacked { base + 1.1 } else { base.max(1.2) }
+        }
+        "munderover" => {
+            // `render_limits` always stacks the two scripts.
+            let base = children
+                .first()
+                .map(|c| estimate_height(*c, display))
+                .unwrap_or(1.0);
+            base + 1.1
         }
         "munder" | "mover" => {
-            let base = children.first().map(|c| estimate_height(*c)).unwrap_or(1.0);
+            let base = children
+                .first()
+                .map(|c| estimate_height(*c, display))
+                .unwrap_or(1.0);
             base + 0.55
         }
         "msqrt" | "mroot" => max_child(&children) + 0.05,
@@ -1150,7 +1183,7 @@ fn estimate_height(node: Node<'_, '_>) -> f32 {
             let mut total = 0.0;
             for row in &children {
                 let cells: Vec<Node> = element_children(*row).collect();
-                total += max_child(&cells) * 1.15 + 0.24;
+                total += max_child(&cells) * 1.2 + 0.3;
             }
             total.max(1.0)
         }
@@ -1485,6 +1518,34 @@ mod tests {
         // own ink height.
         assert!(out.contains("height:"), "{out}");
         assert!(out.contains("line-height:"), "{out}");
+    }
+
+    #[test]
+    fn fences_cover_stacked_limits_and_table_rows() {
+        // `(∑_{k=1}^{n} ...)`: the fence has to span the limits above and below
+        // the operator, not just the operator's own line.
+        let limits = rewrite_mathml(
+            r#"<math display="block"><mrow><mo>(</mo><munderover><mo>∑</mo><mrow><mi>k</mi><mo>=</mo><mn>1</mn></mrow><mi>n</mi></munderover><mi>a</mi><mo>)</mo></mrow></math>"#,
+        );
+        let height = limits
+            .split("height:")
+            .nth(1)
+            .and_then(|rest| rest.split("em").next())
+            .and_then(|value| value.parse::<f32>().ok())
+            .expect("fence height");
+        assert!(height >= 2.0, "fence height {height} in {limits}");
+
+        // A four-row determinant needs bars tall enough for every row.
+        let matrix = rewrite_mathml(
+            r#"<math><mrow><mo>|</mo><mtable><mtr><mtd><mn>1</mn></mtd></mtr><mtr><mtd><mn>2</mn></mtd></mtr><mtr><mtd><mn>3</mn></mtd></mtr><mtr><mtd><mn>4</mn></mtd></mtr></mtable><mo>|</mo></mrow></math>"#,
+        );
+        let height = matrix
+            .split("height:")
+            .nth(1)
+            .and_then(|rest| rest.split("em").next())
+            .and_then(|value| value.parse::<f32>().ok())
+            .expect("bar height");
+        assert!(height >= 4.5, "bar height {height} in {matrix}");
     }
 
     #[test]
