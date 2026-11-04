@@ -359,6 +359,7 @@ fn rewrite_fragment(fragment: &str, metrics: MathMetrics) -> Option<String> {
         Ctx {
             display: false,
             metrics,
+            script_level: 0,
         },
     ))
 }
@@ -369,6 +370,20 @@ fn rewrite_fragment(fragment: &str, metrics: MathMetrics) -> Option<String> {
 struct Ctx {
     display: bool,
     metrics: MathMetrics,
+    /// How deep inside scripts this subtree sits, so `mstyle scriptlevel` can
+    /// size its content relative to it instead of double-shrinking it.
+    script_level: u8,
+}
+
+impl Ctx {
+    /// The context for content inside a script, which the stylesheet already
+    /// draws one level down.
+    fn script(self) -> Self {
+        Self {
+            script_level: (self.script_level + 1).min(3),
+            ..self
+        }
+    }
 }
 
 fn render_node(node: Node<'_, '_>, ctx: Ctx) -> String {
@@ -382,10 +397,7 @@ fn render_node(node: Node<'_, '_>, ctx: Ctx) -> String {
     match name.as_str() {
         "math" => {
             let display = node.attribute("display").unwrap_or("inline") == "block";
-            let ctx = Ctx {
-                display,
-                metrics: ctx.metrics,
-            };
+            let ctx = Ctx { display, ..ctx };
             format!(
                 "<span class=\"cre-math\" data-display=\"{}\">{}</span>",
                 if display { "block" } else { "inline" },
@@ -437,6 +449,22 @@ fn render_node(node: Node<'_, '_>, ctx: Ctx) -> String {
             "<span class=\"cre-mphantom\">{}</span>",
             render_children(node, ctx)
         ),
+        // MathML renders the selected child only (default: the first). The
+        // others are tooltips/toggle alternatives, and drawing them would put
+        // their text inline in the formula.
+        "maction" => {
+            let selection = node
+                .attribute("selection")
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(1)
+                .max(1);
+            node.children()
+                .filter(|child| child.is_element())
+                .nth(selection - 1)
+                .or_else(|| node.children().find(|child| child.is_element()))
+                .map(|child| render_node(child, ctx))
+                .unwrap_or_default()
+        }
         "menclose" => render_menclose(node, ctx),
         "mmultiscripts" => render_multiscripts(node, ctx),
         _ => render_children(node, ctx),
@@ -623,7 +651,7 @@ fn render_script(node: Node<'_, '_>, ctx: Ctx, kind: ScriptKind) -> String {
     let script_node = children.next();
     let base = render_node(base_node, ctx);
     let script = script_node
-        .map(|child| render_node(child, ctx))
+        .map(|child| render_node(child, ctx.script()))
         .unwrap_or_default();
     let class = match kind {
         ScriptKind::Sup => "cre-sup",
@@ -787,10 +815,10 @@ fn render_scripts(node: Node<'_, '_>, ctx: Ctx) -> String {
     let sup_node = children.next();
     let base = render_node(base_node, ctx);
     let sub = sub_node
-        .map(|child| render_node(child, ctx))
+        .map(|child| render_node(child, ctx.script()))
         .unwrap_or_default();
     let sup = sup_node
-        .map(|child| render_node(child, ctx))
+        .map(|child| render_node(child, ctx.script()))
         .unwrap_or_default();
     // `msqrt`-style empty slots are common in hand-written MathML
     // (`<msubsup><mi>a</mi><mi>k</mi><mrow/></msubsup>` means `a_k`): they must
@@ -865,13 +893,13 @@ fn render_limits(node: Node<'_, '_>, ctx: Ctx, over: bool, under: bool) -> Strin
     if under {
         under_html = children
             .next()
-            .map(|child| render_node(child, ctx))
+            .map(|child| render_node(child, ctx.script()))
             .unwrap_or_default();
     }
     if over {
         over_html = children
             .next()
-            .map(|child| render_node(child, ctx))
+            .map(|child| render_node(child, ctx.script()))
             .unwrap_or_default();
     }
     // Outside display style a `movablelimits` operator moves its limits back to
@@ -1213,6 +1241,31 @@ fn render_multiscripts(node: Node<'_, '_>, ctx: Ctx) -> String {
 }
 
 fn render_style(node: Node<'_, '_>, ctx: Ctx) -> String {
+    // `displaystyle` decides whether limits stack (see `movable_limits`); a
+    // test-suite formula keeps its `∑` inline unless this is honoured.
+    let display = match node.attribute("displaystyle").map(str::trim) {
+        Some("true") => true,
+        Some("false") => false,
+        _ => ctx.display,
+    };
+    // `scriptlevel` is absolute ("1") or relative ("+1"), and sizes its content
+    // relative to the level it already sits at.
+    let mut level = ctx.script_level;
+    let mut level_delta = 0i32;
+    if let Some(value) = node.attribute("scriptlevel").map(str::trim) {
+        let relative = value.starts_with('+') || value.starts_with('-');
+        if let Ok(parsed) = value.parse::<i32>() {
+            let target = if relative {
+                i32::from(level) + parsed
+            } else {
+                parsed
+            }
+            .clamp(0, 3);
+            level_delta = target - i32::from(level);
+            level = u8::try_from(target).unwrap_or(level);
+        }
+    }
+
     let mut style = String::new();
     for (attribute, property) in [
         ("mathcolor", "color"),
@@ -1228,6 +1281,19 @@ fn render_style(node: Node<'_, '_>, ctx: Ctx) -> String {
             style.push_str(value);
         }
     }
+    if level_delta != 0 && !style.contains("font-size") {
+        let scale = ctx.metrics.script_scale.powi(level_delta);
+        if !style.is_empty() {
+            style.push(';');
+        }
+        style.push_str(&format!("font-size:{scale:.3}em"));
+    }
+
+    let ctx = Ctx {
+        display,
+        script_level: level,
+        ..ctx
+    };
     if style.is_empty() {
         format!(
             "<span class=\"cre-mstyle\">{}</span>",
@@ -1694,6 +1760,42 @@ mod tests {
             .and_then(|value| value.parse::<f32>().ok())
             .expect("bar height");
         assert!(height >= 4.5, "bar height {height} in {matrix}");
+    }
+
+    #[test]
+    fn mstyle_displaystyle_and_scriptlevel_apply() {
+        // The W3C test suite raises the display style per formula with
+        // `<mstyle displaystyle="true">`; without honouring it every `∑` kept
+        // side scripts.
+        let stacked = rewrite_mathml(
+            r#"<math><mstyle displaystyle="true"><msubsup><mo>∑</mo><mi>i</mi><mi>n</mi></msubsup></mstyle></math>"#,
+        );
+        assert!(stacked.contains("cre-limits"), "{stacked}");
+        let side = rewrite_mathml(
+            r#"<math display="block"><mstyle displaystyle="false"><msubsup><mo>∑</mo><mi>i</mi><mi>n</mi></msubsup></mstyle></math>"#,
+        );
+        assert!(!side.contains("cre-limits"), "{side}");
+
+        // `scriptlevel` sizes its content relative to the level it sits at.
+        let small = rewrite_mathml(r#"<math><mstyle scriptlevel="1"><mi>x</mi></mstyle></math>"#);
+        assert!(small.contains("font-size:0.700em"), "{small}");
+        let same = rewrite_mathml(r#"<math><mstyle scriptlevel="0"><mi>x</mi></mstyle></math>"#);
+        assert!(!same.contains("font-size"), "{same}");
+    }
+
+    #[test]
+    fn maction_renders_only_the_selected_child() {
+        // The W3C test suite puts tooltip text in a second `maction` child;
+        // drawing it would spill prose into the formula.
+        let out = rewrite_mathml(
+            r#"<math><maction actiontype="statusline"><mi>P</mi><mtext>Probability of event E</mtext></maction></math>"#,
+        );
+        assert!(out.contains("cre-mi"), "{out}");
+        assert!(!out.contains("Probability"), "{out}");
+        let second =
+            rewrite_mathml(r#"<math><maction selection="2"><mi>a</mi><mi>b</mi></maction></math>"#);
+        assert!(second.contains(">b<"), "{second}");
+        assert!(!second.contains(">a<"), "{second}");
     }
 
     #[test]
