@@ -52,7 +52,10 @@ pub const CSS: &str = r#"
    the surd is two thin strokes, so the sign keeps its stroke weight at any
    height and always meets the bar. A stretched `√` glyph cannot do either
    (scaling thickens its strokes and its ink does not line up with the bar). */
-.cre-msqrt { display: inline-block; position: relative; vertical-align: middle; white-space: nowrap; border-top: 1px solid currentColor; padding: 0.12em 0.12em 0 0; }
+.cre-msqrt { display: inline-block; position: relative; vertical-align: middle; white-space: nowrap; padding: 0.12em 0 0 0; }
+/* The overbar starts where the drawn surd's tip ends, not at the wrapper's
+   left edge (which is the radical's own width). */
+.cre-vinculum { position: absolute; top: 0; height: 0; border-top: 1px solid currentColor; }
 .cre-surd { position: absolute; left: 0; top: 0; width: 0.62em; }
 .cre-surd-stroke { position: absolute; background: currentColor; }
 .cre-msqrt-body { display: inline-block; }
@@ -262,7 +265,7 @@ pub fn css(font: Option<&MathFont>) -> String {
          .cre-sub {{ vertical-align: -{:.3}em; }}\n\
          .cre-sup, .cre-sub, .cre-script-stack {{ font-size: {:.3}em; }}\n\
          .cre-mfrac-num {{ border-bottom-width: {:.3}em; }}\n\
-         .cre-msqrt {{ border-top-width: {:.3}em; }}\n",
+         .cre-vinculum {{ border-top-width: {:.3}em; }}\n",
         metrics.sup_shift_up,
         metrics.sub_shift_down,
         metrics.script_scale,
@@ -951,6 +954,7 @@ fn render_sqrt(node: Node<'_, '_>, ctx: Ctx) -> String {
     let (width, surd) = surd_markup(height);
     format!(
         "<span class=\"cre-msqrt\" style=\"padding-left:{width:.3}em\">{surd}\
+         <span class=\"cre-vinculum\" style=\"left:{width:.3}em;right:0\"></span>\
          <span class=\"cre-msqrt-body\">{body}</span></span>"
     )
 }
@@ -1020,6 +1024,7 @@ fn render_root(node: Node<'_, '_>, ctx: Ctx) -> String {
     let (width, surd) = surd_markup(height);
     format!(
         "<span class=\"cre-msqrt cre-mroot\" style=\"padding-left:{width:.3}em\">{surd}\
+         <span class=\"cre-vinculum\" style=\"left:{width:.3}em;right:0\"></span>\
          <span class=\"cre-mroot-index\">{index}</span>\
          <span class=\"cre-msqrt-body\">{base}</span></span>"
     )
@@ -1885,6 +1890,26 @@ mod tests {
             r#"<math><mrow><munder><mo>∏</mo><mrow><mi>i</mi></mrow></munder><mo>(</mo><msub><mi>v</mi><mi>j</mi></msub><mo>)</mo></mrow></math>"#,
         );
         assert!(!out.contains("scaleY("), "{out}");
+    }
+
+    #[test]
+    fn vinculum_starts_at_the_surd_tip() {
+        // The overbar is its own element anchored at the drawn surd's right
+        // edge, so it cannot stick out to the left of the diagonal.
+        let out = rewrite_mathml(r#"<math><msqrt><mi>x</mi></msqrt></math>"#);
+        assert!(out.contains("cre-vinculum"), "{out}");
+        let style = out
+            .split("cre-vinculum")
+            .nth(1)
+            .and_then(|rest| rest.split("style=\"").nth(1))
+            .and_then(|rest| rest.split('"').next())
+            .expect("vinculum style");
+        assert!(style.contains("left:"), "{style}");
+        assert!(style.contains("right:0"), "{style}");
+        assert!(
+            !out.contains("border-top:1px solid currentColor; padding:0.12em"),
+            "{out}"
+        );
     }
 
     #[test]
