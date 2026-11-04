@@ -72,6 +72,96 @@ pub const CSS: &str = r#"
 .cre-mspace { display: inline-block; }
 "#;
 
+/// A math-capable font found among the reader's loaded fonts.
+///
+/// Chromium's MathML stylesheet sets `font-family: math`, which resolves to the
+/// platform math font (Cambria Math on Windows). There is no `math` generic
+/// family in Blitz, so `cre-lib` finds a loaded font with an OpenType MATH table
+/// (KOReader ships FreeSerif, which has one) and this type carries its family
+/// name plus the metrics used by the generated CSS.
+#[derive(Clone, Debug)]
+pub struct MathFont {
+    /// Family name to put in front of the math font stack.
+    pub family: String,
+    /// Typographic constants read from the same face.
+    pub metrics: MathMetrics,
+}
+
+impl MathFont {
+    /// Finds the first font with an OpenType MATH table.
+    pub fn from_font_datas<'a>(datas: impl IntoIterator<Item = &'a [u8]>) -> Option<Self> {
+        for data in datas {
+            let face_count = ttf_parser::fonts_in_collection(data).unwrap_or(1);
+            for index in 0..face_count {
+                let Ok(face) = ttf_parser::Face::parse(data, index) else {
+                    continue;
+                };
+                if face.tables().math.is_none() {
+                    continue;
+                }
+                let Some(family) = font_family_name(&face) else {
+                    continue;
+                };
+                if let Some(metrics) = metrics_for_face(&face) {
+                    return Some(Self { family, metrics });
+                }
+            }
+        }
+        None
+    }
+}
+
+fn font_family_name(face: &ttf_parser::Face<'_>) -> Option<String> {
+    let names = face.names();
+    let unicode_name = |name_id: u16| {
+        names
+            .into_iter()
+            .find(|name| name.name_id == name_id && name.is_unicode())
+            .and_then(|name| name.to_string())
+    };
+    unicode_name(ttf_parser::name_id::TYPOGRAPHIC_FAMILY)
+        .or_else(|| unicode_name(ttf_parser::name_id::FAMILY))
+}
+
+fn metrics_for_face(face: &ttf_parser::Face<'_>) -> Option<MathMetrics> {
+    let units_per_em = f32::from(face.units_per_em());
+    if units_per_em <= 0.0 {
+        return None;
+    }
+    let constants = face.tables().math?.constants?;
+    let em = |value: i16| value as f32 / units_per_em;
+    let script_scale = f32::from(constants.script_percent_scale_down()) / 100.0;
+    let mut metrics = MathMetrics::default();
+    let sup = em(constants.superscript_shift_up().value);
+    if sup > 0.0 {
+        metrics.sup_shift_up = sup;
+    }
+    let sub = em(constants.subscript_shift_down().value);
+    if sub > 0.0 {
+        metrics.sub_shift_down = sub;
+    }
+    if (0.5..0.9).contains(&script_scale) {
+        metrics.script_scale = script_scale;
+    }
+    let rule = em(constants.fraction_rule_thickness().value);
+    if rule > 0.0 {
+        metrics.fraction_rule = rule;
+    }
+    let radical_rule = em(constants.radical_rule_thickness().value);
+    if radical_rule > 0.0 {
+        metrics.radical_rule = radical_rule;
+    }
+    let min_height = f32::from(constants.delimited_sub_formula_min_height()) / units_per_em;
+    if min_height >= 0.5 {
+        metrics.delimited_min_height = min_height;
+    }
+    let axis = em(constants.axis_height().value);
+    if axis > 0.0 {
+        metrics.axis_height = axis;
+    }
+    Some(metrics)
+}
+
 /// Typographic constants, in `em`, read from the font's OpenType MATH table.
 ///
 /// Falls back to the values crengine and Chrome's default math layout use when
@@ -117,52 +207,27 @@ impl MathMetrics {
     /// Reads the MATH constants from one font file.
     pub fn from_font_data(data: &[u8]) -> Option<Self> {
         let face = ttf_parser::Face::parse(data, 0).ok()?;
-        let units_per_em = f32::from(face.units_per_em());
-        if units_per_em <= 0.0 {
-            return None;
-        }
-        let constants = face.tables().math?.constants?;
-        let em = |value: i16| value as f32 / units_per_em;
-        let script_scale = f32::from(constants.script_percent_scale_down()) / 100.0;
-        let mut metrics = Self::default();
-        let sup = em(constants.superscript_shift_up().value);
-        if sup > 0.0 {
-            metrics.sup_shift_up = sup;
-        }
-        let sub = em(constants.subscript_shift_down().value);
-        if sub > 0.0 {
-            metrics.sub_shift_down = sub;
-        }
-        if (0.5..0.9).contains(&script_scale) {
-            metrics.script_scale = script_scale;
-        }
-        let rule = em(constants.fraction_rule_thickness().value);
-        if rule > 0.0 {
-            metrics.fraction_rule = rule;
-        }
-        let radical_rule = em(constants.radical_rule_thickness().value);
-        if radical_rule > 0.0 {
-            metrics.radical_rule = radical_rule;
-        }
-        let min_height = f32::from(constants.delimited_sub_formula_min_height()) / units_per_em;
-        if min_height >= 0.5 {
-            metrics.delimited_min_height = min_height;
-        }
-        let axis = em(constants.axis_height().value);
-        if axis > 0.0 {
-            metrics.axis_height = axis;
-        }
-        Some(metrics)
+        metrics_for_face(&face)
     }
 }
 
-/// The math stylesheet. `metrics` refines script shifts, rule thickness and the
-/// minimum fence height; pass `None` to use the built-in defaults.
-pub fn css(metrics: Option<MathMetrics>) -> String {
-    let metrics = metrics.unwrap_or_default();
+/// The math stylesheet. `font` supplies the math family and, through it, the
+/// script shifts and rule thickness; pass `None` to keep the built-in defaults.
+pub fn css(font: Option<&MathFont>) -> String {
+    let metrics = font.map(|font| font.metrics).unwrap_or_default();
     let mut out = String::from(CSS);
+    if let Some(font) = font {
+        out.push_str(&format!(
+            "\n.cre-math {{ font-family: \"{}\", serif; }}\n",
+            css_string(&font.family)
+        ));
+    }
     out.push_str(&format!(
-        "\n.cre-sup {{ vertical-align: {:.3}em; }}\n         .cre-sub {{ vertical-align: -{:.3}em; }}\n         .cre-sup, .cre-sub, .cre-script-stack {{ font-size: {:.3}em; }}\n         .cre-mfrac-num {{ border-bottom-width: {:.3}em; }}\n         .cre-msqrt-body {{ border-top-width: {:.3}em; }}\n",
+        "\n.cre-sup {{ vertical-align: {:.3}em; }}\n\
+         .cre-sub {{ vertical-align: -{:.3}em; }}\n\
+         .cre-sup, .cre-sub, .cre-script-stack {{ font-size: {:.3}em; }}\n\
+         .cre-mfrac-num {{ border-bottom-width: {:.3}em; }}\n\
+         .cre-msqrt-body {{ border-top-width: {:.3}em; }}\n",
         metrics.sup_shift_up,
         metrics.sub_shift_down,
         metrics.script_scale,
@@ -172,16 +237,20 @@ pub fn css(metrics: Option<MathMetrics>) -> String {
     out
 }
 
+fn css_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// Rewrite every `<math>...</math>` subtree in an HTML document into ordinary
 /// HTML elements. If a fragment cannot be parsed as XML it is left untouched.
 pub fn rewrite_mathml(html: &str) -> String {
     rewrite_mathml_with(html, None)
 }
 
-/// Like [`rewrite_mathml`], but uses font metrics for script placement and
-/// fence sizing.
-pub fn rewrite_mathml_with(html: &str, metrics: Option<MathMetrics>) -> String {
-    let metrics = metrics.unwrap_or_default();
+/// Like [`rewrite_mathml`], but uses the math font's metrics for script
+/// placement and fence sizing.
+pub fn rewrite_mathml_with(html: &str, font: Option<&MathFont>) -> String {
+    let metrics = font.map(|font| font.metrics).unwrap_or_default();
     let lower = html.to_ascii_lowercase();
     let mut out = String::with_capacity(html.len());
     let mut cursor = 0usize;
@@ -1181,15 +1250,19 @@ mod tests {
 
     #[test]
     fn metrics_override_script_size_and_rules() {
-        let metrics = MathMetrics {
-            script_scale: 0.8,
-            fraction_rule: 0.04,
-            sup_shift_up: 0.6,
-            ..MathMetrics::default()
+        let font = MathFont {
+            family: "Test Math".to_string(),
+            metrics: MathMetrics {
+                script_scale: 0.8,
+                fraction_rule: 0.04,
+                sup_shift_up: 0.6,
+                ..MathMetrics::default()
+            },
         };
-        let css = css(Some(metrics));
+        let css = css(Some(&font));
         assert!(css.contains("font-size: 0.800em"), "{css}");
         assert!(css.contains("vertical-align: 0.600em"), "{css}");
         assert!(css.contains("border-bottom-width: 0.040em"), "{css}");
+        assert!(css.contains("font-family: \"Test Math\", serif"), "{css}");
     }
 }

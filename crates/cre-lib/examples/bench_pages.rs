@@ -44,12 +44,24 @@ fn main() {
         .ok()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf"));
+    let font_family = std::env::var("FONT_FAMILY").ok();
+    let fallback_font_paths = std::env::var("FALLBACK_FONTS")
+        .map(|value| {
+            value
+                .split(':')
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let options = DocumentOptions {
         width,
         height,
         font_size,
         page_margin: 10.0,
         font_path: Some(font_path),
+        font_family,
+        fallback_font_paths,
         viewport_scale: scale,
         ..Default::default()
     };

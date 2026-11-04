@@ -5008,14 +5008,16 @@ fn create_document(
     // before layout so both engines behave the same.
     let mut html_source = strip_multi_column_styles(base_html);
     if html_source.to_ascii_lowercase().contains("<math") {
-        // Script size, rule thickness and baseline shifts come from the
-        // reader font's OpenType MATH table when it has one.
-        let metrics = cre_mathml::MathMetrics::from_font_datas(
+        // Prefer a loaded font with an OpenType MATH table for math content,
+        // the way Chromium's `math { font-family: math }` picks the platform
+        // math font. KOReader ships FreeSerif (which has a MATH table) in its
+        // fallback list; without one the reader font stays in use.
+        let math_font = cre_mathml::MathFont::from_font_datas(
             font_datas.iter().map(|blob| blob.as_ref().as_ref()),
         );
-        html_source = cre_mathml::rewrite_mathml_with(&html_source, metrics);
+        html_source = cre_mathml::rewrite_mathml_with(&html_source, math_font.as_ref());
         html_source.push_str("<style>");
-        html_source.push_str(&cre_mathml::css(metrics));
+        html_source.push_str(&cre_mathml::css(math_font.as_ref()));
         html_source.push_str("</style>");
     }
     if let Some(stylesheet) = options
