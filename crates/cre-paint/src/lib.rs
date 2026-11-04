@@ -1777,13 +1777,6 @@ fn downscale_premultiplied(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Ve
     // Destination source ranges. Boundaries are rounded so the ranges
     // partition the source exactly: otherwise neighbouring cells overlap and
     // the per-cell divisor no longer matches the accumulated pixels.
-    let box_range = |index: usize, length: usize, cells: usize| {
-        let start = (index * length + cells / 2) / cells;
-        let end = (((index + 1) * length + cells / 2) / cells)
-            .max(start + 1)
-            .min(length);
-        (start.min(length - 1), end)
-    };
     let mut col_ranges = Vec::with_capacity(dw);
     for dx in 0..dw {
         col_ranges.push(box_range(dx, sw, dw));
@@ -1801,14 +1794,100 @@ fn downscale_premultiplied(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Ve
     }
 
     let source = src.as_chunks::<4>().0;
-    let mut sums = vec![[0u32; 4]; dw];
     let mut out = vec![0u8; dw * dh * 4];
+    // A full-page image takes several milliseconds to box-filter, and the
+    // output rows are independent, so split them across the cores. Small
+    // images stay on this thread: thread setup would cost more than the work.
+    let workers = downscale_workers(sw * sh, dh);
+    if workers <= 1 {
+        accumulate_downscaled_rows(
+            source,
+            &col_ranges,
+            &counts,
+            &row_map,
+            dw,
+            sw,
+            0,
+            sh,
+            0,
+            &mut out,
+        );
+        return out;
+    }
+    let band = dh.div_ceil(workers) * dw * 4;
+    let mut dy0 = 0usize;
+    std::thread::scope(|scope| {
+        for chunk in out.chunks_mut(band) {
+            let rows = chunk.len() / (dw * 4);
+            let dy1 = dy0 + rows;
+            let sy0 = box_range(dy0, sh, dh).0;
+            let sy1 = if dy1 >= dh {
+                sh
+            } else {
+                box_range(dy1, sh, dh).0
+            };
+            let (col_ranges, counts, row_map) = (&col_ranges, &counts, &row_map);
+            let band_start = dy0;
+            scope.spawn(move || {
+                accumulate_downscaled_rows(
+                    source, col_ranges, counts, row_map, dw, sw, sy0, sy1, band_start, chunk,
+                );
+            });
+            dy0 = dy1;
+        }
+    });
+    out
+}
+
+/// How many threads a downscale of `source_pixels` into `dh` rows should use.
+fn downscale_workers(source_pixels: usize, dh: usize) -> usize {
+    // Below this the whole filter finishes in well under a millisecond.
+    const MIN_PIXELS: usize = 256 * 1024;
+    if source_pixels < MIN_PIXELS || dh < 32 {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(4)
+        .min(dh)
+}
+
+/// Source range of one destination box along an axis.
+///
+/// Boundaries are rounded so the ranges partition the source exactly;
+/// otherwise neighbouring cells overlap and the per-cell divisor no longer
+/// matches the accumulated pixels.
+fn box_range(index: usize, length: usize, cells: usize) -> (usize, usize) {
+    let start = (index * length + cells / 2) / cells;
+    let end = (((index + 1) * length + cells / 2) / cells)
+        .max(start + 1)
+        .min(length);
+    (start.min(length - 1), end)
+}
+
+/// Box-filters source rows `sy0..sy1` into destination rows starting at
+/// `band_start` in `out`, which holds exactly that band.
+#[allow(clippy::too_many_arguments)]
+fn accumulate_downscaled_rows(
+    source: &[[u8; 4]],
+    col_ranges: &[(usize, usize)],
+    counts: &[u32],
+    row_map: &[u32],
+    dw: usize,
+    sw: usize,
+    sy0: usize,
+    sy1: usize,
+    band_start: usize,
+    out: &mut [u8],
+) {
+    let mut sums = vec![[0u32; 4]; dw];
     let mut current = usize::MAX;
-    for sy in 0..sh {
+    for sy in sy0..sy1 {
         let dy = row_map[sy] as usize;
         if dy != current {
             if current != usize::MAX {
-                flush_downscaled_row(current, &sums, &counts, dw, &mut out);
+                flush_downscaled_row(current, &sums, counts, dw, out, band_start);
                 sums.fill([0; 4]);
             }
             current = dy;
@@ -1830,16 +1909,22 @@ fn downscale_premultiplied(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Ve
         }
     }
     if current != usize::MAX {
-        flush_downscaled_row(current, &sums, &counts, dw, &mut out);
+        flush_downscaled_row(current, &sums, counts, dw, out, band_start);
     }
-    out
 }
 
-fn flush_downscaled_row(dy: usize, sums: &[[u32; 4]], counts: &[u32], dw: usize, out: &mut [u8]) {
+fn flush_downscaled_row(
+    dy: usize,
+    sums: &[[u32; 4]],
+    counts: &[u32],
+    dw: usize,
+    out: &mut [u8],
+    band_start: usize,
+) {
     for dx in 0..dw {
         let count = counts[dy * dw + dx].max(1);
         let sum = &sums[dx];
-        let out_index = (dy * dw + dx) * 4;
+        let out_index = ((dy - band_start) * dw + dx) * 4;
         for channel in 0..4 {
             out[out_index + channel] = ((sum[channel] + count / 2) / count) as u8;
         }
@@ -3047,6 +3132,50 @@ mod tests {
         let pixmap = render_tiny(&scene, 10, 10);
         assert_eq!(pixel(&pixmap, 5, 5), (0, 128, 0, 255));
         assert_eq!(pixel(&pixmap, 0, 0), (255, 255, 255, 255));
+    }
+
+    #[test]
+    fn downscale_premultiplied_matches_the_sequential_filter() {
+        // Large enough that the parallel path (several destination bands) is
+        // taken; its output must be byte-identical to one thread doing all of
+        // it.
+        let (sw, sh, dw, dh) = (701usize, 617usize, 323usize, 281usize);
+        let mut src = vec![0u8; sw * sh * 4];
+        for (index, byte) in src.iter_mut().enumerate() {
+            *byte = (index * 37 % 251) as u8;
+        }
+        let mut col_ranges = Vec::with_capacity(dw);
+        for dx in 0..dw {
+            col_ranges.push(super::box_range(dx, sw, dw));
+        }
+        let mut row_map = vec![0u32; sh];
+        let mut counts = vec![0u32; dw * dh];
+        for dy in 0..dh {
+            let (sy0, sy1) = super::box_range(dy, sh, dh);
+            for slot in &mut row_map[sy0..sy1] {
+                *slot = dy as u32;
+            }
+            for (dx, &(sx0, sx1)) in col_ranges.iter().enumerate() {
+                counts[dy * dw + dx] = ((sy1 - sy0) * (sx1 - sx0)) as u32;
+            }
+        }
+        let source = src.as_chunks::<4>().0;
+        let mut expected = vec![0u8; dw * dh * 4];
+        super::accumulate_downscaled_rows(
+            source,
+            &col_ranges,
+            &counts,
+            &row_map,
+            dw,
+            sw,
+            0,
+            sh,
+            0,
+            &mut expected,
+        );
+        let actual =
+            super::downscale_premultiplied(&src, sw as u32, sh as u32, dw as u32, dh as u32);
+        assert_eq!(actual, expected);
     }
 
     #[test]
