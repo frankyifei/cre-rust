@@ -629,6 +629,21 @@ fn render_script(node: Node<'_, '_>, ctx: Ctx, kind: ScriptKind) -> String {
         ScriptKind::Sup => "cre-sup",
         ScriptKind::Sub => "cre-sub",
     };
+    // On a tall base (a stretched fence, a fraction, a matrix) the script has
+    // to climb to the base's top or drop to its foot; a fixed shift would leave
+    // it hanging around the middle, which is what Chrome does not do. Short
+    // bases keep the font's usual script shift.
+    let (sup_shift, sub_shift) =
+        script_shifts(estimate_height(base_node, ctx.display), ctx.metrics);
+    let shift = match kind {
+        ScriptKind::Sup => sup_shift,
+        ScriptKind::Sub => sub_shift,
+    };
+    let shift_style = match kind {
+        ScriptKind::Sup => format!(" style=\"vertical-align:{shift:.2}em\""),
+        ScriptKind::Sub => format!(" style=\"vertical-align:-{shift:.2}em\""),
+    };
+
     // A script on a large operator sits at that operator's lower (or upper)
     // end instead of around its middle, so `∫_ℝᴺ` hangs off the foot of the
     // sign.
@@ -645,7 +660,9 @@ fn render_script(node: Node<'_, '_>, ctx: Ctx, kind: ScriptKind) -> String {
              </span></span>"
         );
     }
-    format!("<span class=\"cre-script\">{base}<span class=\"{class}\">{script}</span></span>")
+    format!(
+        "<span class=\"cre-script\">{base}<span class=\"{class}\"{shift_style}>{script}</span></span>"
+    )
 }
 
 /// True when a script slot holds nothing that paints: `<mrow/>`, `<none/>` and
@@ -726,17 +743,24 @@ fn render_scripts(node: Node<'_, '_>, ctx: Ctx) -> String {
         );
     }
 
+    // As in `render_script`, a lone script on a tall base climbs to the top or
+    // drops to the foot instead of sitting on the axis.
+    let (sup_shift, sub_shift) =
+        script_shifts(estimate_height(base_node, ctx.display), ctx.metrics);
+
     match (has_sup, has_sub) {
         (true, true) => format!(
             "<span class=\"cre-script\">{base}<span class=\"cre-script-stack\">\
              <span>{sup}</span><span>{sub}</span></span></span>"
         ),
-        (true, false) => {
-            format!("<span class=\"cre-script\">{base}<span class=\"cre-sup\">{sup}</span></span>")
-        }
-        (false, true) => {
-            format!("<span class=\"cre-script\">{base}<span class=\"cre-sub\">{sub}</span></span>")
-        }
+        (true, false) => format!(
+            "<span class=\"cre-script\">{base}\
+             <span class=\"cre-sup\" style=\"vertical-align:{sup_shift:.2}em\">{sup}</span></span>"
+        ),
+        (false, true) => format!(
+            "<span class=\"cre-script\">{base}\
+             <span class=\"cre-sub\" style=\"vertical-align:-{sub_shift:.2}em\">{sub}</span></span>"
+        ),
         (false, false) => format!("<span class=\"cre-script\">{base}</span>"),
     }
 }
@@ -757,6 +781,19 @@ fn fence_scale(text: &str, content: f32, metrics: MathMetrics) -> f32 {
         .filter(|ink| *ink > 0.3)
         .unwrap_or(0.86);
     (content / ink).max(1.0)
+}
+
+/// Baseline shifts for a superscript/subscript on a base `height` em tall, in
+/// the script's own `em` (scripts are drawn at `metrics.script_scale`).
+///
+/// A fixed shift is right for a normal glyph but leaves a script hovering
+/// around the middle of a tall base: MathML (and Chrome) push it to the base's
+/// top/bottom edges instead.
+fn script_shifts(height: f32, metrics: MathMetrics) -> (f32, f32) {
+    let tall = 0.68 * height;
+    let sup = (tall - 0.05).max(metrics.sup_shift_up);
+    let sub = (tall - 0.45).max(metrics.sub_shift_down);
+    (sup, sub)
 }
 
 /// The font-size multiplier `render_mo` gives a large operator.
@@ -1233,7 +1270,7 @@ fn estimate_height(node: Node<'_, '_>, display: bool) -> f32 {
             let mut total = 0.0;
             for row in &children {
                 let cells: Vec<Node> = element_children(*row).collect();
-                total += max_child(&cells) + 0.4;
+                total += max_child(&cells) + 0.3;
             }
             total.max(1.0)
         }
@@ -1596,6 +1633,34 @@ mod tests {
             .and_then(|value| value.parse::<f32>().ok())
             .expect("bar height");
         assert!(height >= 4.5, "bar height {height} in {matrix}");
+    }
+
+    #[test]
+    fn scripts_climb_a_tall_base() {
+        // On a stretched fence the superscript belongs near the base's top;
+        // a fixed shift would leave it halfway up (Chrome puts it at the top).
+        let tall = rewrite_mathml(
+            r#"<math><msup><mrow><mo>(</mo><mfrac><mn>1</mn><mn>2</mn></mfrac><mo>)</mo></mrow><mn>2</mn></msup></math>"#,
+        );
+        let shift = tall
+            .split("cre-sup")
+            .nth(1)
+            .and_then(|rest| rest.split("vertical-align:").nth(1))
+            .and_then(|rest| rest.split("em").next())
+            .and_then(|value| value.parse::<f32>().ok())
+            .expect("superscript shift");
+        assert!(shift > 1.0, "shift {shift} in {tall}");
+
+        // A plain glyph keeps the font's usual shift.
+        let flat = rewrite_mathml(r#"<math><msup><mi>x</mi><mn>2</mn></msup></math>"#);
+        let shift = flat
+            .split("cre-sup")
+            .nth(1)
+            .and_then(|rest| rest.split("vertical-align:").nth(1))
+            .and_then(|rest| rest.split("em").next())
+            .and_then(|value| value.parse::<f32>().ok())
+            .expect("superscript shift");
+        assert!(shift < 0.8, "shift {shift} in {flat}");
     }
 
     #[test]
