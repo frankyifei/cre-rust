@@ -32,9 +32,12 @@ use parley::layout::Affinity;
 use parley::layout::Cluster;
 use percent_encoding::percent_decode_str;
 
+mod memory_report;
 mod page_breaks;
 mod position;
 mod xpointer;
+
+pub use memory_report::LowMemory;
 
 pub use position::{PathSegment, TextPosition, XPointerRange, parse_text_position};
 
@@ -274,35 +277,60 @@ fn chunk_target_override() -> Option<usize> {
 
 /// Bytes the kernel says it can still hand out, if the platform reports it.
 fn available_memory_bytes() -> Option<usize> {
+    memory_available_detail().map(|(bytes, _)| bytes as usize)
+}
+
+/// Free memory and where the figure came from, for the diagnostics page.
+fn memory_available_detail() -> Option<(u64, &'static str)> {
     // Testing knob: pretend the device only has this much memory, so the
     // chunk planner can be exercised on a desktop.
     if let Ok(value) = std::env::var("CRE_AVAILABLE_MB")
-        && let Ok(mb) = value.trim().parse::<usize>()
+        && let Ok(mb) = value.trim().parse::<u64>()
         && mb > 0
     {
-        return Some(mb.saturating_mul(1024 * 1024));
+        return Some((mb.saturating_mul(1024 * 1024), "CRE_AVAILABLE_MB"));
     }
     #[cfg(target_os = "linux")]
     {
         let info = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let field = |key: &str| -> Option<usize> {
+        let field = |key: &str| -> Option<u64> {
             info.lines()
                 .find(|line| line.starts_with(key))
                 .and_then(|line| line.split_whitespace().nth(1))
-                .and_then(|value| value.parse::<usize>().ok())
+                .and_then(|value| value.parse::<u64>().ok())
         };
         // MemAvailable exists since Linux 3.14; the Kindle PW2 runs 3.0, so
         // fall back to the classic free+buffers+cached estimate there.
         if let Some(available) = field("MemAvailable:") {
-            return Some(available.saturating_mul(1024));
+            return Some((available.saturating_mul(1024), "MemAvailable"));
         }
         let free = field("MemFree:")?;
         let buffers = field("Buffers:").unwrap_or(0);
         let cached = field("Cached:").unwrap_or(0);
-        return Some((free + buffers + cached).saturating_mul(1024));
+        return Some((
+            (free + buffers + cached).saturating_mul(1024),
+            "MemFree+Buffers+Cached",
+        ));
     }
     #[allow(unreachable_code)]
     None
+}
+
+/// Installed memory, where the platform reports it (diagnostics only).
+fn memory_total_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+        info.lines()
+            .find(|line| line.starts_with("MemTotal:"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|kb| kb.saturating_mul(1024))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 /// Splits a format that is produced as one HTML document (FB2, TXT, a
@@ -866,6 +894,42 @@ impl Document {
     /// layout that happens uses the final settings, instead of laying the book
     /// out with the defaults and then all over again with the user's font,
     /// margins and so on (~6 s each on a Kindle PW2).
+    /// Builds a document from one in-memory HTML page, used to show the
+    /// low-memory report instead of opening a book that cannot fit.
+    pub fn from_html_page(
+        html: &str,
+        options: &DocumentOptions,
+        font_datas: &[FontBlob],
+    ) -> Result<Self> {
+        let metadata = DocumentMetadata {
+            format: DocumentFormat::Html,
+            title: Some("Not enough memory".to_string()),
+            creator: None,
+            language: None,
+            series: None,
+            description: None,
+            keywords: None,
+            identifiers: None,
+            item_count: 1,
+        };
+        Self::build(
+            vec![html.to_string()],
+            "",
+            Arc::new(EmptyNet),
+            ResourceSource::Empty,
+            None,
+            false,
+            metadata,
+            Vec::new(),
+            String::new(),
+            Vec::new(),
+            options,
+            font_datas,
+            false,
+            html.len() as u64,
+        )
+    }
+
     pub fn with_options_with_font_data_parsed(
         path: impl AsRef<Path>,
         options: &DocumentOptions,
@@ -882,6 +946,9 @@ impl Document {
     ) -> Result<Self> {
         validate_options(options)?;
         let path = path.as_ref();
+        let source_bytes = std::fs::metadata(path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
         let format = detect_format(path);
         // SVG images are rendered at page size: CSS caps them to the page's
         // content box, so this is the largest they can ever be drawn.
@@ -964,6 +1031,7 @@ impl Document {
                     options,
                     font_datas,
                     defer_layout,
+                    source_bytes,
                 )
             }
             DocumentFormat::Fb2 => {
@@ -1011,6 +1079,7 @@ impl Document {
                     options,
                     font_datas,
                     defer_layout,
+                    source_bytes,
                 )
             }
             DocumentFormat::Mobi => {
@@ -1058,6 +1127,7 @@ impl Document {
                     options,
                     font_datas,
                     defer_layout,
+                    source_bytes,
                 )
             }
             DocumentFormat::Azw3 => {
@@ -1105,6 +1175,7 @@ impl Document {
                     options,
                     font_datas,
                     defer_layout,
+                    source_bytes,
                 )
             }
             DocumentFormat::Txt => {
@@ -1139,6 +1210,7 @@ impl Document {
                     options,
                     font_datas,
                     defer_layout,
+                    source_bytes,
                 )
             }
             DocumentFormat::Html => {
@@ -1206,6 +1278,7 @@ impl Document {
                     options,
                     font_datas,
                     defer_layout,
+                    source_bytes,
                 )
             }
         }
@@ -1226,7 +1299,16 @@ impl Document {
         options: &DocumentOptions,
         font_datas: &[FontBlob],
         defer_layout: bool,
+        source_bytes: u64,
     ) -> Result<Self> {
+        // A book that cannot fit is refused here, before the layout allocates
+        // several copies of it; `cre-lua` turns the error into a page that
+        // explains the shortfall instead of letting the reader be killed.
+        if let Some(page) =
+            memory_report::low_memory_page(&htmls, source_bytes, metadata.title.as_deref())
+        {
+            return Err(anyhow::Error::new(LowMemory { page }));
+        }
         let font_context = Arc::new(build_font_ctx_with_fallbacks(
             font_datas,
             options.font_family.as_deref(),

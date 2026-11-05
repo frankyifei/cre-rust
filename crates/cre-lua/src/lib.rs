@@ -324,8 +324,23 @@ impl Doc {
         // Parse now, lay out on the first read: the settings KOReader applies
         // right after loadDocument then shape the single layout instead of
         // forcing a second one.
-        let mut opened =
-            Document::with_options_with_font_data_parsed(&path, &options, &self.font_data_cache)?;
+        let mut opened = match Document::with_options_with_font_data_parsed(
+            &path,
+            &options,
+            &self.font_data_cache,
+        ) {
+            Ok(document) => document,
+            // The book cannot fit in this device's memory. Show the engine's
+            // explanation as a one-page document instead of letting the layout
+            // run out of memory and the reader process be killed.
+            Err(error) => match error.downcast_ref::<cre_lib::LowMemory>() {
+                Some(low) => {
+                    eprintln!("cre: {}", error);
+                    Document::from_html_page(&low.page, &options, &self.font_data_cache)?
+                }
+                None => return Err(error),
+            },
+        };
         opened.set_font_gamma(self.render_font_gamma());
         opened.set_background_color(self.background_color_value);
         self.inner = Some(opened);
