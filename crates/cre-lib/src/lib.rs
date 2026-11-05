@@ -1210,15 +1210,18 @@ impl Document {
                     options.viewport_scale,
                     options.page_margin,
                 );
-                html.push_str(&format!(
-                    "<style>/* cre-render-base */\n\
-                     html, body {{ margin: 0; padding: 0; }}\n\
-                     body {{ font-family: serif; font-size: {}px; line-height: 1.2; \
-                     padding: {:.3}px; }}\n\
-                     img {{ max-width: 100%; height: auto; }}</style>",
-                    options.font_size,
-                    page_margin_css.max(0.0)
-                ));
+                insert_style(
+                    &mut html,
+                    &format!(
+                        "/* cre-render-base */\n\
+                         html, body {{ margin: 0; padding: 0; }}\n\
+                         body {{ font-family: serif; font-size: {}px; line-height: 1.2; \
+                         padding: {:.3}px; }}\n\
+                         img {{ max-width: 100%; height: auto; }}",
+                        options.font_size,
+                        page_margin_css.max(0.0)
+                    ),
+                );
                 let directory = path
                     .parent()
                     .map(Path::to_path_buf)
@@ -5612,6 +5615,23 @@ fn parse_fixed_layout(html: &str) -> Option<FixedLayout> {
     (width > 0.0 && height > 0.0).then_some(FixedLayout::Pixel { width, height })
 }
 
+/// Inserts a `<style>` block into an HTML document: before `</head>` when the
+/// document has one, else before `</body>`, else at the end.
+///
+/// Appending after `</html>` (which is what a bare `push_str` does) makes the
+/// HTML parser drop the block, so standalone documents lost the base typography
+/// and the MathML styles while generated chunk HTML - built with a head of our
+/// own - did not.
+fn insert_style(html: &mut String, css: &str) {
+    let block = format!("<style>{css}</style>");
+    let lower = html.to_ascii_lowercase();
+    let at = lower
+        .rfind("</head>")
+        .or_else(|| lower.rfind("</body>"))
+        .unwrap_or(html.len());
+    html.insert_str(at, &block);
+}
+
 fn create_document(
     html: &str,
     base_url: &str,
@@ -5663,9 +5683,7 @@ fn create_document(
             font_datas.iter().map(|blob| blob.as_ref().as_ref()),
         );
         html_source = cre_mathml::rewrite_mathml_with(&html_source, math_font.as_ref());
-        html_source.push_str("<style>");
-        html_source.push_str(&cre_mathml::css(math_font.as_ref()));
-        html_source.push_str("</style>");
+        insert_style(&mut html_source, &cre_mathml::css(math_font.as_ref()));
     }
     if let Some(stylesheet) = options
         .stylesheet
@@ -5673,9 +5691,10 @@ fn create_document(
         .filter(|value| !value.is_empty())
         && !stylesheet.contains("</style")
     {
-        html_source.push_str("<style>");
-        html_source.push_str(&strip_multi_column_declarations(stylesheet));
-        html_source.push_str("</style>");
+        insert_style(
+            &mut html_source,
+            &strip_multi_column_declarations(stylesheet),
+        );
     }
 
     // Keep images whole: cap them to one page's content height (width is
