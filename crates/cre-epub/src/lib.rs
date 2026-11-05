@@ -1408,6 +1408,11 @@ fn ruby_cell_markup(base: &str, annotation: &str) -> String {
     } else {
         1.0
     };
+    // The rows are placed with `bottom`, relative to a note box whose height is
+    // exactly the padding reserved for them: `top` on a half-size row would be
+    // resolved against the note's own em, so a note without a tone mark (no
+    // second row) would sit half a row lower than one with a tone mark.
+    let pad = if has_tones { "1em" } else { "0.5em" };
     let mut note = String::new();
     if has_tones {
         note.push_str(&format!(
@@ -1422,16 +1427,14 @@ fn ruby_cell_markup(base: &str, annotation: &str) -> String {
         } else {
             letters
         };
-        let top = if has_tones { "0.5em" } else { "0em" };
         note.push_str(&format!(
-            r#"<span style="position:absolute;left:50%;top:{top};transform:translateX(-50%);white-space:nowrap;font-size:50%;line-height:1;letter-spacing:normal;">{letters}</span>"#
+            r#"<span style="position:absolute;left:50%;bottom:0;transform:translateX(-50%);white-space:nowrap;font-size:50%;line-height:1;letter-spacing:normal;">{letters}</span>"#
         ));
     }
     // Reserve the rows the note occupies, so the line box grows like it did when
     // the note was laid out in flow.
-    let pad = if has_tones { "1em" } else { "0.5em" };
     format!(
-        r#"<span style="display:inline-block;position:relative;vertical-align:baseline;padding-top:{pad};"><span style="display:block;white-space:nowrap;line-height:1.15;">{base}</span><span style="position:absolute;left:0;top:0;width:{base_em:.3}em;">{note}</span></span>"#
+        r#"<span style="display:inline-block;position:relative;vertical-align:baseline;padding-top:{pad};"><span style="display:block;white-space:nowrap;line-height:1.15;">{base}</span><span style="position:absolute;left:0;top:0;width:{base_em:.3}em;height:{pad};">{note}</span></span>"#
     )
 }
 
