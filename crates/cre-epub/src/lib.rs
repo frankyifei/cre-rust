@@ -2001,10 +2001,14 @@ fn replace_image_only_svg_block(
     if image_end >= close_start {
         return None;
     }
-    if has_element_tag(html, svg_open_end, image_start)
-        || has_element_tag(html, image_end, close_start)
-        || has_meaningful_text(&html[svg_open_end..image_start])
-        || has_meaningful_text(&html[image_end..close_start])
+    let overlays_are_invisible = |from: usize, to: usize| -> bool {
+        if !has_element_tag(html, from, to) {
+            return !has_meaningful_text(&html[from..to]);
+        }
+        svg_overlays_are_invisible(html, from, to)
+    };
+    if !overlays_are_invisible(svg_open_end, image_start)
+        || !overlays_are_invisible(image_end, close_start)
     {
         return None;
     }
@@ -2030,6 +2034,54 @@ fn replace_image_only_svg_block(
     provider.get(&image_key)?;
 
     Some(svg_image_tag(&image_key, &svg_attrs, &image_attrs))
+}
+
+/// True when the markup in `from..to` only holds invisible image-map
+/// hotspots: `<a>` wrappers and `<rect>`s with no fill.
+///
+/// The SVG painter this replaces draws such a page's shapes but not its
+/// `<image>`, so an image map renders blank; the caller turns the block into an
+/// `<img>` instead (the hotspots are invisible, so only their links are lost).
+fn svg_overlays_are_invisible(html: &str, from: usize, to: usize) -> bool {
+    let mut index = from;
+    while index < to {
+        let Some(open) = html[index..to].find('<').map(|offset| index + offset) else {
+            return html[index..to].trim().is_empty();
+        };
+        if html[open..].starts_with("<!--") {
+            index = html[open..to]
+                .find("-->")
+                .map(|offset| open + offset + 3)
+                .unwrap_or(to);
+            continue;
+        }
+        let Some(end) = find_tag_end(html, open) else {
+            return false;
+        };
+        let raw = &html[open..end];
+        let name = tag_name(raw);
+        match name.as_str() {
+            "a" | "g" | "title" | "desc" | "defs" | "metadata" => {}
+            "rect" | "circle" | "ellipse" | "polygon" | "polyline" | "path" => {
+                let attrs = parse_attrs(raw);
+                let invisible = attrs
+                    .get("fill-opacity")
+                    .is_some_and(|value| value.trim() == "0" || value.trim() == "0.0")
+                    || attrs
+                        .get("opacity")
+                        .is_some_and(|value| value.trim() == "0" || value.trim() == "0.0")
+                    || attrs
+                        .get("fill")
+                        .is_some_and(|value| value.trim().eq_ignore_ascii_case("none"));
+                if !invisible {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+        index = end;
+    }
+    true
 }
 
 fn svg_image_tag(
