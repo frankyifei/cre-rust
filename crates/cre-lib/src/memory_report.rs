@@ -52,6 +52,8 @@ pub(crate) struct MemoryReport {
     pub chunks: usize,
     pub largest_chunk: u64,
     pub dom_bytes: u64,
+    /// Decoded images of the heaviest chunk (they live next to its DOM).
+    pub image_bytes: u64,
     pub index_bytes: u64,
     pub reserve: u64,
     pub need: u64,
@@ -69,7 +71,7 @@ impl MemoryReport {
 }
 
 /// Estimates what laying `htmls` out costs and what is available.
-pub(crate) fn measure(htmls: &[String], source_bytes: u64) -> MemoryReport {
+pub(crate) fn measure(htmls: &[String], source_bytes: u64, image_bytes: u64) -> MemoryReport {
     let html_bytes = htmls.iter().map(|html| html.len() as u64).sum();
     let largest_chunk = htmls
         .iter()
@@ -97,9 +99,10 @@ pub(crate) fn measure(htmls: &[String], source_bytes: u64) -> MemoryReport {
         chunks,
         largest_chunk,
         dom_bytes,
+        image_bytes,
         index_bytes,
         reserve,
-        need: html_bytes + dom_bytes + index_bytes + reserve,
+        need: html_bytes + dom_bytes + image_bytes + index_bytes + reserve,
     }
 }
 
@@ -107,6 +110,7 @@ pub(crate) fn measure(htmls: &[String], source_bytes: u64) -> MemoryReport {
 pub(crate) fn low_memory_page(
     htmls: &[String],
     source_bytes: u64,
+    image_bytes: u64,
     title: Option<&str>,
 ) -> Option<String> {
     // The diagnostic page itself is tiny; never run the check on it, or a
@@ -116,7 +120,7 @@ pub(crate) fn low_memory_page(
     {
         return None;
     }
-    let report = measure(htmls, source_bytes);
+    let report = measure(htmls, source_bytes, image_bytes);
     if report.fits() && std::env::var_os("CRE_FORCE_LOW_MEMORY").is_none() {
         return None;
     }
@@ -196,6 +200,7 @@ td.value { text-align: right; }\
     html.push_str("<h2>Estimated need when opening</h2><table>");
     html.push_str(&row("Text (chunk HTML)", &mb(report.html_bytes)));
     html.push_str(&row("Page layout (one chunk)", &mb(report.dom_bytes)));
+    html.push_str(&row("Images (one chunk, decoded)", &mb(report.image_bytes)));
     html.push_str(&row("Page index", &mb(report.index_bytes)));
     html.push_str(&row("Reserved for the reader", &mb(report.reserve)));
     html.push_str(&row("Total", &mb(report.need)));
@@ -223,13 +228,13 @@ mod tests {
         // The diagnostic page itself is this small, and so are small books:
         // they cannot be the thing that exhausts memory.
         let htmls = vec!["<html><body>hi</body></html>".to_string()];
-        assert!(low_memory_page(&htmls, 100, Some("tiny")).is_none());
+        assert!(low_memory_page(&htmls, 100, 0, Some("tiny")).is_none());
     }
 
     #[test]
     fn the_estimate_covers_text_layout_index_and_reserve() {
         let htmls = vec!["x".repeat(100 * 1024), "x".repeat(120 * 1024)];
-        let report = measure(&htmls, 5000);
+        let report = measure(&htmls, 5000, 0);
         assert_eq!(report.html_bytes, 220 * 1024);
         assert_eq!(report.chunks, 2);
         assert_eq!(report.largest_chunk, 120 * 1024);
@@ -248,7 +253,7 @@ mod tests {
     #[test]
     fn the_page_lists_every_part_of_the_estimate() {
         let htmls = vec!["x".repeat(300 * 1024)];
-        let report = measure(&htmls, 1_000_000);
+        let report = measure(&htmls, 1_000_000, 0);
         let page = render_page(&report, Some("A Book"));
         assert!(page.contains("Not enough memory to open this book"));
         for label in [

@@ -353,9 +353,9 @@ fn split_single_document(html: String) -> Vec<String> {
 /// The text budget uses [`LAYOUT_BYTES_PER_HTML_BYTE`]; the image budget is in
 /// estimated decoded bytes, because blitz decodes a chunk's images while
 /// parsing it (a dense illustrated book costs far more than its text).
-fn chunk_budgets(available: Option<usize>) -> (usize, Option<usize>) {
+fn chunk_budgets(available: Option<usize>) -> (usize, Option<usize>, usize) {
     let Some(available) = available else {
-        return (usize::MAX, None);
+        return (usize::MAX, None, usize::MAX);
     };
     let budget = available
         .saturating_sub(LAYOUT_MEMORY_RESERVE)
@@ -378,7 +378,7 @@ fn chunk_budgets(available: Option<usize>) -> (usize, Option<usize>) {
     {
         images = mb * 1024 * 1024;
     }
-    (text, Some(images))
+    (text, Some(images), budget)
 }
 
 /// Chooses the layout chunk size for `total_html` bytes of generated content.
@@ -927,6 +927,7 @@ impl Document {
             font_datas,
             false,
             html.len() as u64,
+            0,
         )
     }
 
@@ -994,10 +995,23 @@ impl Document {
                 let htmls = match chunk_target_override() {
                     Some(target) => book.to_html_chunks(&html_options, target)?,
                     None => {
-                        let (text_budget, image_budget) = chunk_budgets(available_memory_bytes());
-                        book.to_html_chunks_budgeted(&html_options, text_budget, image_budget)?
+                        let (text_budget, image_budget, layout_budget) =
+                            chunk_budgets(available_memory_bytes());
+                        book.to_html_chunks_budgeted(
+                            &html_options,
+                            text_budget,
+                            image_budget,
+                            layout_budget,
+                        )?
                     }
                 };
+                // Decoded images dominate an illustrated book's footprint, and
+                // they cannot be seen in the HTML size.
+                let chunk_image_bytes = htmls
+                    .iter()
+                    .map(|html| cre_epub::chunk_image_bytes(&book.resource_provider, html))
+                    .max()
+                    .unwrap_or(0) as u64;
                 let t4 = std::time::Instant::now();
                 if std::env::var_os("CRE_OPEN_PROFILE").is_some() {
                     let ms = |a: std::time::Instant, b: std::time::Instant| {
@@ -1032,6 +1046,7 @@ impl Document {
                     font_datas,
                     defer_layout,
                     source_bytes,
+                    chunk_image_bytes,
                 )
             }
             DocumentFormat::Fb2 => {
@@ -1080,6 +1095,7 @@ impl Document {
                     font_datas,
                     defer_layout,
                     source_bytes,
+                    0,
                 )
             }
             DocumentFormat::Mobi => {
@@ -1128,6 +1144,7 @@ impl Document {
                     font_datas,
                     defer_layout,
                     source_bytes,
+                    0,
                 )
             }
             DocumentFormat::Azw3 => {
@@ -1176,6 +1193,7 @@ impl Document {
                     font_datas,
                     defer_layout,
                     source_bytes,
+                    0,
                 )
             }
             DocumentFormat::Txt => {
@@ -1211,6 +1229,7 @@ impl Document {
                     font_datas,
                     defer_layout,
                     source_bytes,
+                    0,
                 )
             }
             DocumentFormat::Html => {
@@ -1279,6 +1298,7 @@ impl Document {
                     font_datas,
                     defer_layout,
                     source_bytes,
+                    0,
                 )
             }
         }
@@ -1300,13 +1320,17 @@ impl Document {
         font_datas: &[FontBlob],
         defer_layout: bool,
         source_bytes: u64,
+        chunk_image_bytes: u64,
     ) -> Result<Self> {
         // A book that cannot fit is refused here, before the layout allocates
         // several copies of it; `cre-lua` turns the error into a page that
         // explains the shortfall instead of letting the reader be killed.
-        if let Some(page) =
-            memory_report::low_memory_page(&htmls, source_bytes, metadata.title.as_deref())
-        {
+        if let Some(page) = memory_report::low_memory_page(
+            &htmls,
+            source_bytes,
+            chunk_image_bytes,
+            metadata.title.as_deref(),
+        ) {
             return Err(anyhow::Error::new(LowMemory { page }));
         }
         let font_context = Arc::new(build_font_ctx_with_fallbacks(

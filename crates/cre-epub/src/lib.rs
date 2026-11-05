@@ -724,7 +724,7 @@ impl EpubBook {
     }
 
     pub fn to_html_chunks(&self, options: &HtmlOptions, max_bytes: usize) -> Result<Vec<String>> {
-        self.to_html_chunks_budgeted(options, max_bytes, None)
+        self.to_html_chunks_budgeted(options, max_bytes, None, usize::MAX)
     }
 
     /// Like [`Self::to_html_chunks`], but also caps how much image data a
@@ -740,6 +740,7 @@ impl EpubBook {
         options: &HtmlOptions,
         max_bytes: usize,
         image_budget: Option<usize>,
+        layout_bytes: usize,
     ) -> Result<Vec<String>> {
         let docs = self.spine_documents()?;
 
@@ -786,20 +787,67 @@ impl EpubBook {
 
         // Estimated decoded bytes of each piece's images, so a chunk can be
         // capped by image payload as well as by text size.
-        let piece_images: Vec<usize> = pieces
-            .iter()
-            .map(|piece| {
-                let dir = parent_dir(&piece.doc.href);
-                let mut total = 0usize;
-                for key in image_sources(&piece.body, dir) {
-                    total += self
-                        .resource_provider
-                        .estimated_decoded_bytes(&key)
-                        .unwrap_or(0);
+        let piece_image_bytes = |piece: &Piece<'_>| -> usize {
+            let dir = parent_dir(&piece.doc.href);
+            image_sources(&piece.body, dir)
+                .iter()
+                .filter_map(|key| self.resource_provider.estimated_decoded_bytes(key))
+                .sum()
+        };
+        let mut piece_images: Vec<usize> = pieces.iter().map(piece_image_bytes).collect();
+
+        // The caps above only stop documents from being merged. One document
+        // that is heavy on its own (a gallery page, a comic with several
+        // images in one XHTML) would still be decoded in one go, so split it
+        // between its images, which is where a page break already falls.
+        if layout_bytes != usize::MAX {
+            let mut expanded: Vec<Piece<'_>> = Vec::new();
+            let mut expanded_images: Vec<usize> = Vec::new();
+            let mut split_pending = false;
+            for (piece, images) in pieces.into_iter().zip(piece_images) {
+                if piece.body.len() * DOM_BYTES_PER_HTML_BYTE + images > layout_bytes {
+                    let dir = parent_dir(&piece.doc.href);
+                    let parts = split_body_html_for_layout(
+                        &piece.body,
+                        dir,
+                        &self.resource_provider,
+                        layout_bytes,
+                        0,
+                    );
+                    if parts.len() > 1 {
+                        for (part_index, part) in parts.into_iter().enumerate() {
+                            let slot = if part_index == 0 {
+                                piece.slot
+                            } else {
+                                let slot = next_extra_slot;
+                                next_extra_slot += 1;
+                                slot
+                            };
+                            split_pending |= part_index == 0;
+                            expanded.push(Piece {
+                                doc: piece.doc,
+                                body: std::borrow::Cow::Owned(part),
+                                slot,
+                                continuation: piece.continuation || part_index > 0,
+                            });
+                            expanded_images.push(0);
+                        }
+                        continue;
+                    }
                 }
-                total
-            })
-            .collect();
+                expanded.push(piece);
+                expanded_images.push(images);
+            }
+            if split_pending {
+                for (index, piece) in expanded.iter().enumerate() {
+                    if expanded_images[index] == 0 {
+                        expanded_images[index] = piece_image_bytes(piece);
+                    }
+                }
+            }
+            pieces = expanded;
+            piece_images = expanded_images;
+        }
 
         let mut chunks = Vec::new();
         let mut body = String::new();
@@ -837,7 +885,13 @@ impl EpubBook {
             let over_images = image_budget.is_some_and(|budget| {
                 !body.is_empty() && body_images > 0 && body_images + images > budget
             });
-            if over_text || over_images {
+            // The text and image caps are separate, but a chunk holds both at
+            // the same time: bound their sum against the layout budget too.
+            let over_layout = layout_bytes != usize::MAX
+                && !body.is_empty()
+                && (body.len() + section.len()) * DOM_BYTES_PER_HTML_BYTE + body_images + images
+                    > layout_bytes;
+            if over_text || over_images || over_layout {
                 flush(&mut body, &mut chunks, &mut chunk_docs);
                 body_images = 0;
             }
@@ -1163,12 +1217,104 @@ fn split_body_html(body: &str, limit: usize) -> Vec<String> {
     parts
 }
 
+/// True when the body carries no text of its own, only elements: an image
+/// gallery, where splitting between images cannot break a paragraph.
+fn body_is_image_only(body: &str) -> bool {
+    let mut index = 0usize;
+    while index < body.len() {
+        let Some(open) = body[index..].find('<').map(|offset| index + offset) else {
+            return body[index..].trim().is_empty();
+        };
+        if !body[index..open].trim().is_empty() {
+            return false;
+        }
+        if body[open..].starts_with("<!--") {
+            index = body[open..]
+                .find("-->")
+                .map(|offset| open + offset + 3)
+                .unwrap_or(body.len());
+            continue;
+        }
+        let Some(end) = find_tag_end(body, open) else {
+            return false;
+        };
+        let name = tag_name(&body[open..end]);
+        if matches!(name.as_str(), "script" | "style" | "textarea" | "title") {
+            let close = find_closing_tag(body, end, &name).unwrap_or(body.len());
+            if !body[end..close].trim().is_empty() {
+                return false;
+            }
+            index = find_tag_end(body, close).unwrap_or(body.len());
+            continue;
+        }
+        index = end;
+    }
+    true
+}
+
+/// Splits an image-only body so that each part's text DOM plus decoded images
+/// fits `budget`.
+///
+/// The split points come from `split_body_html`, which cuts at element
+/// boundaries and closes/re-opens the tags around the cut, so every part stays
+/// valid HTML. Only bodies without text are split: cutting a paragraph would
+/// move text onto another page, while an image gallery already puts each image
+/// on its own page.
+fn split_body_html_for_layout(
+    body: &str,
+    doc_dir: &str,
+    provider: &LazyResource,
+    budget: usize,
+    depth: usize,
+) -> Vec<String> {
+    if budget == 0 || depth > 4 || body.len() < 2 || !body_is_image_only(body) {
+        return vec![body.to_string()];
+    }
+    let images: usize = image_sources(body, doc_dir)
+        .iter()
+        .filter_map(|key| provider.estimated_decoded_bytes(key))
+        .sum();
+    let cost = body.len() * DOM_BYTES_PER_HTML_BYTE + images;
+    if cost <= budget {
+        return vec![body.to_string()];
+    }
+    let parts_wanted = cost.div_ceil(budget).max(1);
+    let limit = (body.len() / parts_wanted).max(1);
+    let parts = split_body_html(body, limit);
+    if parts.len() <= 1 {
+        return vec![body.to_string()];
+    }
+    let mut out = Vec::new();
+    for part in parts {
+        out.extend(split_body_html_for_layout(
+            &part,
+            doc_dir,
+            provider,
+            budget,
+            depth + 1,
+        ));
+    }
+    out
+}
+
 fn floor_char_boundary(text: &str, index: usize) -> usize {
     let mut index = index.min(text.len());
     while index > 0 && !text.is_char_boundary(index) {
         index -= 1;
     }
     index
+}
+
+/// Estimated decoded (RGBA) bytes of the images a generated chunk refers to.
+///
+/// Chunk HTML points at resources through `epub://book/`, so no document
+/// directory is needed. `cre-lib` uses this to include the decoded-image cost
+/// of a chunk in its low-memory estimate.
+pub fn chunk_image_bytes(provider: &LazyResource, chunk_html: &str) -> usize {
+    image_sources(chunk_html, "")
+        .iter()
+        .filter_map(|key| provider.estimated_decoded_bytes(key))
+        .sum()
 }
 
 /// Root-relative resource paths of every `<img>` in a chunk body. Spine
@@ -1254,6 +1400,10 @@ fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     }
     None
 }
+
+/// Memory a chunk's text costs per byte of generated HTML (DOM nodes,
+/// computed styles and line boxes). Matches `cre-lib`'s chunk planner.
+const DOM_BYTES_PER_HTML_BYTE: usize = 128;
 
 /// Rough decoded size of an image resource, from its file size and format.
 fn estimated_decoded_image_bytes(name: &str, file_bytes: usize) -> usize {
@@ -2670,10 +2820,10 @@ mod tests {
         let book = EpubBook::open(&path).unwrap();
         let options = HtmlOptions::default();
         let free = book
-            .to_html_chunks_budgeted(&options, 8 * 1024 * 1024, None)
+            .to_html_chunks_budgeted(&options, 8 * 1024 * 1024, None, usize::MAX)
             .unwrap();
         let capped = book
-            .to_html_chunks_budgeted(&options, 8 * 1024 * 1024, Some(1024 * 1024))
+            .to_html_chunks_budgeted(&options, 8 * 1024 * 1024, Some(1024 * 1024), usize::MAX)
             .unwrap();
         assert!(
             capped.len() > free.len(),
