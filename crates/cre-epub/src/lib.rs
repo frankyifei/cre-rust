@@ -1408,11 +1408,10 @@ fn ruby_cell_markup(base: &str, annotation: &str) -> String {
     } else {
         1.0
     };
-    // The rows are placed with `bottom`, relative to a note box whose height is
-    // exactly the padding reserved for them: `top` on a half-size row would be
-    // resolved against the note's own em, so a note without a tone mark (no
-    // second row) would sit half a row lower than one with a tone mark.
-    let pad = if has_tones { "1em" } else { "0.5em" };
+    // The mark is top-anchored and the letters bottom-anchored, so the note band
+    // is only a little taller than one half-size row: a full extra row left a
+    // visible gap between the mark and the letters under it.
+    let pad = if has_tones { "0.82em" } else { "0.5em" };
     let mut note = String::new();
     if has_tones {
         note.push_str(&format!(
@@ -3205,7 +3204,7 @@ mod tests {
         // The three letters are centred over the base and squeezed to fit it.
         assert!(cell.contains("translateX(-50%)"), "{cell}");
         assert!(cell.contains("scaleX("), "{cell}");
-        assert!(cell.contains("padding-top:1em"), "{cell}");
+        assert!(cell.contains("padding-top:0.82em"), "{cell}");
         // The base still sits in flow, so the cell keeps the character's width.
         assert!(cell.contains(">想</span>"), "{cell}");
     }
