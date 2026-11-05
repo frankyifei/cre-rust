@@ -44,6 +44,7 @@ pub const CSS: &str = r#"
 .cre-limits-base { display: block; line-height: 1.1; }
 .cre-limits-over, .cre-limits-under { display: block; font-size: 0.7em; line-height: 1; }
 .cre-limits-under { padding-top: 0.08em; }
+.cre-mo-hstretch { display: block; text-align: center; }
 .cre-limits-over { padding-bottom: 0.04em; }
 .cre-mfrac { display: inline-block; vertical-align: middle; text-align: center; margin: 0 0.15em; }
 .cre-mfrac-num { display: block; padding: 0 0.15em 0.06em 0.15em; border-bottom: 1px solid currentColor; line-height: 1.1; }
@@ -891,20 +892,20 @@ fn render_limits(node: Node<'_, '_>, ctx: Ctx, over: bool, under: bool) -> Strin
     // MathML orders the scripts as base, underscript, overscript (unlike
     // `msubsup`, where the subscript comes first too, but `mover`/`munder`
     // carry only one of them).
-    let mut over_html = String::new();
-    let mut under_html = String::new();
-    if under {
-        under_html = children
-            .next()
-            .map(|child| render_node(child, ctx.script()))
-            .unwrap_or_default();
-    }
-    if over {
-        over_html = children
-            .next()
-            .map(|child| render_node(child, ctx.script()))
-            .unwrap_or_default();
-    }
+    let under_node = under.then(|| children.next()).flatten();
+    let over_node = over.then(|| children.next()).flatten();
+    let under_html = under_node
+        .map(|child| render_node(child, ctx.script()))
+        .unwrap_or_default();
+    let over_html = over_node
+        .map(|child| render_node(child, ctx.script()))
+        .unwrap_or_default();
+    // A brace or arrow over/under an expression is stretched along x to the
+    // base's width (MathML "horizontal stretch"), centred on it. The vertical
+    // case above scales y; here the glyph is scaled about its centre and the
+    // factor comes from the same width estimate the layout uses.
+    let under_html = horizontal_stretch(under_html, under_node, base_node);
+    let over_html = horizontal_stretch(over_html, over_node, base_node);
     // Outside display style a `movablelimits` operator moves its limits back to
     // the side (MathML core), so `∑` inside a paragraph keeps side scripts even
     // when the author wrote `munderover`.
@@ -930,6 +931,57 @@ fn render_limits(node: Node<'_, '_>, ctx: Ctx, over: bool, under: bool) -> Strin
     }
     out.push_str("</span>");
     out
+}
+
+/// True for the operators MathML stretches horizontally over/under content.
+fn is_horizontal_stretchy(text: &str) -> bool {
+    text.chars().any(|ch| {
+        matches!(
+            ch,
+            '\u{23DE}'
+                | '\u{23DF}'
+                | '\u{23DC}'
+                | '\u{23DD}'
+                | '\u{23B4}'
+                | '\u{23B5}'
+                | '\u{203E}'
+                | '\u{005F}'
+                | '\u{2190}'
+                | '\u{2192}'
+                | '\u{2194}'
+                | '\u{27F5}'
+                | '\u{27F6}'
+                | '\u{27F7}'
+                | '\u{21D0}'
+                | '\u{21D2}'
+                | '\u{21D4}'
+        )
+    })
+}
+
+/// Wraps a horizontal over/under operator so it spans its base.
+fn horizontal_stretch(html: String, script: Option<Node<'_, '_>>, base: Node<'_, '_>) -> String {
+    let Some(script) = script else {
+        return html;
+    };
+    if html.is_empty() || !is_horizontal_stretchy(&token_text(script)) {
+        return html;
+    }
+    if script
+        .attribute("stretchy")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("false"))
+    {
+        return html;
+    }
+    let base_width = estimate_width(base).max(0.5);
+    let operator_width = estimate_width(script).max(0.2);
+    let scale = (base_width / operator_width).clamp(1.0, 8.0);
+    if scale <= 1.02 {
+        return html;
+    }
+    format!(
+        "<span class=\"cre-mo-hstretch\" style=\"display:block;text-align:center;         transform:scaleX({scale:.2});\">{html}</span>"
+    )
 }
 
 fn render_fraction(node: Node<'_, '_>, ctx: Ctx) -> String {
@@ -1641,6 +1693,25 @@ fn escape_attr(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn horizontal_operators_stretch_to_their_base() {
+        let html = r#"<math><mover><mrow><mi>a</mi><mo>+</mo><mi>b</mi></mrow><mo>&#x23DE;</mo></mover></math>"#;
+        let out = super::rewrite_mathml(html);
+        assert!(
+            out.contains("cre-mo-hstretch"),
+            "overbrace should be stretched: {out}"
+        );
+        assert!(
+            out.contains("scaleX("),
+            "expected a horizontal scale: {out}"
+        );
+
+        // A non-stretchy script is left alone.
+        let plain = r#"<math><mover><mi>a</mi><mi>b</mi></mover></math>"#;
+        let out = super::rewrite_mathml(plain);
+        assert!(!out.contains("cre-mo-hstretch"), "plain mover: {out}");
+    }
 
     #[test]
     fn rewrites_superscript_and_fenced_expression() {
