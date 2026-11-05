@@ -877,11 +877,13 @@ impl EpubBook {
                 body_images = 0;
             }
             let mut section = String::new();
+            let body_html = svg_hrefs_to_book_paths(&piece.body, parent_dir(&piece.doc.href));
+            let body_html = std::borrow::Cow::Owned(body_html);
             push_section_html(
                 &mut section,
                 piece.doc,
                 piece.slot,
-                &piece.body,
+                &body_html,
                 piece.continuation,
             );
             if !chunk_docs.iter().any(|doc| std::ptr::eq(*doc, piece.doc)) {
@@ -1310,6 +1312,147 @@ fn floor_char_boundary(text: &str, index: usize) -> usize {
         index -= 1;
     }
     index
+}
+
+/// Points the `<image>` hrefs of inline SVG blocks at `epub://book/...`.
+///
+/// The parse-time inliner then needs no document directory: chunks can hold
+/// documents from several directories.
+fn svg_hrefs_to_book_paths(html: &str, doc_dir: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut cursor = 0usize;
+    while let Some(open_start) = next_tag_start(html, cursor, "<svg") {
+        let Some((_close_start, close_end)) =
+            find_matching_close_tag(html, open_start, "<svg", "</svg")
+        else {
+            break;
+        };
+        out.push_str(&html[cursor..open_start]);
+        let block = &html[open_start..close_end];
+        let mut block_out = String::with_capacity(block.len());
+        let mut inner = 0usize;
+        while let Some(start) = next_tag_start(block, inner, "<image") {
+            let Some(end) = find_tag_end(block, start) else {
+                break;
+            };
+            block_out.push_str(&block[inner..start]);
+            let tag = &block[start..end];
+            let attrs = parse_attrs(tag);
+            let mut replaced = tag.to_string();
+            if let Some(href) = attrs.get("xlink:href").or_else(|| attrs.get("href")) {
+                let href = href.trim();
+                if !href.is_empty() && !href.starts_with("data:") && !is_external(href) {
+                    let resolved = resolve_href(doc_dir, &value_without_fragment(href));
+                    let url = format!("epub://book/{}", encode_path(&resolved));
+                    replaced = replace_attribute_value(tag, "xlink:href", &url)
+                        .or_else(|| replace_attribute_value(tag, "href", &url))
+                        .unwrap_or(replaced);
+                }
+            }
+            block_out.push_str(&replaced);
+            inner = end;
+        }
+        block_out.push_str(&block[inner..]);
+        out.push_str(&block_out);
+        cursor = close_end;
+    }
+    if cursor == 0 {
+        return html.to_string();
+    }
+    out.push_str(&html[cursor..]);
+    out
+}
+
+/// Rewrites the images inside inline SVG blocks to `data:` URIs.
+///
+/// Blitz parses an inline `<svg>` with usvg's default href resolver, which only
+/// understands `data:` URIs; a relative `xlink:href` makes the image node
+/// unreadable and the whole SVG is dropped (fixed-layout pages render blank,
+/// including any text the SVG draws). Passing the bytes inline lets usvg build
+/// the tree, so the image, the text and the link hotspots all survive.
+///
+/// The rewrite is for the HTML handed to the parser only: storing it would
+/// keep a base64 copy of every page image for the whole session.
+pub fn inline_svg_images_to_data_uris(html: &str, provider: &LazyResource) -> Option<String> {
+    let mut out = String::with_capacity(html.len());
+    let mut cursor = 0usize;
+    let mut changed = false;
+    while let Some(open_start) = next_tag_start(html, cursor, "<svg") {
+        let Some((_close_start, close_end)) =
+            find_matching_close_tag(html, open_start, "<svg", "</svg")
+        else {
+            break;
+        };
+        out.push_str(&html[cursor..open_start]);
+        let block = &html[open_start..close_end];
+        let (rewritten, block_changed) = svg_block_inline_images(block, provider);
+        changed |= block_changed;
+        out.push_str(&rewritten);
+        cursor = close_end;
+    }
+    if !changed {
+        return None;
+    }
+    out.push_str(&html[cursor..]);
+    Some(out)
+}
+
+/// Replaces the href of every `<image>` in one SVG block with a data URI.
+fn svg_block_inline_images(block: &str, provider: &LazyResource) -> (String, bool) {
+    let mut out = String::with_capacity(block.len());
+    let mut cursor = 0usize;
+    let mut changed = false;
+    while let Some(start) = next_tag_start(block, cursor, "<image") {
+        let Some(end) = find_tag_end(block, start) else {
+            break;
+        };
+        out.push_str(&block[cursor..start]);
+        let tag = &block[start..end];
+        let mut replaced = tag.to_string();
+        let attrs = parse_attrs(tag);
+        if let Some(href) = attrs.get("xlink:href").or_else(|| attrs.get("href")) {
+            let href = href.trim();
+            let book_url = href.starts_with("epub://book/");
+            if !href.is_empty() && !href.starts_with("data:") && (book_url || !is_external(href)) {
+                let without_fragment = href.split('#').next().unwrap_or(href);
+                let relative = without_fragment
+                    .strip_prefix("epub://book/")
+                    .unwrap_or(without_fragment);
+                let key = normalize_path(&percent_decode_str(relative).decode_utf8_lossy());
+                if let Some(bytes) = provider.get(&key) {
+                    let mime = image_mime(&bytes, &key);
+                    let encoded = base64_encode(&bytes);
+                    let data_uri = format!("data:{mime};base64,{encoded}");
+                    replaced = replace_attribute_value(tag, "xlink:href", &data_uri)
+                        .or_else(|| replace_attribute_value(tag, "href", &data_uri))
+                        .unwrap_or(replaced);
+                    changed = true;
+                }
+            }
+        }
+        out.push_str(&replaced);
+        cursor = end;
+    }
+    out.push_str(&block[cursor..]);
+    (out, changed)
+}
+
+/// Rewrites `name="value"` (or single quotes) inside one tag.
+fn replace_attribute_value(tag: &str, name: &str, value: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let at = lower.find(&format!("{name}="))?;
+    let rest = &tag[at + name.len() + 1..];
+    let quote = rest.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let close = rest[1..].find(quote)? + 1;
+    let mut out = String::with_capacity(tag.len() + value.len());
+    out.push_str(&tag[..at + name.len() + 1]);
+    out.push(quote);
+    out.push_str(value);
+    out.push_str(&rest[close..]);
+    Some(out)
 }
 
 /// Estimated decoded (RGBA) bytes of the images a generated chunk refers to.
