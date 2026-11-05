@@ -1378,6 +1378,9 @@ fn ruby_cell(inner: &str) -> Option<String> {
     // Both blocks are centred on the cell with absolute positioning: the
     // layout engine does not apply `text-align` inside an inline-block, but it
     // does resolve `left: 50%` + `translateX(-50%)` against the cell.
+    // The note is usually wider than the character it annotates (three bopomofo
+    // letters over one ideograph), so the cell follows whichever is wider and
+    // the annotation keeps its own width instead of being squeezed.
     let base_em = text_em(&base);
     let annotation_em = text_em(&annotation) * 0.5;
     let cell = base_em.max(annotation_em).max(0.5);
@@ -1401,9 +1404,8 @@ fn text_em(text: &str) -> f32 {
             match code {
                 // Combining marks: no advance.
                 0x0300..=0x036F | 0x02C0..=0x02FF | 0xFE20..=0xFE2F => 0.0,
-                // Bopomofo letters.
-                0x3100..=0x312F | 0x31A0..=0x31BF => 0.5,
-                0x2E80..=0xF9FF | 0xFF00..=0xFF60 => 1.0,
+                // Full-width forms, ideographs, kana and bopomofo.
+                0x2E80..=0x312F | 0x31A0..=0xF9FF | 0xFF00..=0xFF60 => 1.0,
                 _ => 0.5,
             }
         })
