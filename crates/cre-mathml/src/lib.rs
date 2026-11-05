@@ -425,13 +425,7 @@ fn render_node(node: Node<'_, '_>, ctx: Ctx) -> String {
             "<span class=\"cre-mtext\" style=\"white-space:pre\">{}</span>",
             escape_html(&token_text(node))
         ),
-        "mspace" => {
-            let width = node.attribute("width").unwrap_or("0.5em");
-            format!(
-                "<span class=\"cre-mspace\" style=\"width:{}\"></span>",
-                escape_attr(width)
-            )
-        }
+        "mspace" => render_mspace(node),
         "msup" => render_script(node, ctx, ScriptKind::Sup),
         "msub" => render_script(node, ctx, ScriptKind::Sub),
         "msubsup" => render_scripts(node, ctx),
@@ -984,6 +978,26 @@ fn horizontal_stretch(html: String, script: Option<Node<'_, '_>>, base: Node<'_,
     )
 }
 
+/// `mspace`: a horizontal gap the author sized explicitly.
+fn render_mspace(node: Node<'_, '_>) -> String {
+    let width = estimate_mspace_width(node);
+    let height = node
+        .attribute("height")
+        .and_then(parse_length_em)
+        .unwrap_or(0.0);
+    let depth = node
+        .attribute("depth")
+        .and_then(parse_length_em)
+        .unwrap_or(0.0);
+    let mut style = format!("display:inline-block;width:{width:.3}em;");
+    if height > 0.0 {
+        style.push_str(&format!("height:{:.3}em;", height + depth));
+        style.push_str("vertical-align:");
+        style.push_str(&format!("-{depth:.3}em;"));
+    }
+    format!("<span class=\"cre-mspace\" style=\"{style}\"></span>")
+}
+
 fn render_fraction(node: Node<'_, '_>, ctx: Ctx) -> String {
     let mut children = element_children(node);
     let numerator = children
@@ -1465,6 +1479,38 @@ fn estimate_height(node: Node<'_, '_>, display: bool) -> f32 {
 
 /// Rough content width in `em`. Only used to angle `menclose` diagonal strikes
 /// corner to corner, so a coarse token-width model is enough.
+/// The width an `mspace` asks for, in em (default 0.25em per MathML core).
+fn estimate_mspace_width(node: Node<'_, '_>) -> f32 {
+    node.attribute("width")
+        .and_then(|value| parse_length_em(value))
+        .unwrap_or(0.25)
+        .clamp(0.0, 40.0)
+}
+
+/// `1.5em` / `2em` / `12px` / `0.3` (unitless is em) to em.
+fn parse_length_em(value: &str) -> Option<f32> {
+    let value = value.trim();
+    let (number, unit) = value.split_at(
+        value
+            .find(|ch: char| !(ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == '+'))
+            .unwrap_or(value.len()),
+    );
+    let number: f32 = number.parse().ok()?;
+    if !number.is_finite() || number < 0.0 {
+        return None;
+    }
+    Some(match unit.trim() {
+        "em" | "" => number,
+        "ex" => number * 0.5,
+        "px" => number / 16.0,
+        "pt" => number / 12.0,
+        "cm" => number / 0.42,
+        "mm" => number / 4.2,
+        "in" => number * 6.0,
+        _ => number,
+    })
+}
+
 fn estimate_width(node: Node<'_, '_>) -> f32 {
     if node.is_text() {
         return 0.5;
@@ -1489,6 +1535,7 @@ fn estimate_width(node: Node<'_, '_>) -> f32 {
     match name.as_str() {
         "math" | "mrow" | "mstyle" | "merror" | "mphantom" | "semantics" | "mtr" | "mtd"
         | "mth" => sum(&children),
+        "mspace" => estimate_mspace_width(node),
         "menclose" => sum(&children) + 0.24,
         "mfrac" => max(&children) + 0.3,
         "msup" | "msub" => {
