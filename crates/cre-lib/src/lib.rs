@@ -266,15 +266,6 @@ const LAYOUT_MEMORY_RESERVE: usize = 24 * 1024 * 1024;
 const MIN_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_CHUNK_BYTES: usize = 128 * 1024;
 
-/// Explicit chunk size override (`CRE_CHUNK_BYTES`), for testing and for
-/// forcing chunking on a device where the automatic choice misjudges.
-fn chunk_target_override() -> Option<usize> {
-    std::env::var("CRE_CHUNK_BYTES")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value >= 16 * 1024)
-}
-
 /// Bytes the kernel says it can still hand out, if the platform reports it.
 fn available_memory_bytes() -> Option<usize> {
     memory_available_detail().map(|(bytes, _)| bytes as usize)
@@ -337,10 +328,7 @@ fn memory_total_bytes() -> Option<u64> {
 /// standalone HTML file) into layout chunks when it would not fit in one,
 /// using the same memory budget as EPUB chunking.
 fn split_single_document(html: String) -> Vec<String> {
-    let target = match chunk_target_override() {
-        Some(target) => target,
-        None => plan_chunk_bytes(html.len(), available_memory_bytes()),
-    };
+    let target = plan_chunk_bytes(html.len(), available_memory_bytes());
     if target == usize::MAX || html.len() <= target {
         return vec![html];
     }
@@ -371,13 +359,7 @@ fn chunk_budgets(available: Option<usize>) -> (usize, Option<usize>, usize) {
     } else {
         (budget * 3) / 5
     };
-    let mut images = image_share;
-    if let Ok(value) = std::env::var("CRE_IMAGE_BUDGET_MB")
-        && let Ok(mb) = value.trim().parse::<usize>()
-        && mb > 0
-    {
-        images = mb * 1024 * 1024;
-    }
+    let images = image_share;
     (text, Some(images), budget)
 }
 
@@ -962,11 +944,8 @@ impl Document {
         let svg_raster = Arc::new(SvgRaster::new(content_width, content_height));
         match format {
             DocumentFormat::Epub => {
-                let t0 = std::time::Instant::now();
                 let mut book = EpubBook::open(path)?;
-                let t1 = std::time::Instant::now();
                 let _ = book.normalize_inline_svg_images();
-                let t2 = std::time::Instant::now();
                 let raw_toc = std::mem::take(&mut book.toc);
                 let raw_page_map_source = std::mem::take(&mut book.page_map_source);
                 let raw_page_map = std::mem::take(&mut book.page_map);
@@ -991,20 +970,14 @@ impl Document {
                     html_options.margin_x,
                     html_options.margin_y,
                 );
-                let t3 = std::time::Instant::now();
-                let htmls = match chunk_target_override() {
-                    Some(target) => book.to_html_chunks(&html_options, target)?,
-                    None => {
-                        let (text_budget, image_budget, layout_budget) =
-                            chunk_budgets(available_memory_bytes());
-                        book.to_html_chunks_budgeted(
-                            &html_options,
-                            text_budget,
-                            image_budget,
-                            layout_budget,
-                        )?
-                    }
-                };
+                let (text_budget, image_budget, layout_budget) =
+                    chunk_budgets(available_memory_bytes());
+                let htmls = book.to_html_chunks_budgeted(
+                    &html_options,
+                    text_budget,
+                    image_budget,
+                    layout_budget,
+                )?;
                 // Decoded images dominate an illustrated book's footprint, and
                 // they cannot be seen in the HTML size.
                 let chunk_image_bytes = htmls
@@ -1012,19 +985,6 @@ impl Document {
                     .map(|html| cre_epub::chunk_image_bytes(&book.resource_provider, html))
                     .max()
                     .unwrap_or(0) as u64;
-                let t4 = std::time::Instant::now();
-                if std::env::var_os("CRE_OPEN_PROFILE").is_some() {
-                    let ms = |a: std::time::Instant, b: std::time::Instant| {
-                        b.duration_since(a).as_secs_f64() * 1000.0
-                    };
-                    eprintln!(
-                        "  open: epub={:.1} svg={:.1} images={:.1} chunk={:.1}",
-                        ms(t0, t1),
-                        ms(t1, t2),
-                        ms(t2, t3),
-                        ms(t3, t4)
-                    );
-                }
                 let cover_image = epub_cover_image(&book);
                 let has_non_linear_flows = book.spine.iter().any(|item| !item.linear);
                 let resource_provider = Arc::new(book.resource_provider);
@@ -1416,16 +1376,6 @@ impl Document {
             options.height = (height * scale).round().max(1.0) as u32;
             options.layout_height = options.height;
             options.page_margin = 0.0;
-            if std::env::var_os("CRE_FXL_DEBUG").is_some() {
-                eprintln!(
-                    "cre-lib: fxl chunk={chunk_index} fixed={fixed:?} canvas={}x{} scale={scale} reader_css={:?} options={}x{}",
-                    self.width,
-                    self.height,
-                    self.reader_css_size(),
-                    options.width,
-                    options.height
-                );
-            }
         }
         options
     }
@@ -1564,7 +1514,6 @@ fn layout_chunk_html(
     fixed_height: Option<f32>,
 ) -> Result<(ChunkLayout, HtmlDocument, Vec<LineBox>, Vec<PageStart>)> {
     {
-        let started = std::time::Instant::now();
         let mut timer = StageTimer::new();
         timer.last = std::time::Instant::now();
         let fixed_layout = fixed_height.map(|_| true);
@@ -1766,14 +1715,6 @@ fn layout_chunk_html(
         };
         timer.mark("tail");
         timer.report(chunk_index);
-        if std::env::var_os("CRE_LAYOUT_TIMING").is_some() {
-            eprintln!(
-                "cre-lib: chunk {chunk_index} laid out in {:.0} ms ({} pages, {} lines)",
-                started.elapsed().as_secs_f64() * 1000.0,
-                layout.pages.len(),
-                layout.line_count
-            );
-        }
         Ok((layout, doc, lines, page_starts))
     }
 }
@@ -5702,13 +5643,6 @@ fn create_document(
         let math_font = cre_mathml::MathFont::from_font_datas(
             font_datas.iter().map(|blob| blob.as_ref().as_ref()),
         );
-        if std::env::var_os("CRE_MATH_DEBUG").is_some() {
-            eprintln!(
-                "cre-math: fonts={} math_font={:?}",
-                font_datas.len(),
-                math_font.as_ref().map(|font| font.family.clone())
-            );
-        }
         html_source = cre_mathml::rewrite_mathml_with(&html_source, math_font.as_ref());
         html_source.push_str("<style>");
         html_source.push_str(&cre_mathml::css(math_font.as_ref()));

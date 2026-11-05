@@ -25,11 +25,7 @@ fn options(font_size: f32) -> DocumentOptions {
 
 #[test]
 fn font_change_relayouts_only_the_chunk_being_read() {
-    // juliet is small, so ask for small chunks: the point is a book with several
-    // of them. This is an environment variable in the *document*, and only this
-    // test binary uses it, so nothing else in the test run sees it.
-    // SAFETY: this integration test file is its own process.
-    unsafe { std::env::set_var("CRE_CHUNK_BYTES", "32768") };
+    // juliet is split into several chunks, which is what this test needs.
     let path = fixture("juliet.epub");
 
     let mut doc = Document::with_options(&path, &options(18.0)).unwrap();

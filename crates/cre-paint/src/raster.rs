@@ -112,19 +112,7 @@ impl<'a> Rasterizer<'a> {
     }
 
     pub(crate) fn run(mut self, scene: &'a Scene) -> Pixmap {
-        let stats = std::env::var_os("CRE_RASTER_STATS").is_some();
-        let mut acc = [std::time::Duration::ZERO; 8];
-        let mut counts = [0usize; 8];
         for command in &scene.commands {
-            let started = stats.then(std::time::Instant::now);
-            let slot = match command {
-                RenderCommand::Fill(_) => 0,
-                RenderCommand::Stroke(_) => 1,
-                RenderCommand::GlyphRun(_) => 2,
-                RenderCommand::PushLayer(_) | RenderCommand::PopLayer => 3,
-                RenderCommand::PushClipLayer(_) => 4,
-                RenderCommand::BoxShadow(_) => 5,
-            };
             match command {
                 RenderCommand::Fill(cmd) => self.fill(cmd),
                 RenderCommand::Stroke(cmd) => self.stroke(cmd),
@@ -134,26 +122,9 @@ impl<'a> Rasterizer<'a> {
                 RenderCommand::PopLayer => self.pop_layer(),
                 RenderCommand::BoxShadow(cmd) => self.box_shadow(cmd),
             }
-            if let Some(started) = started {
-                acc[slot] += started.elapsed();
-                counts[slot] += 1;
-            }
         }
         while !self.layers.is_empty() {
             self.pop_layer();
-        }
-        if stats {
-            let names = ["fill", "stroke", "glyphs", "layer", "clip", "shadow"];
-            for index in 0..names.len() {
-                if counts[index] > 0 {
-                    eprintln!(
-                        "raster {:>6}: {:>4} cmds {:>8.2} ms",
-                        names[index],
-                        counts[index],
-                        acc[index].as_secs_f64() * 1000.0
-                    );
-                }
-            }
         }
         self.base
     }

@@ -360,12 +360,6 @@ impl Doc {
             return None;
         }
         let face = find_font_face(name, false, false);
-        if std::env::var_os("CRE_MATH_DEBUG").is_some() {
-            eprintln!(
-                "cre-math: family.faces={value:?} math_name={name:?} path={:?}",
-                face.as_ref().map(|face| face.path.clone())
-            );
-        }
         face.map(|face| face.path)
     }
 
@@ -451,12 +445,6 @@ impl Doc {
         let snapshot = self.render_state_snapshot(path.clone());
         if self.inner.is_some() && self.render_state_snapshot == snapshot {
             return;
-        }
-        if std::env::var_os("CRE_SNAPSHOT_DEBUG").is_some() {
-            eprintln!(
-                "cre-lua: relayout, before={}\n              after ={}",
-                self.render_state_snapshot, snapshot
-            );
         }
         self.rerender_count = self.rerender_count.saturating_add(1);
         let xpointer = self.current_xpointer();

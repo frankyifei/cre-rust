@@ -57,19 +57,8 @@ impl ImageCache {
             return Some(bytes.clone());
         }
         let premultiplied = premultiplied_rgba(image)?;
-        let started = std::env::var_os("CRE_RASTER_STATS")
-            .is_some()
-            .then(std::time::Instant::now);
         let bytes =
             downscale_premultiplied(premultiplied.as_ref(), image.width, image.height, dw, dh);
-        if let Some(started) = started {
-            eprintln!(
-                "downscale {}x{} -> {dw}x{dh} {:.2} ms",
-                image.width,
-                image.height,
-                started.elapsed().as_secs_f64() * 1000.0
-            );
-        }
         let bytes = Arc::new(bytes);
         if self.scaled.len() >= 8 {
             self.scaled.clear();
@@ -145,25 +134,11 @@ impl PaintCache {
         self.glyphs.len()
     }
 
-    /// `CRE_PAINT_GLYPH_CACHE=0` disables reuse, for A/B measurements.
-    fn enabled() -> bool {
-        !matches!(
-            std::env::var("CRE_PAINT_GLYPH_CACHE").as_deref(),
-            Ok("0") | Ok("false")
-        )
-    }
-
     fn get(&self, key: &GlyphKey) -> Option<GlyphBitmap> {
-        if !Self::enabled() {
-            return None;
-        }
         self.glyphs.get(key).cloned()
     }
 
     fn insert(&mut self, key: GlyphKey, value: GlyphBitmap) {
-        if !Self::enabled() {
-            return;
-        }
         let weight = value
             .as_ref()
             .as_ref()
@@ -304,6 +279,12 @@ impl PageBitmap {
         std::fs::write(path, out)
     }
 }
+/// `CRE_RENDER_PROFILE` asked for per-page timings (read once).
+fn render_profile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CRE_RENDER_PROFILE").is_some())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn render_page(
     scene: &Scene,
@@ -363,7 +344,7 @@ pub fn render_page_cached(
             background,
         );
     }
-    let profile = std::env::var_os("CRE_RENDER_PROFILE").is_some();
+    let profile = render_profile_enabled();
     let started = std::time::Instant::now();
     let page_transform = Affine::translate((0.0, -page_top as f64));
     let local_top = (clip_top - page_top).clamp(0.0, height as f32);
