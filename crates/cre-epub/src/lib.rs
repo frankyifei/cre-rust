@@ -1375,41 +1375,18 @@ fn ruby_cell(inner: &str) -> Option<String> {
     if base.trim().is_empty() || annotation.trim().is_empty() {
         return None;
     }
-    // Both blocks are centred on the cell with absolute positioning: the
-    // layout engine does not apply `text-align` inside an inline-block, but it
-    // does resolve `left: 50%` + `translateX(-50%)` against the cell.
-    // The note is usually wider than the character it annotates (three bopomofo
-    // letters over one ideograph), so the cell follows whichever is wider and
-    // the annotation keeps its own width instead of being squeezed.
-    let base_em = text_em(&base);
-    let annotation_em = text_em(&annotation) * 0.5;
-    let cell = base_em.max(annotation_em).max(0.5);
-    // The annotation line sits on top of the base line; the cell reserves both
-    // so the note cannot run into the previous line.
-    let height = 1.15 + 0.55;
+    // Both blocks stay in flow: the cell takes the width of the wider one, so a
+    // note longer than its character keeps its own width instead of running
+    // into the neighbouring note (bopomofo/zhuyin notes are usually longer than
+    // the ideograph they annotate), and `text-align: center` centres whichever
+    // block is narrower. That is the same construction the MathML limits use.
+    //
+    // The note drops the inherited `letter-spacing`: books apply it to body text
+    // for breathing room between characters, which on a 50%-size annotation only
+    // inflates the cell and pushes the characters apart.
     Some(format!(
-        r#"<span style="display:inline-block;position:relative;width:{cell:.3}em;height:{height:.2}em;vertical-align:bottom;"><span style="position:absolute;left:50%;transform:translateX(-50%);top:0;white-space:nowrap;font-size:50%;line-height:1;">{annotation}</span><span style="position:absolute;left:50%;transform:translateX(-50%);bottom:0;white-space:nowrap;line-height:1.15;">{base}</span></span>"#
+        r#"<span style="display:inline-block;text-align:center;vertical-align:bottom;"><span style="display:block;white-space:nowrap;font-size:50%;line-height:1;letter-spacing:normal;">{annotation}</span><span style="display:block;white-space:nowrap;line-height:1.15;">{base}</span></span>"#
     ))
-}
-
-/// Approximate text width in em.
-///
-/// Bopomofo and other narrow phonetic letters are half-width, ideographs and
-/// kana are full-width, and combining tone marks take no advance of their own.
-fn text_em(text: &str) -> f32 {
-    text.chars()
-        .filter(|ch| !ch.is_whitespace() && *ch != '<' && *ch != '>')
-        .map(|ch| {
-            let code = ch as u32;
-            match code {
-                // Combining marks: no advance.
-                0x0300..=0x036F | 0x02C0..=0x02FF | 0xFE20..=0xFE2F => 0.0,
-                // Full-width forms, ideographs, kana and bopomofo.
-                0x2E80..=0x312F | 0x31A0..=0xF9FF | 0xFF00..=0xFF60 => 1.0,
-                _ => 0.5,
-            }
-        })
-        .sum()
 }
 
 /// Drops `<rb>`/`<rp>` wrappers and their closing tags, keeping the text.
