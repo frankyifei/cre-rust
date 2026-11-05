@@ -705,7 +705,11 @@ impl EpubBook {
                 id: item.idref.clone(),
                 href: item.href.clone(),
                 media_type: item.media_type.clone(),
-                body_html: rewrite_urls(&body, parent_dir(&item.href), &self.opf_dir),
+                body_html: rewrite_ruby(&rewrite_urls(
+                    &body,
+                    parent_dir(&item.href),
+                    &self.opf_dir,
+                )),
                 css_urls,
                 inline_styles,
                 nonlinear,
@@ -1318,6 +1322,83 @@ fn floor_char_boundary(text: &str, index: usize) -> usize {
 ///
 /// The parse-time inliner then needs no document directory: chunks can hold
 /// documents from several directories.
+/// Turns `<ruby>base<rt>ann</rt></ruby>` into two stacked, centred inline
+/// blocks.
+///
+/// Blitz has no ruby layout: it lays the annotation out as ordinary inline text
+/// after the base character, so the note sits to the right of its character and
+/// the line keeps the annotation's own advance. A ruby cell is a small vertical
+/// stack instead - annotation above the base, both centred, the cell as wide as
+/// the wider of the two - which is how crengine and browsers draw it.
+fn rewrite_ruby(html: &str) -> String {
+    if !html
+        .as_bytes()
+        .windows(5)
+        .any(|window| window.eq_ignore_ascii_case(b"<ruby"))
+    {
+        return html.to_string();
+    }
+    let mut out = String::with_capacity(html.len() + html.len() / 16);
+    let mut cursor = 0usize;
+    while let Some(open_start) = next_tag_start(html, cursor, "<ruby") {
+        let Some((close_start, close_end)) =
+            find_matching_close_tag(html, open_start, "<ruby", "</ruby")
+        else {
+            break;
+        };
+        out.push_str(&html[cursor..open_start]);
+        let inner = &html[find_tag_end(html, open_start).unwrap_or(close_start)..close_start];
+        match ruby_cell(inner) {
+            Some(cell) => out.push_str(&cell),
+            None => out.push_str(&html[open_start..close_end]),
+        }
+        cursor = close_end;
+    }
+    out.push_str(&html[cursor..]);
+    out
+}
+
+/// The two stacked blocks of one ruby cell, or `None` when the markup is not a
+/// plain base + annotation pair.
+fn ruby_cell(inner: &str) -> Option<String> {
+    let lower = inner.to_ascii_lowercase();
+    let rt_start = next_tag_start(&lower, 0, "<rt")?;
+    let rt_body_start = find_tag_end(inner, rt_start)?;
+    let rt_end = next_tag_start(&lower, rt_body_start, "</rt")?;
+    // Only the first pair is handled; anything else (multiple annotations,
+    // nested markup we do not understand) is left to the normal inline path.
+    if next_tag_start(&lower, rt_end + "</rt".len(), "<rt").is_some() {
+        return None;
+    }
+    let base = strip_ruby_wrappers(&inner[..rt_start]);
+    let annotation = strip_ruby_wrappers(&inner[rt_body_start..rt_end]);
+    if base.trim().is_empty() || annotation.trim().is_empty() {
+        return None;
+    }
+    Some(format!(
+        r#"<span style="display:inline-block;text-align:center;vertical-align:bottom;"><span style="display:block;text-align:center;font-size:50%;line-height:1.05;">{annotation}</span><span style="display:block;text-align:center;line-height:1.05;">{base}</span></span>"#
+    ))
+}
+
+/// Drops `<rb>`/`<rp>` wrappers and their closing tags, keeping the text.
+fn strip_ruby_wrappers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    while let Some(open) = text[cursor..].find('<').map(|offset| cursor + offset) {
+        out.push_str(&text[cursor..open]);
+        let Some(end) = find_tag_end(text, open) else {
+            return out;
+        };
+        let name = tag_name(&text[open..end]);
+        if !matches!(name.as_str(), "rb" | "rp" | "rt") {
+            out.push_str(&text[open..end]);
+        }
+        cursor = end;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
 fn svg_hrefs_to_book_paths(html: &str, doc_dir: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut cursor = 0usize;
