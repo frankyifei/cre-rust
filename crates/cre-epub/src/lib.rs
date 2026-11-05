@@ -593,10 +593,14 @@ impl EpubBook {
             if !include {
                 continue;
             }
-            let bytes = self
-                .resource_provider
-                .get(&item.href)
-                .with_context(|| format!("spine document missing: {}", item.href))?;
+            // A package can list documents that are not in the archive at all
+            // (the Readium epub30-test-230 case). Refusing the whole book hides
+            // everything else in it, so skip the missing item; its slot keeps
+            // its spine index, so the items after it still map correctly.
+            let Some(bytes) = self.resource_provider.get(&item.href) else {
+                eprintln!("cre-epub: spine document missing: {}", item.href);
+                continue;
+            };
             let text = decode_text(&bytes);
             let layout = spine_layout(&item.properties, self.global_layout);
             // A pre-paginated XHTML page declares its initial containing block
@@ -708,6 +712,9 @@ impl EpubBook {
                 layout,
                 viewport,
             });
+        }
+        if docs.is_empty() {
+            bail!("no readable spine document");
         }
         Ok(docs)
     }
