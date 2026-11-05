@@ -2006,7 +2006,10 @@ impl Document {
         // to be laid out anyway, so measuring it costs nothing, and it keeps
         // the worker count from being decided by a cheap text chunk while an
         // image-heavy one waits behind it.
-        let probe_index = (0..count)
+        // Chunk 0 is never the probe: when the pass runs on one thread its DOM
+        // is kept from here to the first page, and laying the other chunks out
+        // next to it would add a whole chunk's layout to the peak for nothing.
+        let probe_index = (1..count)
             .max_by_key(|&index| {
                 let html = &self.sources[index];
                 let images = html
