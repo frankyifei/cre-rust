@@ -980,7 +980,17 @@ fn for_each_glyph_pixel<'a>(
         ttf_parser::Face::parse(data, font_data.index).expect("parse font data")
     });
 
-    let scale = transform.as_coeffs();
+    // The scene's `glyph_transform` is the synthesis transform (faux oblique,
+    // stretched fences) expressed in font space, where y grows up. The raster and
+    // the page grow down, so the shear has to be mirrored through the x axis:
+    // without that, a synthesized italic leans left instead of right.
+    let flip = Affine::new([1.0, 0.0, 0.0, -1.0, 0.0, 0.0]);
+    let glyph_transform = glyph_transform
+        .map(|local| flip * local * flip)
+        .unwrap_or(Affine::IDENTITY);
+    let glyph_transform = transform * glyph_transform;
+
+    let scale = glyph_transform.as_coeffs();
     let scale_x = (scale[0] * scale[0] + scale[1] * scale[1]).sqrt() as f32;
     let scale_y = (scale[2] * scale[2] + scale[3] * scale[3]).sqrt() as f32;
     let glyph_size = font_size * scale_y.max(scale_x);
@@ -992,9 +1002,11 @@ fn for_each_glyph_pixel<'a>(
         if glyph.id == 0 {
             continue;
         }
-        let mut glyph_transform = glyph_transform.unwrap_or(Affine::IDENTITY);
-        glyph_transform = transform * glyph_transform;
-        let origin = glyph_transform * Point::new(glyph.x as f64, glyph.y as f64);
+        // The glyph's own position is only affected by the page transform: the
+        // synthesis transform acts on the outline around the pen position, not
+        // on the pen position itself (skewing the position shifted every italic
+        // run right into the word that follows it).
+        let origin = transform * Point::new(glyph.x as f64, glyph.y as f64);
         if (origin.y as f32) < clip_top - glyph_size || (origin.y as f32) > clip_bottom + glyph_size
         {
             continue;

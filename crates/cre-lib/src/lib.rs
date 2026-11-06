@@ -5556,6 +5556,97 @@ fn strip_multi_column_declarations(css: &str) -> String {
     column_declaration_regex().replace_all(css, "").into_owned()
 }
 
+/// Blitz's automatic table layout treats a cell's `width` as the column's exact
+/// width, while browsers treat it as a minimum and let the column grow to fit the
+/// cell's content. Books that set a small width on every cell (`td { width: 1em }`
+/// is common for character tables) therefore collapse their cells onto each other
+/// and the text overlaps. Rewriting the declaration to `min-width` gives Blitz the
+/// browser behaviour: the declared width stays a floor, the content sets the size.
+fn widen_table_cell_widths(html: &str) -> String {
+    if !contains_ignore_ascii_case(html, "<style") {
+        return html.to_string();
+    }
+    static STYLE_BLOCK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let style_block = STYLE_BLOCK.get_or_init(|| {
+        regex::Regex::new(r"(?is)(<style\b[^>]*>)(.*?)(</style\s*>)").expect("style regex is valid")
+    });
+    style_block
+        .replace_all(html, |captures: &regex::Captures<'_>| {
+            format!(
+                "{}{}{}",
+                &captures[1],
+                widen_cell_widths_in_stylesheet(&captures[2]),
+                &captures[3]
+            )
+        })
+        .into_owned()
+}
+
+/// True when the rule's subject is a table cell (`td`/`th`).
+fn selector_targets_cell(selector: &str) -> bool {
+    selector.split(',').any(|part| {
+        let last = part.split_whitespace().last().unwrap_or("");
+        let last = last.trim_start_matches(['>', '+', '~']);
+        let name = last
+            .split(['.', '#', ':', '['])
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(')');
+        name.eq_ignore_ascii_case("td") || name.eq_ignore_ascii_case("th")
+    })
+}
+
+fn widen_cell_widths_in_stylesheet(css: &str) -> String {
+    if !contains_ignore_ascii_case(css, "width") {
+        return css.to_string();
+    }
+    // `table-layout: fixed` really does use the declared widths; leave it alone.
+    if contains_ignore_ascii_case(css, "table-layout")
+        && css.to_ascii_lowercase().contains("table-layout: fixed")
+    {
+        return css.to_string();
+    }
+    static RULE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static WIDTH: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let rule = RULE.get_or_init(|| {
+        regex::Regex::new(r"(?is)([^{}]+)\{([^{}]*)\}").expect("CSS rule regex is valid")
+    });
+    let width = WIDTH.get_or_init(|| {
+        regex::Regex::new(r"(?i)(^|;)(\s*)width(\s*):").expect("CSS width regex is valid")
+    });
+    rule.replace_all(css, |captures: &regex::Captures<'_>| {
+        let declarations = &captures[2];
+        if !selector_targets_cell(&captures[1]) || !width.is_match(declarations) {
+            return captures[0].to_string();
+        }
+        let rewritten = width.replace_all(declarations, "${1}${2}min-width${3}:");
+        format!("{}{{{}}}", &captures[1], rewritten)
+    })
+    .into_owned()
+}
+
+/// Blitz ignores `<caption>` (the table layout logs and skips it), so the title
+/// of a table disappears. Move a leading caption in front of the table as a
+/// centred block, which is where the reader would draw it.
+fn move_table_captions(html: &str) -> String {
+    if !contains_ignore_ascii_case(html, "<caption") {
+        return html.to_string();
+    }
+    static CAPTION: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let caption = CAPTION.get_or_init(|| {
+        regex::Regex::new(r"(?is)(<table\b[^>]*>)(\s*)<caption\b[^>]*>(.*?)</caption\s*>")
+            .expect("caption regex is valid")
+    });
+    caption
+        .replace_all(html, |captures: &regex::Captures<'_>| {
+            format!(
+                r#"<div class="cre-caption" style="display:block;text-align:center;">{}</div>{}"#,
+                &captures[3], &captures[1]
+            )
+        })
+        .into_owned()
+}
+
 fn strip_multi_column_styles(html: &str) -> String {
     // These regexes run over every chunk's HTML; a chunk without a
     // `column-*`/`columns` declaration cannot match and is skipped entirely.
@@ -5672,7 +5763,9 @@ fn create_document(
     // but lays the container out badly (the following image was pulled above
     // the overflowing text in Juliet's home page). Remove the declarations
     // before layout so both engines behave the same.
-    let mut html_source = strip_multi_column_styles(base_html);
+    let html_source = strip_multi_column_styles(base_html);
+    let html_source = widen_table_cell_widths(&html_source);
+    let mut html_source = move_table_captions(&html_source);
     let stripped_at = started.elapsed().as_secs_f64() * 1000.0;
     if html_source.to_ascii_lowercase().contains("<math") {
         // Prefer a loaded font with an OpenType MATH table for math content,

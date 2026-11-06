@@ -925,16 +925,11 @@ impl EpubBook {
 
     fn html_head(&self, options: &HtmlOptions, docs: &[&SpineDocument]) -> String {
         let mut css_urls = Vec::new();
-        let mut inline_styles = Vec::new();
+        let mut seen_inline: Vec<&str> = Vec::new();
         for doc in docs {
             for url in &doc.css_urls {
                 if !css_urls.contains(url) {
                     css_urls.push(url.clone());
-                }
-            }
-            for style in &doc.inline_styles {
-                if !inline_styles.contains(style) {
-                    inline_styles.push(style.clone());
                 }
             }
         }
@@ -951,10 +946,22 @@ impl EpubBook {
                 escape_attr(url)
             ));
         }
-        for style in &inline_styles {
-            html.push_str("<style>");
-            html.push_str(style);
-            html.push_str("</style>");
+        // A `<style>` block belongs to its own spine document, the way a browser
+        // loads each XHTML separately. Chunks hold several documents at once, so
+        // leaving these rules global let one document restyle the others: the
+        // character-entity table's `td { height: 1em; line-height: 1em }` made
+        // every other table in the chunk overlap its own rows.
+        for doc in docs {
+            let scope = format!("[data-spine-id=\"{}\"]", escape_attr(&doc.id));
+            for style in &doc.inline_styles {
+                if seen_inline.contains(&style.as_str()) {
+                    continue;
+                }
+                seen_inline.push(style.as_str());
+                html.push_str("<style>");
+                html.push_str(&scope_stylesheet(style, &scope));
+                html.push_str("</style>");
+            }
         }
         // crengine gives every EPUB spine item its own <DocFragment> and its
         // epub.css puts `page-break-before: always` on it, so a chapter always
@@ -3193,6 +3200,71 @@ fn escape_attr(value: &str) -> String {
     value.replace('&', "&amp;").replace('"', "&quot;")
 }
 
+/// Rewrites a stylesheet so every rule only applies inside `scope`.
+///
+/// Each spine document is a `<section data-spine-id="...">` in the chunk, so a
+/// document's own `<style>` block has to be prefixed with that section; `html`
+/// and `body` refer to the section itself, which is what the browser would style
+/// when it renders the document on its own.
+fn scope_stylesheet(css: &str, scope: &str) -> String {
+    let mut out = String::with_capacity(css.len() + css.len() / 4);
+    let mut rest = css;
+    while let Some(open) = rest.find('{') {
+        // An at-rule without a selector (`@font-face`, `@page`, `@charset`)
+        // must stay as it is, and `@media`/`@supports` wrap rules that are
+        // scoped individually as the scan reaches them.
+        let selector = &rest[..open];
+        if selector.trim_start().starts_with('@') {
+            out.push_str(selector);
+        } else {
+            out.push_str(&scope_selector_list(selector, scope));
+        }
+        out.push('{');
+        let Some(close) = rest[open..].find('}') else {
+            out.push_str(&rest[open + 1..]);
+            return out;
+        };
+        out.push_str(&rest[open + 1..open + close]);
+        out.push('}');
+        rest = &rest[open + close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn scope_selector_list(selectors: &str, scope: &str) -> String {
+    selectors
+        .split(',')
+        .map(|part| {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                return String::new();
+            }
+            let lower = trimmed.to_ascii_lowercase();
+            for root in ["html", "body", ":root"] {
+                if lower == root {
+                    // A rule on the document root itself stays global: our base
+                    // typography sets the reader's font size (and margins) on the
+                    // chunk's body, and scoping `body { font-size: 75% }` onto a
+                    // section would multiply the two instead of overriding.
+                    return trimmed.to_string();
+                }
+                if lower.starts_with(root)
+                    && matches!(
+                        lower.as_bytes().get(root.len()),
+                        Some(b' ') | Some(b'>') | Some(b'+') | Some(b'~')
+                    )
+                {
+                    // `body p` becomes `<section> p`.
+                    return format!("{scope}{}", &trimmed[root.len()..]);
+                }
+            }
+            format!("{scope} {trimmed}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -3447,7 +3519,11 @@ mod tests {
     fn combined_html_has_cdata_free_inline_styles() {
         let book = EpubBook::from_bytes(synthetic_cdata_styled_epub()).unwrap();
         let html = book.to_html(&HtmlOptions::default()).unwrap();
-        assert!(html.contains("p.cdata-marker { color: #ff0000; }"));
+        // The style is scoped to its spine document (a chunk holds several
+        // documents, and their styles must not leak into each other), so the
+        // selector is prefixed; the declaration itself is unchanged.
+        assert!(html.contains("p.cdata-marker"), "{html}");
+        assert!(html.contains("color: #ff0000"), "{html}");
         assert!(!html.contains("<![CDATA["));
         assert!(!html.contains("]]>"));
     }

@@ -1482,7 +1482,7 @@ fn estimate_height(node: Node<'_, '_>, display: bool) -> f32 {
 /// The width an `mspace` asks for, in em (default 0.25em per MathML core).
 fn estimate_mspace_width(node: Node<'_, '_>) -> f32 {
     node.attribute("width")
-        .and_then(|value| parse_length_em(value))
+        .and_then(parse_length_em)
         .unwrap_or(0.25)
         .clamp(0.0, 40.0)
 }

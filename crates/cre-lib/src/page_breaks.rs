@@ -99,7 +99,7 @@ fn parse_css_rules(css: &str) -> Vec<BreakRule> {
             Some(index) => &before[index + 1..],
             None => before,
         };
-        let selector = selector_text.trim();
+        let selector = strip_scope_prefix(selector_text.trim());
         if selector.starts_with('@') {
             match balanced_block_end(after_open) {
                 Some(end) => rest = &after_open[end + 1..],
@@ -118,6 +118,17 @@ fn parse_css_rules(css: &str) -> Vec<BreakRule> {
         }
     }
     rules
+}
+
+/// Drops the `[data-spine-id="…"]` prefix that scoped spine-document styles
+/// carry, so the simple-selector parser below sees the original rule.
+fn strip_scope_prefix(selector: &str) -> &str {
+    if let Some(rest) = selector.strip_prefix("[data-spine-id=")
+        && let Some(end) = rest.find(']')
+    {
+        return rest[end + 1..].trim_start();
+    }
+    selector
 }
 
 fn balanced_block_end(text: &str) -> Option<usize> {
