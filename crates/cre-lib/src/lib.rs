@@ -6714,28 +6714,33 @@ fn fit_picture_sections(html: &str, width: f32, height: f32) -> String {
             .expect("img src regex is valid")
     });
     let (width, height) = (width.max(1.0).round(), height.max(1.0).round());
-    let mut out = String::with_capacity(html.len());
+    let closing = "</section>";
+    let mut out = String::with_capacity(html.len() + 256);
+    // `cursor` is how far the output has been written, `scan` how far the
+    // search has got; a section that is left alone only moves `scan`, so its
+    // content is copied with the surrounding text.
     let mut cursor = 0usize;
+    let mut scan = 0usize;
+    let mut changed = false;
     let lower = html.to_ascii_lowercase();
-    while let Some(pos) = lower[cursor..].find("<section") {
-        let start = cursor + pos;
+    while let Some(pos) = lower[scan..].find("<section") {
+        let start = scan + pos;
         let Some(open_end) = html[start..].find('>').map(|end| start + end + 1) else {
             break;
         };
-        let open_tag = &html[start..open_end];
-        if !open_tag.to_ascii_lowercase().contains("cre-spine") {
-            cursor = open_end;
+        if !html[start..open_end]
+            .to_ascii_lowercase()
+            .contains("cre-spine")
+        {
+            scan = open_end;
             continue;
         }
-        let Some(close) = lower[open_end..]
-            .find("</section>")
-            .map(|end| open_end + end)
-        else {
+        let Some(close) = lower[open_end..].find(closing).map(|end| open_end + end) else {
             break;
         };
-        let body = &html[open_end..close];
-        let Some(picture) = picture_only_body(body, src) else {
-            cursor = close;
+        let end = close + closing.len();
+        let Some(picture) = picture_only_body(&html[open_end..close], src) else {
+            scan = end;
             continue;
         };
         out.push_str(&html[cursor..open_end]);
@@ -6746,14 +6751,15 @@ fn fit_picture_sections(html: &str, width: f32, height: f32) -> String {
              <image x=\"0\" y=\"0\" width=\"{width:.0}\" height=\"{height:.0}\" \
              preserveAspectRatio=\"xMidYMid meet\" href=\"{picture}\"/></svg>"
         ));
-        out.push_str(&html[close..]);
-        cursor = close;
+        // Keep the section's own closing tag.
+        out.push_str(&html[close..end]);
+        cursor = end;
+        scan = end;
+        changed = true;
     }
-    if cursor == 0 {
+    if !changed {
         return html.to_string();
     }
-    // `out` holds everything up to the closing tag of the last rewritten
-    // section; the rest follows as it was written.
     out.push_str(&html[cursor..]);
     out
 }
@@ -7272,6 +7278,29 @@ body { font-size: 20px; }
     assert!(find_case_insensitive(bytes, b"cre-render-base", 0).is_some());
     assert!(find_case_insensitive(bytes, b"font-size: 20px", 0).is_some());
     assert!(find_case_insensitive(bytes, b"visible", 0).is_some());
+}
+
+#[cfg(test)]
+mod picture_section_tests {
+    use super::*;
+
+    #[test]
+    fn documents_without_a_picture_section_are_untouched() {
+        let html = r#"<html><body><section class="cre-spine"><p>text</p><p><img src="mobi-image-1"/></p></section><section class="cre-spine"><p>more</p></section></body></html>"#;
+        assert_eq!(fit_picture_sections(html, 600.0, 800.0), html);
+    }
+
+    #[test]
+    fn a_picture_only_section_is_wrapped_in_a_page_svg() {
+        let html = r#"<html><body><p>intro</p><section class="cre-spine"><p><img src="mobi-image-1"/></p></section><section class="cre-spine"><p>after</p></section></body></html>"#;
+        let out = fit_picture_sections(html, 600.0, 800.0);
+        assert!(out.contains("<p>intro</p>"), "{out}");
+        assert!(out.contains("viewBox=\"0 0 600 800\""), "{out}");
+        assert!(out.contains("href=\"mobi-image-1\""), "{out}");
+        assert!(out.contains("<p>after</p>"), "{out}");
+        // The section keeps its tags and the document keeps its tail.
+        assert!(out.ends_with("</section></body></html>"), "{out}");
+    }
 }
 
 #[cfg(test)]
