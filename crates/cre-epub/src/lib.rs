@@ -2029,13 +2029,76 @@ fn extract_styles(html: &str, opf_dir: &str, doc_path: &str) -> (Vec<String>, Ve
         let text_end = text_start + close;
         let css = clean_css(&html[text_start..text_end]);
         if !css.is_empty() {
-            styles.push(css);
+            styles.push(rewrite_css_urls(&css, doc_dir));
         }
         cursor = text_end + 8;
     }
 
     let _ = opf_dir;
     (css_urls, styles)
+}
+
+/// Rewrites `url(...)` references inside a stylesheet so they point at the book
+/// (`epub://book/...`). Background images declared in a document's CSS are
+/// relative to that document otherwise, and the chunk's HTML lives at the book
+/// root, so they silently failed to load.
+fn rewrite_css_urls(css: &str, doc_dir: &str) -> String {
+    let lower = css.to_ascii_lowercase();
+    if !lower.contains("url(") {
+        return css.to_string();
+    }
+    let mut out = String::with_capacity(css.len() + 64);
+    let mut i = 0usize;
+    while let Some(rel) = lower[i..].find("url(") {
+        let start = i + rel;
+        out.push_str(&css[i..start]);
+        let mut j = start + 4;
+        while j < css.len() && css.as_bytes()[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let quote = css
+            .as_bytes()
+            .get(j)
+            .copied()
+            .filter(|byte| *byte == b'"' || *byte == b'\'');
+        if quote.is_some() {
+            j += 1;
+        }
+        let arg_start = j;
+        while j < css.len() {
+            let byte = css.as_bytes()[j];
+            if quote.is_some_and(|q| byte == q) || (quote.is_none() && byte == b')') {
+                break;
+            }
+            j += 1;
+        }
+        let arg = css[arg_start..j].trim();
+        let mut end = j;
+        if quote.is_some() && css.as_bytes().get(end) == quote.as_ref() {
+            end += 1;
+        }
+        while end < css.len() && css.as_bytes()[end].is_ascii_whitespace() {
+            end += 1;
+        }
+        if css.as_bytes().get(end) == Some(&b')') {
+            end += 1;
+        }
+        if arg.is_empty() || is_external(arg) {
+            out.push_str(&css[start..end]);
+        } else {
+            let path = resolve_href(doc_dir, &value_without_fragment(arg));
+            out.push_str(&format!(
+                "url(\"epub://book/{}\")",
+                encode_path(&normalize_path(&path))
+            ));
+        }
+        i = end;
+        if i >= css.len() {
+            break;
+        }
+    }
+    out.push_str(&css[i..]);
+    out
 }
 
 fn clean_css(raw: &str) -> String {
@@ -2111,7 +2174,7 @@ fn rewrite_tag(tag: &str, doc_dir: &str, opf_dir: &str) -> String {
             let name = &tag[start..i];
             let lower = name.to_ascii_lowercase();
             out.push_str(name);
-            if lower == "src" || lower == "href" || lower == "poster" || lower == "data" {
+            if matches!(lower.as_str(), "src" | "href" | "poster" | "data" | "style") {
                 while i < tag.len() && tag[i..].chars().next().is_some_and(|c| c.is_whitespace()) {
                     out.push(tag[i..].chars().next().unwrap());
                     i += 1;
@@ -2138,7 +2201,11 @@ fn rewrite_tag(tag: &str, doc_dir: &str, opf_dir: &str) -> String {
                                 i += ch.len_utf8();
                             }
                             let value = &tag[value_start..i];
-                            let rewritten = if is_external(value) {
+                            let rewritten = if lower == "style" {
+                                // CSS in a `style` attribute carries its own
+                                // `url(...)` references (background images).
+                                rewrite_css_urls(value, doc_dir)
+                            } else if is_external(value) {
                                 value.to_string()
                             } else {
                                 let path = resolve_href(doc_dir, &value_without_fragment(value));
@@ -2166,7 +2233,11 @@ fn rewrite_tag(tag: &str, doc_dir: &str, opf_dir: &str) -> String {
                                 i += ch.len_utf8();
                             }
                             let value = &tag[value_start..i];
-                            let rewritten = if is_external(value) {
+                            let rewritten = if lower == "style" {
+                                // CSS in a `style` attribute carries its own
+                                // `url(...)` references (background images).
+                                rewrite_css_urls(value, doc_dir)
+                            } else if is_external(value) {
                                 value.to_string()
                             } else {
                                 let path = resolve_href(doc_dir, &value_without_fragment(value));
