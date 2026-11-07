@@ -1540,9 +1540,15 @@ fn layout_chunk_html(
             }
         };
         // A section that holds nothing but a picture is a plate page: scale it
-        // to the page. The EPUB path does this per spine document while it
-        // assembles the book; MOBI/KF8 are one document with `<section
-        // class="cre-spine">` parts, so do it here. Run before inlining so the
+        // to the page. MOBI/KF8 are one document with `<section
+        // class="cre-spine">` parts, so it has to be done here, per section.
+        //
+        // EPUB keeps its own version (`cre_epub::normalize_full_page_images`)
+        // for two reasons: it rewrites the spine bytes before chunking, so the
+        // chunk budgets already account for it, and it points the `<img>` at a
+        // generated SVG *resource*. The SVG below is inlined instead, which
+        // base64-copies the picture into the chunk HTML — fine for one cover,
+        // wasteful for a book of plates. Run before the inliner so the
         // `<image>` this generates is inlined too.
         let fitted = (!matches!(resources, ResourceSource::Epub(_))).then(|| {
             let width = options.width as f32 - options.page_margin * 2.0;
