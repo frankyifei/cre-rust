@@ -5677,7 +5677,7 @@ fn has_border_declaration(style: &str) -> bool {
     })
 }
 
-/// Blitz's automatic table layout treats a cell's `width` as the column's exact
+/// Blitz's automatic table layout treats a cell's `width`/`height` as exact
 /// width, while browsers treat it as a minimum and let the column grow to fit the
 /// cell's content. Books that set a small width on every cell (`td { width: 1em }`
 /// is common for character tables) therefore collapse their cells onto each other
@@ -5696,7 +5696,7 @@ fn widen_table_cell_widths(html: &str) -> String {
             format!(
                 "{}{}{}",
                 &captures[1],
-                widen_cell_widths_in_stylesheet(&captures[2]),
+                widen_cell_dimensions_in_stylesheet(&captures[2]),
                 &captures[3]
             )
         })
@@ -5717,8 +5717,8 @@ fn selector_targets_cell(selector: &str) -> bool {
     })
 }
 
-fn widen_cell_widths_in_stylesheet(css: &str) -> String {
-    if !contains_ignore_ascii_case(css, "width") {
+fn widen_cell_dimensions_in_stylesheet(css: &str) -> String {
+    if !contains_ignore_ascii_case(css, "width") && !contains_ignore_ascii_case(css, "height") {
         return css.to_string();
     }
     // `table-layout: fixed` really does use the declared widths; leave it alone.
@@ -5729,18 +5729,37 @@ fn widen_cell_widths_in_stylesheet(css: &str) -> String {
     }
     static RULE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static WIDTH: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static HEIGHT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let rule = RULE.get_or_init(|| {
         regex::Regex::new(r"(?is)([^{}]+)\{([^{}]*)\}").expect("CSS rule regex is valid")
     });
     let width = WIDTH.get_or_init(|| {
         regex::Regex::new(r"(?i)(^|;)(\s*)width(\s*):").expect("CSS width regex is valid")
     });
+    let height = HEIGHT.get_or_init(|| {
+        regex::Regex::new(r"(?i)(^|;)(\s*)height(\s*):").expect("CSS height regex is valid")
+    });
     rule.replace_all(css, |captures: &regex::Captures<'_>| {
         let declarations = &captures[2];
-        if !selector_targets_cell(&captures[1]) || !width.is_match(declarations) {
+        if !selector_targets_cell(&captures[1]) {
             return captures[0].to_string();
         }
-        let rewritten = width.replace_all(declarations, "${1}${2}min-width${3}:");
+        // A table cell's width and height are minima in CSS 2.1; Blitz treats a
+        // declared height as the row's exact height, so `td { height: 1em }`
+        // collapsed every row of the entity table and the cells painted over
+        // the content below. `min-width`/`min-height` keep the floor and let the
+        // row/cell grow to its content.
+        let mut rewritten = declarations.to_string();
+        if width.is_match(&rewritten) {
+            rewritten = width
+                .replace_all(&rewritten, "${1}${2}min-width${3}:")
+                .into_owned();
+        }
+        if height.is_match(&rewritten) {
+            rewritten = height
+                .replace_all(&rewritten, "${1}${2}min-height${3}:")
+                .into_owned();
+        }
         format!("{}{{{}}}", &captures[1], rewritten)
     })
     .into_owned()
