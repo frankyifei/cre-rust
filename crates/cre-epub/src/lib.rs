@@ -1351,7 +1351,13 @@ fn floor_char_boundary(text: &str, index: usize) -> usize {
 /// the line keeps the annotation's own advance. A ruby cell is a small vertical
 /// stack instead - annotation above the base, both centred, the cell as wide as
 /// the wider of the two - which is how crengine and browsers draw it.
-fn rewrite_ruby(html: &str) -> String {
+/// Turns `<ruby>` markup into the stacked cell Blitz can lay out.
+///
+/// Blitz has no ruby box, so each base + annotation pair becomes an
+/// inline-block with the note absolutely positioned above the base (see
+/// [`ruby_cell_markup`]). Exposed so every format that can carry ruby (EPUB,
+/// KF8, MOBI, TXT) shares the same conversion.
+pub fn rewrite_ruby(html: &str) -> String {
     if !html
         .as_bytes()
         .windows(5)

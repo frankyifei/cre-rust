@@ -35,6 +35,38 @@ fn options() -> DocumentOptions {
     }
 }
 
+/// Ruby is not EPUB-specific: KF8/MOBI documents carry the same `<ruby>`
+/// markup. Blitz has no ruby box, so the shared preprocessing stacks the note
+/// above its base; that band makes the paragraph taller, which is what pushes
+/// the next paragraph down. Before the conversion the note rendered inline.
+#[test]
+fn ruby_notes_are_stacked_on_every_format() {
+    require_font();
+    let plain = Document::with_options(fixture("no-ruby.html"), &options()).unwrap();
+    let ruby = Document::with_options(fixture("ruby.html"), &options()).unwrap();
+
+    let second_top = |doc: &Document| -> f32 {
+        doc.page_text_boxes(1)
+            .unwrap()
+            .into_iter()
+            .find(|text| text.text.contains("SECOND"))
+            .expect("the second paragraph should be on page 1")
+            .y
+    };
+    let plain_top = second_top(&plain);
+    let ruby_top = second_top(&ruby);
+    assert!(
+        ruby_top > plain_top + 2.0,
+        "the ruby line should be taller: plain {plain_top}, ruby {ruby_top}"
+    );
+
+    let text = ruby.page_text(1).unwrap();
+    assert!(
+        text.contains("ㄒㄧㄤ"),
+        "the note should still be text: {text:?}"
+    );
+}
+
 #[test]
 fn opens_standalone_html_file() {
     require_font();
