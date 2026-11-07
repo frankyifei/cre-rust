@@ -1582,7 +1582,10 @@ fn svg_hrefs_to_book_paths(html: &str, doc_dir: &str) -> String {
 ///
 /// The rewrite is for the HTML handed to the parser only: storing it would
 /// keep a base64 copy of every page image for the whole session.
-pub fn inline_svg_images_to_data_uris(html: &str, provider: &LazyResource) -> Option<String> {
+pub fn inline_svg_images_to_data_uris(
+    html: &str,
+    fetch: &dyn Fn(&str) -> Option<std::sync::Arc<Vec<u8>>>,
+) -> Option<String> {
     let mut out = String::with_capacity(html.len());
     let mut cursor = 0usize;
     let mut changed = false;
@@ -1594,7 +1597,7 @@ pub fn inline_svg_images_to_data_uris(html: &str, provider: &LazyResource) -> Op
         };
         out.push_str(&html[cursor..open_start]);
         let block = &html[open_start..close_end];
-        let (rewritten, block_changed) = svg_block_inline_images(block, provider);
+        let (rewritten, block_changed) = svg_block_inline_images(block, fetch);
         changed |= block_changed;
         out.push_str(&rewritten);
         cursor = close_end;
@@ -1607,7 +1610,10 @@ pub fn inline_svg_images_to_data_uris(html: &str, provider: &LazyResource) -> Op
 }
 
 /// Replaces the href of every `<image>` in one SVG block with a data URI.
-fn svg_block_inline_images(block: &str, provider: &LazyResource) -> (String, bool) {
+fn svg_block_inline_images(
+    block: &str,
+    fetch: &dyn Fn(&str) -> Option<std::sync::Arc<Vec<u8>>>,
+) -> (String, bool) {
     let mut out = String::with_capacity(block.len());
     let mut cursor = 0usize;
     let mut changed = false;
@@ -1628,7 +1634,7 @@ fn svg_block_inline_images(block: &str, provider: &LazyResource) -> (String, boo
                     .strip_prefix("epub://book/")
                     .unwrap_or(without_fragment);
                 let key = normalize_path(&percent_decode_str(relative).decode_utf8_lossy());
-                if let Some(bytes) = provider.get(&key) {
+                if let Some(bytes) = fetch(&key) {
                     let mime = image_mime(&bytes, &key);
                     let encoded = base64_encode(&bytes);
                     let data_uri = format!("data:{mime};base64,{encoded}");
@@ -3391,6 +3397,30 @@ fn scope_selector_list(selectors: &str, scope: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inline_svg_images_resolve_any_resource_name() {
+        // KF8 names its images `mobi-image-N`; the EPUB path passes
+        // `epub://book/…` hrefs. Both have to reach the fetch closure, or
+        // usvg drops the picture.
+        let mut resources = std::collections::HashMap::new();
+        resources.insert("mobi-image-2", b"\x89PNG\r\n\x1a\nrest".to_vec());
+        resources.insert("images/one.jpg", b"\xff\xd8\xffrest".to_vec());
+        let fetch = |key: &str| {
+            resources
+                .get(key)
+                .map(|data| std::sync::Arc::new(data.clone()))
+        };
+
+        let html = r#"<svg viewBox="0 0 10 10"><image xlink:href="mobi-image-2" width="10" height="10"/></svg>"#;
+        let out = inline_svg_images_to_data_uris(html, &fetch).expect("a KF8 image should inline");
+        assert!(out.contains("data:image/png;base64,"), "{out}");
+
+        let html = r#"<svg viewBox="0 0 10 10"><image href="epub://book/images/one.jpg"/></svg>"#;
+        let out =
+            inline_svg_images_to_data_uris(html, &fetch).expect("an EPUB image should inline");
+        assert!(out.contains("data:image/jpeg;base64,"), "{out}");
+    }
+
     #[test]
     fn zhuyin_ruby_squeezes_the_note_onto_the_character() {
         let cell = ruby_cell("想<rt>ㄒㄧㄤˇ</rt>").unwrap();

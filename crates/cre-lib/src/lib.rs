@@ -483,7 +483,7 @@ struct ChunkLayoutWork<'a> {
     gate: &'a LayoutMemoryGate,
     probe_index: usize,
     count: usize,
-    svg_images: Option<&'a LazyResource>,
+    resources: &'a ResourceSource,
 }
 
 impl ChunkLayoutWork<'_> {
@@ -500,7 +500,7 @@ impl ChunkLayoutWork<'_> {
             self.font_blobs,
             &self.options[index],
             self.fixed_heights[index],
-            self.svg_images,
+            self.resources,
         )
     }
 
@@ -1492,10 +1492,6 @@ impl Document {
             .get(chunk_index)
             .and_then(|fixed| *fixed)
             .map(|fixed| self.fixed_size(fixed).1);
-        let svg_images = match &self.resources {
-            ResourceSource::Epub(provider) => Some(provider.as_ref()),
-            _ => None,
-        };
         layout_chunk_html(
             html,
             chunk_index,
@@ -1505,7 +1501,7 @@ impl Document {
             &self.font_blobs,
             &self.layout_options_for_chunk(chunk_index),
             fixed_height,
-            svg_images,
+            &self.resources,
         )
     }
 }
@@ -1525,22 +1521,34 @@ fn layout_chunk_html(
     font_blobs: &[FontBlob],
     options: &DocumentOptions,
     fixed_height: Option<f32>,
-    svg_images: Option<&LazyResource>,
+    resources: &ResourceSource,
 ) -> Result<(ChunkLayout, HtmlDocument, Vec<LineBox>, Vec<PageStart>)> {
     {
         let mut timer = StageTimer::new();
         timer.last = std::time::Instant::now();
         let fixed_layout = fixed_height.map(|_| true);
-        // SVG images are addressed relative to the document; the SVG parser
-        // only reads `data:` URIs, so inline them for the parse (and only for
-        // the parse: the stored chunk HTML keeps the short href).
-        let inlined = svg_images
-            .and_then(|provider| cre_epub::inline_svg_images_to_data_uris(html, provider));
+        // Images inside an inline `<svg>` are addressed relative to the
+        // document; usvg only reads `data:` URIs, so inline them for the parse
+        // (and only for the parse: the stored chunk HTML keeps the short href).
+        // Every format goes through here, so a KF8 cover wrapped in `<svg>`
+        // keeps its picture too.
+        let inlined = |key: &str| -> Option<Arc<Vec<u8>>> {
+            match resources {
+                ResourceSource::Epub(provider) => provider.get(key),
+                ResourceSource::Map(map) => map.get(key).map(|data| Arc::new(data.clone())),
+                ResourceSource::Empty => None,
+            }
+        };
+        let inlined = cre_epub::inline_svg_images_to_data_uris(html, &inlined);
         let html = inlined.as_deref().unwrap_or(html);
         // Inline SVG needs the document's CSS and a pattern-capable rasterizer;
         // see `prepare_inline_svgs`. Text-only chunks skip the work entirely.
         let prepared_svg = contains_ignore_ascii_case(html, "<svg").then(|| {
-            let css = document_css_for_svg(html, svg_images);
+            let epub_provider = match resources {
+                ResourceSource::Epub(provider) => Some(provider.as_ref()),
+                _ => None,
+            };
+            let css = document_css_for_svg(html, epub_provider);
             prepare_inline_svgs(html, &css, options.width)
         });
         let html = prepared_svg.as_deref().unwrap_or(html);
@@ -2151,10 +2159,6 @@ impl Document {
             // Workers take every chunk except the probe and the opening one.
             let next = std::sync::atomic::AtomicUsize::new(1);
             let gate = LayoutMemoryGate::new();
-            let svg_images = match &self.resources {
-                ResourceSource::Epub(provider) => Some(provider.as_ref()),
-                _ => None,
-            };
             let work = ChunkLayoutWork {
                 sources: &self.sources,
                 base_url: &self.base_url,
@@ -2170,7 +2174,7 @@ impl Document {
                 gate: &gate,
                 probe_index,
                 count,
-                svg_images,
+                resources: &self.resources,
             };
             std::thread::scope(|scope| {
                 for _ in 1..workers {
