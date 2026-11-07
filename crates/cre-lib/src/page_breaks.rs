@@ -5,14 +5,14 @@
 //! supported:
 //!
 //! * the `style` attribute of an element (the classic EPUB idiom), and
-//! * rules inside `<style>` elements of the document, restricted to compound
-//!   selectors (`tag`, `#id`, `.class`, optionally combined); selectors using
-//!   combinators, attribute selectors, `*`, or pseudo-classes are skipped.
+//! * rules inside `<style>` elements of the document, matched with
+//!   `BaseDocument::matches_selector`, so combinators, attribute selectors and
+//!   pseudo-classes behave like they do in the browser.
 //!
 //! `page-break-inside: avoid` is not implemented, nor are `left`/`right`
 //! forced verso semantics (they behave like `always`).
 
-use blitz_dom::Node;
+use blitz_dom::{BaseDocument, Node};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BreakDirection {
@@ -21,15 +21,9 @@ enum BreakDirection {
 }
 
 #[derive(Clone, Debug)]
-struct SimpleSelector {
-    tag: Option<String>,
-    id: Option<String>,
-    classes: Vec<String>,
-}
-
-#[derive(Clone, Debug)]
 struct BreakRule {
-    selectors: Vec<SimpleSelector>,
+    /// Selector list as written; matched with `BaseDocument::matches_selector`.
+    selectors: Vec<String>,
     direction: BreakDirection,
 }
 
@@ -39,7 +33,7 @@ struct BreakFlags {
     after: Option<bool>,
 }
 
-pub(crate) fn collect_forced_breaks(root: &Node) -> Vec<f32> {
+pub(crate) fn collect_forced_breaks(doc: &BaseDocument, root: &Node) -> Vec<f32> {
     let mut rules = Vec::new();
     let mut style_sources = Vec::new();
     collect_style_text(root, &mut style_sources);
@@ -48,7 +42,7 @@ pub(crate) fn collect_forced_breaks(root: &Node) -> Vec<f32> {
     }
 
     let mut breaks = Vec::new();
-    collect_break_positions(root, &rules, &mut breaks);
+    collect_break_positions(doc, root, &rules, &mut breaks);
     breaks.sort_by(f32::total_cmp);
     breaks.dedup_by(|a, b| (*a - *b).abs() < 0.5);
     breaks
@@ -99,7 +93,7 @@ fn parse_css_rules(css: &str) -> Vec<BreakRule> {
             Some(index) => &before[index + 1..],
             None => before,
         };
-        let selector = strip_scope_prefix(selector_text.trim());
+        let selector = selector_text.trim();
         if selector.starts_with('@') {
             match balanced_block_end(after_open) {
                 Some(end) => rest = &after_open[end + 1..],
@@ -122,15 +116,6 @@ fn parse_css_rules(css: &str) -> Vec<BreakRule> {
 
 /// Drops the `[data-spine-id="…"]` prefix that scoped spine-document styles
 /// carry, so the simple-selector parser below sees the original rule.
-fn strip_scope_prefix(selector: &str) -> &str {
-    if let Some(rest) = selector.strip_prefix("[data-spine-id=")
-        && let Some(end) = rest.find(']')
-    {
-        return rest[end + 1..].trim_start();
-    }
-    selector
-}
-
 fn balanced_block_end(text: &str) -> Option<usize> {
     let mut depth = 1usize;
     for (index, ch) in text.char_indices() {
@@ -176,7 +161,13 @@ fn break_rule_from(selector_text: &str, declarations: &str) -> Option<BreakRule>
     };
     let mut selectors = Vec::new();
     for part in selector_text.split(',') {
-        selectors.push(parse_simple_selector(part.trim())?);
+        let selector = part.trim();
+        // An at-rule block (`@media`, `@supports`) wraps rules; its own text is
+        // not a selector, the inner rules are scanned separately.
+        if selector.is_empty() || selector.starts_with('@') {
+            continue;
+        }
+        selectors.push(selector.to_string());
     }
     if selectors.is_empty() {
         return None;
@@ -209,93 +200,6 @@ fn is_forced_value(value: &str) -> bool {
     )
 }
 
-fn parse_simple_selector(text: &str) -> Option<SimpleSelector> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut index = 0usize;
-    let mut selector = SimpleSelector {
-        tag: None,
-        id: None,
-        classes: Vec::new(),
-    };
-    if chars.is_empty() {
-        return None;
-    }
-    let first = chars[0];
-    if first == '*' {
-        return None;
-    }
-    if first.is_ascii_alphabetic() || first == '_' || first == '-' {
-        let start = index;
-        while index < chars.len()
-            && (chars[index].is_ascii_alphanumeric() || matches!(chars[index], '-' | '_'))
-        {
-            index += 1;
-        }
-        let name: String = chars[start..index].iter().collect();
-        selector.tag = Some(name.to_ascii_lowercase());
-    }
-    while index < chars.len() {
-        let marker = chars[index];
-        if marker != '#' && marker != '.' {
-            return None;
-        }
-        index += 1;
-        let start = index;
-        while index < chars.len()
-            && (chars[index].is_ascii_alphanumeric() || matches!(chars[index], '-' | '_'))
-        {
-            index += 1;
-        }
-        if start == index {
-            return None;
-        }
-        let name: String = chars[start..index].iter().collect();
-        if marker == '#' {
-            if selector.id.is_some() {
-                return None;
-            }
-            selector.id = Some(name);
-        } else {
-            selector.classes.push(name);
-        }
-    }
-    if selector.tag.is_none() && selector.id.is_none() && selector.classes.is_empty() {
-        return None;
-    }
-    Some(selector)
-}
-
-fn selector_matches(selector: &SimpleSelector, node: &Node) -> bool {
-    let Some(element) = node.element_data() else {
-        return false;
-    };
-    if let Some(tag) = &selector.tag
-        && element.name.local.to_string().to_ascii_lowercase() != *tag
-    {
-        return false;
-    }
-    if let Some(id) = &selector.id {
-        let node_id = element
-            .id
-            .as_ref()
-            .map(|value| value.to_string())
-            .or_else(|| node_attr(node, "id").map(str::to_string));
-        if node_id.as_deref() != Some(id.as_str()) {
-            return false;
-        }
-    }
-    if !selector.classes.is_empty() {
-        let class_attr = node_attr(node, "class").unwrap_or_default();
-        let present: Vec<&str> = class_attr.split_whitespace().collect();
-        for class in &selector.classes {
-            if !present.contains(&class.as_str()) {
-                return false;
-            }
-        }
-    }
-    true
-}
-
 fn node_attr<'a>(node: &'a Node, name: &str) -> Option<&'a str> {
     node.attrs()?
         .iter()
@@ -303,12 +207,17 @@ fn node_attr<'a>(node: &'a Node, name: &str) -> Option<&'a str> {
         .map(|attr| attr.value.as_str())
 }
 
-fn collect_break_positions(node: &Node, rules: &[BreakRule], out: &mut Vec<f32>) {
+fn collect_break_positions(
+    doc: &BaseDocument,
+    node: &Node,
+    rules: &[BreakRule],
+    out: &mut Vec<f32>,
+) {
     if node.element_data().is_some() {
         let layout = node.unrounded_layout();
         let height = layout.size.height;
         if layout.size.width > 0.0 && height > 0.0 {
-            let flags = break_flags_for(node, rules);
+            let flags = break_flags_for(doc, node, rules);
             let inset = layout.padding + layout.border;
             let origin = node.absolute_position(inset.left, inset.top);
             if flags.before.unwrap_or(false) {
@@ -321,18 +230,18 @@ fn collect_break_positions(node: &Node, rules: &[BreakRule], out: &mut Vec<f32>)
     }
     if let Some(layout_children) = node.layout_children.borrow().as_ref() {
         for child in layout_children.iter() {
-            collect_break_positions(node.with(*child), rules, out);
+            collect_break_positions(doc, node.with(*child), rules, out);
         }
     }
 }
 
-fn break_flags_for(node: &Node, rules: &[BreakRule]) -> BreakFlags {
+fn break_flags_for(doc: &BaseDocument, node: &Node, rules: &[BreakRule]) -> BreakFlags {
     let mut from_rules = BreakFlags::default();
     for rule in rules {
         if rule
             .selectors
             .iter()
-            .any(|selector| selector_matches(selector, node))
+            .any(|selector| doc.matches_selector(node.id, selector).unwrap_or(false))
         {
             match rule.direction {
                 BreakDirection::Before => from_rules.before = Some(true),

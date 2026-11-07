@@ -1553,7 +1553,7 @@ fn layout_chunk_html(
         let mut line_flows = lines.iter().map(|_| 0i64).collect::<Vec<i64>>();
         collect_line_flows(root, 0, &mut max_flow, &line_indices, &mut line_flows);
         timer.mark("flows");
-        let forced_breaks = page_breaks::collect_forced_breaks(root);
+        let forced_breaks = page_breaks::collect_forced_breaks(&doc, root);
         let mut boxes = collect_content_boxes(&doc, root);
         timer.mark("boxes");
         for (top, bottom, display) in &math_boxes {
@@ -2797,7 +2797,7 @@ impl Document {
         let mut lines = collect_lines(doc.root_element());
         let math_boxes = collect_math_boxes(&doc, doc.root_element());
         extend_lines_for_math(&mut lines, &math_boxes);
-        let forced_breaks = page_breaks::collect_forced_breaks(doc.root_element());
+        let forced_breaks = page_breaks::collect_forced_breaks(&doc, doc.root_element());
         let mut boxes = collect_content_boxes(&doc, doc.root_element());
         for (top, bottom, display) in &math_boxes {
             if *display {
