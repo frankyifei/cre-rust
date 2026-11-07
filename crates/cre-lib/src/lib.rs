@@ -175,6 +175,9 @@ pub struct HitResult {
     point: PagePosition,
     line_index: usize,
     byte_offset: usize,
+    /// Word range around the hit point, from parley's `Selection::word_from_point`
+    /// (byte offsets relative to the line's layout text).
+    word_range: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2946,6 +2949,24 @@ impl Document {
             let max_offset = line.text_end.saturating_sub(line.text_start);
             let byte_offset = byte_offset.min(max_offset).min(inline_layout.text.len());
 
+            // Ask parley for the word under the point, the same way a text
+            // editor does (`Selection::word_from_point`), instead of deriving
+            // the boundaries from clusters ourselves. The range is relative to
+            // the block's layout text; the caller wants it relative to the line.
+            let word_range = {
+                let scale = inline_layout.layout.scale();
+                let selection = ParleySelection::word_from_point(
+                    &inline_layout.layout,
+                    local_x * scale,
+                    (local_y - inline_layout.block_offset) * scale,
+                );
+                let range = selection.text_range();
+                let line_start = line.text_start;
+                let line_end = line.text_end;
+                let start = range.start.max(line_start).saturating_sub(line_start);
+                let end = range.end.min(line_end).saturating_sub(line_start);
+                (start < end).then_some((start, end))
+            };
             let text_position = xpointer::position_for_line_offset(root, line, byte_offset)
                 .or_else(|_| xpointer::position_for_line_offset(root, line, 0))?;
             let source_id = source_element_at_line_offset(root, line, byte_offset)
@@ -2962,6 +2983,7 @@ impl Document {
                 point: position,
                 line_index,
                 byte_offset,
+                word_range,
             }))
         })
     }
@@ -3050,9 +3072,10 @@ impl Document {
             .context("line index is outside its chunk")?;
 
         let fallback = word_byte_range(&hit.text, hit.byte_offset);
-        let parley_range = self
-            .parley_word_byte_range(hit.page, hit.line_index, hit.byte_offset)
-            .unwrap_or(None);
+        let parley_range = hit.word_range.or_else(|| {
+            self.parley_word_byte_range(hit.page, hit.line_index, hit.byte_offset)
+                .unwrap_or(None)
+        });
         let use_parley = match (fallback, parley_range) {
             (Some((fallback_start, fallback_end)), Some((parley_start, parley_end))) => {
                 parley_start >= fallback_start
@@ -6260,7 +6283,8 @@ fn collect_content_boxes_into(doc: &HtmlDocument, node: &Node, out: &mut Vec<Con
                     pushed = true;
                 }
             }
-            if !pushed && let Some(rect) = doc.get_client_bounding_rect(node.id)
+            if !pushed
+                && let Some(rect) = doc.get_client_bounding_rect(node.id)
                 && rect.height > 0.0
             {
                 out.push(ContentBox {
