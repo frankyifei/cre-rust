@@ -2765,13 +2765,8 @@ fn full_page_image_replacement(
     }
     *generated_counter += 1;
     let generated_key = generated_full_page_image_key(*generated_counter);
-    let svg = full_page_image_svg_document(
-        available_width,
-        available_height,
-        image_mime,
-        &image_bytes,
-        is_cover,
-    );
+    let svg =
+        full_page_image_svg_document(available_width, available_height, image_mime, &image_bytes);
     generated.insert(generated_key.clone(), Arc::new(svg.into_bytes()));
 
     Some(full_page_image_tag(&generated_key, &attrs))
@@ -2822,17 +2817,12 @@ fn generated_full_page_image_key(counter: usize) -> String {
     format!("cre-page-fit-{counter}.svg")
 }
 
-fn full_page_image_svg_document(
-    width: f32,
-    height: f32,
-    mime: &str,
-    image_bytes: &[u8],
-    cover: bool,
-) -> String {
+fn full_page_image_svg_document(width: f32, height: f32, mime: &str, image_bytes: &[u8]) -> String {
     let encoded = base64_encode(image_bytes);
-    // A cover fills the page (the overflow is cropped, like `object-fit: cover`);
-    // any other full-page illustration is letterboxed so nothing is cut off.
-    let fit = if cover { "slice" } else { "meet" };
+    // Always `meet`: the image is scaled up to the page but the whole picture
+    // stays visible. `slice` looked "fuller" but cut the top/bottom off the
+    // cover of 3.epub / jk.epub.
+    let fit = "meet";
     format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"{width:.0}\" height=\"{height:.0}\" viewBox=\"0 0 {width:.0} {height:.0}\"><image x=\"0\" y=\"0\" width=\"{width:.0}\" height=\"{height:.0}\" preserveAspectRatio=\"xMidYMid {fit}\" xlink:href=\"data:{mime};base64,{encoded}\" /></svg>"
     )
