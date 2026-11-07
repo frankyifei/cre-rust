@@ -176,9 +176,17 @@ fn metrics_for_face(face: &ttf_parser::Face<'_>) -> Option<MathMetrics> {
     if axis > 0.0 {
         metrics.axis_height = axis;
     }
-    // How tall each fence glyph's ink actually is, in `em`: a stretched fence
-    // must not be scaled by the content height alone, or it ends up short by
-    // the glyph's own side bearings.
+    let ascent = f32::from(face.ascender()) / units_per_em;
+    let descent = -f32::from(face.descender()) / units_per_em;
+    if (0.5..2.0).contains(&ascent) && (0.0..1.0).contains(&descent) {
+        metrics.ascent = ascent;
+        metrics.descent = descent;
+    }
+    // How tall each fence glyph's ink actually is, in `em`, and where its
+    // centre sits: a stretched fence must not be scaled by the content height
+    // alone (it would end up short by the glyph's side bearings), and scaling
+    // it about the box centre moves its ink off-centre unless the glyph's own
+    // centre is taken into account.
     for (slot, ch) in FENCE_CHARS.iter().enumerate() {
         let Some(glyph) = face.glyph_index(*ch) else {
             continue;
@@ -189,6 +197,8 @@ fn metrics_for_face(face: &ttf_parser::Face<'_>) -> Option<MathMetrics> {
         let ink = (f32::from(bounds.y_max) - f32::from(bounds.y_min)) / units_per_em;
         if ink > 0.3 && ink < 2.0 {
             metrics.fence_ink[slot] = ink;
+            metrics.fence_center[slot] =
+                (f32::from(bounds.y_max) + f32::from(bounds.y_min)) / 2.0 / units_per_em;
         }
     }
     Some(metrics)
@@ -216,6 +226,12 @@ pub struct MathMetrics {
     pub axis_height: f32,
     /// Ink height of each fence glyph (see [`FENCE_CHARS`]), in `em`.
     pub fence_ink: [f32; FENCE_CHARS.len()],
+    /// Height of each fence glyph's ink centre above the baseline, in `em`.
+    pub fence_center: [f32; FENCE_CHARS.len()],
+    /// Font ascent above the baseline, in `em`.
+    pub ascent: f32,
+    /// Font descent below the baseline, in `em`.
+    pub descent: f32,
 }
 
 /// Fence glyphs whose ink height is read from the MATH font, in the order of
@@ -233,6 +249,9 @@ impl Default for MathMetrics {
             delimited_min_height: 1.15,
             axis_height: 0.25,
             fence_ink: [0.78; FENCE_CHARS.len()],
+            fence_center: [0.29; FENCE_CHARS.len()],
+            ascent: 0.9,
+            descent: 0.25,
         }
     }
 }
@@ -420,7 +439,7 @@ fn render_node(node: Node<'_, '_>, ctx: Ctx) -> String {
             "<span class=\"cre-mn\">{}</span>",
             escape_html(&token_text(node))
         ),
-        "mo" => render_mo(node, ctx, 1.0, false),
+        "mo" => render_mo(node, ctx, 1.0, 1.0, false),
         "mtext" | "ms" => format!(
             "<span class=\"cre-mtext\" style=\"white-space:pre\">{}</span>",
             escape_html(&token_text(node))
@@ -482,18 +501,26 @@ fn render_children(node: Node<'_, '_>, ctx: Ctx) -> String {
 /// item (the tall table after a piecewise brace, for example).
 fn render_row(node: Node<'_, '_>, ctx: Ctx) -> String {
     let children: Vec<Node> = element_children(node).collect();
+    // `heights` is what the content's line boxes reserve (and therefore what
+    // the fence's own box must be, to keep pagination), `ink_heights` is what
+    // the stretched glyph has to cover.
     let heights: Vec<f32> = children
         .iter()
         .map(|child| estimate_height(*child, ctx.display))
+        .collect();
+    let ink_heights: Vec<f32> = children
+        .iter()
+        .map(|child| estimate_ink_height(*child, ctx.display))
         .collect();
     let mut out = String::from("<span class=\"cre-mrow\">");
     let mut operator_context = true;
     for (index, child) in children.iter().enumerate() {
         if child.is_element() && child.tag_name().name().eq_ignore_ascii_case("mo") {
             let stretch = fence_stretch(&children, &heights, index);
+            let target = fence_stretch(&children, &ink_heights, index);
             let text = token_text(*child);
             let unary = operator_class(&text) == "cre-mo-bin" && operator_context;
-            out.push_str(&render_mo(*child, ctx, stretch, unary));
+            out.push_str(&render_mo(*child, ctx, stretch, target, unary));
             operator_context = matches!(
                 operator_class(&text),
                 "cre-mo-bin" | "cre-mo-rel" | "cre-mo-invisible"
@@ -596,7 +623,7 @@ fn render_mi(node: Node<'_, '_>, _ctx: Ctx) -> String {
     }
 }
 
-fn render_mo(node: Node<'_, '_>, ctx: Ctx, stretch: f32, unary: bool) -> String {
+fn render_mo(node: Node<'_, '_>, ctx: Ctx, stretch: f32, target: f32, unary: bool) -> String {
     let text = token_text(node);
     let class = if unary {
         "cre-mo-unary"
@@ -611,16 +638,16 @@ fn render_mo(node: Node<'_, '_>, ctx: Ctx, stretch: f32, unary: bool) -> String 
         );
     }
     if is_fence(&text) {
-        // Fence height follows the enclosed content; the MATH
-        // `delimited_sub_formula_min_height` constant is about spacing, not
-        // about forcing an unscaled fence taller.
+        // The fence's box is the height its content's line boxes reserve; the
+        // glyph is stretched to cover everything the content paints, scripts
+        // included. The MATH `delimited_sub_formula_min_height` constant is
+        // about spacing, not about forcing an unscaled fence taller.
         let content = stretch.clamp(1.0, 12.0);
-        if content > 1.25 {
-            let scale = fence_scale(&text, content, ctx.metrics);
+        let target = target.clamp(content, 12.0);
+        if target > 1.25 {
+            let style = stretched_fence_style(&text, content, target, ctx.metrics);
             return format!(
-                "<span class=\"cre-mo cre-fence\" \
-                 style=\"height:{content:.3}em;line-height:{content:.3}em;\
-                 vertical-align:top;transform:scaleY({scale:.3})\">{}</span>",
+                "<span class=\"cre-mo cre-fence\"{style}>{}</span>",
                 escape_html(&text)
             );
         }
@@ -849,14 +876,49 @@ fn render_scripts(node: Node<'_, '_>, ctx: Ctx) -> String {
 /// fills about 0.86 em per em of font size, so the transform has to make up
 /// the difference: scaling by the content height alone leaves every stretched
 /// fence short of the material it is supposed to enclose.
-fn fence_scale(text: &str, content: f32, metrics: MathMetrics) -> f32 {
-    let ink = FENCE_CHARS
-        .iter()
-        .position(|ch| ch.to_string() == text)
+fn fence_slot(text: &str) -> Option<usize> {
+    FENCE_CHARS.iter().position(|ch| ch.to_string() == text)
+}
+
+/// Style that stretches a fence glyph to `content` em and centres it on the
+/// content it encloses.
+///
+/// `scaleY` pivots on the box centre, but a glyph's ink is not centred in its
+/// line box: the baseline sits `ascent` below the box top (once the leading is
+/// split evenly) and the ink's own centre is `fence_center` above the baseline.
+/// Scaling therefore pushes the ink down by `scale` times that difference; the
+/// shift takes it back so the stretched glyph is centred on its own box, which
+/// the content fills. The box stays `vertical-align: top` — switching it to
+/// `middle` grew the line box and added a page to `juliet.epub`.
+fn stretched_fence_style(text: &str, content: f32, target: f32, metrics: MathMetrics) -> String {
+    let scale = fence_scale(text, target, metrics);
+    let offset = (metrics.ascent - metrics.descent) / 2.0 - fence_center(text, metrics);
+    // The ink is centred on the box it is drawn in, so moving it from the
+    // box's centre to the middle of what it has to cover takes half the
+    // difference; `scaleY` also moves the glyph's own off-centre ink, which is
+    // taken back here.
+    let shift = (target - content) / 2.0 - scale * offset;
+    format!(
+        " style=\"height:{content:.3}em;line-height:{content:.3}em;\
+         vertical-align:top;transform:translateY({shift:.3}em) scaleY({scale:.3})\""
+    )
+}
+
+fn fence_ink(text: &str, metrics: MathMetrics) -> f32 {
+    fence_slot(text)
         .map(|slot| metrics.fence_ink[slot])
         .filter(|ink| *ink > 0.3)
-        .unwrap_or(0.86);
-    (content / ink).max(1.0)
+        .unwrap_or(0.86)
+}
+
+fn fence_center(text: &str, metrics: MathMetrics) -> f32 {
+    fence_slot(text)
+        .map(|slot| metrics.fence_center[slot])
+        .unwrap_or(0.29)
+}
+
+fn fence_scale(text: &str, content: f32, metrics: MathMetrics) -> f32 {
+    (content / fence_ink(text, metrics)).max(1.0)
 }
 
 /// Baseline shifts for a superscript/subscript on a base `height` em tall, in
@@ -1109,16 +1171,17 @@ fn render_fenced(node: Node<'_, '_>, ctx: Ctx) -> String {
         .iter()
         .map(|child| estimate_height(*child, ctx.display))
         .fold(1.0_f32, f32::max);
+    let ink_height = children
+        .iter()
+        .map(|child| estimate_ink_height(*child, ctx.display))
+        .fold(1.0_f32, f32::max);
     let content = height.clamp(1.0, 12.0);
+    let target = ink_height.clamp(content, 12.0);
     let fence_style = |text: &str| -> String {
-        if content <= 1.25 || text.is_empty() {
+        if target <= 1.25 || text.is_empty() {
             return String::new();
         }
-        let scale = fence_scale(text, content, ctx.metrics);
-        format!(
-            " style=\"height:{content:.3}em;line-height:{content:.3}em;\
-             vertical-align:top;transform:scaleY({scale:.3})\""
-        )
+        stretched_fence_style(text, content, target, ctx.metrics)
     };
     let open_style = fence_style(open);
     let close_style = fence_style(close);
@@ -1383,6 +1446,22 @@ fn render_style(node: Node<'_, '_>, ctx: Ctx) -> String {
 /// needs to be close enough: Chrome/crengine use real font metrics, but the
 /// heights here differ by a fraction of an em.
 fn estimate_height(node: Node<'_, '_>, display: bool) -> f32 {
+    estimate_extent(node, display, false)
+}
+
+/// Height a stretched fence has to cover.
+///
+/// Same model as [`estimate_height`] — which is what the generated line boxes
+/// reserve — but a fence must also cover what sticks out of a row: a
+/// superscript rises `0.55 + 0.7*script` above the baseline plus the font's
+/// descent below it, and a subscript hangs 0.25em below the baseline. Sizing
+/// the fence with the line-box figure left `(x²)` and the top row of a
+/// piecewise table uncovered.
+fn estimate_ink_height(node: Node<'_, '_>, display: bool) -> f32 {
+    estimate_extent(node, display, true)
+}
+
+fn estimate_extent(node: Node<'_, '_>, display: bool, ink: bool) -> f32 {
     if node.is_text() {
         return 1.0;
     }
@@ -1398,7 +1477,7 @@ fn estimate_height(node: Node<'_, '_>, display: bool) -> f32 {
     let max_child = |children: &[Node]| {
         children
             .iter()
-            .map(|child| estimate_height(*child, display))
+            .map(|child| estimate_extent(*child, display, ink))
             .fold(1.0_f32, f32::max)
     };
     match name.as_str() {
@@ -1408,32 +1487,51 @@ fn estimate_height(node: Node<'_, '_>, display: bool) -> f32 {
         "mfrac" => {
             let numerator = children
                 .first()
-                .map(|c| estimate_height(*c, display))
+                .map(|c| estimate_extent(*c, display, ink))
                 .unwrap_or(1.0);
             let denominator = children
                 .get(1)
-                .map(|c| estimate_height(*c, display))
+                .map(|c| estimate_extent(*c, display, ink))
                 .unwrap_or(1.0);
             // A stacked fraction adds the rule and the gaps around it, but its
             // two lines overlap for the part that straddles the baseline, so
             // adding both heights overestimates tall nests badly.
             (numerator.max(denominator) + 0.9).max(1.7)
         }
-        "msup" | "msub" => {
+        "msup" => {
             let base = children
                 .first()
-                .map(|c| estimate_height(*c, display))
+                .map(|c| estimate_extent(*c, display, ink))
                 .unwrap_or(1.0);
             let script = children
                 .get(1)
-                .map(|c| estimate_height(*c, display))
+                .map(|c| estimate_extent(*c, display, ink))
                 .unwrap_or(1.0);
-            base.max(script * 0.7 + 0.55)
+            // The script is drawn at 0.7em and raised 0.55em, so it reaches
+            // `0.55 + 0.7*script` above the baseline; a fence also keeps the
+            // font's 0.25em descent below the base.
+            let overhang = if ink { 0.8 } else { 0.55 };
+            base.max(script * 0.7 + overhang)
+        }
+        "msub" => {
+            let base = children
+                .first()
+                .map(|c| estimate_extent(*c, display, ink))
+                .unwrap_or(1.0);
+            let script = children
+                .get(1)
+                .map(|c| estimate_extent(*c, display, ink))
+                .unwrap_or(1.0);
+            // A subscript hangs 0.25em below the baseline, inside the base's
+            // own descent, so it rarely makes the row taller; the line-box
+            // figure keeps the old (larger) value so pagination stays put.
+            let overhang = if ink { 0.25 } else { 0.55 };
+            base.max(script * 0.7 + overhang)
         }
         "msubsup" => {
             let base_node = children.first();
             let base = base_node
-                .map(|c| estimate_height(*c, display))
+                .map(|c| estimate_extent(*c, display, ink))
                 .unwrap_or(1.0);
             // Display style stacks the limits of a large operator above and
             // below it (see `render_scripts`); otherwise the scripts sit at the
@@ -1448,14 +1546,14 @@ fn estimate_height(node: Node<'_, '_>, display: bool) -> f32 {
             // `render_limits` always stacks the two scripts.
             let base = children
                 .first()
-                .map(|c| estimate_height(*c, display))
+                .map(|c| estimate_extent(*c, display, ink))
                 .unwrap_or(1.0);
             base + 1.1
         }
         "munder" | "mover" => {
             let base = children
                 .first()
-                .map(|c| estimate_height(*c, display))
+                .map(|c| estimate_extent(*c, display, ink))
                 .unwrap_or(1.0);
             base + 0.55
         }
@@ -2041,6 +2139,49 @@ mod tests {
         // A glyph with full-height ink needs no correction.
         metrics.fence_ink[slot] = 1.0;
         assert!((fence_scale("(", 2.0, metrics) - 2.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn stretched_fences_are_centred_on_the_content() {
+        // A glyph whose ink sits low in the em: scaling about the box centre
+        // would push it further down, so the style has to lift it back.
+        let mut metrics = MathMetrics::default();
+        let slot = FENCE_CHARS.iter().position(|ch| *ch == '{').unwrap();
+        metrics.fence_ink[slot] = 0.8;
+        metrics.fence_center[slot] = 0.1;
+        metrics.ascent = 0.9;
+        metrics.descent = 0.25;
+        // offset = (0.9 - 0.25) / 2 - 0.1 = 0.225; scale = 4.5 / 0.8 = 5.625
+        let style = stretched_fence_style("{", 4.5, 4.5, metrics);
+        assert!(style.contains("height:4.500em"), "{style}");
+        assert!(style.contains("vertical-align:top"), "{style}");
+        assert!(style.contains("scaleY(5.625)"), "{style}");
+        assert!(style.contains("translateY(-1.266em)"), "{style}");
+
+        // An ink centre that already matches the baseline centre needs no
+        // shift at all.
+        metrics.fence_center[slot] = (metrics.ascent - metrics.descent) / 2.0;
+        let centred = stretched_fence_style("{", 4.5, 4.5, metrics);
+        assert!(centred.contains("translateY(0.000em)"), "{centred}");
+
+        // A fence whose content paints above its line box (a superscript) has
+        // to grow past the box while the box keeps the line height.
+        metrics.fence_center[slot] = 0.1;
+        let grown = stretched_fence_style("{", 1.0, 1.5, metrics);
+        assert!(grown.contains("height:1.000em"), "{grown}");
+        assert!(grown.contains("scaleY(1.875)"), "{grown}");
+        assert!(grown.contains("translateY(-0.172em)"), "{grown}");
+    }
+
+    #[test]
+    fn mfenced_uses_the_same_stretch_and_centring() {
+        let out = rewrite_mathml(
+            r#"<math><mfenced open="{"><mtable><mtr><mtd><mn>1</mn></mtd></mtr><mtr><mtd><mn>2</mn></mtd></mtr></mtable></mfenced></math>"#,
+        );
+        assert!(
+            out.contains("vertical-align:top;transform:translateY("),
+            "{out}"
+        );
     }
 
     #[test]
