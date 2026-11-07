@@ -5259,16 +5259,21 @@ fn find_image_data_at(
     if node
         .element_data()
         .is_some_and(|element| element.name.local.to_string() == "img")
-        && let Some(rect) = doc.get_client_bounding_rect(node.id)
     {
-        let local_top = rect.y as f32;
-        let visible_top = local_top.max(0.0);
-        let visible_bottom = (local_top + rect.height as f32).min(page_bottom);
-        let hit = visible_bottom > visible_top
-            && x >= rect.x as f32
-            && x <= (rect.x + rect.width) as f32
-            && y >= visible_top
-            && y <= visible_bottom;
+        let mut rects = doc.node_client_rects(node.id);
+        if rects.is_empty() {
+            rects.extend(doc.get_client_bounding_rect(node.id));
+        }
+        let hit = rects.iter().any(|rect| {
+            let local_top = rect.y as f32;
+            let visible_top = local_top.max(0.0);
+            let visible_bottom = (local_top + rect.height as f32).min(page_bottom);
+            visible_bottom > visible_top
+                && x >= rect.x as f32
+                && x <= (rect.x + rect.width) as f32
+                && y >= visible_top
+                && y <= visible_bottom
+        });
         if hit {
             let src = node_attr(node, "src")?;
             let resolved = if src.contains("://") {
@@ -6243,13 +6248,26 @@ fn collect_content_boxes_into(doc: &HtmlDocument, node: &Node, out: &mut Vec<Con
         if matches!(
             tag.as_str(),
             "img" | "svg" | "video" | "canvas" | "object" | "embed"
-        ) && let Some(rect) = doc.get_client_bounding_rect(node.id)
-            && rect.height > 0.0
-        {
-            out.push(ContentBox {
-                top: rect.y as f32,
-                bottom: (rect.y + rect.height) as f32,
-            });
+        ) {
+            let rects = doc.node_client_rects(node.id);
+            let mut pushed = false;
+            for rect in &rects {
+                if rect.height > 0.0 {
+                    out.push(ContentBox {
+                        top: rect.y as f32,
+                        bottom: (rect.y + rect.height) as f32,
+                    });
+                    pushed = true;
+                }
+            }
+            if !pushed && let Some(rect) = doc.get_client_bounding_rect(node.id)
+                && rect.height > 0.0
+            {
+                out.push(ContentBox {
+                    top: rect.y as f32,
+                    bottom: (rect.y + rect.height) as f32,
+                });
+            }
             // No need to descend into a replaced element.
             return;
         }
