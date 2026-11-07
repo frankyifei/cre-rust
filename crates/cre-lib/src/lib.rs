@@ -1545,11 +1545,10 @@ fn layout_chunk_html(
         // class="cre-spine">` parts, so do it here. Run before inlining so the
         // `<image>` this generates is inlined too.
         let fitted = (!matches!(resources, ResourceSource::Epub(_))).then(|| {
-            fit_picture_sections(
-                html,
-                options.width as f32 - options.page_margin * 2.0,
-                options.height as f32 - options.page_margin * 2.0,
-            )
+            let width = options.width as f32 - options.page_margin * 2.0;
+            let height = options.height as f32 - options.page_margin * 2.0;
+            let html = fit_cover_images(html, width, height);
+            fit_picture_sections(&html, width, height)
         });
         let html = fitted.as_deref().unwrap_or(html);
         let inlined = cre_epub::inline_svg_images_to_data_uris(html, &inlined);
@@ -5608,6 +5607,168 @@ fn strip_multi_column_declarations(css: &str) -> String {
     column_declaration_regex().replace_all(css, "").into_owned()
 }
 
+/// Turns `<font size="N">` into an inline `font-size`.
+///
+/// `<font>` is a legacy element whose `size` attribute maps to one of the
+/// absolute CSS sizes (1 → x-small … 7 → xxx-large, with `+1`/`-1` counted from
+/// 3). Blitz's presentational-hint pass handles `align`, `bgcolor`, `border`,
+/// `width`/`height` and `hspace`/`vspace` but not the `font` element, so MOBI
+/// and KF8 titles marked up with `<font size="6">` came out at body size.
+///
+/// TODO(upstream): delete this once blitz-dom maps the `font` element's `size`
+/// (and `color`/`face`) to the corresponding properties.
+fn font_size_attributes_become_styles(html: &str, base: f32) -> String {
+    if !contains_ignore_ascii_case(html, "<font") {
+        return html.to_string();
+    }
+    static TAG: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static SIZE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static STYLE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let tag = TAG.get_or_init(|| {
+        regex::Regex::new(r"(?is)<font\b([^>]*)>").expect("font tag regex is valid")
+    });
+    let size = SIZE.get_or_init(|| {
+        regex::Regex::new(r#"(?is)\bsize\s*=\s*(?:"([^"]*)"|'([^']*)')"#)
+            .expect("font size regex is valid")
+    });
+    let style = STYLE.get_or_init(|| {
+        regex::Regex::new(r#"(?is)\bstyle\s*=\s*(?:"([^"]*)"|'([^']*)')"#)
+            .expect("style attribute regex is valid")
+    });
+    tag.replace_all(html, |captures: &regex::Captures<'_>| {
+        let attrs = &captures[1];
+        let Some(size_match) = size.captures(attrs) else {
+            return captures[0].to_string();
+        };
+        let raw = size_match
+            .get(1)
+            .or_else(|| size_match.get(2))
+            .map_or("", |value| value.as_str());
+        let Some(level) = font_size_level(raw) else {
+            return captures[0].to_string();
+        };
+        let Some(pixels) = css_font_size_for_level(level, base) else {
+            return captures[0].to_string();
+        };
+        // An author declaration wins over the attribute, like it does in a
+        // browser.
+        let whole = size_match.get(0).expect("the whole size attribute");
+        let mut rest = String::with_capacity(attrs.len());
+        rest.push_str(attrs[..whole.start()].trim_end());
+        rest.push_str(&attrs[whole.end()..]);
+        if contains_ignore_ascii_case(&rest, "font-size") {
+            return captures[0].to_string();
+        }
+        let rebuilt = match style.captures(&rest) {
+            Some(existing) => {
+                let whole = existing.get(0).expect("the whole style attribute");
+                let value = existing
+                    .get(1)
+                    .or_else(|| existing.get(2))
+                    .map_or("", |value| value.as_str());
+                let separator = if value.trim().is_empty() || value.trim_end().ends_with(';') {
+                    ""
+                } else {
+                    ";"
+                };
+                format!(
+                    "{}style=\"{}font-size:{pixels}px{}\"{}",
+                    &rest[..whole.start()],
+                    value,
+                    separator,
+                    &rest[whole.end()..]
+                )
+            }
+            None => format!("{rest} style=\"font-size:{pixels}px\""),
+        };
+        format!("<font{rebuilt}>")
+    })
+    .into_owned()
+}
+
+/// The HTML `<font size>` level: absolute 1..7, or `+1`/`-2` from the default
+/// of 3.
+fn font_size_level(raw: &str) -> Option<i32> {
+    let raw = raw.trim();
+    let (base, value) = match raw.strip_prefix('+') {
+        Some(rest) => (3, rest.parse::<i32>().ok()?),
+        None => match raw.strip_prefix('-') {
+            Some(rest) => (3, -rest.parse::<i32>().ok()?),
+            None => (0, raw.parse::<i32>().ok()?),
+        },
+    };
+    Some(if base == 0 { value } else { base + value }.clamp(1, 7))
+}
+
+/// The scale browsers apply to the absolute sizes, xx-small to xxx-large.
+const FONT_SIZE_FACTORS: [f32; 8] = [0.6, 0.75, 0.89, 1.0, 1.2, 1.5, 2.0, 3.0];
+
+/// Pixel size for an absolute size level (1 = x-small ... 7 = xxx-large),
+/// rounded up.
+///
+/// The factor applies to the *medium* size, which is the reader's font size
+/// here so headings scale with the setting; only the pixels are rounded, which
+/// keeps every step distinct (16px: 10, 12, 15, 16, 20, 24, 32, 48).
+fn css_font_size_for_level(level: i32, base: f32) -> Option<u32> {
+    if !(1..=7).contains(&level) {
+        return None;
+    }
+    // Level 1 is x-small, the second factor; HTML's `size` never means
+    // xx-small, so the levels line up with the factors one to one.
+    let factor = FONT_SIZE_FACTORS[level as usize];
+    Some((base.max(1.0) * factor).ceil() as u32)
+}
+
+/// Pixel size for a CSS absolute-size keyword, or `None` for anything else.
+fn css_font_size_keyword_px(keyword: &str, base: f32) -> Option<u32> {
+    let index = match keyword.to_ascii_lowercase().as_str() {
+        "xx-small" => 0,
+        "x-small" => 1,
+        "small" => 2,
+        "medium" => 3,
+        "large" => 4,
+        "x-large" => 5,
+        "xx-large" => 6,
+        "xxx-large" => 7,
+        _ => return None,
+    };
+    Some((base.max(1.0) * FONT_SIZE_FACTORS[index]).ceil() as u32)
+}
+
+/// Rewrites the absolute `font-size` keywords in a document's CSS to the pixel
+/// sizes browsers compute.
+///
+/// The keywords are absolute: Chrome applies the scale to the *medium* size and
+/// ignores the parent (a page whose body is 100px still renders
+/// `font-size: large` at 19px). stylo does the same but against a fixed 16px
+/// default, while the reader's font size moves with the setting, so a book's
+/// `large` heading did not change size with it. Compute the same table from the
+/// reader size — 0.6, 0.75, 0.89, 1, 1.2, 1.5, 2, 3, rounded up to whole
+/// pixels so the steps stay distinct.
+///
+/// TODO(upstream): drop this if stylo ever takes the medium size from the
+/// document instead of its built-in default.
+fn absolute_font_size_keywords_become_px(html: &str, base: f32) -> String {
+    if !contains_ignore_ascii_case(html, "font-size") {
+        return html.to_string();
+    }
+    static SIZES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let sizes = SIZES.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)(font-size\s*:\s*)(xx-small|x-small|small|medium|large|x-large|xx-large|xxx-large)\b",
+        )
+        .expect("font-size keyword regex is valid")
+    });
+    sizes
+        .replace_all(html, |captures: &regex::Captures<'_>| {
+            let Some(pixels) = css_font_size_keyword_px(&captures[2], base) else {
+                return captures[0].to_string();
+            };
+            format!("{}{pixels}px", &captures[1])
+        })
+        .into_owned()
+}
+
 /// Blitz only paints borders, padding and background on boxes it builds for
 /// block-level and atomic inline elements; a bordered `<span>` gets nothing, so
 /// `border: thin dotted black` on an inline element is invisible (and takes no
@@ -5936,6 +6097,8 @@ fn create_document(
     // the one place every format passes through, rather than in the EPUB
     // generator as well.
     html_source = cre_epub::rewrite_ruby(&html_source);
+    html_source = font_size_attributes_become_styles(&html_source, options.font_size);
+    html_source = absolute_font_size_keywords_become_px(&html_source, options.font_size);
     let stripped_at = started.elapsed().as_secs_f64() * 1000.0;
     let mut math_metrics = None;
     if html_source.to_ascii_lowercase().contains("<math") {
@@ -6695,6 +6858,126 @@ const SVG_PRESENTATION_PROPERTIES: &[&str] = &[
     "color",
 ];
 
+/// Gives the book's cover image a page of its own.
+///
+/// MOBI and KF8 put the cover at the top of the first chapter section, inline
+/// with the title text; `cre-mobi`/`cre-kf8` mark that `<img>` with
+/// `data-cre-cover` (it is the EXTH cover record). A page-tall inline image
+/// makes its line box taller than the page, which pushed the whole first
+/// paragraph onto the second page and left page one blank, and its
+/// `max-height` cap kept it smaller than the screen. Replacing it with a
+/// block-level page-sized SVG makes it fill the page exactly and moves the
+/// following text to the next page, like a cover should.
+fn fit_cover_images(html: &str, width: f32, height: f32) -> String {
+    // The cover is the first picture of the first part, with nothing before it:
+    // MOBI/KF8 writers put it at the top of chapter one, inline with the title.
+    // It has to be a tall picture (its `height` attribute is the only size we
+    // have at this point), otherwise a publisher logo on a title page would
+    // become a page of its own.
+    if !contains_ignore_ascii_case(html, "<img") {
+        return html.to_string();
+    }
+    let lower = html.to_ascii_lowercase();
+    // The stylesheet also mentions `.cre-spine`, so look at the tags.
+    let mut scan = 0usize;
+    let mut open_end = None;
+    while let Some(pos) = lower[scan..].find("<section") {
+        let start = scan + pos;
+        let Some(end) = html[start..].find('>').map(|offset| start + offset + 1) else {
+            break;
+        };
+        if html[start..end].to_ascii_lowercase().contains("cre-spine") {
+            open_end = Some(end);
+            break;
+        }
+        scan = end;
+    }
+    let Some(open_end) = open_end else {
+        return html.to_string();
+    };
+    let Some(picture_start) = lower[open_end..].find("<img").map(|pos| open_end + pos) else {
+        return html.to_string();
+    };
+    let Some(picture_end) = html[picture_start..]
+        .find('>')
+        .map(|end| picture_start + end + 1)
+    else {
+        return html.to_string();
+    };
+    // Anything but whitespace before the picture means this is a normal page
+    // that happens to start with an image.
+    let before = text_without_tags(&html[open_end..picture_start]);
+    if !before.trim().is_empty() {
+        return html.to_string();
+    }
+    let tag = &html[picture_start..picture_end];
+    let Some(src) = attr_value(tag, "src") else {
+        return html.to_string();
+    };
+    let Some(declared_height) = attr_value(tag, "height").and_then(parse_pixels) else {
+        return html.to_string();
+    };
+    if declared_height < height * 0.5 {
+        return html.to_string();
+    }
+    let (width, height) = (width.max(1.0).round(), height.max(1.0).round());
+    let mut out = String::with_capacity(html.len() + 256);
+    out.push_str(&html[..picture_start]);
+    out.push_str(&page_picture_svg(&src, width, height, true));
+    out.push_str(&html[picture_end..]);
+    out
+}
+
+/// The text of an HTML fragment with its tags removed.
+fn text_without_tags(html: &str) -> String {
+    let mut text = String::new();
+    let mut depth = 0usize;
+    for ch in html.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => text.push(ch),
+            _ => {}
+        }
+    }
+    text
+}
+
+/// The value of `name` in one tag, without the quotes.
+fn attr_value(tag: &str, name: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let at = lower.find(name)?;
+    let rest = tag[at + name.len()..].trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    let quote = rest.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let end = rest[1..].find(quote)? + 1;
+    Some(rest[1..end].to_string())
+}
+
+/// A length attribute as pixels, ignoring its unit (`987`, `987px`).
+fn parse_pixels(value: String) -> Option<f32> {
+    let digits: String = value
+        .trim()
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
+        .collect();
+    digits.parse::<f32>().ok()
+}
+
+/// The page-sized SVG that shows `picture` at page size without cropping.
+fn page_picture_svg(picture: &str, width: f32, height: f32, block: bool) -> String {
+    let display = if block { "display:block;" } else { "" };
+    format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {width:.0} {height:.0}\" \
+         preserveAspectRatio=\"xMidYMid meet\" style=\"{display}width:100%;height:auto\">\
+         <image x=\"0\" y=\"0\" width=\"{width:.0}\" height=\"{height:.0}\" \
+         preserveAspectRatio=\"xMidYMid meet\" href=\"{picture}\"/></svg>"
+    )
+}
+
 /// Scales a picture-only section to the page.
 ///
 /// MOBI and KF8 keep the whole book in one document and mark each part with
@@ -6744,13 +7027,7 @@ fn fit_picture_sections(html: &str, width: f32, height: f32) -> String {
             continue;
         };
         out.push_str(&html[cursor..open_end]);
-        out.push_str(&format!(
-            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {width:.0} {height:.0}\" \
-             preserveAspectRatio=\"xMidYMid meet\" \
-             style=\"display:block;width:100%;height:auto\">\
-             <image x=\"0\" y=\"0\" width=\"{width:.0}\" height=\"{height:.0}\" \
-             preserveAspectRatio=\"xMidYMid meet\" href=\"{picture}\"/></svg>"
-        ));
+        out.push_str(&page_picture_svg(&picture, width, height, true));
         // Keep the section's own closing tag.
         out.push_str(&html[close..end]);
         cursor = end;
@@ -6785,17 +7062,10 @@ fn picture_only_body(body: &str, src: &regex::Regex) -> Option<String> {
     // Anything left after removing the image (tags excluded) is text, so the
     // section is a normal page with a picture in it.
     let rest = format!("{}{}", &body[..start], &body[end..]);
-    let mut depth = 0usize;
-    let mut text = String::new();
-    for ch in rest.chars() {
-        match ch {
-            '<' => depth += 1,
-            '>' => depth = depth.saturating_sub(1),
-            _ if depth == 0 => text.push(ch),
-            _ => {}
-        }
-    }
-    text.trim().is_empty().then_some(picture)
+    text_without_tags(&rest)
+        .trim()
+        .is_empty()
+        .then_some(picture)
 }
 
 /// Prepares the inline `<svg>` elements of one chunk for Blitz.
@@ -7278,6 +7548,47 @@ body { font-size: 20px; }
     assert!(find_case_insensitive(bytes, b"cre-render-base", 0).is_some());
     assert!(find_case_insensitive(bytes, b"font-size: 20px", 0).is_some());
     assert!(find_case_insensitive(bytes, b"visible", 0).is_some());
+}
+
+#[cfg(test)]
+mod font_size_tests {
+    use super::*;
+
+    #[test]
+    fn absolute_font_size_keywords_use_the_browser_ratios() {
+        let html = concat!(
+            "<p style=\"font-size: x-large\">x</p>",
+            "<style>h1 { font-size: large; } h2 { font-size: XX-SMALL; }</style>"
+        );
+        // 18px medium: x-large 1.5 -> 27, large 1.2 -> 22 (21.6 rounded up),
+        // xx-small 0.6 -> 11 (10.8 rounded up).
+        let out = absolute_font_size_keywords_become_px(html, 18.0);
+        assert!(out.contains("font-size: 27px"), "{out}");
+        assert!(out.contains("font-size: 22px"), "{out}");
+        assert!(out.contains("font-size: 11px"), "{out}");
+        // `smaller`/`larger` are relative keywords and stay as they are.
+        let relative = absolute_font_size_keywords_become_px("p { font-size: smaller }", 18.0);
+        assert_eq!(relative, "p { font-size: smaller }");
+    }
+
+    #[test]
+    fn font_tags_get_pixel_sizes_from_the_reader_size() {
+        let out = font_size_attributes_become_styles(
+            "<font size=\"5\">x</font><font size=\"+1\">y</font><font size=\"1\">z</font>",
+            18.0,
+        );
+        // 5 = x-large 27px, +1 = large 22px, 1 = x-small 14px (13.5 up).
+        assert!(out.contains("font-size:27px"), "{out}");
+        assert!(out.contains("font-size:22px"), "{out}");
+        assert!(out.contains("font-size:14px"), "{out}");
+        // An explicit declaration wins, like it does in a browser.
+        let styled = font_size_attributes_become_styles(
+            "<font size=\"6\" style=\"font-size:10px\">x</font>",
+            18.0,
+        );
+        assert!(styled.contains("font-size:10px"), "{styled}");
+        assert!(!styled.contains("font-size:36px"), "{styled}");
+    }
 }
 
 #[cfg(test)]

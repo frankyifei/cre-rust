@@ -264,6 +264,23 @@ fn filepos_references(data: &[u8]) -> Vec<u32> {
     refs
 }
 
+/// True when the open tag's name is `name` (case-insensitive).
+fn tag_name_is(tag: &[u8], name: &[u8]) -> bool {
+    let mut index = 1;
+    while index < tag.len() && (tag[index] as char).is_ascii_whitespace() {
+        index += 1;
+    }
+    let rest = &tag[index..];
+    if rest.len() < name.len() {
+        return false;
+    }
+    if !rest[..name.len()].eq_ignore_ascii_case(name) {
+        return false;
+    }
+    rest.get(name.len())
+        .is_none_or(|byte| byte.is_ascii_whitespace() || *byte == b'>' || *byte == b'/')
+}
+
 fn rewrite_tag(tag: &[u8], id_by_offset: &HashMap<u32, String>) -> Vec<u8> {
     if tag.starts_with(b"</") {
         // `</mbp:pagebreak>` carries no content.
@@ -307,6 +324,20 @@ fn rewrite_tag(tag: &[u8], id_by_offset: &HashMap<u32, String>) -> Vec<u8> {
     if parsed.attribute("xmlns:mbp").is_some() {
         parsed.remove_attribute("xmlns:mbp");
         changed = true;
+    }
+    // MOBI writers put `height="1em" width="2em"` on `<p>` and `<div>` as
+    // spacing/indent hints, and the odd cover paragraph says
+    // `height="0pt" width="0pt"`. They are not the CSS box dimensions the
+    // attributes mean on an image or a table cell, and a zero one would
+    // collapse the box it is on, so drop them rather than let a hint rule take
+    // them literally. (`align` is a real hint and stays.)
+    if tag_name_is(tag, b"p") || tag_name_is(tag, b"div") {
+        for name in ["height", "width"] {
+            if parsed.attribute(name).is_some() {
+                parsed.remove_attribute(name);
+                changed = true;
+            }
+        }
     }
     if changed {
         parsed.to_bytes()
