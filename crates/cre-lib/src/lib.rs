@@ -5556,6 +5556,99 @@ fn strip_multi_column_declarations(css: &str) -> String {
     column_declaration_regex().replace_all(css, "").into_owned()
 }
 
+/// Blitz only paints borders, padding and background on boxes it builds for
+/// block-level and atomic inline elements; a bordered `<span>` gets nothing, so
+/// `border: thin dotted black` on an inline element is invisible (and takes no
+/// space). Turn such elements into inline blocks, which does paint the border
+/// and reserve its width, like a browser does for the same markup.
+fn inline_borders_become_blocks(html: &str) -> String {
+    if !contains_ignore_ascii_case(html, "style") || !contains_ignore_ascii_case(html, "border") {
+        return html.to_string();
+    }
+    static TAG: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static STYLE_ATTR: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let tag = TAG.get_or_init(|| {
+        regex::Regex::new(r"(?is)<([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>").expect("tag regex is valid")
+    });
+    let style_attr = STYLE_ATTR.get_or_init(|| {
+        regex::Regex::new(r#"(?is)\bstyle\s*=\s*(?:"([^"]*)"|'([^']*)')"#)
+            .expect("style attribute regex is valid")
+    });
+    tag.replace_all(html, |captures: &regex::Captures<'_>| {
+        let name = captures[1].to_ascii_lowercase();
+        if !matches!(
+            name.as_str(),
+            "span"
+                | "a"
+                | "em"
+                | "strong"
+                | "b"
+                | "i"
+                | "cite"
+                | "code"
+                | "abbr"
+                | "dfn"
+                | "var"
+                | "kbd"
+                | "samp"
+                | "q"
+                | "small"
+                | "big"
+                | "sub"
+                | "sup"
+                | "u"
+                | "s"
+                | "mark"
+                | "time"
+                | "label"
+        ) {
+            return captures[0].to_string();
+        }
+        let attrs = &captures[2];
+        let Some(style) = style_attr.captures(attrs) else {
+            return captures[0].to_string();
+        };
+        let value = style
+            .get(1)
+            .or_else(|| style.get(2))
+            .map_or("", |m| m.as_str());
+        let lower = value.to_ascii_lowercase();
+        if !has_border_declaration(&lower) || lower.contains("display") {
+            return captures[0].to_string();
+        }
+        // Rebuild the tag with `display:inline-block` added to its style value.
+        // Capture offsets are absolute in the haystack, but the style capture was
+        // taken over the attribute text, so shift it by where the attributes start
+        // inside the tag (`<` + name).
+        let whole_style = style.get(0).unwrap();
+        let attrs_off = 1 + captures[1].len();
+        let start = attrs_off + whole_style.start();
+        let end = attrs_off + whole_style.end();
+        let mut out = String::with_capacity(captures[0].len() + 28);
+        out.push_str(&captures[0][..start]);
+        out.push_str(&format!(
+            "style=\"display:inline-block;line-height:inherit;{value}\""
+        ));
+        out.push_str(&captures[0][end..]);
+        out
+    })
+    .into_owned()
+}
+
+/// True when a lower-cased `style` value sets a border on any side.
+fn has_border_declaration(style: &str) -> bool {
+    style.split(';').any(|declaration| {
+        let name = declaration
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_start_matches("-webkit-")
+            .trim_start_matches("-moz-");
+        name == "border" || name.starts_with("border-")
+    })
+}
+
 /// Blitz's automatic table layout treats a cell's `width` as the column's exact
 /// width, while browsers treat it as a minimum and let the column grow to fit the
 /// cell's content. Books that set a small width on every cell (`td { width: 1em }`
@@ -5765,6 +5858,7 @@ fn create_document(
     // before layout so both engines behave the same.
     let html_source = strip_multi_column_styles(base_html);
     let html_source = widen_table_cell_widths(&html_source);
+    let html_source = inline_borders_become_blocks(&html_source);
     let mut html_source = move_table_captions(&html_source);
     let stripped_at = started.elapsed().as_secs_f64() * 1000.0;
     if html_source.to_ascii_lowercase().contains("<math") {
