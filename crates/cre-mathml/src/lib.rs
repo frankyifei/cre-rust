@@ -512,9 +512,39 @@ fn render_row(node: Node<'_, '_>, ctx: Ctx) -> String {
         .iter()
         .map(|child| estimate_ink_height(*child, ctx.display))
         .collect();
+    // A stretched fence wraps the siblings it covers in a `.cre-fence-body`
+    // marker, so the layout pass can measure that content and replace the
+    // estimated height with the real one (see `fence_style_for_height`).
+    let mut bodies: Vec<(usize, usize)> = Vec::new();
+    for (index, child) in children.iter().enumerate() {
+        if !child.is_element() || !child.tag_name().name().eq_ignore_ascii_case("mo") {
+            continue;
+        }
+        if fence_stretch(&children, &ink_heights, index) <= 1.25 {
+            continue;
+        }
+        if let Some(range) = fence_covered(&children, index) {
+            bodies.push(range);
+        }
+    }
     let mut out = String::from("<span class=\"cre-mrow\">");
+    let mut opened: Vec<usize> = Vec::new();
     let mut operator_context = true;
     for (index, child) in children.iter().enumerate() {
+        while opened.last() == Some(&index) {
+            out.push_str("</span>");
+            opened.pop();
+        }
+        let mut starting: Vec<(usize, usize)> = bodies
+            .iter()
+            .copied()
+            .filter(|(start, _)| *start == index)
+            .collect();
+        starting.sort_by_key(|(_, end)| std::cmp::Reverse(*end));
+        for (_, end) in starting {
+            out.push_str("<span class=\"cre-fence-body\">");
+            opened.push(end);
+        }
         if child.is_element() && child.tag_name().name().eq_ignore_ascii_case("mo") {
             let stretch = fence_stretch(&children, &heights, index);
             let target = fence_stretch(&children, &ink_heights, index);
@@ -530,6 +560,9 @@ fn render_row(node: Node<'_, '_>, ctx: Ctx) -> String {
             operator_context = false;
         }
     }
+    while opened.pop().is_some() {
+        out.push_str("</span>");
+    }
     out.push_str("</span>");
     out
 }
@@ -543,15 +576,25 @@ fn mo_fence_text(node: Node<'_, '_>) -> Option<String> {
 }
 
 fn fence_stretch(children: &[Node<'_, '_>], heights: &[f32], index: usize) -> f32 {
-    let Some(text) = mo_fence_text(children[index]) else {
-        return 1.0;
-    };
-    let max_range =
-        |from: usize, to: usize| heights[from..to].iter().copied().fold(1.0_f32, f32::max);
+    match fence_covered(children, index) {
+        Some((start, end)) => heights[start..end].iter().copied().fold(1.0_f32, f32::max),
+        None => 1.0,
+    }
+}
+
+/// Sibling range (`start..end`) that the fence at `index` encloses: the items
+/// between a matching pair, the neighbouring items for a `|`, or the single
+/// item that follows (or precedes) an unmatched fence.
+fn fence_covered(children: &[Node<'_, '_>], index: usize) -> Option<(usize, usize)> {
+    let text = mo_fence_text(children[index])?;
     if text == "|" || text == "‖" {
-        let previous = if index > 0 { heights[index - 1] } else { 1.0 };
-        let next = heights.get(index + 1).copied().unwrap_or(1.0);
-        return previous.max(next);
+        // A bar is a one-sided fence: it covers the item next to it. Prefer
+        // the following one (a matrix after `|`) and fall back to the previous
+        // one (the closing bar), never including the bar itself.
+        if index + 1 < children.len() {
+            return Some((index + 1, index + 2));
+        }
+        return (index > 0).then_some((index - 1, index));
     }
     if is_open_fence(&text) {
         let mut depth = 0i32;
@@ -563,13 +606,13 @@ fn fence_stretch(children: &[Node<'_, '_>], heights: &[f32], index: usize) -> f3
                 depth += 1;
             } else if is_close_fence(&other) {
                 if depth == 0 {
-                    return max_range(index + 1, next);
+                    return (index + 1 < next).then_some((index + 1, next));
                 }
                 depth -= 1;
             }
         }
         // Unmatched: a piecewise brace applies to the item that follows it.
-        return heights.get(index + 1).copied().unwrap_or(1.0).max(1.0);
+        return (index + 1 < children.len()).then_some((index + 1, index + 2));
     }
     if is_close_fence(&text) {
         let mut depth = 0i32;
@@ -581,14 +624,14 @@ fn fence_stretch(children: &[Node<'_, '_>], heights: &[f32], index: usize) -> f3
                 depth += 1;
             } else if is_open_fence(&other) {
                 if depth == 0 {
-                    return max_range(previous + 1, index);
+                    return (previous + 1 < index).then_some((previous + 1, index));
                 }
                 depth -= 1;
             }
         }
-        return if index > 0 { heights[index - 1] } else { 1.0 };
+        return (index > 0).then_some((index - 1, index));
     }
-    1.0
+    None
 }
 
 fn is_open_fence(text: &str) -> bool {
@@ -645,11 +688,7 @@ fn render_mo(node: Node<'_, '_>, ctx: Ctx, stretch: f32, target: f32, unary: boo
         let content = stretch.clamp(1.0, 12.0);
         let target = target.clamp(content, 12.0);
         if target > 1.25 {
-            let style = stretched_fence_style(&text, content, target, ctx.metrics);
-            return format!(
-                "<span class=\"cre-mo cre-fence\"{style}>{}</span>",
-                escape_html(&text)
-            );
+            return stretched_fence_html(&text, content, target, ctx.metrics);
         }
         return format!(
             "<span class=\"cre-mo cre-fence\">{}</span>",
@@ -890,17 +929,55 @@ fn fence_slot(text: &str) -> Option<usize> {
 /// shift takes it back so the stretched glyph is centred on its own box, which
 /// the content fills. The box stays `vertical-align: top` — switching it to
 /// `middle` grew the line box and added a page to `juliet.epub`.
-fn stretched_fence_style(text: &str, content: f32, target: f32, metrics: MathMetrics) -> String {
+/// Markup of a fence glyph stretched to cover `target` em.
+///
+/// The `data-cre-fence`/`data-cre-fence-box` attributes let the layout pass
+/// find the element again and replace the estimate with the height it measured
+/// for the `.cre-fence-body` wrapper (see [`fence_style_for_height`]).
+fn stretched_fence_html(text: &str, content: f32, target: f32, metrics: MathMetrics) -> String {
+    let style = stretched_fence_style(text, content, target, 0.0, metrics);
+    format!(
+        "<span class=\"cre-mo cre-fence\" data-cre-fence=\"{}\" \
+         data-cre-fence-box=\"{content:.3}\" style=\"{style}\">{}</span>",
+        escape_html(text),
+        escape_html(text)
+    )
+}
+
+/// Declarations for a fence whose covered height the layout pass measured.
+///
+/// `box` is the height the element already had (the estimate the first layout
+/// used) — keeping it leaves pagination untouched — `target` is the measured
+/// height of the content, and `align` (in em) moves the glyph onto the
+/// content's top edge when the two boxes do not line up.
+pub fn fence_style_for_measured(
+    text: &str,
+    box_height: f32,
+    target: f32,
+    align: f32,
+    metrics: MathMetrics,
+) -> String {
+    stretched_fence_style(text, box_height, target, align, metrics)
+}
+
+fn stretched_fence_style(
+    text: &str,
+    content: f32,
+    target: f32,
+    align: f32,
+    metrics: MathMetrics,
+) -> String {
     let scale = fence_scale(text, target, metrics);
     let offset = (metrics.ascent - metrics.descent) / 2.0 - fence_center(text, metrics);
     // The ink is centred on the box it is drawn in, so moving it from the
     // box's centre to the middle of what it has to cover takes half the
     // difference; `scaleY` also moves the glyph's own off-centre ink, which is
-    // taken back here.
-    let shift = (target - content) / 2.0 - scale * offset;
+    // taken back here. `align` moves the box onto the content's top edge when
+    // the measured layout says they do not line up.
+    let shift = (target - content) / 2.0 - scale * offset + align;
     format!(
-        " style=\"height:{content:.3}em;line-height:{content:.3}em;\
-         vertical-align:top;transform:translateY({shift:.3}em) scaleY({scale:.3})\""
+        "height:{content:.3}em;line-height:{content:.3}em;\
+         vertical-align:top;transform:translateY({shift:.3}em) scaleY({scale:.3})"
     )
 }
 
@@ -1177,19 +1254,28 @@ fn render_fenced(node: Node<'_, '_>, ctx: Ctx) -> String {
         .fold(1.0_f32, f32::max);
     let content = height.clamp(1.0, 12.0);
     let target = ink_height.clamp(content, 12.0);
-    let fence_style = |text: &str| -> String {
+    let fence_html = |text: &str| -> Option<String> {
         if target <= 1.25 || text.is_empty() {
-            return String::new();
+            return None;
         }
-        stretched_fence_style(text, content, target, ctx.metrics)
+        Some(stretched_fence_html(text, content, target, ctx.metrics))
     };
-    let open_style = fence_style(open);
-    let close_style = fence_style(close);
+    let open_html = fence_html(open);
+    let close_html = fence_html(close);
     let mut out = String::from("<span class=\"cre-mrow\">");
-    out.push_str(&format!(
-        "<span class=\"cre-mo cre-fence\"{open_style}>{}</span>",
-        escape_html(open)
-    ));
+    match &open_html {
+        Some(html) => out.push_str(html),
+        None => out.push_str(&format!(
+            "<span class=\"cre-mo cre-fence\">{}</span>",
+            escape_html(open)
+        )),
+    }
+    // Each stretched fence wraps the children it covers, so the layout pass can
+    // measure them (`render_row` does the same for `<mrow>`).
+    let bodies = usize::from(open_html.is_some()) + usize::from(close_html.is_some());
+    for _ in 0..bodies {
+        out.push_str("<span class=\"cre-fence-body\">");
+    }
     for (index, child) in children.iter().enumerate() {
         if index > 0 {
             let separator = separators
@@ -1204,10 +1290,16 @@ fn render_fenced(node: Node<'_, '_>, ctx: Ctx) -> String {
         }
         out.push_str(&render_node(*child, ctx));
     }
-    out.push_str(&format!(
-        "<span class=\"cre-mo cre-fence\"{close_style}>{}</span>",
-        escape_html(close)
-    ));
+    for _ in 0..bodies {
+        out.push_str("</span>");
+    }
+    match &close_html {
+        Some(html) => out.push_str(html),
+        None => out.push_str(&format!(
+            "<span class=\"cre-mo cre-fence\">{}</span>",
+            escape_html(close)
+        )),
+    }
     out.push_str("</span>");
     out
 }
@@ -2152,7 +2244,7 @@ mod tests {
         metrics.ascent = 0.9;
         metrics.descent = 0.25;
         // offset = (0.9 - 0.25) / 2 - 0.1 = 0.225; scale = 4.5 / 0.8 = 5.625
-        let style = stretched_fence_style("{", 4.5, 4.5, metrics);
+        let style = stretched_fence_style("{", 4.5, 4.5, 0.0, metrics);
         assert!(style.contains("height:4.500em"), "{style}");
         assert!(style.contains("vertical-align:top"), "{style}");
         assert!(style.contains("scaleY(5.625)"), "{style}");
@@ -2161,13 +2253,13 @@ mod tests {
         // An ink centre that already matches the baseline centre needs no
         // shift at all.
         metrics.fence_center[slot] = (metrics.ascent - metrics.descent) / 2.0;
-        let centred = stretched_fence_style("{", 4.5, 4.5, metrics);
+        let centred = stretched_fence_style("{", 4.5, 4.5, 0.0, metrics);
         assert!(centred.contains("translateY(0.000em)"), "{centred}");
 
         // A fence whose content paints above its line box (a superscript) has
         // to grow past the box while the box keeps the line height.
         metrics.fence_center[slot] = 0.1;
-        let grown = stretched_fence_style("{", 1.0, 1.5, metrics);
+        let grown = stretched_fence_style("{", 1.0, 1.5, 0.0, metrics);
         assert!(grown.contains("height:1.000em"), "{grown}");
         assert!(grown.contains("scaleY(1.875)"), "{grown}");
         assert!(grown.contains("translateY(-0.172em)"), "{grown}");

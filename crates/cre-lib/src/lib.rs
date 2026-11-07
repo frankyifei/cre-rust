@@ -5915,6 +5915,7 @@ fn create_document(
     let html_source = inline_borders_become_blocks(&html_source);
     let mut html_source = move_table_captions(&html_source);
     let stripped_at = started.elapsed().as_secs_f64() * 1000.0;
+    let mut math_metrics = None;
     if html_source.to_ascii_lowercase().contains("<math") {
         // Prefer a loaded font with an OpenType MATH table for math content,
         // the way Chromium's `math { font-family: math }` picks the platform
@@ -5925,6 +5926,7 @@ fn create_document(
         );
         html_source = cre_mathml::rewrite_mathml_with(&html_source, math_font.as_ref());
         insert_style(&mut html_source, &cre_mathml::css(math_font.as_ref()));
+        math_metrics = math_font.as_ref().map(|font| font.metrics);
     }
     if let Some(stylesheet) = options
         .stylesheet
@@ -5993,6 +5995,12 @@ fn create_document(
         doc.handle_messages();
         doc.resolve(0.0);
     }
+    // Stretched MathML fences were sized from a model of the generated CSS.
+    // The content they wrap is in the DOM now, so measure it and replace the
+    // estimate with the height the layout actually gave it.
+    if let Some(metrics) = math_metrics {
+        fit_stretched_fences(&mut doc, metrics);
+    }
     if profile {
         eprintln!(
             "  create_document: preprocess={:.2}ms strip={:.2}ms setup={:.2}ms from_html={:.2}ms \
@@ -6006,6 +6014,101 @@ fn create_document(
         );
     }
     doc
+}
+
+/// Sizes stretched MathML fences from the layout instead of an estimate.
+///
+/// `cre-mathml` emits each stretched fence as `<span class="cre-mo cre-fence"
+/// data-cre-fence="{glyph}" data-cre-fence-box="{estimate}">` and wraps the
+/// content it encloses in `<span class="cre-fence-body">`. The estimate is what
+/// the first layout used; here the content's real box is read back and the
+/// glyph is restyled to that height, centred on it. The element keeps the
+/// estimated box height (changing it moved a page in `juliet.epub`), so this
+/// only corrects what is painted. Before this the brace was off by up to a
+/// fifth of its length, and sat low, on tables with scripts in a corner row.
+fn fit_stretched_fences(doc: &mut HtmlDocument, metrics: cre_mathml::MathMetrics) -> bool {
+    let Ok(fences) = doc.query_selector_all("[data-cre-fence]") else {
+        return false;
+    };
+    let Ok(bodies) = doc.query_selector_all(".cre-fence-body") else {
+        return false;
+    };
+    if fences.is_empty() || fences.len() != bodies.len() {
+        return false;
+    }
+    let glyph_attr = blitz_dom::LocalName::from("data-cre-fence");
+    let guess_attr = blitz_dom::LocalName::from("data-cre-fence-box");
+    let mut updates: Vec<(NodeId, String)> = Vec::new();
+    for (fence, body) in fences.iter().zip(bodies.iter()) {
+        let Some(element) = doc.get_node(*fence).and_then(|node| node.element_data()) else {
+            continue;
+        };
+        let Some(glyph) = element.attr(glyph_attr.clone()).map(str::to_string) else {
+            continue;
+        };
+        let Some(guess) = element
+            .attr(guess_attr.clone())
+            .and_then(|value| value.parse::<f32>().ok())
+        else {
+            continue;
+        };
+        // The wrapper is an inline span; when it holds a single element (the
+        // common case: one `<mtable>`), that element's box is the content the
+        // fence has to cover, and its top edge is where the fence starts.
+        let measured = single_element_child(doc, *body).unwrap_or(*body);
+        let (Some(fence_rect), Some(body_rect)) = (
+            doc.get_client_bounding_rect(*fence),
+            doc.get_client_bounding_rect(measured),
+        ) else {
+            continue;
+        };
+        // The fence box is `guess` em tall, which gives the size of one em in
+        // layout units; the body's height in the same units is what the glyph
+        // has to cover.
+        if fence_rect.height.is_nan() || fence_rect.height <= 0.0 || guess <= 0.0 {
+            continue;
+        }
+        let em = fence_rect.height / f64::from(guess);
+        let target = body_rect.height / em;
+        let align = (body_rect.y - fence_rect.y) / em;
+        if !target.is_finite() || target <= 0.0 || !align.is_finite() {
+            continue;
+        }
+        let style = cre_mathml::fence_style_for_measured(
+            &glyph,
+            guess,
+            target as f32,
+            align as f32,
+            metrics,
+        );
+        updates.push((*fence, style));
+    }
+    if updates.is_empty() {
+        return false;
+    }
+    {
+        let mut mutator = doc.mutate();
+        for (node, style) in updates {
+            mutator.set_attribute(
+                node,
+                blitz_dom::QualName::new(None, blitz_dom::ns!(), blitz_dom::local_name!("style")),
+                &style,
+            );
+        }
+    }
+    doc.handle_messages();
+    doc.resolve(0.0);
+    true
+}
+
+/// The only element child of `node`, if it has exactly one.
+fn single_element_child(doc: &HtmlDocument, node: NodeId) -> Option<NodeId> {
+    let children = doc.get_node(node)?.children.clone();
+    let mut elements = children
+        .into_iter()
+        .filter(|child| doc.get_node(*child).is_some_and(|node| node.is_element()));
+    let first = elements.next()?;
+    elements.next().is_none().then_some(first)
 }
 
 fn base_style_block_is_marker(body: &[u8]) -> bool {
