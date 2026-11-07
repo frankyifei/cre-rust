@@ -4853,20 +4853,30 @@ fn paginate(
                 });
             }
             pending_break = false;
-            let current = starts.last().unwrap();
-            let clip_bottom = current.top + page_height - margin_bottom;
+            let current_clip_top = starts.last().unwrap().clip_top;
+            let clip_bottom = starts.last().unwrap().top + page_height - margin_bottom;
             let height = box_.bottom - box_.top;
             // Keep an image whole: start a new page when it does not fit in
             // the space left, unless it is taller than a page even on its own
             // (then it has to be clipped, which the CSS max-height prevents).
             if box_.bottom > clip_bottom
-                && box_.top > current.clip_top
+                && box_.top > current_clip_top
                 && height <= page_content_height
             {
-                starts.push(PageStart {
-                    top: (box_.top - margin_top).max(0.0),
-                    clip_top: box_.top,
-                });
+                if page_has_content {
+                    starts.push(PageStart {
+                        top: (box_.top - margin_top).max(0.0),
+                        clip_top: box_.top,
+                    });
+                } else {
+                    // Only blank space (a leading margin or padding) is above
+                    // the picture, so moving it down would leave an empty page:
+                    // start this page at the picture instead, which is what a
+                    // browser does when a page begins with a full-page image.
+                    let start = starts.last_mut().unwrap();
+                    start.clip_top = box_.top;
+                    start.top = (box_.top - margin_top).max(0.0);
+                }
             }
             page_has_content = true;
             continue;

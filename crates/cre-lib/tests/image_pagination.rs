@@ -145,6 +145,38 @@ fn image_hit_test_uses_device_coordinates() {
     );
 }
 
+/// A picture sized to the page, preceded only by the section's own padding,
+/// does not fit once that padding is counted. Pushing it to the next page would
+/// leave page 1 holding nothing but the padding (an empty page) and the picture
+/// on page 2 — a MOBI cover did exactly that as soon as a stylesheet gave its
+/// paragraph a margin. The page must start at the picture instead.
+#[test]
+fn page_tall_image_after_leading_padding_does_not_leave_a_blank_page() {
+    let body = r##"
+        <div style="page-break-before: always; padding: 60px 0 40px 0">
+          <svg width="560" height="760" viewBox="0 0 560 760">
+            <rect width="560" height="760" fill="#000000"/>
+          </svg>
+        </div>
+        <div style="page-break-before: always"><p>title</p></div>"##;
+    let path = write_page("cover-leading-padding.html", body);
+    let mut doc = Document::with_options(Path::new(&path), &options()).unwrap();
+    let bitmap = doc.render_page(1).unwrap();
+    let ink = dark_pixels(&bitmap, 0..bitmap.height);
+    assert!(
+        ink > 10_000,
+        "page 1 is blank: the cover was pushed to page 2 ({ink} dark pixels)"
+    );
+    assert!(
+        doc.page_text(1).unwrap().trim().is_empty(),
+        "page 1 should hold only the picture"
+    );
+    assert!(
+        doc.page_text(2).unwrap().contains("title"),
+        "the title page should follow the cover"
+    );
+}
+
 #[test]
 fn image_only_sections_honor_forced_page_breaks() {
     // A spine item often starts with an image and no text. The forced break
