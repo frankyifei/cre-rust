@@ -204,7 +204,8 @@ impl MobiBook {
 fn base_css(options: &MobiHtmlOptions) -> String {
     format!(
         "html, body {{ margin: 0; padding: 0; }}\n\
-         body {{ font-family: serif; font-size: {}px; line-height: {}; padding: {}px {}px; }}\n\
+         html {{ font-size: {}px; }}\n\
+         body {{ font-family: serif; font-size: 1em; line-height: {}; padding: {}px {}px; }}\n\
          img {{ max-width: 100%; height: auto; }}\n\
          h1, h2, h3, h4, h5, h6 {{ font-family: sans-serif; }}\n\
          .cre-spine {{ display: block; page-break-before: always; }}\n\

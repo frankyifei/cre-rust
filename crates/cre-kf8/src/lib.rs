@@ -229,7 +229,7 @@ impl Kf8Book {
             toc,
             cover_image,
             section_count,
-            body: with_styles(&body, &styles),
+            body: rewrite_kindle_urls(&with_styles(&body, &styles)),
         })
     }
 
@@ -257,7 +257,8 @@ impl Kf8Book {
 fn base_css(options: &Kf8HtmlOptions) -> String {
     format!(
         "html, body {{ margin: 0; padding: 0; }}\n\
-         body {{ font-family: serif; font-size: {}px; line-height: {}; padding: {}px {}px; }}\n\
+         html {{ font-size: {}px; }}\n\
+         body {{ font-family: serif; font-size: 1em; line-height: {}; padding: {}px {}px; }}\n\
          img {{ max-width: 100%; height: auto; }}\n\
          h1, h2, h3, h4, h5, h6 {{ font-family: sans-serif; }}\n\
          .cre-spine {{ display: block; page-break-before: always; }}",
@@ -656,6 +657,63 @@ fn flow_styles(flows: &[Vec<u8>]) -> String {
     styles
 }
 
+/// Rewrites `url(kindle:embed:N…),` inside the book's CSS.
+///
+/// Kindlegen addresses images and fonts from stylesheets with
+/// `url(kindle:embed:XXXX?mime=…)`, which the resource provider cannot resolve:
+/// a cover declared as `background-image: url(kindle:embed:0002?mime=image/jpg)`
+/// stayed blank. `rewrite_tag` already maps the same form in `src`/`href`
+/// attributes to `mobi-image-N`; do the same for stylesheet URLs and drop the
+/// `?mime=` query.
+fn rewrite_kindle_urls(html: &str) -> String {
+    if !contains_kindle_url(html) {
+        return html.to_string();
+    }
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(pos) = rest.find("kindle:embed:") {
+        // Only URLs are rewritten; the text around them is copied as it is.
+        let before = &rest[..pos];
+        let Some(open) = before.rfind("url(") else {
+            out.push_str(&rest[..pos + "kindle:embed:".len()]);
+            rest = &rest[pos + "kindle:embed:".len()..];
+            continue;
+        };
+        let inner = &before[open + 4..];
+        if !inner.trim().is_empty() || before[open + 4..].contains(')') {
+            out.push_str(&rest[..pos + "kindle:embed:".len()]);
+            rest = &rest[pos + "kindle:embed:".len()..];
+            continue;
+        }
+        out.push_str(before);
+        let tail = &rest[pos + "kindle:embed:".len()..];
+        let number: String = tail
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric())
+            .collect();
+        let Some(index) = parse_base32(&number) else {
+            out.push_str("kindle:embed:");
+            rest = tail;
+            continue;
+        };
+        out.push_str(&format!("mobi-image-{index}"));
+        // Skip `?mime=…` up to the closing parenthesis.
+        let after = tail[number.len()..].trim_start();
+        let after = after.strip_prefix('?').map_or(after, |rest| {
+            rest.find(')').map_or(rest, |close| &rest[close..])
+        });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+fn contains_kindle_url(html: &str) -> bool {
+    html.as_bytes()
+        .windows("kindle:embed:".len())
+        .any(|window| window.eq_ignore_ascii_case(b"kindle:embed:"))
+}
+
 fn with_styles(body: &str, styles: &str) -> String {
     if styles.trim().is_empty() {
         return body.to_string();
@@ -891,6 +949,31 @@ mod tests {
         );
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("href=\"#chapter2\""), "{text}");
+    }
+
+    #[test]
+    fn stylesheet_embed_urls_are_rewritten() {
+        let css = ".cover { background-image: url(kindle:embed:0002?mime=image/jpg); }\n\
+                   .plain { background: url(../Images/bg.png); }";
+        let out = rewrite_kindle_urls(css);
+        assert!(out.contains("url(mobi-image-2)"), "{out}");
+        // Unrelated URLs and the surrounding CSS are untouched.
+        assert!(out.contains("url(../Images/bg.png)"), "{out}");
+        assert!(out.contains(".cover { background-image:"), "{out}");
+        assert_eq!(rewrite_kindle_urls("p { margin: 0 }"), "p { margin: 0 }");
+    }
+
+    #[test]
+    fn base_css_puts_the_reader_size_on_the_root() {
+        // A book that sets `body { font-size: 97% }` resolves the percentage
+        // against the root, so the reader size has to live on `html` or the
+        // setting does nothing.
+        let css = base_css(&Kf8HtmlOptions::default());
+        assert!(css.contains("html { font-size: 18px; }"), "{css}");
+        assert!(
+            css.contains("body { font-family: serif; font-size: 1em;"),
+            "{css}"
+        );
     }
 
     #[test]

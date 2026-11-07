@@ -983,7 +983,8 @@ impl EpubBook {
         html.push_str("<style>/* cre-render-base */");
         html.push_str(&format!(
             "html, body {{ margin: 0; padding: 0; }}\n\
-             body {{ font-family: serif; font-size: {FONT_SIZE_TOKEN}px; line-height: {}; \
+             html {{ font-size: {FONT_SIZE_TOKEN}px; }}\n\
+             body {{ font-family: serif; font-size: 1em; line-height: {}; \
              padding: {}px {}px; }}\n\
              img {{ max-width: 100%; height: auto; }}\n\
              .cre-spine {{ display: block; page-break-before: always; }}\n",

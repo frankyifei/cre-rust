@@ -27,7 +27,8 @@ impl TextBook {
 
     pub fn to_html(&self, opts: &TextHtmlOptions) -> String {
         let css = format!(
-            "/* cre-render-base */\nbody {{ font-family: serif; font-size: {}px; line-height: {}; padding: {}px {}px; background: white; color: black; text-align: justify; }}\n\
+            "/* cre-render-base */\nhtml {{ font-size: {}px; }}\n\
+             body {{ font-family: serif; font-size: 1em; line-height: {}; padding: {}px {}px; background: white; color: black; text-align: justify; }}\n\
              .cre-heading {{ font-weight: bold; font-size: 1.2em; }}",
             opts.font_size, opts.line_height, opts.margin_y, opts.margin_x,
         );
