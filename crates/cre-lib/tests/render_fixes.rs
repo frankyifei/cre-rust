@@ -88,6 +88,36 @@ fn svg_images_are_decoded_and_painted() {
     );
 }
 
+/// An inline `<svg>` is handed to usvg on its own, so the document's CSS never
+/// reached it (`.fil0 { fill: url(#star) }` was ignored and the shape painted
+/// black), and blitz-paint's SVG renderer cannot paint a `url(#pattern)` fill
+/// (it draws a translucent red box instead). The fixture must show the green
+/// star pattern, so neither a black nor a red result passes.
+#[test]
+fn inline_svg_uses_document_css_and_pattern_fills() {
+    require_font();
+
+    let mut doc = Document::open(fixture("svg-pattern.epub")).unwrap();
+    let (bitmap, _, _) = doc.render_page_color_with_stats(1).unwrap();
+
+    let mut green = 0usize;
+    let mut red = 0usize;
+    for pixel in bitmap.data.as_chunks::<4>().0 {
+        let (r, g) = (pixel[0] as i32, pixel[1] as i32);
+        if g > r + 16 {
+            green += 1;
+        }
+        if r > g + 16 {
+            red += 1;
+        }
+    }
+    assert!(
+        green > 500,
+        "expected the green star pattern to be painted, found {green} green pixels"
+    );
+    assert_eq!(red, 0, "no part of the pattern should paint red");
+}
+
 #[test]
 fn forced_page_breaks_create_new_pages() {
     require_font();

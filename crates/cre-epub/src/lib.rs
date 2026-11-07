@@ -2905,7 +2905,8 @@ fn image_mime(data: &[u8], path: &str) -> &'static str {
     }
 }
 
-fn base64_encode(data: &[u8]) -> String {
+/// Encodes raw bytes as standard base64 (used to build `data:` URIs).
+pub fn base64_encode(data: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {

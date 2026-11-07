@@ -1537,6 +1537,13 @@ fn layout_chunk_html(
         let inlined = svg_images
             .and_then(|provider| cre_epub::inline_svg_images_to_data_uris(html, provider));
         let html = inlined.as_deref().unwrap_or(html);
+        // Inline SVG needs the document's CSS and a pattern-capable rasterizer;
+        // see `prepare_inline_svgs`. Text-only chunks skip the work entirely.
+        let prepared_svg = contains_ignore_ascii_case(html, "<svg").then(|| {
+            let css = document_css_for_svg(html, svg_images);
+            prepare_inline_svgs(html, &css, options.width)
+        });
+        let html = prepared_svg.as_deref().unwrap_or(html);
         let doc = create_document(html, base_url, net, font_context, font_blobs, options);
         timer.mark("parse");
         let root = doc.root_element();
@@ -6526,6 +6533,349 @@ fn page_for_node(doc: &HtmlDocument, node_id: NodeId, page_starts: &[PageStart])
     Ok(page_containing_top(top, page_starts))
 }
 
+/// CSS properties that only describe how an SVG drawing is painted.
+const SVG_PRESENTATION_PROPERTIES: &[&str] = &[
+    "fill",
+    "fill-opacity",
+    "fill-rule",
+    "stroke",
+    "stroke-width",
+    "stroke-opacity",
+    "stroke-linecap",
+    "stroke-linejoin",
+    "stroke-dasharray",
+    "stroke-dashoffset",
+    "stop-color",
+    "stop-opacity",
+    "flood-color",
+    "flood-opacity",
+    "lighting-color",
+    "paint-order",
+    "marker",
+    "clip-rule",
+    "shape-rendering",
+    "text-rendering",
+    "image-rendering",
+    "color-rendering",
+    "dominant-baseline",
+    "text-anchor",
+    "font-family",
+    "font-size",
+    "font-style",
+    "font-weight",
+    "letter-spacing",
+    "word-spacing",
+    "visibility",
+    "opacity",
+    "color",
+];
+
+/// Prepares the inline `<svg>` elements of one chunk for Blitz.
+///
+/// Blitz hands an inline `<svg>` to `usvg` as a standalone image
+/// (`BaseDocument::svg_source` -> `SpecialElementData::Image`), so the drawing
+/// never sees the HTML document's stylesheets: `.fil0 { fill: green }` in the
+/// page `<head>` is ignored and the element keeps the SVG defaults. Rules that
+/// describe painting are copied into each element, where `usvg` reads them.
+///
+/// `anyrender_svg`, which blitz-paint uses to paint the element, has no
+/// `<pattern>` support: `usvg::Paint::Pattern` becomes `None` and its error
+/// handler paints a translucent red box over the shape. Those drawings are
+/// rasterized with resvg instead (which does support patterns) and put back as
+/// one `<image>` inside the same `<svg>`, so the element keeps its size.
+///
+/// TODO(upstream): drop both halves once Blitz passes the document's cascaded
+/// `fill`/`stroke` into the inline SVG and `anyrender_svg` renders patterns.
+fn prepare_inline_svgs(html: &str, css: &str, width_hint: u32) -> String {
+    let styled = apply_document_css_to_inline_svgs(html, &svg_presentation_rules(css));
+    rasterize_pattern_svgs(&styled, width_hint)
+}
+
+/// Copies the SVG presentation rules of a document into every inline `<svg>`.
+fn apply_document_css_to_inline_svgs(html: &str, rules: &str) -> String {
+    if rules.is_empty() {
+        return html.to_string();
+    }
+    let ranges = inline_svg_ranges(html);
+    if ranges.is_empty() {
+        return html.to_string();
+    }
+    let style = format!("<style type=\"text/css\">{rules}</style>");
+    let mut out = String::with_capacity(html.len() + ranges.len() * style.len());
+    let mut cursor = 0usize;
+    for (start, _end) in ranges {
+        let Some(open_end) = html[start..].find('>').map(|end| start + end + 1) else {
+            continue;
+        };
+        out.push_str(&html[cursor..open_end]);
+        out.push_str(&style);
+        cursor = open_end;
+    }
+    out.push_str(&html[cursor..]);
+    out
+}
+
+/// Keeps only the rules whose declarations paint SVG content, with the
+/// `[data-spine-id]` scoping prefix stripped (usvg does not understand
+/// attribute selectors, and inside the SVG the rules are already local).
+fn svg_presentation_rules(css: &str) -> String {
+    if !contains_ignore_ascii_case(css, "fill") && !contains_ignore_ascii_case(css, "stroke") {
+        return String::new();
+    }
+    static RULE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static SCOPE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let rule = RULE.get_or_init(|| {
+        regex::Regex::new(r"(?is)([^{}]+)\{([^{}]*)\}").expect("CSS rule regex is valid")
+    });
+    let scope = SCOPE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)\[data-spine-id\s*=\s*"[^"]*"\]\s*"#)
+            .expect("CSS scope regex is valid")
+    });
+    let mut out = String::new();
+    for captures in rule.captures_iter(css) {
+        let selectors = captures[1].trim_start();
+        if selectors.starts_with('@') {
+            continue;
+        }
+        let declarations = &captures[2];
+        if !svg_declarations_paint(declarations) {
+            continue;
+        }
+        let selectors = scope.replace_all(&captures[1], "");
+        out.push_str(selectors.trim());
+        out.push('{');
+        out.push_str(declarations);
+        out.push('}');
+    }
+    out
+}
+
+fn svg_declarations_paint(declarations: &str) -> bool {
+    declarations.split(';').any(|declaration| {
+        let name = declaration
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        SVG_PRESENTATION_PROPERTIES.contains(&name.as_str())
+    })
+}
+
+/// Byte ranges of the outermost `<svg>...</svg>` elements.
+fn inline_svg_ranges(html: &str) -> Vec<(usize, usize)> {
+    let lower = html.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut ranges = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(pos) = lower[cursor..].find("<svg") {
+        let start = cursor + pos;
+        // `<svgfoo>` is not an svg element.
+        if !svg_tag_boundary(bytes.get(start + 4).copied()) {
+            cursor = start + 4;
+            continue;
+        }
+        let Some(open_end) = html[start..].find('>').map(|end| start + end + 1) else {
+            break;
+        };
+        let mut depth = 1usize;
+        let mut scan = open_end;
+        let mut end = html.len();
+        while depth > 0 {
+            let next_open = lower[scan..].find("<svg").map(|pos| scan + pos);
+            let next_close = lower[scan..].find("</svg").map(|pos| scan + pos);
+            match (next_open, next_close) {
+                (Some(open), Some(close)) if open < close => {
+                    if svg_tag_boundary(bytes.get(open + 4).copied()) {
+                        depth += 1;
+                    }
+                    scan = open + 4;
+                }
+                (_, Some(close)) => {
+                    depth -= 1;
+                    let close_end = lower[close..]
+                        .find('>')
+                        .map(|end| close + end + 1)
+                        .unwrap_or(html.len());
+                    scan = close_end;
+                    if depth == 0 {
+                        end = close_end;
+                    }
+                }
+                _ => return ranges,
+            }
+        }
+        ranges.push((start, end));
+        cursor = end;
+    }
+    ranges
+}
+
+fn svg_tag_boundary(byte: Option<u8>) -> bool {
+    matches!(byte, Some(b'>') | Some(b'/')) || byte.is_some_and(|b| b.is_ascii_whitespace())
+}
+
+/// Rasterizes inline SVGs that paint with a `<pattern>` and swaps the drawing
+/// for the resulting picture. `resvg` supports patterns; `anyrender_svg`, which
+/// blitz-paint uses, does not.
+fn rasterize_pattern_svgs(html: &str, width_hint: u32) -> String {
+    if !contains_ignore_ascii_case(html, "<pattern") {
+        return html.to_string();
+    }
+    let ranges = inline_svg_ranges(html);
+    if ranges.is_empty() {
+        return html.to_string();
+    }
+    let mut out = String::with_capacity(html.len());
+    let mut cursor = 0usize;
+    for (start, end) in ranges {
+        let block = &html[start..end];
+        if !contains_ignore_ascii_case(block, "<pattern") || !pattern_is_referenced(block) {
+            continue;
+        }
+        let Some(open_end) = html[start..].find('>').map(|pos| start + pos + 1) else {
+            continue;
+        };
+        let open_tag = &html[start..open_end];
+        let Some((x, y, width, height)) = svg_view_box(open_tag) else {
+            continue;
+        };
+        // Twice the CSS size of the drawing keeps it sharp on screen without
+        // holding a full-page bitmap per picture.
+        let target = (width * 2.0).clamp(240.0, width_hint.max(240) as f32 * 2.0);
+        let Some((rgba, raster_width, raster_height)) =
+            render_svg_image(block.as_bytes(), Some(target as u32), None)
+        else {
+            continue;
+        };
+        let Some(png) = encode_png(&rgba, raster_width, raster_height) else {
+            continue;
+        };
+        let encoded = cre_epub::base64_encode(&png);
+        out.push_str(&html[cursor..open_end]);
+        out.push_str(&format!(
+            "<image x=\"{x}\" y=\"{y}\" width=\"{width}\" height=\"{height}\" \
+             href=\"data:image/png;base64,{encoded}\"/></svg>"
+        ));
+        cursor = end;
+    }
+    out.push_str(&html[cursor..]);
+    out
+}
+
+/// True when the drawing references one of its own `<pattern>` elements.
+fn pattern_is_referenced(block: &str) -> bool {
+    static PATTERN_ID: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let pattern_id = PATTERN_ID.get_or_init(|| {
+        regex::Regex::new(r#"(?is)<pattern\b[^>]*\bid\s*=\s*(?:"([^"]+)"|'([^']+)')"#)
+            .expect("pattern id regex is valid")
+    });
+    let lower = block.to_ascii_lowercase();
+    pattern_id.captures_iter(block).any(|captures| {
+        let id = captures
+            .get(1)
+            .or_else(|| captures.get(2))
+            .map_or("", |id| id.as_str());
+        !id.is_empty() && lower.contains(&format!("url(#{})", id.to_ascii_lowercase()))
+    })
+}
+
+/// The `viewBox` of the root `<svg>` open tag.
+fn svg_view_box(open_tag: &str) -> Option<(f32, f32, f32, f32)> {
+    static VIEW_BOX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let view_box = VIEW_BOX.get_or_init(|| {
+        regex::Regex::new(r#"(?i)\bviewBox\s*=\s*(?:"([^"]*)"|'([^']*)')"#)
+            .expect("viewBox regex is valid")
+    });
+    let captures = view_box.captures(open_tag)?;
+    let value = captures.get(1).or_else(|| captures.get(2))?.as_str();
+    let numbers: Vec<f32> = value
+        .split(|character: char| character.is_whitespace() || character == ',')
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<f32>().ok())
+        .collect();
+    let [x, y, width, height] = numbers.as_slice() else {
+        return None;
+    };
+    (width.is_finite() && height.is_finite() && *width > 0.0 && *height > 0.0)
+        .then_some((*x, *y, *width, *height))
+}
+
+/// The document's CSS, from its `<style>` blocks and linked stylesheets.
+fn document_css_for_svg(html: &str, provider: Option<&LazyResource>) -> String {
+    if !contains_ignore_ascii_case(html, "<style") && provider.is_none() {
+        return String::new();
+    }
+    let lower = html.to_ascii_lowercase();
+    let head_end = lower.find("</head").unwrap_or(lower.len());
+    let head = &html[..head_end];
+    let lower_head = &lower[..head_end];
+    let mut css = String::new();
+
+    let mut cursor = 0usize;
+    while let Some(pos) = lower_head[cursor..].find("<style") {
+        let start = cursor + pos;
+        let Some(text_start) = lower_head[start..].find('>').map(|end| start + end + 1) else {
+            break;
+        };
+        let Some(close) = lower_head[text_start..].find("</style") else {
+            break;
+        };
+        css.push_str(&head[text_start..text_start + close]);
+        css.push('\n');
+        cursor = text_start + close + "</style".len();
+    }
+
+    let Some(provider) = provider else {
+        return css;
+    };
+    static LINK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static HREF: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static REL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let link = LINK
+        .get_or_init(|| regex::Regex::new(r"(?is)<link\b[^>]*>").expect("link tag regex is valid"));
+    let href = HREF.get_or_init(|| {
+        regex::Regex::new(r#"(?is)\bhref\s*=\s*(?:"([^"]*)"|'([^']*)')"#)
+            .expect("href regex is valid")
+    });
+    let rel = REL.get_or_init(|| {
+        regex::Regex::new(r#"(?is)\brel\s*=\s*(?:"([^"]*)"|'([^']*)')"#)
+            .expect("rel regex is valid")
+    });
+    for tag in link.find_iter(head) {
+        let tag = tag.as_str();
+        let Some(rel_value) = rel
+            .captures(tag)
+            .and_then(|captures| captures.get(1).or_else(|| captures.get(2)))
+        else {
+            continue;
+        };
+        if !rel_value
+            .as_str()
+            .split_ascii_whitespace()
+            .any(|value| value.eq_ignore_ascii_case("stylesheet"))
+        {
+            continue;
+        }
+        let Some(href_value) = href
+            .captures(tag)
+            .and_then(|captures| captures.get(1).or_else(|| captures.get(2)))
+        else {
+            continue;
+        };
+        let href_value = href_value.as_str().trim();
+        let Some(path) = href_value.strip_prefix("epub://book/") else {
+            continue;
+        };
+        let key = normalize_path(&percent_decode_str(path).decode_utf8_lossy());
+        if let Some(bytes) = provider.get(&key) {
+            css.push_str(&String::from_utf8_lossy(&bytes));
+            css.push('\n');
+        }
+    }
+    css
+}
+
 /// Rasterizes SVG resources once, at page size, and keeps the PNGs in a
 /// byte-bounded cache.
 struct SvgRaster {
@@ -6700,4 +7050,80 @@ body { font-size: 20px; }
     assert!(find_case_insensitive(bytes, b"cre-render-base", 0).is_some());
     assert!(find_case_insensitive(bytes, b"font-size: 20px", 0).is_some());
     assert!(find_case_insensitive(bytes, b"visible", 0).is_some());
+}
+
+#[cfg(test)]
+mod inline_svg_tests {
+    use super::*;
+
+    #[test]
+    fn only_painting_rules_are_copied_into_an_svg() {
+        let css = r#"[data-spine-id="ch1"] p { margin: 0; }
+[data-spine-id="ch1"] .fil0 { fill: url(#star); stroke: green; }
+body { font-size: 12px; }
+[data-spine-id="ch1"] .hint { color: red; }"#;
+        let rules = svg_presentation_rules(css);
+        assert!(rules.contains(".fil0{ fill: url(#star); stroke: green; }"));
+        assert!(rules.contains(".hint{ color: red; }"));
+        assert!(!rules.contains("margin"));
+        assert!(!rules.contains("data-spine-id"));
+    }
+
+    #[test]
+    fn svg_blocks_include_nested_svg_elements() {
+        let html =
+            r#"<svg viewBox="0 0 10 10"><svg viewBox="0 0 5 5"><path/></svg><path/></svg><p>x</p>"#;
+        let ranges = inline_svg_ranges(html);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(
+            &html[ranges[0].0..ranges[0].1],
+            &html[..html.find("<p>").unwrap()]
+        );
+    }
+
+    #[test]
+    fn document_rules_are_inserted_inside_the_svg_element() {
+        let html = r#"<p>text</p><svg viewBox="0 0 10 10"><rect class="fil0"/></svg>"#;
+        let rules = ".fil0{fill:url(#star)}";
+        let out = apply_document_css_to_inline_svgs(html, rules);
+        let svg_start = out.find("<svg").unwrap();
+        let style = out.find("<style type=\"text/css\">.fil0").unwrap();
+        let rect = out.find("<rect").unwrap();
+        assert!(svg_start < style && style < rect, "{out}");
+        // Nothing outside the element is touched.
+        assert!(out.starts_with("<p>text</p><svg"));
+    }
+
+    #[test]
+    fn patterns_are_rasterized_and_plain_drawings_are_not() {
+        let pattern = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+                 <defs><pattern id="p" width="10%" height="10%">
+                   <rect width="5" height="5" fill="green"/>
+                 </pattern></defs>
+                 <rect width="20" height="20" fill="url(#p)"/></svg>"#;
+        let out = rasterize_pattern_svgs(pattern, 600);
+        assert!(
+            out.contains("<image x=\"0\" y=\"0\" width=\"20\" height=\"20\""),
+            "{out}"
+        );
+        assert!(out.contains("data:image/png;base64,"));
+        assert!(!out.contains("<pattern"));
+
+        let plain = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><rect width="5" height="5" fill="green"/></svg>"#;
+        assert_eq!(rasterize_pattern_svgs(plain, 600), plain);
+
+        // A `<pattern>` nobody references still paints fine as vectors.
+        let unused = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><defs><pattern id="p" width="10%" height="10%"/></defs><rect width="5" height="5" fill="green"/></svg>"#;
+        assert_eq!(rasterize_pattern_svgs(unused, 600), unused);
+    }
+
+    #[test]
+    fn view_box_is_read_from_the_root_open_tag_only() {
+        assert_eq!(
+            svg_view_box(r#"<svg viewBox="0,0 100 50" xmlns="x">"#),
+            Some((0.0, 0.0, 100.0, 50.0))
+        );
+        assert_eq!(svg_view_box(r#"<svg width="10" height="10">"#), None);
+        assert_eq!(svg_view_box(r#"<svg viewBox="0 0 0 10">"#), None);
+    }
 }
