@@ -5915,9 +5915,9 @@ fn create_document(
     let html_source = inline_borders_become_blocks(&html_source);
     let mut html_source = move_table_captions(&html_source);
     // Ruby is not specific to EPUB: KF8/MOBI documents carry the same `<ruby>`
-    // markup and Blitz has no ruby box, so stack the note over the base for
-    // every format. EPUB already did this while assembling its spine
-    // documents; running it again here is a no-op for those.
+    // markup, and Blitz has no ruby box. Stack the note over its base here, in
+    // the one place every format passes through, rather than in the EPUB
+    // generator as well.
     html_source = cre_epub::rewrite_ruby(&html_source);
     let stripped_at = started.elapsed().as_secs_f64() * 1000.0;
     let mut math_metrics = None;

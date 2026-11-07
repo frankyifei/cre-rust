@@ -710,11 +710,7 @@ impl EpubBook {
                 id: item.idref.clone(),
                 href: item.href.clone(),
                 media_type: item.media_type.clone(),
-                body_html: rewrite_ruby(&rewrite_urls(
-                    &body,
-                    parent_dir(&item.href),
-                    &self.opf_dir,
-                )),
+                body_html: rewrite_urls(&body, parent_dir(&item.href), &self.opf_dir),
                 css_urls,
                 inline_styles,
                 nonlinear,
