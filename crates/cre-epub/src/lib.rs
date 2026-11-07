@@ -556,10 +556,10 @@ impl EpubBook {
                 continue;
             }
 
-            // A cover page is drawn full-bleed: scaled up to the screen even
-            // when the file is smaller (and cropped, like `object-fit: cover`).
-            // Other pages keep the "never enlarge" behaviour of `max-width`.
-            let is_cover = document_is_cover(&text) && document_is_single_image(&text);
+            // A page that holds nothing but one picture is a picture page: the
+            // reader scales it to fill the page even when the file is smaller.
+            // Pages with text keep the "never enlarge" behaviour of `max-width`.
+            let image_only = document_is_single_image(&text);
             let mut generated = HashMap::new();
             let normalized = rewrite_full_page_image_tags(
                 &text,
@@ -568,7 +568,7 @@ impl EpubBook {
                 &mut generated,
                 &mut generated_counter,
                 (available_width, available_height),
-                is_cover,
+                image_only,
             );
             if !generated.is_empty() || normalized != text {
                 updates.push((doc_key, normalized, generated));
@@ -2674,7 +2674,7 @@ fn rewrite_full_page_image_tags(
     generated: &mut HashMap<String, Arc<Vec<u8>>>,
     generated_counter: &mut usize,
     available: (f32, f32),
-    is_cover: bool,
+    image_only: bool,
 ) -> String {
     let lower = html.to_ascii_lowercase();
     let mut out = String::with_capacity(html.len());
@@ -2694,7 +2694,7 @@ fn rewrite_full_page_image_tags(
             generated,
             generated_counter,
             available,
-            is_cover,
+            image_only,
         ) {
             out.push_str(&replacement);
         } else {
@@ -2714,11 +2714,11 @@ fn full_page_image_replacement(
     generated: &mut HashMap<String, Arc<Vec<u8>>>,
     generated_counter: &mut usize,
     available: (f32, f32),
-    is_cover: bool,
+    image_only: bool,
 ) -> Option<String> {
     let (available_width, available_height) = available;
     let attrs = parse_attrs(tag);
-    let full_height = is_cover
+    let full_height = image_only
         || attrs
             .get("style")
             .is_some_and(|style| style_has_full_height(style));
@@ -2798,19 +2798,6 @@ fn document_is_single_image(html: &str) -> bool {
         }
     }
     text.trim().is_empty()
-}
-
-/// True when the document marks itself as a cover (`epub:type="cover"`, the
-/// common `class="cover"` idiom, or an id containing "cover"): those pages are
-/// drawn full-bleed instead of letterboxed.
-fn document_is_cover(html: &str) -> bool {
-    let lower = html.to_ascii_lowercase();
-    lower.contains("epub:type=\"cover\"")
-        || lower.contains("epub:type='cover'")
-        || lower.contains("class=\"cover\"")
-        || lower.contains("class='cover'")
-        || lower.contains("id=\"cover\"")
-        || lower.contains("id='cover'")
 }
 
 fn generated_full_page_image_key(counter: usize) -> String {
@@ -4008,9 +3995,10 @@ mod tests {
     fn fits_a_full_page_image_with_an_epub_url_source() {
         let mut book = EpubBook::from_bytes(synthetic_epub_url_image_epub()).unwrap();
         assert_eq!(book.normalize_full_page_images(600.0, 800.0, 40.0, 32.0), 1);
+        // An image-only page is scaled to the page through a generated SVG.
+        assert!(book.resource("cre-page-fit-1.svg").is_some());
         let html = book.to_html(&HtmlOptions::default()).unwrap();
-        assert!(html.contains("epub://book/images/one.jpg"));
-        assert!(html.contains("max-height:736px"));
+        assert!(html.contains("epub://book/cre-page-fit-1.svg"));
         assert!(!html.contains("height: 100%"));
     }
 
