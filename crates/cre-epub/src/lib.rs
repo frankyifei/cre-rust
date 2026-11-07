@@ -556,6 +556,10 @@ impl EpubBook {
                 continue;
             }
 
+            // A cover page is drawn full-bleed: scaled up to the screen even
+            // when the file is smaller (and cropped, like `object-fit: cover`).
+            // Other pages keep the "never enlarge" behaviour of `max-width`.
+            let is_cover = document_is_cover(&text) && document_is_single_image(&text);
             let mut generated = HashMap::new();
             let normalized = rewrite_full_page_image_tags(
                 &text,
@@ -564,6 +568,7 @@ impl EpubBook {
                 &mut generated,
                 &mut generated_counter,
                 (available_width, available_height),
+                is_cover,
             );
             if !generated.is_empty() || normalized != text {
                 updates.push((doc_key, normalized, generated));
@@ -951,6 +956,14 @@ impl EpubBook {
         // leaving these rules global let one document restyle the others: the
         // character-entity table's `td { height: 1em; line-height: 1em }` made
         // every other table in the chunk overlap its own rows.
+        //
+        // TODO(upstream): Blitz has no subtree-scoped stylesheet.
+        // `BaseDocument::add_stylesheet_for_node` only records the owning node
+        // (the sheet still applies document-wide) and `make_stylesheet` needs
+        // stylo's `Origin`, which blitz-dom does not re-export. Until upstream
+        // offers scoped sheets (or we render each spine item as a sub-document),
+        // prefixing the selectors is the only way to keep a document's CSS to
+        // itself. See docs/blitz-dom-adoption-plan.md, item C3.
         for doc in docs {
             let scope = format!("[data-spine-id=\"{}\"]", escape_attr(&doc.id));
             for style in &doc.inline_styles {
@@ -2661,6 +2674,7 @@ fn rewrite_full_page_image_tags(
     generated: &mut HashMap<String, Arc<Vec<u8>>>,
     generated_counter: &mut usize,
     available: (f32, f32),
+    is_cover: bool,
 ) -> String {
     let lower = html.to_ascii_lowercase();
     let mut out = String::with_capacity(html.len());
@@ -2680,6 +2694,7 @@ fn rewrite_full_page_image_tags(
             generated,
             generated_counter,
             available,
+            is_cover,
         ) {
             out.push_str(&replacement);
         } else {
@@ -2699,12 +2714,14 @@ fn full_page_image_replacement(
     generated: &mut HashMap<String, Arc<Vec<u8>>>,
     generated_counter: &mut usize,
     available: (f32, f32),
+    is_cover: bool,
 ) -> Option<String> {
     let (available_width, available_height) = available;
     let attrs = parse_attrs(tag);
-    let full_height = attrs
-        .get("style")
-        .is_some_and(|style| style_has_full_height(style));
+    let full_height = is_cover
+        || attrs
+            .get("style")
+            .is_some_and(|style| style_has_full_height(style));
     let src = attrs.get("src").map(String::as_str).unwrap_or_default();
     let src = src.trim();
     if src.is_empty() || src.starts_with("data:") {
@@ -2748,21 +2765,76 @@ fn full_page_image_replacement(
     }
     *generated_counter += 1;
     let generated_key = generated_full_page_image_key(*generated_counter);
-    let svg =
-        full_page_image_svg_document(available_width, available_height, image_mime, &image_bytes);
+    let svg = full_page_image_svg_document(
+        available_width,
+        available_height,
+        image_mime,
+        &image_bytes,
+        is_cover,
+    );
     generated.insert(generated_key.clone(), Arc::new(svg.into_bytes()));
 
     Some(full_page_image_tag(&generated_key, &attrs))
+}
+
+/// True when the document's body holds exactly one image and no text: the
+/// "cover page" case, which the reader scales to the screen.
+fn document_is_single_image(html: &str) -> bool {
+    let lower = html.to_ascii_lowercase();
+    if lower.matches("<img").count() != 1 {
+        return false;
+    }
+    let body_start = lower
+        .find("<body")
+        .and_then(|at| lower[at..].find('>').map(|o| at + o + 1));
+    let body_end = lower.rfind("</body").unwrap_or(lower.len());
+    let body = match body_start {
+        Some(start) if start <= body_end => &html[start..body_end],
+        _ => html,
+    };
+    let mut text = String::with_capacity(body.len() / 4);
+    let mut in_tag = false;
+    for ch in body.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => text.push(ch),
+            _ => {}
+        }
+    }
+    text.trim().is_empty()
+}
+
+/// True when the document marks itself as a cover (`epub:type="cover"`, the
+/// common `class="cover"` idiom, or an id containing "cover"): those pages are
+/// drawn full-bleed instead of letterboxed.
+fn document_is_cover(html: &str) -> bool {
+    let lower = html.to_ascii_lowercase();
+    lower.contains("epub:type=\"cover\"")
+        || lower.contains("epub:type='cover'")
+        || lower.contains("class=\"cover\"")
+        || lower.contains("class='cover'")
+        || lower.contains("id=\"cover\"")
+        || lower.contains("id='cover'")
 }
 
 fn generated_full_page_image_key(counter: usize) -> String {
     format!("cre-page-fit-{counter}.svg")
 }
 
-fn full_page_image_svg_document(width: f32, height: f32, mime: &str, image_bytes: &[u8]) -> String {
+fn full_page_image_svg_document(
+    width: f32,
+    height: f32,
+    mime: &str,
+    image_bytes: &[u8],
+    cover: bool,
+) -> String {
     let encoded = base64_encode(image_bytes);
+    // A cover fills the page (the overflow is cropped, like `object-fit: cover`);
+    // any other full-page illustration is letterboxed so nothing is cut off.
+    let fit = if cover { "slice" } else { "meet" };
     format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"{width:.0}\" height=\"{height:.0}\" viewBox=\"0 0 {width:.0} {height:.0}\"><image x=\"0\" y=\"0\" width=\"{width:.0}\" height=\"{height:.0}\" preserveAspectRatio=\"xMidYMid meet\" xlink:href=\"data:{mime};base64,{encoded}\" /></svg>"
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"{width:.0}\" height=\"{height:.0}\" viewBox=\"0 0 {width:.0} {height:.0}\"><image x=\"0\" y=\"0\" width=\"{width:.0}\" height=\"{height:.0}\" preserveAspectRatio=\"xMidYMid {fit}\" xlink:href=\"data:{mime};base64,{encoded}\" /></svg>"
     )
 }
 
@@ -4027,7 +4099,9 @@ mod tests {
 <html xmlns="http://www.w3.org/1999/xhtml">
   <head><title>Sec1</title></head>
   <body>
+    <p>An inline picture in a page of text.</p>
     <img src="images/one.jpg" alt="Inline" style="max-width: 100%; height: auto;" />
+    <p>And the text continues after it.</p>
   </body>
 </html>"#;
         synthetic_epub_fixture(container, opf, doc, &jpg_fixture_bytes())
