@@ -35,6 +35,30 @@ fn options() -> DocumentOptions {
     }
 }
 
+/// MOBI/KF8 mark their parts with `<section class="cre-spine">`; a part whose
+/// only content is an image is a plate page and has to fill the page, like an
+/// EPUB spine document that is one picture. A 1x1 image would otherwise stay
+/// one pixel.
+#[test]
+fn picture_only_sections_fill_the_page() {
+    require_font();
+    let mut doc = Document::with_options(fixture("picture-section.html"), &options()).unwrap();
+    let (bitmap, _, _) = doc.render_page_color_with_stats(1).unwrap();
+    let pixels = bitmap.data.as_chunks::<4>().0.len() as f32;
+    let red = bitmap
+        .data
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|pixel| pixel[0] > 180 && pixel[1] < 120 && pixel[2] < 120)
+        .count() as f32;
+    assert!(
+        red > pixels * 0.3,
+        "the plate should be scaled to the page, covered {:.0}%",
+        red / pixels * 100.0
+    );
+}
+
 /// Ruby is not EPUB-specific: KF8/MOBI documents carry the same `<ruby>`
 /// markup. Blitz has no ruby box, so the shared preprocessing stacks the note
 /// above its base; that band makes the paragraph taller, which is what pushes

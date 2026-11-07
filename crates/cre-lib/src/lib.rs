@@ -1539,6 +1539,19 @@ fn layout_chunk_html(
                 ResourceSource::Empty => None,
             }
         };
+        // A section that holds nothing but a picture is a plate page: scale it
+        // to the page. The EPUB path does this per spine document while it
+        // assembles the book; MOBI/KF8 are one document with `<section
+        // class="cre-spine">` parts, so do it here. Run before inlining so the
+        // `<image>` this generates is inlined too.
+        let fitted = (!matches!(resources, ResourceSource::Epub(_))).then(|| {
+            fit_picture_sections(
+                html,
+                options.width as f32 - options.page_margin * 2.0,
+                options.height as f32 - options.page_margin * 2.0,
+            )
+        });
+        let html = fitted.as_deref().unwrap_or(html);
         let inlined = cre_epub::inline_svg_images_to_data_uris(html, &inlined);
         let html = inlined.as_deref().unwrap_or(html);
         // Inline SVG needs the document's CSS and a pattern-capable rasterizer;
@@ -6681,6 +6694,103 @@ const SVG_PRESENTATION_PROPERTIES: &[&str] = &[
     "opacity",
     "color",
 ];
+
+/// Scales a picture-only section to the page.
+///
+/// MOBI and KF8 keep the whole book in one document and mark each part with
+/// `<section class="cre-spine">`. A part whose only content is an image (a
+/// cover, a plate) should fill the page the way an EPUB spine document that is
+/// one picture does; a plain `<img>` is capped to its own size by
+/// `max-width: 100%`, so it sat small in the middle of the page. The picture is
+/// wrapped in a page-sized SVG with `preserveAspectRatio="… meet"`, so it is
+/// enlarged and never cropped.
+fn fit_picture_sections(html: &str, width: f32, height: f32) -> String {
+    if !contains_ignore_ascii_case(html, "<img") || !contains_ignore_ascii_case(html, "cre-spine") {
+        return html.to_string();
+    }
+    static SRC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let src = SRC.get_or_init(|| {
+        regex::Regex::new(r#"(?is)\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)')"#)
+            .expect("img src regex is valid")
+    });
+    let (width, height) = (width.max(1.0).round(), height.max(1.0).round());
+    let mut out = String::with_capacity(html.len());
+    let mut cursor = 0usize;
+    let lower = html.to_ascii_lowercase();
+    while let Some(pos) = lower[cursor..].find("<section") {
+        let start = cursor + pos;
+        let Some(open_end) = html[start..].find('>').map(|end| start + end + 1) else {
+            break;
+        };
+        let open_tag = &html[start..open_end];
+        if !open_tag.to_ascii_lowercase().contains("cre-spine") {
+            cursor = open_end;
+            continue;
+        }
+        let Some(close) = lower[open_end..]
+            .find("</section>")
+            .map(|end| open_end + end)
+        else {
+            break;
+        };
+        let body = &html[open_end..close];
+        let Some(picture) = picture_only_body(body, src) else {
+            cursor = close;
+            continue;
+        };
+        out.push_str(&html[cursor..open_end]);
+        out.push_str(&format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {width:.0} {height:.0}\" \
+             preserveAspectRatio=\"xMidYMid meet\" \
+             style=\"display:block;width:100%;height:auto\">\
+             <image x=\"0\" y=\"0\" width=\"{width:.0}\" height=\"{height:.0}\" \
+             preserveAspectRatio=\"xMidYMid meet\" href=\"{picture}\"/></svg>"
+        ));
+        out.push_str(&html[close..]);
+        cursor = close;
+    }
+    if cursor == 0 {
+        return html.to_string();
+    }
+    // `out` holds everything up to the closing tag of the last rewritten
+    // section; the rest follows as it was written.
+    out.push_str(&html[cursor..]);
+    out
+}
+
+/// The `src` of the single image `body` holds, when that is all it holds.
+fn picture_only_body(body: &str, src: &regex::Regex) -> Option<String> {
+    let lower = body.to_ascii_lowercase();
+    if lower.matches("<img").count() != 1 {
+        return None;
+    }
+    let start = lower.find("<img")?;
+    let end = body[start..].find('>').map(|offset| start + offset + 1)?;
+    let captures = src.captures(&body[start..end])?;
+    let picture = captures
+        .get(1)
+        .or_else(|| captures.get(2))?
+        .as_str()
+        .trim()
+        .to_string();
+    if picture.is_empty() {
+        return None;
+    }
+    // Anything left after removing the image (tags excluded) is text, so the
+    // section is a normal page with a picture in it.
+    let rest = format!("{}{}", &body[..start], &body[end..]);
+    let mut depth = 0usize;
+    let mut text = String::new();
+    for ch in rest.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => text.push(ch),
+            _ => {}
+        }
+    }
+    text.trim().is_empty().then_some(picture)
+}
 
 /// Prepares the inline `<svg>` elements of one chunk for Blitz.
 ///
