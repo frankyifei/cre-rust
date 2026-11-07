@@ -242,10 +242,11 @@ fn small_page_options() -> cre_lib::DocumentOptions {
     }
 }
 
-/// A file-level TOC target is a spine document. Its forced page break is
-/// applied at the first line that carries text, so a title page with a large
-/// top margin has its section top on the previous page. The TOC must use the
-/// page of the title, not the page of the section top.
+/// A file-level TOC target is a spine document. Its forced page break starts
+/// the section at the top of a new page and keeps the section's own leading
+/// margin (what a browser does), so the title can still spill onto the next
+/// page when that margin is huge. The TOC must use the page where the title
+/// starts, not an empty page before it.
 #[test]
 fn toc_file_target_uses_the_page_of_the_title() {
     require_resources();
@@ -263,13 +264,15 @@ fn toc_file_target_uses_the_page_of_the_title() {
     assert!(page > 1, "title page should not be the first page");
     let normalize = |text: String| text.split_whitespace().collect::<Vec<_>>().join(" ");
     let text = normalize(doc.page_text(page).unwrap_or_default());
+    // The fixture's title is pushed so far down that it straddles a page, so
+    // only its first word has to be on the TOC page.
     assert!(
-        text.contains("Unique Chapter Title"),
+        text.contains("Unique"),
         "TOC page {page} does not show the title: {text:?}"
     );
     let previous = normalize(doc.page_text(page - 1).unwrap_or_default());
     assert!(
-        !previous.contains("Unique Chapter Title"),
+        !previous.contains("Unique"),
         "TOC page {page} is one page late"
     );
     assert_eq!(doc.page_from_href(&entry.href).unwrap(), page);

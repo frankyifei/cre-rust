@@ -48,6 +48,11 @@ pub struct SpineDocument {
     pub href: String,
     pub media_type: String,
     pub body_html: String,
+    /// `class`/`style` of the document's own `<body>`, carried onto the section
+    /// wrapper so `body.cov2 { … }` style rules keep matching (the body element
+    /// itself does not survive the chunk assembly).
+    pub body_class: Option<String>,
+    pub body_style: Option<String>,
     pub css_urls: Vec<String>,
     pub inline_styles: Vec<String>,
     pub nonlinear: bool,
@@ -705,11 +710,14 @@ impl EpubBook {
             } else {
                 (Vec::new(), Vec::new())
             };
+            let body_attrs = body_attributes(&text);
             docs.push(SpineDocument {
                 index,
                 id: item.idref.clone(),
                 href: item.href.clone(),
                 media_type: item.media_type.clone(),
+                body_class: body_attrs.get("class").cloned(),
+                body_style: body_attrs.get("style").cloned(),
                 body_html: rewrite_urls(&body, parent_dir(&item.href), &self.opf_dir),
                 css_urls,
                 inline_styles,
@@ -982,7 +990,7 @@ impl EpubBook {
              html {{ font-size: {FONT_SIZE_TOKEN}px; }}\n\
              body {{ font-family: serif; font-size: 1em; line-height: {}; \
              padding: {}px {}px; }}\n\
-             .cre-spine {{ display: block; page-break-before: always; }}\n",
+             .cre-spine {{ display: flow-root; page-break-before: always; }}\n",
             options.line_height, options.margin_y, options.margin_x
         ));
         html.push_str("</style></head><body>");
@@ -1004,14 +1012,31 @@ fn push_section_html(
     };
     // A continuation part stays inside the same spine document; it must not
     // add another page break (the chunk boundary already starts a page).
-    let class = if continuation {
-        "cre-spine-cont"
+    let mut class = if continuation {
+        "cre-spine-cont".to_string()
     } else {
-        "cre-spine"
+        "cre-spine".to_string()
     };
+    if let Some(extra) = doc
+        .body_class
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
+        class.push(' ');
+        class.push_str(extra);
+    }
+    let style = doc
+        .body_style
+        .as_deref()
+        .map(str::trim)
+        .filter(|style| !style.is_empty())
+        .map(|style| format!(" style=\"{}\"", escape_attr(style)))
+        .unwrap_or_default();
     out.push_str(&format!(
-        "<section class=\"{class}\" data-spine-index=\"{slot}\" data-spine-real-index=\"{}\" \
-         data-spine-id=\"{}\" data-spine-href=\"{}\"{nonlinear_attr}>",
+        "<section class=\"{}\" data-spine-index=\"{slot}\" data-spine-real-index=\"{}\" \
+         data-spine-id=\"{}\" data-spine-href=\"{}\"{nonlinear_attr}{style}>",
+        escape_attr(&class),
         doc.index as u32 + 1,
         escape_attr(&doc.id),
         escape_attr(&normalize_path(&doc.href)),
@@ -1093,6 +1118,30 @@ pub fn split_html_document(html: &str, limit: usize) -> Vec<String> {
 /// alone is larger than `limit` (the caller then falls back to the generic
 /// splitter, which can cut inside a part).
 pub fn split_html_document_at_sections(html: &str, limit: usize) -> Option<Vec<String>> {
+    split_html_document_at_sections_with(html, limit, usize::MAX, usize::MAX, 128, |section| {
+        (section.len(), 0)
+    })
+}
+
+/// Like [`split_html_document_at_sections`], but a chunk also has to stay
+/// within an estimated decoded-image budget and a layout budget.
+///
+/// `cost` returns the HTML bytes and the estimated decoded bytes of the images
+/// of one section; `dom_factor` is how many bytes of DOM one HTML byte is
+/// assumed to take, so `layout_limit` can be checked the way `chunk_budgets`
+/// computes it for EPUB.
+#[allow(clippy::too_many_arguments)]
+pub fn split_html_document_at_sections_with<F>(
+    html: &str,
+    limit: usize,
+    image_limit: usize,
+    layout_limit: usize,
+    dom_factor: usize,
+    cost: F,
+) -> Option<Vec<String>>
+where
+    F: Fn(&str) -> (usize, usize),
+{
     if limit == 0 {
         return None;
     }
@@ -1135,7 +1184,11 @@ pub fn split_html_document_at_sections(html: &str, limit: usize) -> Option<Vec<S
     if !body[cursor..].trim().is_empty() {
         return None;
     }
-    if sections.iter().any(|section| section.len() > limit) {
+    // A section too big for the *text* budget has to be cut by the generic
+    // splitter, which can cut inside it; the caller falls back then. An image
+    // overrun is not a reason to fall back: a section is indivisible here (it
+    // carries a spine index), so it simply gets a chunk of its own.
+    if sections.iter().any(|section| cost(section).0 > limit) {
         return None;
     }
 
@@ -1144,12 +1197,21 @@ pub fn split_html_document_at_sections(html: &str, limit: usize) -> Option<Vec<S
     let tail = &html[body_close..];
     let mut parts: Vec<String> = Vec::new();
     let mut current = String::new();
+    let mut current_images = 0usize;
     for section in sections {
-        if !current.is_empty() && prefix.len() + current.len() + section.len() > limit {
+        let (text, images) = cost(section);
+        let over_text = prefix.len() + current.len() + text > limit;
+        let over_images = current_images + images > image_limit;
+        let over_layout =
+            (prefix.len() + current.len() + text) * dom_factor + current_images + images
+                > layout_limit;
+        if !current.is_empty() && (over_text || over_images || over_layout) {
             parts.push(format!("{head}{prefix}{current}{tail}"));
             current.clear();
+            current_images = 0;
         }
         current.push_str(section);
+        current_images += images;
     }
     if !current.is_empty() {
         parts.push(format!("{head}{prefix}{current}{tail}"));
@@ -1784,6 +1846,11 @@ pub fn chunk_image_bytes(provider: &LazyResource, chunk_html: &str) -> usize {
 
 /// Root-relative resource paths of every `<img>` in a chunk body. Spine
 /// parsing rewrites `src` to `epub://book/...`, so both forms are accepted.
+/// Resource names referenced by the `<img>` tags of a fragment.
+pub fn image_sources_in(body: &str) -> Vec<String> {
+    image_sources(body, "")
+}
+
 fn image_sources(body: &str, doc_dir: &str) -> Vec<String> {
     // ASCII lowercasing keeps byte offsets, so positions found in `lower` can
     // be used to slice the original text (zip names are case-sensitive).
@@ -1871,6 +1938,25 @@ fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 const DOM_BYTES_PER_HTML_BYTE: usize = 128;
 
 /// Rough decoded size of an image resource, from its file size and format.
+/// Estimated decoded size of one image, for the chunk memory budgets.
+///
+/// Used by the formats whose resources are a plain in-memory map (MOBI/KF8):
+/// there is no provider to ask, but the bytes are at hand, so the same
+/// dimensions-based estimate the EPUB path uses applies. `name` supplies the
+/// format when the magic bytes are not recognised (`mobi-image-3` has no
+/// extension).
+pub fn estimated_image_bytes(name: &str, bytes: &[u8]) -> usize {
+    if let Some((width, height)) = image_dimensions(bytes) {
+        return (width as usize * height as usize * 4).max(64 * 1024);
+    }
+    estimated_decoded_image_bytes(name, bytes.len())
+}
+
+/// True when `name` ends in a picture extension the estimator understands.
+pub fn is_image_bytes(bytes: &[u8]) -> bool {
+    image_dimensions(bytes).is_some() || bytes.starts_with(b"<svg")
+}
+
 fn estimated_decoded_image_bytes(name: &str, file_bytes: usize) -> usize {
     let factor = if name.ends_with(".jpg") || name.ends_with(".jpeg") {
         32
@@ -2158,6 +2244,61 @@ fn extract_styles(html: &str, opf_dir: &str, doc_path: &str) -> (Vec<String>, Ve
 
     let _ = opf_dir;
     (css_urls, styles)
+}
+
+/// Rewrites `body.class`, `body#id` and `body[...]` selectors to the bare
+/// selector.
+///
+/// A spine document's `<body class="cov2">` is rebuilt as a
+/// `<section class="cov2">` inside the chunk, because a chunk holds several
+/// documents and only one `<body>` can exist. Rules like
+/// `body.cov2 { background-image: … }` — the usual way a cover page styles its
+/// own background — therefore never matched, and the background was lost.
+/// Linked stylesheets are shared by every document and are not scoped, so the
+/// one thing that can be done there is to drop the `body` part of the selector;
+/// the class still only appears on the document that declared it.
+pub fn body_selectors_to_class(css: &str) -> String {
+    if !contains_ignore_ascii_case(css, "body") {
+        return css.to_string();
+    }
+    let bytes = css.as_bytes();
+    let mut out = String::with_capacity(css.len());
+    let mut copied = 0usize;
+    let mut index = 0usize;
+    while index + 4 <= bytes.len() {
+        if bytes[index..index + 4].eq_ignore_ascii_case(b"body") {
+            // Not part of a longer name (`tbody`, `.body`, `my-body`).
+            let previous_ok = index == 0
+                || !matches!(
+                    bytes[index - 1],
+                    b'-' | b'_' | b'.' | b'#' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z'
+                );
+            let follows_ok = matches!(
+                bytes.get(index + 4),
+                Some(b'.') | Some(b'#') | Some(b'[') | Some(b':')
+            );
+            if previous_ok && follows_ok {
+                out.push_str(&css[copied..index]);
+                copied = index + 4;
+                index += 4;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    out.push_str(&css[copied..]);
+    out
+}
+
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    if needle.is_empty() {
+        return true;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
 /// Rewrites `url(...)` references inside a stylesheet so they point at the book
@@ -3488,6 +3629,16 @@ fn scope_selector_list(selectors: &str, scope: &str) -> String {
                     // `body p` becomes `<section> p`.
                     return format!("{scope}{}", &trimmed[root.len()..]);
                 }
+                if lower.starts_with(root)
+                    && matches!(
+                        lower.as_bytes().get(root.len()),
+                        Some(b'.') | Some(b'#') | Some(b'[') | Some(b':')
+                    )
+                {
+                    // `body.cov2` matches the section, which carries the
+                    // body's own class/style attributes.
+                    return format!("{scope}{}", &trimmed[root.len()..]);
+                }
             }
             format!("{scope} {trimmed}")
         })
@@ -3517,6 +3668,26 @@ mod tests {
             assert!(part.starts_with("<html><head>"), "{part}");
             assert!(part.ends_with("</body></html>"), "{part}");
         }
+    }
+
+    #[test]
+    fn a_chunk_stays_within_the_image_budget() {
+        let html = "<html><body>\
+                    <section class=\"cre-spine\"><p>one</p></section>\
+                    <section class=\"cre-spine\"><p>two</p></section>\
+                    <section class=\"cre-spine\"><p>three</p></section>\
+                    </body></html>";
+        // Each section claims 10 bytes of decoded images; the budget fits one.
+        let parts = super::split_html_document_at_sections_with(
+            html,
+            1000,
+            12,
+            1_000_000,
+            128,
+            |section| (section.len(), 10),
+        )
+        .expect("sections");
+        assert_eq!(parts.len(), 3, "{parts:?}");
     }
 
     #[test]

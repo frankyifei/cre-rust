@@ -330,18 +330,53 @@ fn memory_total_bytes() -> Option<u64> {
 /// Splits a format that is produced as one HTML document (FB2, TXT, a
 /// standalone HTML file) into layout chunks when it would not fit in one,
 /// using the same memory budget as EPUB chunking.
-fn split_single_document(html: String) -> Vec<String> {
-    let target = plan_chunk_bytes(html.len(), available_memory_bytes());
+fn split_single_document(html: String, resources: &ResourceSource) -> Vec<String> {
+    let available = available_memory_bytes();
+    let target = plan_chunk_bytes(html.len(), available);
     if target == usize::MAX || html.len() <= target {
         return vec![html];
     }
+    // The same budgets the EPUB chunker uses: decoded images dominate a
+    // chunk's footprint, and they cannot be seen in the HTML size. A KF8
+    // photo page can be 100 kB of JPEG and 20 MB decoded.
+    let (text_budget, image_budget, layout_budget) = chunk_budgets(available);
+    let text_limit = target.min(text_budget).max(MIN_CHUNK_BYTES);
+    let image_budget = image_budget.unwrap_or(usize::MAX);
+    let cost = |section: &str| -> (usize, usize) {
+        let images = cre_epub::image_sources_in(section)
+            .into_iter()
+            .filter_map(|key| resource_image_bytes(resources, &key))
+            .sum();
+        (section.len(), images)
+    };
     // MOBI/KF8 bodies are a run of `<section class="cre-spine">` parts; cutting
     // between them keeps each chunk a whole number of parts. A book whose part
-    // is bigger than the budget falls back to the generic splitter.
-    if let Some(parts) = cre_epub::split_html_document_at_sections(&html, target) {
+    // is bigger than the budget falls back to the generic splitter, which can
+    // only respect the text budget.
+    if let Some(parts) = cre_epub::split_html_document_at_sections_with(
+        &html,
+        text_limit,
+        image_budget,
+        layout_budget,
+        LAYOUT_BYTES_PER_HTML_BYTE,
+        cost,
+    ) {
         return parts;
     }
-    cre_epub::split_html_document(&html, target)
+    cre_epub::split_html_document(&html, text_limit)
+}
+
+/// Estimated decoded size of one resource, for the chunk image budget.
+fn resource_image_bytes(resources: &ResourceSource, key: &str) -> Option<usize> {
+    match resources {
+        ResourceSource::Epub(provider) => provider.estimated_decoded_bytes(key),
+        ResourceSource::Map(map) => {
+            let key = normalize_path(key);
+            map.get(&key)
+                .map(|bytes| cre_epub::estimated_image_bytes(&key, bytes))
+        }
+        ResourceSource::Empty => None,
+    }
 }
 
 /// Text and image budget for one layout chunk, from the memory the kernel can
@@ -1048,14 +1083,15 @@ impl Document {
                     .collect();
                 let cover_image = book.binary.values().next().cloned();
                 let binary = Arc::new(book.binary);
+                let resource_source = ResourceSource::Map(binary.clone());
                 Self::build(
-                    split_single_document(html),
+                    split_single_document(html, &resource_source),
                     "fb2://book/",
                     Arc::new(MapNet {
                         resources: binary.clone(),
                         svg: svg_raster.clone(),
                     }),
-                    ResourceSource::Map(binary),
+                    resource_source,
                     cover_image,
                     false,
                     metadata,
@@ -1097,14 +1133,15 @@ impl Document {
                     .collect();
                 let cover_image = book.cover_image.clone();
                 let resources = Arc::new(book.resources);
+                let resource_source = ResourceSource::Map(resources.clone());
                 Self::build(
-                    split_single_document(html),
+                    split_single_document(html, &resource_source),
                     "mobi://book/",
                     Arc::new(MapNet {
                         resources: resources.clone(),
                         svg: svg_raster.clone(),
                     }),
-                    ResourceSource::Map(resources),
+                    resource_source,
                     cover_image,
                     false,
                     metadata,
@@ -1146,14 +1183,15 @@ impl Document {
                     .collect();
                 let cover_image = book.cover_image.clone();
                 let resources = Arc::new(book.resources);
+                let resource_source = ResourceSource::Map(resources.clone());
                 Self::build(
-                    split_single_document(html),
+                    split_single_document(html, &resource_source),
                     "azw3://book/",
                     Arc::new(MapNet {
                         resources: resources.clone(),
                         svg: svg_raster.clone(),
                     }),
-                    ResourceSource::Map(resources),
+                    resource_source,
                     cover_image,
                     false,
                     metadata,
@@ -1186,7 +1224,7 @@ impl Document {
                 };
                 let html = book.to_html(&html_options);
                 Self::build(
-                    split_single_document(html),
+                    split_single_document(html, &ResourceSource::Empty),
                     "text://book/",
                     Arc::new(EmptyNet),
                     ResourceSource::Empty,
@@ -1255,7 +1293,7 @@ impl Document {
                     item_count: 1,
                 };
                 Self::build(
-                    split_single_document(html),
+                    split_single_document(html, &ResourceSource::Empty),
                     &base_url,
                     Arc::new(FileNet {
                         root: root.clone(),
@@ -4762,6 +4800,11 @@ fn paginate(
     }];
     let mut forced_index = 0usize;
     let mut pending_break = false;
+    // Where the pending forced break starts the page. It is the element's own
+    // top, not the first line's: a section that opens with a top margin (a
+    // chapter title pushed 40% down, say) keeps that margin on the new page
+    // instead of having it trimmed away.
+    let mut pending_break_at: Option<f32> = None;
     // Visible content on the current page: a line with text or an image box.
     // A chunk starts on a fresh page, so a break before its very first content
     // would only add an empty page.
@@ -4793,9 +4836,10 @@ fn paginate(
                     && box_.top > starts.last().unwrap().clip_top + BREAK_EPSILON
                     && page_has_content
                 {
+                    let clip_top = forced_breaks[forced_index].min(box_.top);
                     starts.push(PageStart {
-                        top: (box_.top - margin_top).max(0.0),
-                        clip_top: box_.top,
+                        top: (clip_top - margin_top).max(0.0),
+                        clip_top,
                     });
                     page_has_content = false;
                 }
@@ -4839,6 +4883,7 @@ fn paginate(
                 && line.top > current.clip_top + BREAK_EPSILON
             {
                 pending_break = true;
+                pending_break_at = Some(forced_breaks[forced_index]);
             }
             forced_index += 1;
         }
@@ -4850,7 +4895,11 @@ fn paginate(
         if pending_break && has_text {
             pending_break = false;
             if page_has_content {
-                starts.push(page_start_for_line(line, margin_top));
+                starts.push(page_start_for_break(
+                    line,
+                    pending_break_at.take(),
+                    margin_top,
+                ));
                 // The break already starts a page at this line; running the
                 // height check as well pushed a second start for the same line,
                 // which made an empty page and a duplicate start XPointer.
@@ -4869,6 +4918,16 @@ fn paginate(
         }
     }
     starts
+}
+
+/// Page start for a forced break: the break's own position when it is above
+/// the line (so a leading margin stays visible), never below the line.
+fn page_start_for_break(line: &LineBox, at: Option<f32>, margin_top: f32) -> PageStart {
+    let clip_top = at.unwrap_or(line.visual_top).min(line.visual_top);
+    PageStart {
+        top: (clip_top - margin_top).max(0.0),
+        clip_top,
+    }
 }
 
 fn page_start_for_line(line: &LineBox, margin_top: f32) -> PageStart {
@@ -7478,6 +7537,14 @@ impl NetProvider for EpubNet {
             .get(&key)
             .map(|data| (*data).clone())
             .unwrap_or_default();
+        // A document's `<body class="…">` becomes a `<section class="…">` in
+        // the chunk, so the stylesheet's `body.class` rules have to lose the
+        // `body` part to keep matching (a cover's `body.cov2 { background }`).
+        let bytes = if key.to_ascii_lowercase().ends_with(".css") {
+            cre_epub::body_selectors_to_class(&String::from_utf8_lossy(&bytes)).into_bytes()
+        } else {
+            bytes
+        };
         let bytes = self.svg.rasterize(&key, &bytes).unwrap_or(bytes);
         handler.bytes(request.url.to_string(), Bytes::from(bytes));
     }
