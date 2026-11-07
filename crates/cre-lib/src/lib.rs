@@ -335,6 +335,12 @@ fn split_single_document(html: String) -> Vec<String> {
     if target == usize::MAX || html.len() <= target {
         return vec![html];
     }
+    // MOBI/KF8 bodies are a run of `<section class="cre-spine">` parts; cutting
+    // between them keeps each chunk a whole number of parts. A book whose part
+    // is bigger than the budget falls back to the generic splitter.
+    if let Some(parts) = cre_epub::split_html_document_at_sections(&html, target) {
+        return parts;
+    }
     cre_epub::split_html_document(&html, target)
 }
 

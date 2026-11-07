@@ -1081,6 +1081,107 @@ pub fn split_html_document(html: &str, limit: usize) -> Vec<String> {
         .collect()
 }
 
+/// Splits a single-document book at its `<section class="cre-spine">` parts.
+///
+/// MOBI and KF8 keep the whole book in one flow; `cre-mobi`/`cre-kf8` rebuild
+/// the original parts (the "HTML files" a converter shows) as sections. When
+/// memory forces a book into several layout chunks, cutting at those boundaries
+/// keeps every chunk a whole number of parts, so page numbers do not depend on
+/// where a byte budget happened to fall and no section is split in two.
+///
+/// Returns `None` when the body is not a run of sections, or when one section
+/// alone is larger than `limit` (the caller then falls back to the generic
+/// splitter, which can cut inside a part).
+pub fn split_html_document_at_sections(html: &str, limit: usize) -> Option<Vec<String>> {
+    if limit == 0 {
+        return None;
+    }
+    let lower = html.to_ascii_lowercase();
+    let body_start = lower.find("<body")?;
+    let body_open_end = lower[body_start..].find('>')? + body_start + 1;
+    let body_close = lower.rfind("</body>")?;
+    if body_close < body_open_end {
+        return None;
+    }
+    let body = &html[body_open_end..body_close];
+    let lower_body = &lower[body_open_end..body_close];
+
+    let mut sections: Vec<&str> = Vec::new();
+    let mut cursor = 0usize;
+    let mut prefix_end = 0usize;
+    let mut first = true;
+    while let Some(pos) = lower_body[cursor..].find("<section") {
+        let start = cursor + pos;
+        let gap = &body[cursor..start];
+        if first {
+            // A KF8 body starts with the book's stylesheet before the first
+            // part; every chunk needs it, so it becomes a repeated prefix.
+            if !only_style_blocks(gap) {
+                return None;
+            }
+            prefix_end = start;
+            first = false;
+        } else if !gap.trim().is_empty() {
+            return None;
+        }
+        let close = lower_body[start..].find("</section>")? + start;
+        let end = close + "</section>".len();
+        sections.push(&body[start..end]);
+        cursor = end;
+    }
+    if sections.is_empty() {
+        return None;
+    }
+    if !body[cursor..].trim().is_empty() {
+        return None;
+    }
+    if sections.iter().any(|section| section.len() > limit) {
+        return None;
+    }
+
+    let prefix = &body[..prefix_end];
+    let head = &html[..body_open_end];
+    let tail = &html[body_close..];
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for section in sections {
+        if !current.is_empty() && prefix.len() + current.len() + section.len() > limit {
+            parts.push(format!("{head}{prefix}{current}{tail}"));
+            current.clear();
+        }
+        current.push_str(section);
+    }
+    if !current.is_empty() {
+        parts.push(format!("{head}{prefix}{current}{tail}"));
+    }
+    Some(parts)
+}
+
+/// True when a fragment holds only `<style>`/`<script>` blocks and whitespace.
+fn only_style_blocks(fragment: &str) -> bool {
+    let mut rest = fragment;
+    loop {
+        let trimmed = rest.trim_start();
+        let lower = trimmed.to_ascii_lowercase();
+        let (open, close) = if lower.starts_with("<style") {
+            ("<style", "</style")
+        } else if lower.starts_with("<script") {
+            ("<script", "</script")
+        } else {
+            return trimmed.trim().is_empty();
+        };
+        let _ = open;
+        let Some(end) = lower.find(close) else {
+            return false;
+        };
+        let after = lower[end..]
+            .find('>')
+            .map(|offset| end + offset + 1)
+            .unwrap_or(lower.len());
+        rest = &trimmed[after..];
+    }
+}
+
 /// Shifts every `data-spine-index="N"` in a split part by `part * 100_000`
 /// so slots stay unique across parts.
 fn renumber_spine_indices(html: &str, part_index: usize) -> String {
@@ -3396,6 +3497,54 @@ fn scope_selector_list(selectors: &str, scope: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sections_are_packed_whole_into_chunks() {
+        let html = "<html><head><title>t</title></head><body>\
+                    <section class=\"cre-spine\" data-spine-index=\"1\"><p>one</p></section>\
+                    <section class=\"cre-spine\" data-spine-index=\"2\"><p>two</p></section>\
+                    <section class=\"cre-spine\" data-spine-index=\"3\"><p>three</p></section>\
+                    </body></html>";
+        // Room for two sections per chunk.
+        let limit = 150;
+        let parts = super::split_html_document_at_sections(html, limit).expect("sections");
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert!(parts[0].contains("data-spine-index=\"1\""), "{}", parts[0]);
+        assert!(parts[0].contains("data-spine-index=\"2\""), "{}", parts[0]);
+        assert!(!parts[0].contains("data-spine-index=\"3\""), "{}", parts[0]);
+        assert!(parts[1].contains("data-spine-index=\"3\""), "{}", parts[1]);
+        // The head and the closing tags are repeated in every part.
+        for part in &parts {
+            assert!(part.starts_with("<html><head>"), "{part}");
+            assert!(part.ends_with("</body></html>"), "{part}");
+        }
+    }
+
+    #[test]
+    fn a_leading_stylesheet_is_repeated_in_every_chunk() {
+        // KF8 bodies start with the book's CSS before the first part.
+        let html = "<html><body><style>p{color:red}</style>\
+                    <section class=\"cre-spine\"><p>one</p></section>\
+                    <section class=\"cre-spine\"><p>two</p></section>\
+                    </body></html>";
+        let parts = super::split_html_document_at_sections(html, 110).expect("sections");
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        for part in &parts {
+            assert!(part.contains("<style>p{color:red}</style>"), "{part}");
+        }
+    }
+
+    #[test]
+    fn a_body_without_sections_or_with_text_between_them_is_generic() {
+        let plain = "<html><body><p>a</p><p>b</p></body></html>";
+        assert!(super::split_html_document_at_sections(plain, 10).is_none());
+        let mixed = "<html><body><section class=\"cre-spine\"><p>a</p></section>tail</body></html>";
+        assert!(super::split_html_document_at_sections(mixed, 10).is_none());
+        // One section larger than the budget: let the generic splitter cut it.
+        let large =
+            "<html><body><section class=\"cre-spine\"><p>aaaaaaaaaa</p></section></body></html>";
+        assert!(super::split_html_document_at_sections(large, 20).is_none());
+    }
+
     #[test]
     fn inline_svg_images_resolve_any_resource_name() {
         // KF8 names its images `mobi-image-N`; the EPUB path passes
