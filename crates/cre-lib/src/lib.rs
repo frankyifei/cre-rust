@@ -1767,7 +1767,15 @@ fn layout_chunk_html(
             prepare_inline_svgs(html, &css, options.width)
         });
         let html = prepared_svg.as_deref().unwrap_or(html);
-        let doc = create_document(html, base_url, net, font_context, font_blobs, options, margins);
+        let doc = create_document(
+            html,
+            base_url,
+            net,
+            font_context,
+            font_blobs,
+            options,
+            margins,
+        );
         timer.mark("parse");
         let root = doc.root_element();
         let mut lines = collect_lines(root);
@@ -4209,11 +4217,33 @@ impl Document {
         if page_count == 0 {
             bail!("document has no pages");
         }
-        let page = if pos <= 0 {
-            1
-        } else {
-            (pos / i64::from(self.height) + 1).min(page_count as i64) as usize
-        };
+        // `pos` is a document-space y (see `current_document_pos`), i.e. the
+        // top of a page. Staying on the current page when the position falls
+        // inside it keeps the reader's frequent `gotoPos(getCurrentPos())`
+        // refresh from moving; anything else is looked up by page start, and
+        // pages whose start is still provisional (0) are skipped so a lookup
+        // never jumps past real pages.
+        let current = self.current_page.max(1).min(page_count);
+        let start = self.page_start_y(current);
+        let height = self.page_render_height(current).max(0);
+        if pos >= start && pos < start + height {
+            return Ok(current);
+        }
+        if pos <= 0 {
+            return self.go_to_page(1);
+        }
+        let mut page = 1usize;
+        for candidate in 2..=page_count {
+            let candidate_start = self.page_start_y(candidate);
+            if candidate_start <= 0 {
+                continue;
+            }
+            if candidate_start <= pos {
+                page = candidate;
+            } else {
+                break;
+            }
+        }
         self.go_to_page(page)
     }
 

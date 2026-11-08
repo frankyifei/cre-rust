@@ -86,15 +86,15 @@ pub(crate) fn cfi_range_for_positions(
     )
 }
 
+/// Where the reader is in the document: the top of the page being shown.
+///
+/// This used to add the page's first line offset, which made the scroll-mode
+/// highlight mapping subtract it as well: a word's box came out one line offset
+/// too high, and a box belonging to another page was shifted by whole pages
+/// (`3.epub` in continuous mode). The renderer draws a page from its start, so
+/// the page start is the position that matches both modes.
 pub(crate) fn current_document_pos(inner: &Document) -> i64 {
-    let page = inner.current_page();
-    let page_y = inner.page_start_y(page);
-    if let Some(xpointer) = inner.xpointer_from_page(page).ok()
-        && let Some((_, y)) = inner.point_from_xpointer(&xpointer).ok().flatten()
-    {
-        return page_y + y.round() as i64;
-    }
-    page_y
+    inner.page_start_y(inner.current_page())
 }
 
 pub(crate) fn expand_to_visible_word_start(inner: &Document, xpointer: &str) -> String {

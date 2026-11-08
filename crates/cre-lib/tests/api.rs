@@ -1075,3 +1075,47 @@ fn layout_can_be_deferred_to_the_first_read() {
     assert!(text.contains("Romeo"), "unexpected text: {text:?}");
     doc.render_page(1).unwrap();
 }
+
+/// The reader's position (`getCurrentPos`) is the top of the page being shown,
+/// and it restores/refreshes it with `gotoPos(position)`. That round trip must
+/// stay on the page, in page and continuous view alike.
+#[test]
+fn goto_pos_returns_to_the_page_it_came_from() {
+    require_resources();
+
+    let options = DocumentOptions {
+        width: 400,
+        height: 600,
+        font_size: 16.0,
+        page_margin: 10.0,
+        font_path: Some(
+            Path::new("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf").to_path_buf(),
+        ),
+        ..Default::default()
+    };
+    let mut doc = Document::with_options(fixture("juliet.epub"), &options).unwrap();
+    assert!(doc.page_count() > 20, "fixture should have many pages");
+
+    for page in [2usize, 5, 13] {
+        if page > doc.page_count() {
+            break;
+        }
+        let pos = doc.page_start_y(page);
+        if pos <= 0 {
+            // Provisional page: no document offset to jump to yet.
+            continue;
+        }
+        doc.go_to_page(1).unwrap();
+        let landed = doc.set_pos(pos).unwrap();
+        assert_eq!(
+            landed, page,
+            "gotoPos({pos}) should land on page {page}, landed on {landed}"
+        );
+        // The reader refreshes the position of the page it is on: no move.
+        assert_eq!(
+            doc.set_pos(pos).unwrap(),
+            page,
+            "refreshing the position moved away from page {page}"
+        );
+    }
+}
