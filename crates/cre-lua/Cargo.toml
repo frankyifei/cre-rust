@@ -7,7 +7,8 @@ rust-version.workspace = true
 
 [lib]
 crate-type = ["cdylib"]
-test = false
+# Unit tests run with the rest of the workspace: they cover the property to CSS
+# mapping, which needs no Lua state.
 doctest = false
 
 [features]

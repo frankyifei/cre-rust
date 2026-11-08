@@ -180,7 +180,38 @@ impl Doc {
         r#"body, div, p, span, li, td, th, h1, h2, h3, h4, h5, h6 { font-feature-settings: "chws" 1; }"#.to_string()
     }
 
+    /// The reader's settings that are expressed as CSS, plus the reader's own
+    /// stylesheet (the "Style" menu choice and the style tweaks).
+    ///
+    /// Every KOReader property that has a CSS counterpart is handled in
+    /// [`Doc::properties_css`]; this only joins the result with the stylesheet.
     fn settings_stylesheet(&self) -> String {
+        let settings_css = self.properties_css().join("\n");
+        if self.stylesheet.is_empty() {
+            return settings_css;
+        }
+        if settings_css.is_empty() {
+            return self.stylesheet.clone();
+        }
+        format!("{}\n{}", settings_css, self.stylesheet)
+    }
+
+    /// CSS for the reader properties, in one place.
+    ///
+    /// KOReader configures the engine through crengine properties. Those that
+    /// are CSS in disguise are collected here, so adding one means adding a
+    /// block below rather than editing several call sites. The rest are
+    /// handled by `Doc::apply_int_property` / `Doc::apply_string_property`
+    /// (state changes) and by the renderer (paint-only ones).
+    ///
+    /// | property | rule |
+    /// | --- | --- |
+    /// | `crengine.interline.space` | `line-height` on the text elements |
+    /// | `font.face.base.weight`, `font.face.weight.embolden` | `font-weight` |
+    /// | `crengine.style.space.width.scale.percent` | `word-spacing` |
+    /// | `crengine.style.max.added.letter.spacing.percent` | `letter-spacing` |
+    fn properties_css(&self) -> Vec<String> {
+        let text_elements = "body, div, p, span, li, td, th, h1, h2, h3, h4, h5, h6";
         let mut rules: Vec<String> = Vec::new();
         let default_font_feature_css = self.default_font_feature_css();
         if !default_font_feature_css.is_empty() {
@@ -190,31 +221,43 @@ impl Doc {
             let percent = self.interline.clamp(1, 1000);
             let line_height = (((percent as f32) / 100.0) * 1.2).clamp(0.2, 10.0);
             rules.push(format!(
-                "body, div, p, span, li, td, th, h1, h2, h3, h4, h5, h6 {{ line-height: {:.3} !important; }}",
-                line_height,
+                "{text_elements} {{ line-height: {line_height:.3} !important; }}"
             ));
         }
-        for name in ["font.face.base.weight", "font.face.weight.embolden"] {
-            if let Some(value) = self.properties.get(name)
-                && let Ok(weight) = value.trim().parse::<i64>()
-            {
-                if (1_i64..=1000_i64).contains(&weight) && weight != 400 {
-                    rules.push(format!(
-                        "body, div, p, span, li, td, th, h1, h2, h3, h4, h5, h6 {{ font-weight: {} !important; }}",
-                        weight,
-                    ));
-                }
-                break;
-            }
+        if let Some(weight) = self.int_property("font.face.base.weight")
+            .or_else(|| self.int_property("font.face.weight.embolden"))
+            && (1..=1000).contains(&weight)
+            && weight != 400
+        {
+            rules.push(format!(
+                "{text_elements} {{ font-weight: {weight} !important; }}"
+            ));
         }
-        let settings_css = rules.join("\n");
-        if self.stylesheet.is_empty() {
-            return settings_css;
+        // Word Spacing: `word-spacing` takes a length that is *added* to the
+        // space glyph, while crengine scales the glyph itself, so the scale is
+        // approximated from a typical 0.25em space. The companion
+        // `crengine.style.space.condensing.percent` (shrink spaces to fit more
+        // words) has no CSS counterpart and is left to the engine one day.
+        if let Some(percent) = self.int_property("crengine.style.space.width.scale.percent")
+            && percent != 100
+        {
+            let extra_em = (percent as f32 - 100.0) / 100.0 * 0.25;
+            rules.push(format!(
+                "{text_elements} {{ word-spacing: {extra_em:.4}em !important; }}"
+            ));
         }
-        if settings_css.is_empty() {
-            return self.stylesheet.clone();
+        // Word Expansion: crengine caps how much letter spacing it may add to
+        // justify a line, so this is a maximum; CSS applies it to every
+        // character of the matched elements.
+        if let Some(percent) = self.int_property("crengine.style.max.added.letter.spacing.percent")
+            && percent > 0
+        {
+            let letter_em = percent as f32 / 100.0;
+            rules.push(format!(
+                "{text_elements} {{ letter-spacing: {letter_em:.4}em !important; }}"
+            ));
         }
-        format!("{}\n{}", settings_css, self.stylesheet)
+        rules
     }
 
     fn render_font_gamma(&self) -> f32 {
@@ -298,6 +341,100 @@ impl Doc {
             stylesheet: (!effective_stylesheet.is_empty()).then(|| effective_stylesheet.clone()),
             embedded_styles_enabled: self.embedded_stylesheet_enabled,
             viewport_scale: self.render_viewport_scale(),
+        }
+    }
+
+    /// One of the reader's integer properties (`setIntProperty`), if set.
+    fn int_property(&self, name: &str) -> Option<i64> {
+        self.properties.get(name)?.trim().parse().ok()
+    }
+
+    /// Stores an integer property and applies what it configures. Returns
+    /// whether the layout has to run again.
+    ///
+    /// This is the single place that knows what a KOReader property means;
+    /// `doc_set_int_property` only stores the value and schedules the relayout.
+    /// Properties that become CSS live in [`Doc::properties_css`] instead.
+    fn apply_int_property(&mut self, name: &str, value: i64) -> bool {
+        self.properties.insert(name.to_string(), value.to_string());
+        match name {
+            "font.size" => {
+                let size = value.clamp(1, 512) as i32;
+                if size == self.font_size {
+                    return false;
+                }
+                self.font_size = size;
+                true
+            }
+            "view.mode" => {
+                if value == 0 || value == 1 {
+                    self.view_mode = value as i32;
+                }
+                false
+            }
+            "crengine.page.margin.left" => {
+                self.margins.0 = value as i32;
+                true
+            }
+            "crengine.page.margin.top" => {
+                self.margins.1 = value as i32;
+                true
+            }
+            "crengine.page.margin.right" => {
+                self.margins.2 = value as i32;
+                true
+            }
+            "crengine.page.margin.bottom" => {
+                self.margins.3 = value as i32;
+                true
+            }
+            "crengine.interline.space" => {
+                let interline = value.clamp(0, 1000) as i32;
+                if interline == self.interline {
+                    return false;
+                }
+                self.interline = interline;
+                true
+            }
+            "window.status.battery.percent" => {
+                self.battery = value as i32;
+                false
+            }
+            "crengine.doc.embedded.styles.enabled" => {
+                let enabled = value != 0;
+                if enabled == self.embedded_stylesheet_enabled {
+                    return false;
+                }
+                self.embedded_stylesheet_enabled = enabled;
+                true
+            }
+            "crengine.render.dpi" => {
+                let dpi = value.clamp(0, i64::from(u32::MAX)) as u32;
+                if dpi == self.render_dpi {
+                    return false;
+                }
+                self.render_dpi = dpi;
+                true
+            }
+            "crengine.render.scale.font.with.dpi" => {
+                let enabled = value != 0;
+                if enabled == self.scale_font_with_dpi {
+                    return false;
+                }
+                self.scale_font_with_dpi = enabled;
+                true
+            }
+            "crengine.doc.embedded.fonts.enabled" => false,
+            // Typography sliders: they end up in the settings stylesheet.
+            "crengine.style.space.width.scale.percent"
+            | "crengine.style.space.condensing.percent"
+            | "crengine.style.max.added.letter.spacing.percent"
+            | "crengine.style.cjk.width.scale.percent" => true,
+            // Weight changes the font the chunks are laid out with.
+            "font.face.base.weight" | "font.face.weight.embolden" => true,
+            // font.gamma / font.gamma.index are paint-only (see
+            // `render_state_snapshot`): they repaint without a relayout.
+            _ => false,
         }
     }
 
@@ -3218,74 +3355,7 @@ unsafe extern "C-unwind" fn doc_set_int_property(l: *mut lua_State) -> c_int {
         let Some(doc) = doc_mut(l) else {
             return 0;
         };
-        doc.properties.insert(name.clone(), value.to_string());
-        let mut relayout = false;
-        match name.as_str() {
-            "font.size" => {
-                let size = value.clamp(1, 512) as i32;
-                if size != doc.font_size {
-                    doc.font_size = size;
-                    relayout = true;
-                }
-            }
-            "view.mode" => {
-                if value == 0 || value == 1 {
-                    doc.view_mode = value as i32;
-                }
-            }
-            "crengine.page.margin.left" => {
-                doc.margins.0 = value as i32;
-                relayout = true;
-            }
-            "crengine.page.margin.top" => {
-                doc.margins.1 = value as i32;
-                relayout = true;
-            }
-            "crengine.page.margin.right" => {
-                doc.margins.2 = value as i32;
-                relayout = true;
-            }
-            "crengine.page.margin.bottom" => {
-                doc.margins.3 = value as i32;
-                relayout = true;
-            }
-            "crengine.interline.space" => {
-                let interline = value.clamp(0, 1000) as i32;
-                if interline != doc.interline {
-                    doc.interline = interline;
-                    relayout = true;
-                }
-            }
-            "window.status.battery.percent" => doc.battery = value as i32,
-            "crengine.doc.embedded.styles.enabled" => {
-                let enabled = value != 0;
-                if doc.embedded_stylesheet_enabled != enabled {
-                    doc.embedded_stylesheet_enabled = enabled;
-                    relayout = true;
-                }
-            }
-            "crengine.render.dpi" => {
-                let dpi = value.clamp(0, i64::from(u32::MAX)) as u32;
-                if dpi != doc.render_dpi {
-                    doc.render_dpi = dpi;
-                    relayout = true;
-                }
-            }
-            "crengine.render.scale.font.with.dpi" => {
-                let enabled = value != 0;
-                if enabled != doc.scale_font_with_dpi {
-                    doc.scale_font_with_dpi = enabled;
-                    relayout = true;
-                }
-            }
-            "crengine.doc.embedded.fonts.enabled" => {}
-            // font.gamma / font.gamma.index are paint-only (see
-            // render_state_snapshot); a change repaints, it does not relayout.
-            "font.face.base.weight" | "font.face.weight.embolden" => {
-                relayout = true;
-            }
-            _ => {}
-        }
+        let relayout = doc.apply_int_property(&name, value);
         if relayout && doc.inner.is_some() {
             doc.relayout();
         }
@@ -5198,5 +5268,57 @@ mod old_glibc {
             offset += word * 2;
         }
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reader_doc() -> Doc {
+        Doc::new(600, 800, 0)
+    }
+
+    #[test]
+    fn typography_sliders_become_css() {
+        let mut doc = reader_doc();
+        assert!(!doc.properties_css().iter().any(|rule| rule.contains("word-spacing")));
+
+        // Word Spacing: 150% of the normal space width, approximated as 0.5 of
+        // the typical 0.25em space.
+        assert!(doc.apply_int_property("crengine.style.space.width.scale.percent", 150));
+        let css = doc.properties_css().join("\n");
+        assert!(css.contains("word-spacing: 0.1250em"), "{css}");
+
+        // Word Expansion: 5% of the font size of added letter spacing.
+        assert!(doc.apply_int_property("crengine.style.max.added.letter.spacing.percent", 5));
+        let css = doc.properties_css().join("\n");
+        assert!(css.contains("letter-spacing: 0.0500em"), "{css}");
+        assert!(css.contains("word-spacing: 0.1250em"), "{css}");
+
+        // Back to neutral: the rules go away again.
+        assert!(doc.apply_int_property("crengine.style.space.width.scale.percent", 100));
+        assert!(doc.apply_int_property("crengine.style.max.added.letter.spacing.percent", 0));
+        let css = doc.properties_css().join("\n");
+        assert!(!css.contains("word-spacing"), "{css}");
+        assert!(!css.contains("letter-spacing"), "{css}");
+    }
+
+    #[test]
+    fn property_effects_match_what_they_change() {
+        let mut doc = reader_doc();
+        // Layout settings.
+        assert!(doc.apply_int_property("crengine.page.margin.left", 40));
+        assert!(doc.apply_int_property("crengine.interline.space", 120));
+        assert!(doc.apply_int_property("crengine.doc.embedded.styles.enabled", 0));
+        // CSS-only, but still needs a layout run.
+        assert!(doc.apply_int_property("crengine.style.space.condensing.percent", 75));
+        // Paint-only or no-op: no relayout.
+        assert!(!doc.apply_int_property("window.status.battery.percent", 42));
+        assert!(!doc.apply_int_property("view.mode", 0));
+        assert!(!doc.apply_int_property("unknown.property", 1));
+        // Same value twice is not a change.
+        assert!(doc.apply_int_property("font.size", 20));
+        assert!(!doc.apply_int_property("font.size", 20));
     }
 }
