@@ -533,11 +533,17 @@ fn render_row(node: Node<'_, '_>, ctx: Ctx) -> String {
         if let Some(range) = fence_covered(&children, index) {
             bodies.push(range);
             let (start, end) = range;
-            if end < children.len() {
-                let open = start.saturating_sub(1);
-                if !groups.contains(&(open, end)) {
-                    groups.push((open, end));
-                }
+            let open = start.saturating_sub(1);
+            // The range ends at the closing fence when there is one; an
+            // unmatched fence (a piecewise `{`) has no closer, so the group
+            // ends with the item it covers.
+            let closes = children
+                .get(end)
+                .and_then(|child| mo_fence_text(*child))
+                .is_some_and(|text| is_close_fence(&text) || text == "|" || text == "‖");
+            let close = if closes { end } else { end - 1 };
+            if close >= open && !groups.contains(&(open, close)) {
+                groups.push((open, close));
             }
         }
     }
@@ -1344,6 +1350,10 @@ fn render_fenced(node: Node<'_, '_>, ctx: Ctx) -> String {
     let open_html = fence_html(open, true);
     let close_html = fence_html(close, false);
     let mut out = String::from("<span class=\"cre-mrow\">");
+    // `mfenced` is a delimited group like a bracket pair: keep it on one line.
+    if open_html.is_some() || close_html.is_some() {
+        out.push_str("<span class=\"cre-fence-group\">");
+    }
     match &open_html {
         Some(html) => out.push_str(html),
         None => out.push_str(&format!(
@@ -1380,6 +1390,9 @@ fn render_fenced(node: Node<'_, '_>, ctx: Ctx) -> String {
             "<span class=\"cre-mo cre-fence\">{}</span>",
             escape_html(close)
         )),
+    }
+    if open_html.is_some() || close_html.is_some() {
+        out.push_str("</span>");
     }
     out.push_str("</span>");
     out
