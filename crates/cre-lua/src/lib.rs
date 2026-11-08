@@ -301,6 +301,17 @@ impl Doc {
         }
     }
 
+    /// Page margins in the order KOReader sends them: left, top, right, bottom,
+    /// in device pixels.
+    fn page_margins(&self) -> cre_lib::PageMargins {
+        cre_lib::PageMargins::new(
+            self.margins.0.max(0) as f32,
+            self.margins.1.max(0) as f32,
+            self.margins.2.max(0) as f32,
+            self.margins.3.max(0) as f32,
+        )
+    }
+
     /// Loads the font files the settings ask for, reusing the previous load when
     /// the paths did not change. Returns whether they changed.
     fn refresh_font_data(&mut self, options: &DocumentOptions) -> anyhow::Result<bool> {
@@ -343,6 +354,7 @@ impl Doc {
         };
         opened.set_font_gamma(self.render_font_gamma());
         opened.set_background_color(self.background_color_value);
+        opened.set_page_margins(self.page_margins());
         self.inner = Some(opened);
         self.path = Some(path);
         self.needs_layout = true;
@@ -449,7 +461,11 @@ impl Doc {
         self.rerender_count = self.rerender_count.saturating_add(1);
         let xpointer = self.current_xpointer();
         let options = self.document_options();
+        let margins = self.page_margins();
         let fonts_changed = self.refresh_font_data(&options).unwrap_or(false);
+        if let Some(inner) = self.inner.as_mut() {
+            inner.set_page_margins(margins);
+        }
         if self
             .inner
             .as_ref()

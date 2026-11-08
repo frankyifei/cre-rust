@@ -151,6 +151,53 @@ struct PendingWord {
     end: Option<TextPosition>,
 }
 
+/// The four page margins, in device pixels.
+///
+/// `DocumentOptions::page_margin` only carries the top one (it predates the
+/// reader telling us all four). The reader installs the real values with
+/// [`Document::set_page_margins`]; a caller that never does keeps the uniform
+/// margin for every side.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PageMargins {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+    /// Set by [`Document::set_page_margins`]: the caller configured the margins,
+    /// so they replace the padding the format generator baked into the chunk.
+    explicit: bool,
+}
+
+impl PageMargins {
+    /// All four sides at `margin`, as a caller that only knows one margin.
+    pub fn uniform(margin: f32) -> Self {
+        Self {
+            left: margin,
+            top: margin,
+            right: margin,
+            bottom: margin,
+            explicit: false,
+        }
+    }
+
+    /// Four margins from a reader, which replace the generated padding.
+    pub fn new(left: f32, top: f32, right: f32, bottom: f32) -> Self {
+        Self {
+            left,
+            top,
+            right,
+            bottom,
+            explicit: true,
+        }
+    }
+
+    /// True when the caller configured the margins (rather than them coming
+    /// from `DocumentOptions::page_margin`).
+    pub fn is_explicit(&self) -> bool {
+        self.explicit
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PagePosition {
     pub page: usize,
@@ -538,6 +585,7 @@ struct ChunkLayoutWork<'a> {
     probe_index: usize,
     count: usize,
     resources: &'a ResourceSource,
+    margins: &'a [PageMargins],
 }
 
 impl ChunkLayoutWork<'_> {
@@ -553,6 +601,7 @@ impl ChunkLayoutWork<'_> {
             self.font_context.clone(),
             self.font_blobs,
             &self.options[index],
+            self.margins[index],
             self.fixed_heights[index],
             self.resources,
         )
@@ -894,6 +943,7 @@ pub struct Document {
     height: u32,
     layout_height: u32,
     page_margin: f32,
+    margins: PageMargins,
     font_css_size: f32,
     viewport_scale: f32,
     font_gamma: f32,
@@ -1412,6 +1462,7 @@ impl Document {
             height: options.height,
             layout_height: options.layout_height,
             page_margin: options.page_margin,
+            margins: PageMargins::uniform(options.page_margin),
             stylesheet: options.stylesheet.clone(),
             embedded_styles_enabled: options.embedded_styles_enabled,
             font_css_size: options.font_size,
@@ -1461,7 +1512,7 @@ impl Document {
             width: self.width,
             height: self.height,
             layout_height: self.layout_height,
-            page_margin: self.page_margin,
+            page_margin: self.margins.top,
             font_size: self.font_css_size,
             font_path: None,
             font_family: self.font_family.clone(),
@@ -1470,6 +1521,24 @@ impl Document {
             embedded_styles_enabled: self.embedded_styles_enabled,
             viewport_scale: self.viewport_scale,
         }
+    }
+
+    /// The margins a chunk is laid out with: none for a pre-paginated page (it
+    /// is fitted to the viewport), otherwise the reader's, or the uniform
+    /// `page_margin` when the caller never configured them.
+    fn chunk_margins(&self, chunk_index: usize) -> PageMargins {
+        if self
+            .fixed_layouts
+            .get(chunk_index)
+            .and_then(|fixed| *fixed)
+            .is_some()
+        {
+            return PageMargins::uniform(0.0);
+        }
+        if self.margins.is_explicit() {
+            return self.margins;
+        }
+        PageMargins::uniform(self.layout_options_for_chunk(chunk_index).page_margin)
     }
 
     fn layout_options_for_chunk(&self, chunk_index: usize) -> DocumentOptions {
@@ -1540,6 +1609,8 @@ impl Document {
         self.width = options.width;
         self.height = options.height;
         self.layout_height = options.layout_height;
+        // Follow the options of the chunk being laid out: a fixed-layout chunk
+        // zeroes its page margin, and the page transform reads this value.
         self.page_margin = options.page_margin;
         self.font_css_size = options.font_size;
         if self.font_family != options.font_family {
@@ -1549,6 +1620,22 @@ impl Document {
         self.stylesheet = options.stylesheet.clone();
         self.embedded_styles_enabled = options.embedded_styles_enabled;
         self.viewport_scale = options.viewport_scale;
+    }
+
+    /// Sets the four page margins (device pixels) for the next layout.
+    ///
+    /// The reader configures left, top, right and bottom separately. Only the
+    /// top one could be expressed before, so moving the left, right or bottom
+    /// margin changed a setting without changing the page. Call this and then
+    /// [`Self::relayout`].
+    pub fn set_page_margins(&mut self, margins: PageMargins) {
+        self.margins = PageMargins::new(margins.left, margins.top, margins.right, margins.bottom);
+        self.page_margin = margins.top;
+    }
+
+    /// The page margins currently in use.
+    pub fn page_margins(&self) -> PageMargins {
+        self.margins
     }
 
     /// Replaces the fonts used by the next chunk layout. Chunks already laid out
@@ -1597,6 +1684,7 @@ impl Document {
             self.font_context.clone(),
             &self.font_blobs,
             &self.layout_options_for_chunk(chunk_index),
+            self.margins,
             fixed_height,
             &self.resources,
         )
@@ -1617,9 +1705,21 @@ fn layout_chunk_html(
     font_context: Arc<FontContext>,
     font_blobs: &[FontBlob],
     options: &DocumentOptions,
+    margins: PageMargins,
     fixed_height: Option<f32>,
     resources: &ResourceSource,
 ) -> Result<(ChunkLayout, HtmlDocument, Vec<LineBox>, Vec<PageStart>)> {
+    // A caller that never configured page margins keeps the uniform
+    // `page_margin` of the options in use for this chunk (a fixed-layout chunk
+    // zeroes it), and a pre-paginated page gets no margin at all: it is scaled
+    // to the viewport instead.
+    let margins = if fixed_height.is_some() {
+        PageMargins::uniform(0.0)
+    } else if margins.is_explicit() {
+        margins
+    } else {
+        PageMargins::uniform(options.page_margin)
+    };
     {
         let mut timer = StageTimer::new();
         timer.last = std::time::Instant::now();
@@ -1648,8 +1748,8 @@ fn layout_chunk_html(
         // wasteful for a book of plates. Run before the inliner so the
         // `<image>` this generates is inlined too.
         let fitted = (!matches!(resources, ResourceSource::Epub(_))).then(|| {
-            let width = options.width as f32 - options.page_margin * 2.0;
-            let height = options.height as f32 - options.page_margin * 2.0;
+            let width = options.width as f32 - margins.left - margins.right;
+            let height = options.height as f32 - margins.top - margins.bottom;
             let html = fit_cover_images(html, width, height);
             fit_picture_sections(&html, width, height)
         });
@@ -1667,7 +1767,7 @@ fn layout_chunk_html(
             prepare_inline_svgs(html, &css, options.width)
         });
         let html = prepared_svg.as_deref().unwrap_or(html);
-        let doc = create_document(html, base_url, net, font_context, font_blobs, options);
+        let doc = create_document(html, base_url, net, font_context, font_blobs, options, margins);
         timer.mark("parse");
         let root = doc.root_element();
         let mut lines = collect_lines(root);
@@ -1710,6 +1810,12 @@ fn layout_chunk_html(
                     options.page_margin,
                 )
             };
+        let (_, _, page_margin_css_bottom) = css_page_geometry(
+            options.width,
+            options.height,
+            options.viewport_scale,
+            margins.bottom,
+        );
         let page_starts = if fixed_layout.is_some() {
             vec![PageStart {
                 top: 0.0,
@@ -1722,7 +1828,7 @@ fn layout_chunk_html(
                 &forced_breaks,
                 page_height_css,
                 page_margin_css,
-                page_margin_css,
+                page_margin_css_bottom,
             )
         };
         timer.mark("paginate");
@@ -1834,8 +1940,12 @@ fn layout_chunk_html(
         let mut pages = Vec::with_capacity(page_starts.len());
         let mut previous_page_flow = 0;
         for (local_index, start) in page_starts.iter().enumerate() {
-            let clip_bottom =
-                page_chunk_clip_bottom(&page_starts, local_index, page_height_css, page_margin_css);
+            let clip_bottom = page_chunk_clip_bottom(
+                &page_starts,
+                local_index,
+                page_height_css,
+                page_margin_css_bottom,
+            );
             let page_flow = first_non_blank_line_flow(
                 root,
                 &lines,
@@ -2274,6 +2384,8 @@ impl Document {
             // Workers take every chunk except the probe and the opening one.
             let next = std::sync::atomic::AtomicUsize::new(1);
             let gate = LayoutMemoryGate::new();
+            let chunk_margins: Vec<PageMargins> =
+                (0..count).map(|index| self.chunk_margins(index)).collect();
             let work = ChunkLayoutWork {
                 sources: &self.sources,
                 base_url: &self.base_url,
@@ -2290,6 +2402,7 @@ impl Document {
                 probe_index,
                 count,
                 resources: &self.resources,
+                margins: &chunk_margins,
             };
             std::thread::scope(|scope| {
                 for _ in 1..workers {
@@ -2922,6 +3035,7 @@ impl Document {
             self.font_context.clone(),
             &self.font_blobs,
             &self.layout_options_for_chunk(index),
+            self.chunk_margins(index),
         );
         let mut lines = collect_lines(doc.root_element());
         let math_boxes = collect_math_boxes(&doc, doc.root_element());
@@ -2999,11 +3113,9 @@ impl Document {
 
     pub fn page_text(&self, page: usize) -> Result<String> {
         let lines = self.page_text_lines(page)?;
-        Ok(join_text_boxes(
-            lines
-                .iter()
-                .map(|(_, text_box, line)| (text_box.text.as_str(), *line)),
-        ))
+        Ok(join_text_boxes(lines.iter().map(|(_, text_box, line)| {
+            (text_box.text.as_str(), *line)
+        })))
     }
 
     pub fn text_at(&self, position: PagePosition) -> Result<Option<String>> {
@@ -4811,7 +4923,11 @@ fn collect_lines_inner(node: &Node, out: &mut Vec<LineBox>) {
             let text_range = line.text_range();
             let class = element_class(node);
             let math = class
-                .map(|value| value.split_whitespace().any(|name| name.starts_with("cre-m")))
+                .map(|value| {
+                    value
+                        .split_whitespace()
+                        .any(|name| name.starts_with("cre-m"))
+                })
                 .unwrap_or(false);
             let math_root = class
                 .map(|value| value.split_whitespace().any(|name| name == "cre-math"))
@@ -6256,6 +6372,7 @@ fn create_document(
     font_context: Arc<FontContext>,
     font_datas: &[FontBlob],
     options: &DocumentOptions,
+    margins: PageMargins,
 ) -> HtmlDocument {
     let profile = std::env::var_os("CRE_LAYOUT_PROFILE").is_some();
     let started = std::time::Instant::now();
@@ -6326,6 +6443,22 @@ fn create_document(
         );
     }
 
+    let scale = options.viewport_scale.max(0.1);
+    let margin_left_css = (margins.left / scale).max(0.0);
+    let margin_right_css = (margins.right / scale).max(0.0);
+    let margin_bottom_css = (margins.bottom / scale).max(0.0);
+    // Each format bakes one padding (`margin_x`/`margin_y`) into the body rule
+    // it generates, because chunk HTML is built before the reader's settings are
+    // known. A reader that sets the margins itself replaces that padding: left
+    // and right with its own values, top and bottom with zero, since pagination
+    // already places the text inside the top and bottom margins.
+    if margins.is_explicit() {
+        html_source.push_str(&format!(
+            "<style>/* cre-page-margins */ html, body {{ padding: 0 {margin_right_css:.3}px 0 \
+             {margin_left_css:.3}px; }}</style>"
+        ));
+    }
+
     // Keep images whole: cap them to one page's content height (width is
     // already capped), so pagination never has to clip an image. crengine
     // scales oversized images the same way.
@@ -6335,7 +6468,7 @@ fn create_document(
         options.viewport_scale,
         options.page_margin,
     );
-    let max_image_height = (page_height_css - page_margin_css * 2.0).max(1.0);
+    let max_image_height = (page_height_css - page_margin_css - margin_bottom_css).max(1.0);
     html_source.push_str(&format!(
         "<style>img, svg, video, canvas, object, embed {{ max-width: 100%; \
          max-height: {max_image_height:.0}px; height: auto; }}</style>"
