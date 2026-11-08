@@ -6296,20 +6296,22 @@ fn fit_stretched_fences(doc: &mut HtmlDocument, metrics: cre_mathml::MathMetrics
     let Ok(fences) = doc.query_selector_all("[data-cre-fence]") else {
         return false;
     };
-    let Ok(bodies) = doc.query_selector_all(".cre-fence-body") else {
-        return false;
-    };
-    if fences.is_empty() || fences.len() != bodies.len() {
+    if fences.is_empty() {
         return false;
     }
     let glyph_attr = blitz_dom::LocalName::from("data-cre-fence");
     let guess_attr = blitz_dom::LocalName::from("data-cre-fence-box");
+    let body_after_attr = blitz_dom::LocalName::from("data-cre-fence-body-after");
     let mut updates: Vec<(NodeId, String)> = Vec::new();
-    for (fence, body) in fences.iter().zip(bodies.iter()) {
+    for fence in fences.iter() {
         let Some(element) = doc.get_node(*fence).and_then(|node| node.element_data()) else {
             continue;
         };
         let Some(glyph) = element.attr(glyph_attr.clone()).map(str::to_string) else {
+            continue;
+        };
+        let body_after = element.attr(body_after_attr.clone()).is_some();
+        let Some(body) = fence_body_sibling(doc, *fence, body_after) else {
             continue;
         };
         let Some(guess) = element
@@ -6321,7 +6323,7 @@ fn fit_stretched_fences(doc: &mut HtmlDocument, metrics: cre_mathml::MathMetrics
         // The wrapper is an inline span; when it holds a single element (the
         // common case: one `<mtable>`), that element's box is the content the
         // fence has to cover, and its top edge is where the fence starts.
-        let measured = single_element_child(doc, *body).unwrap_or(*body);
+        let measured = single_element_child(doc, body).unwrap_or(body);
         let (Some(fence_rect), Some(body_rect)) = (
             doc.get_client_bounding_rect(*fence),
             doc.get_client_bounding_rect(measured),
@@ -6335,10 +6337,21 @@ fn fit_stretched_fences(doc: &mut HtmlDocument, metrics: cre_mathml::MathMetrics
             continue;
         }
         let em = fence_rect.height / f64::from(guess);
-        let target = body_rect.height / em;
-        let align = (body_rect.y - fence_rect.y) / em;
+        let mut target = body_rect.height / em;
+        let mut align = (body_rect.y - fence_rect.y) / em;
         if !target.is_finite() || target <= 0.0 || !align.is_finite() {
             continue;
+        }
+        // A display formula that is wider than the page wraps inside its
+        // delimited group, and then this measured body is several lines tall —
+        // stretching the parenthesis over all of them painted it across the
+        // text (a large font in `juliet.epub`). The estimate `guess` was made
+        // for the content on one line, so when the measurement is far taller
+        // than it, the group wrapped: keep the one-line size and leave the
+        // glyph on its own line.
+        if target > f64::from(guess) * 1.6 {
+            target = f64::from(guess);
+            align = 0.0;
         }
         let style = cre_mathml::fence_style_for_measured(
             &glyph,
@@ -6365,6 +6378,50 @@ fn fit_stretched_fences(doc: &mut HtmlDocument, metrics: cre_mathml::MathMetrics
     doc.handle_messages();
     doc.resolve(0.0);
     true
+}
+
+/// The `.cre-fence-body` span that belongs to `fence`.
+///
+/// `cre-mathml` wraps the content a fence covers in that span, in place, and
+/// marks on the fence whether the body is the following or the preceding
+/// sibling (`data-cre-fence-body-after`). A glyph cannot say it: `|` opens and
+/// closes groups, so guessing from the character paired the closing bar of a
+/// determinant with the wrong span and left it at its estimated height — the
+/// right bar came out taller than the left.
+fn fence_body_sibling(doc: &HtmlDocument, fence: NodeId, body_after: bool) -> Option<NodeId> {
+    let node = doc.get_node(fence)?;
+    let siblings = &doc.get_node(node.parent?)?.children;
+    let index = siblings.iter().position(|id| *id == fence)?;
+    let preferred = if body_after {
+        siblings.get(index + 1)
+    } else {
+        index.checked_sub(1).and_then(|i| siblings.get(i))
+    };
+    let fallback = if body_after {
+        index.checked_sub(1).and_then(|i| siblings.get(i))
+    } else {
+        siblings.get(index + 1)
+    };
+    preferred
+        .into_iter()
+        .chain(fallback)
+        .copied()
+        .find(|id| is_fence_body(doc, *id))
+}
+
+/// Whether `node` is a `.cre-fence-body` span.
+fn is_fence_body(doc: &HtmlDocument, node: NodeId) -> bool {
+    let Some(element) = doc.get_node(node).and_then(|node| node.element_data()) else {
+        return false;
+    };
+    element.name.local.to_string() == "span"
+        && element.attrs().iter().any(|attr| {
+            attr.name.local.to_string() == "class"
+                && attr
+                    .value
+                    .split_whitespace()
+                    .any(|name| name == "cre-fence-body")
+        })
 }
 
 /// The only element child of `node`, if it has exactly one.

@@ -439,7 +439,7 @@ fn render_node(node: Node<'_, '_>, ctx: Ctx) -> String {
             "<span class=\"cre-mn\">{}</span>",
             escape_html(&token_text(node))
         ),
-        "mo" => render_mo(node, ctx, 1.0, 1.0, false),
+        "mo" => render_mo(node, ctx, 1.0, 1.0, false, true),
         "mtext" | "ms" => format!(
             "<span class=\"cre-mtext\" style=\"white-space:pre\">{}</span>",
             escape_html(&token_text(node))
@@ -550,7 +550,17 @@ fn render_row(node: Node<'_, '_>, ctx: Ctx) -> String {
             let target = fence_stretch(&children, &ink_heights, index);
             let text = token_text(*child);
             let unary = operator_class(&text) == "cre-mo-bin" && operator_context;
-            out.push_str(&render_mo(*child, ctx, stretch, target, unary));
+            let body_follows = fence_covered(&children, index)
+                .map(|(start, end)| start > index || end > index + 1)
+                .unwrap_or(true);
+            out.push_str(&render_mo(
+                *child,
+                ctx,
+                stretch,
+                target,
+                unary,
+                body_follows,
+            ));
             operator_context = matches!(
                 operator_class(&text),
                 "cre-mo-bin" | "cre-mo-rel" | "cre-mo-invisible"
@@ -588,13 +598,26 @@ fn fence_stretch(children: &[Node<'_, '_>], heights: &[f32], index: usize) -> f3
 fn fence_covered(children: &[Node<'_, '_>], index: usize) -> Option<(usize, usize)> {
     let text = mo_fence_text(children[index])?;
     if text == "|" || text == "‖" {
-        // A bar is a one-sided fence: it covers the item next to it. Prefer
-        // the following one (a matrix after `|`) and fall back to the previous
-        // one (the closing bar), never including the bar itself.
+        // Bars come in pairs (`|x|`, `⟨0|A|x⟩`) and as one-sided delimiters
+        // (`\left. A \right|`). A bar that has an earlier bar of the same kind
+        // before it closes that group, so both bars cover the content between
+        // them: sizing each bar to its own neighbouring item made the closing
+        // bar taller than the opening one whenever those items differed height
+        // (a large font in `juliet.epub`).
+        if let Some(open) = children
+            .iter()
+            .take(index)
+            .rposition(|child| mo_fence_text(*child).as_deref() == Some(text.as_str()))
+            && open + 1 < index
+        {
+            return Some((open + 1, index));
+        }
+        // Opening bar: the item that follows it.
         if index + 1 < children.len() {
             return Some((index + 1, index + 2));
         }
-        return (index > 0).then_some((index - 1, index));
+        // Lone `\right|`: everything before it in the row.
+        return (index > 0).then_some((0, index));
     }
     if is_open_fence(&text) {
         let mut depth = 0i32;
@@ -666,7 +689,14 @@ fn render_mi(node: Node<'_, '_>, _ctx: Ctx) -> String {
     }
 }
 
-fn render_mo(node: Node<'_, '_>, ctx: Ctx, stretch: f32, target: f32, unary: bool) -> String {
+fn render_mo(
+    node: Node<'_, '_>,
+    ctx: Ctx,
+    stretch: f32,
+    target: f32,
+    unary: bool,
+    body_follows: bool,
+) -> String {
     let text = token_text(node);
     let class = if unary {
         "cre-mo-unary"
@@ -688,7 +718,7 @@ fn render_mo(node: Node<'_, '_>, ctx: Ctx, stretch: f32, target: f32, unary: boo
         let content = stretch.clamp(1.0, 12.0);
         let target = target.clamp(content, 12.0);
         if target > 1.25 {
-            return stretched_fence_html(&text, content, target, ctx.metrics);
+            return stretched_fence_html(&text, content, target, ctx.metrics, body_follows);
         }
         return format!(
             "<span class=\"cre-mo cre-fence\">{}</span>",
@@ -934,11 +964,22 @@ fn fence_slot(text: &str) -> Option<usize> {
 /// The `data-cre-fence`/`data-cre-fence-box` attributes let the layout pass
 /// find the element again and replace the estimate with the height it measured
 /// for the `.cre-fence-body` wrapper (see [`fence_style_for_height`]).
-fn stretched_fence_html(text: &str, content: f32, target: f32, metrics: MathMetrics) -> String {
+fn stretched_fence_html(
+    text: &str,
+    content: f32,
+    target: f32,
+    metrics: MathMetrics,
+    body_follows: bool,
+) -> String {
     let style = stretched_fence_style(text, content, target, 0.0, metrics);
+    let body = if body_follows {
+        " data-cre-fence-body-after=\"1\""
+    } else {
+        ""
+    };
     format!(
         "<span class=\"cre-mo cre-fence\" data-cre-fence=\"{}\" \
-         data-cre-fence-box=\"{content:.3}\" style=\"{style}\">{}</span>",
+         data-cre-fence-box=\"{content:.3}\"{body} style=\"{style}\">{}</span>",
         escape_html(text),
         escape_html(text)
     )
@@ -1254,14 +1295,20 @@ fn render_fenced(node: Node<'_, '_>, ctx: Ctx) -> String {
         .fold(1.0_f32, f32::max);
     let content = height.clamp(1.0, 12.0);
     let target = ink_height.clamp(content, 12.0);
-    let fence_html = |text: &str| -> Option<String> {
+    let fence_html = |text: &str, body_follows: bool| -> Option<String> {
         if target <= 1.25 || text.is_empty() {
             return None;
         }
-        Some(stretched_fence_html(text, content, target, ctx.metrics))
+        Some(stretched_fence_html(
+            text,
+            content,
+            target,
+            ctx.metrics,
+            body_follows,
+        ))
     };
-    let open_html = fence_html(open);
-    let close_html = fence_html(close);
+    let open_html = fence_html(open, true);
+    let close_html = fence_html(close, false);
     let mut out = String::from("<span class=\"cre-mrow\">");
     match &open_html {
         Some(html) => out.push_str(html),
