@@ -1,6 +1,7 @@
 # cre-rust
 
-**cre-rust is a rewrite of crengine in Rust, built on Blitz.**
+**cre-rust is a ebook reading library in Rust, built on Blitz. It is compatible
+to Koreader**
 
 It implements KOReader's `cre` module (`libkoreader-cre.so`) API on
 top of the [Blitz](https://github.com/DioxusLabs/blitz) HTML/CSS engine —
@@ -9,8 +10,8 @@ engine. KOReader keeps its Lua API and does not change: drop the resulting
 module into `koreader/libs/` and the reader opens EPUB, FB2, MOBI, AZW, HTML and
 plain text exactly as before.
 
-This is not a port of crengine. No crengine code is directly used; the layout model,
-the pagination, the painter and the MathML translator are new code written
+This is not a direct port of crengine. No crengine code is directly used; the 
+layout model, the pagination, the painter and the MathML translator are new code written
 against Rust libraries. It references crengine heavily for its behaviour.
 
 ## Status
