@@ -463,6 +463,7 @@ version = "0.1.0"
 dependencies = [
  "anyrender",
  "anyrender_vello_cpu",
+ "image",
  "kurbo",
  "peniko",
  "tiny-skia 0.11.4",

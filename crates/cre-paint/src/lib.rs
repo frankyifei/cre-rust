@@ -79,6 +79,153 @@ struct GlyphRaster {
     data: Vec<u8>,
 }
 
+/// How an image fills its element box, matching CSS `object-fit`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImageFit {
+    Fill,
+    Contain,
+    Cover,
+    None,
+    ScaleDown,
+}
+
+/// An image whose page carries only a transparent size placeholder.
+///
+/// The layout sees an SVG with the image's real intrinsic size, so blitz never
+/// decodes (and caches) a natural-size RGBA copy. Painting decodes the original
+/// here, draws it through the same `draw_image_fill` path as a normal image,
+/// and lets the pixels drop; the engine keeps no decoded image at rest.
+#[derive(Clone)]
+pub struct PlacedImage {
+    /// Element content box, page-local device pixels.
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub intrinsic_width: u32,
+    pub intrinsic_height: u32,
+    pub fit: ImageFit,
+    pub bytes: Arc<Vec<u8>>,
+}
+
+/// Paints the images a page only carries as placeholders.
+///
+/// Mirrors what blitz-paint does for a raster image (`object-fit` sizing, then
+/// the same image fill), so a page looks the same as when blitz drew it.
+pub fn draw_placed_images(pixmap: &mut Pixmap, images: &[PlacedImage], clip_mask: Option<&Mask>) {
+    if images.is_empty() {
+        return;
+    }
+    let mut cache = ImageCache::default();
+    for placed in images {
+        let Ok(decoded) = image::load_from_memory(&placed.bytes) else {
+            continue;
+        };
+        let rgba = decoded.into_rgba8();
+        let (image_width, image_height) = rgba.dimensions();
+        if image_width == 0 || image_height == 0 {
+            continue;
+        }
+        let (x, y, width, height) = object_fit_rect(placed, image_width, image_height);
+        if width < 1.0 || height < 1.0 {
+            continue;
+        }
+        let brush = peniko::ImageBrush {
+            image: peniko::ImageData {
+                data: peniko::Blob::new(Arc::new(rgba.into_raw())),
+                format: peniko::ImageFormat::Rgba8,
+                width: image_width,
+                height: image_height,
+                alpha_type: peniko::ImageAlphaType::Alpha,
+            },
+            sampler: peniko::ImageSampler {
+                x_extend: peniko::Extend::Repeat,
+                y_extend: peniko::Extend::Repeat,
+                quality: peniko::ImageQuality::Medium,
+                alpha: 1.0,
+            },
+        };
+        let shape = kurbo::Rect::new(0.0, 0.0, f64::from(image_width), f64::from(image_height))
+            .to_path(0.1);
+        let transform = Affine::translate((x, y))
+            * Affine::scale_non_uniform(
+                width / f64::from(image_width),
+                height / f64::from(image_height),
+            );
+        // `cover`/`none` can paint outside the element box; blitz clips replaced
+        // content to that box, so do the same.
+        let mut mask = clip_mask.cloned();
+        let box_right = f64::from(placed.x) + f64::from(placed.width);
+        let box_bottom = f64::from(placed.y) + f64::from(placed.height);
+        if x < f64::from(placed.x)
+            || y < f64::from(placed.y)
+            || x + width > box_right + 0.5
+            || y + height > box_bottom + 0.5
+        {
+            let box_shape = kurbo::Rect::new(
+                f64::from(placed.x),
+                f64::from(placed.y),
+                box_right,
+                box_bottom,
+            )
+            .to_path(0.1);
+            let box_mask = raster::shape_mask(
+                &box_shape,
+                Affine::IDENTITY,
+                AnyFill::NonZero,
+                pixmap.width(),
+                pixmap.height(),
+            );
+            mask = raster::intersect_optional(mask.as_ref(), box_mask);
+        }
+        draw_image_fill(
+            pixmap,
+            &brush,
+            &shape,
+            AnyFill::NonZero,
+            transform,
+            None,
+            mask.as_ref(),
+            &mut cache,
+        );
+    }
+}
+
+/// The box an image occupies inside its element, in device pixels, for the
+/// CSS `object-fit` value in effect.
+fn object_fit_rect(
+    placed: &PlacedImage,
+    image_width: u32,
+    image_height: u32,
+) -> (f64, f64, f64, f64) {
+    let box_width = f64::from(placed.width).max(0.0);
+    let box_height = f64::from(placed.height).max(0.0);
+    let iw = image_width as f64;
+    let ih = image_height as f64;
+    let (width, height) = match placed.fit {
+        ImageFit::Fill => (box_width, box_height),
+        ImageFit::Contain => {
+            let scale = (box_width / iw).min(box_height / ih);
+            (iw * scale, ih * scale)
+        }
+        ImageFit::Cover => {
+            let scale = (box_width / iw).max(box_height / ih);
+            (iw * scale, ih * scale)
+        }
+        ImageFit::None => (iw, ih),
+        ImageFit::ScaleDown => {
+            let scale = 1.0f64.min((box_width / iw).min(box_height / ih));
+            (iw * scale, ih * scale)
+        }
+    };
+    (
+        f64::from(placed.x) + (box_width - width) / 2.0,
+        f64::from(placed.y) + (box_height - height) / 2.0,
+        width,
+        height,
+    )
+}
+
 /// Caches that survive between page renders of the same document.
 ///
 /// Glyph masks are the expensive part of painting a text page: the same
@@ -297,6 +444,7 @@ pub fn render_page(
     clip_bottom: f32,
     background: u32,
     font_gamma: f32,
+    images: &[PlacedImage],
 ) -> (Arc<PageBitmap>, usize, usize) {
     let mut cache = PaintCache::new();
     render_page_cached(
@@ -310,6 +458,7 @@ pub fn render_page(
         clip_bottom,
         background,
         font_gamma,
+        images,
         &mut cache,
     )
 }
@@ -328,10 +477,11 @@ pub fn render_page_cached(
     clip_bottom: f32,
     background: u32,
     font_gamma: f32,
+    images: &[PlacedImage],
     cache: &mut PaintCache,
 ) -> (Arc<PageBitmap>, usize, usize) {
     #[cfg(feature = "vello-cpu")]
-    if vello_backend_requested() {
+    if images.is_empty() && vello_backend_requested() {
         return render_page_vello(
             scene,
             width,
@@ -366,11 +516,12 @@ pub fn render_page_cached(
         local_bottom,
         font_gamma,
         background,
-        clip_mask,
+        clip_mask.clone(),
         cache,
     );
     let raster_started = std::time::Instant::now();
-    let pixmap = rasterizer.run(scene);
+    let mut pixmap = rasterizer.run(scene);
+    draw_placed_images(&mut pixmap, images, clip_mask.as_ref());
     let raster_ms = raster_started.elapsed().as_secs_f64() * 1000.0;
 
     let convert_started = std::time::Instant::now();
@@ -2364,9 +2515,10 @@ pub fn render_page_rgba(
     clip_bottom: f32,
     background: u32,
     font_gamma: f32,
+    images: &[PlacedImage],
 ) -> (Arc<ColorPageBitmap>, usize, usize) {
     #[cfg(feature = "vello-cpu")]
-    if vello_backend_requested() {
+    if images.is_empty() && vello_backend_requested() {
         return render_page_rgba_vello(
             scene,
             width,
@@ -2400,10 +2552,11 @@ pub fn render_page_rgba(
         local_bottom,
         font_gamma,
         background,
-        clip_mask,
+        clip_mask.clone(),
         &mut cache,
     );
-    let pixmap = rasterizer.run(scene);
+    let mut pixmap = rasterizer.run(scene);
+    draw_placed_images(&mut pixmap, images, clip_mask.as_ref());
 
     let mut data: Vec<u8> = Vec::with_capacity((width * height * 4) as usize);
     for pixel in pixmap.pixels() {
@@ -2675,7 +2828,8 @@ mod tests {
             None,
             &kurbo::Rect::new(0.0, 0.0, 16.0, 8.0),
         );
-        let (bitmap, _, _) = render_page(&scene, 16, 8, 0.0, 0.0, 16.0, 0.0, 8.0, 0xffffff, 1.0);
+        let (bitmap, _, _) =
+            render_page(&scene, 16, 8, 0.0, 0.0, 16.0, 0.0, 8.0, 0xffffff, 1.0, &[]);
         assert!(
             bitmap.data[0] < 32,
             "left pixel should be dark, got {}",

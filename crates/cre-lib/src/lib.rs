@@ -962,6 +962,9 @@ pub struct Document {
     fixed_layouts: Vec<Option<FixedLayout>>,
     base_url: String,
     resources: ResourceSource,
+    /// Page-size SVGs and the raster images replaced by a size placeholder.
+    /// Painting reads the original pixels through `resources`.
+    images: Arc<ImageRaster>,
     cover_image: Option<Vec<u8>>,
     has_non_linear_flows: bool,
     net: Arc<dyn NetProvider>,
@@ -1048,6 +1051,7 @@ impl Document {
             "",
             Arc::new(EmptyNet),
             ResourceSource::Empty,
+            Arc::new(ImageRaster::new(options.width, options.height)),
             None,
             false,
             metadata,
@@ -1090,7 +1094,7 @@ impl Document {
         let content_height = ((options.height as f32 - options.page_margin * 2.0)
             * options.viewport_scale)
             .max(1.0) as u32;
-        let svg_raster = Arc::new(SvgRaster::new(content_width, content_height));
+        let svg_raster = Arc::new(ImageRaster::new(content_width, content_height));
         match format {
             DocumentFormat::Epub => {
                 let mut book = EpubBook::open(path)?;
@@ -1145,6 +1149,7 @@ impl Document {
                         resource_provider: resource_provider.clone(),
                     }),
                     ResourceSource::Epub(resource_provider),
+                    svg_raster.clone(),
                     cover_image,
                     has_non_linear_flows,
                     metadata,
@@ -1195,6 +1200,7 @@ impl Document {
                         svg: svg_raster.clone(),
                     }),
                     resource_source,
+                    svg_raster.clone(),
                     cover_image,
                     false,
                     metadata,
@@ -1245,6 +1251,7 @@ impl Document {
                         svg: svg_raster.clone(),
                     }),
                     resource_source,
+                    svg_raster.clone(),
                     cover_image,
                     false,
                     metadata,
@@ -1295,6 +1302,7 @@ impl Document {
                         svg: svg_raster.clone(),
                     }),
                     resource_source,
+                    svg_raster.clone(),
                     cover_image,
                     false,
                     metadata,
@@ -1331,6 +1339,7 @@ impl Document {
                     "text://book/",
                     Arc::new(EmptyNet),
                     ResourceSource::Empty,
+                    Arc::new(ImageRaster::new(options.width, options.height)),
                     None,
                     false,
                     metadata,
@@ -1403,6 +1412,7 @@ impl Document {
                         svg: svg_raster.clone(),
                     }),
                     ResourceSource::Empty,
+                    Arc::new(ImageRaster::new(options.width, options.height)),
                     None,
                     false,
                     metadata,
@@ -1425,6 +1435,7 @@ impl Document {
         base_url: &str,
         net: Arc<dyn NetProvider>,
         resources: ResourceSource,
+        images: Arc<ImageRaster>,
         cover_image: Option<Vec<u8>>,
         has_non_linear_flows: bool,
         metadata: DocumentMetadata,
@@ -1455,7 +1466,18 @@ impl Document {
         // Only the EPUB generator emits chunk HTML without the layout settings
         // in it, which is what allows a relayout instead of a reopen.
         let layout_independent_sources = matches!(metadata.format, DocumentFormat::Epub);
-        let fixed_layouts = htmls.iter().map(|html| parse_fixed_layout(html)).collect();
+        let fixed_layouts: Vec<Option<FixedLayout>> =
+            htmls.iter().map(|html| parse_fixed_layout(html)).collect();
+        // Only images an `<img>` element references may become a size
+        // placeholder: a CSS background image has no other painter, and a
+        // fixed-layout page draws its images through its own transform.
+        if !matches!(resources, ResourceSource::Empty) {
+            images.set_content_images(
+                htmls
+                    .iter()
+                    .flat_map(|html| cre_epub::image_sources_in(html)),
+            );
+        }
         let mut document = Self {
             metadata,
             width: options.width,
@@ -1474,6 +1496,7 @@ impl Document {
             fixed_layouts,
             base_url: base_url.to_string(),
             resources,
+            images,
             cover_image,
             has_non_linear_flows,
             net,
@@ -2766,6 +2789,7 @@ impl Document {
             let viewport_scale = self.viewport_scale;
             let fixed_layout = self.fixed_layouts.get(chunk_index).and_then(|fixed| *fixed);
             let mut scene = Scene::default();
+            let mut placed: Vec<cre_paint::PlacedImage> = Vec::new();
             if let Some(fixed) = fixed_layout {
                 active.doc.set_viewport_scroll(Point { x: 0.0, y: 0.0 });
                 let (fit, offset_x, offset_y) = self.fixed_page_transform(fixed);
@@ -2779,6 +2803,21 @@ impl Document {
                     (offset_x * viewport_scale).round().max(0.0) as u32,
                     (offset_y * viewport_scale).round().max(0.0) as u32,
                 );
+                {
+                    let root = active.doc.root_element();
+                    collect_placed_images(
+                        &active.doc,
+                        root,
+                        f32::MAX,
+                        viewport_scale * fit,
+                        offset_x * viewport_scale,
+                        offset_y * viewport_scale,
+                        &self.images,
+                        &self.resources,
+                        &self.base_url,
+                        &mut placed,
+                    );
+                }
                 let (clip_left, clip_top, clip_right, clip_bottom) = self.fixed_page_rect(fixed);
                 let (image_arc, paint_count, paint_surface) = paint_page(
                     &scene,
@@ -2791,6 +2830,7 @@ impl Document {
                     clip_bottom,
                     self.background_color,
                     self.font_gamma,
+                    &placed,
                 );
                 (image_arc, paint_count, paint_surface)
             } else {
@@ -2799,6 +2839,23 @@ impl Document {
                     x: 0.0,
                     y: f64::from(start.top),
                 });
+                // Images the page only carries as a size placeholder are not in
+                // the scene; decode their originals for this paint.
+                {
+                    let root = active.doc.root_element();
+                    collect_placed_images(
+                        &active.doc,
+                        root,
+                        clip_bottom,
+                        viewport_scale,
+                        0.0,
+                        0.0,
+                        &self.images,
+                        &self.resources,
+                        &self.base_url,
+                        &mut placed,
+                    );
+                }
                 blitz_paint::paint_scene(
                     &mut scene,
                     &mut active.doc,
@@ -2829,6 +2886,7 @@ impl Document {
                     local_bottom,
                     self.background_color,
                     self.font_gamma,
+                    &placed,
                     &mut self.paint_cache.borrow_mut(),
                 );
                 if std::env::var_os("CRE_RENDER_PROFILE").is_some() {
@@ -2880,6 +2938,7 @@ impl Document {
         let viewport_scale = self.viewport_scale;
         let fixed_layout = self.fixed_layouts.get(chunk_index).and_then(|fixed| *fixed);
         let mut scene = Scene::default();
+        let mut placed: Vec<cre_paint::PlacedImage> = Vec::new();
         let (clip_left, clip_right, local_top, local_bottom) = if let Some(fixed) = fixed_layout {
             active.doc.set_viewport_scroll(Point { x: 0.0, y: 0.0 });
             let (fit, offset_x, offset_y) = self.fixed_page_transform(fixed);
@@ -2900,6 +2959,21 @@ impl Document {
                 x: 0.0,
                 y: f64::from(start.top),
             });
+            {
+                let root = active.doc.root_element();
+                collect_placed_images(
+                    &active.doc,
+                    root,
+                    clip_bottom,
+                    viewport_scale,
+                    0.0,
+                    0.0,
+                    &self.images,
+                    &self.resources,
+                    &self.base_url,
+                    &mut placed,
+                );
+            }
             blitz_paint::paint_scene(
                 &mut scene,
                 &mut active.doc,
@@ -2927,6 +3001,7 @@ impl Document {
             local_bottom,
             self.background_color,
             self.font_gamma,
+            &placed,
         );
         Ok((bitmap, image_count, image_surface))
     }
@@ -5700,6 +5775,78 @@ fn find_image_data_at(
     None
 }
 
+/// Collects the images a page carries only as a size placeholder, with the
+/// page-local device rectangle each one occupies.
+///
+/// The placeholder gave layout the image's exact intrinsic size, so the
+/// element box here is the box the real image must fill. The original bytes are
+/// read from `resources` (the same data `getImageDataFromPosition` returns).
+#[allow(clippy::too_many_arguments)]
+fn collect_placed_images(
+    doc: &HtmlDocument,
+    node: &Node,
+    page_bottom: f32,
+    scale: f32,
+    offset_x: f32,
+    offset_y: f32,
+    images: &ImageRaster,
+    resources: &ResourceSource,
+    base_url: &str,
+    out: &mut Vec<cre_paint::PlacedImage>,
+) {
+    if node
+        .element_data()
+        .is_some_and(|element| element.name.local.to_string() == "img")
+        && let Some(src) = node_attr(node, "src")
+    {
+        let resolved = if src.contains("://") {
+            src.to_string()
+        } else if src.starts_with('/') {
+            format!("{}{}", base_url.trim_end_matches('/'), src)
+        } else {
+            format!("{base_url}{src}")
+        };
+        let (key, _) = href_key(&resolved);
+        let key = key.strip_prefix("binary/").unwrap_or(&key);
+        if let Some((intrinsic_width, intrinsic_height)) = images.placeheld_size(key)
+            && let Some(bytes) = lookup_resource(resources, key)
+        {
+            let bytes = Arc::new(bytes);
+            for rect in doc.node_client_rects(node.id) {
+                let top = rect.y as f32;
+                let bottom = top + rect.height as f32;
+                if bottom <= 0.0 || top >= page_bottom || rect.width <= 0.0 || rect.height <= 0.0 {
+                    continue;
+                }
+                out.push(cre_paint::PlacedImage {
+                    x: rect.x as f32 * scale + offset_x,
+                    y: top * scale + offset_y,
+                    width: rect.width as f32 * scale,
+                    height: rect.height as f32 * scale,
+                    intrinsic_width,
+                    intrinsic_height,
+                    fit: cre_paint::ImageFit::Fill,
+                    bytes: bytes.clone(),
+                });
+            }
+        }
+    }
+    for child in node.children.iter() {
+        collect_placed_images(
+            doc,
+            node.with(*child),
+            page_bottom,
+            scale,
+            offset_x,
+            offset_y,
+            images,
+            resources,
+            base_url,
+            out,
+        );
+    }
+}
+
 fn epub_cover_image(book: &EpubBook) -> Option<Vec<u8>> {
     let item = book
         .manifest
@@ -7805,32 +7952,109 @@ fn document_css_for_svg(html: &str, provider: Option<&LazyResource>) -> String {
     css
 }
 
+/// Transparent SVG placeholders, by intrinsic size.
+type PlaceholderCache = HashMap<(u32, u32), Arc<Vec<u8>>>;
+
 /// Rasterizes SVG resources once, at page size, and keeps the PNGs in a
-/// byte-bounded cache.
-struct SvgRaster {
+/// byte-bounded cache; also replaces oversized raster images with a size
+/// placeholder (see [`ImageRaster::placeholder`]).
+struct ImageRaster {
     max_width: u32,
     max_height: u32,
-    cache: std::sync::Mutex<SvgRasterCache>,
+    cache: std::sync::Mutex<ImageRasterCache>,
+    /// Resource keys referenced by `<img>` elements. Only those may become a
+    /// placeholder: a CSS `background-image` has no other painter, so it must
+    /// keep its pixels.
+    content: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Keys replaced by a placeholder, with the image's real intrinsic size.
+    placeheld: std::sync::Mutex<HashMap<String, (u32, u32)>>,
+    /// Transparent SVG of a given intrinsic size, used as a layout placeholder.
+    placeholders: std::sync::Mutex<PlaceholderCache>,
 }
 
 #[derive(Default)]
-struct SvgRasterCache {
+struct ImageRasterCache {
     entries: HashMap<String, Arc<Vec<u8>>>,
     order: std::collections::VecDeque<String>,
     bytes: usize,
     limit: usize,
 }
 
-impl SvgRaster {
+impl ImageRaster {
     fn new(width: u32, height: u32) -> Self {
         Self {
             max_width: width.max(1),
             max_height: height.max(1),
-            cache: std::sync::Mutex::new(SvgRasterCache {
+            cache: std::sync::Mutex::new(ImageRasterCache {
                 limit: 8 * 1024 * 1024,
-                ..SvgRasterCache::default()
+                ..ImageRasterCache::default()
             }),
+            content: std::sync::Mutex::new(std::collections::HashSet::new()),
+            placeheld: std::sync::Mutex::new(HashMap::new()),
+            placeholders: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Notes which resources `<img>` elements reference.
+    fn set_content_images(&self, keys: impl IntoIterator<Item = String>) {
+        if let Ok(mut content) = self.content.lock() {
+            content.clear();
+            content.extend(keys);
+        }
+    }
+
+    /// The intrinsic size recorded when `key` was replaced by a placeholder.
+    fn placeheld_size(&self, key: &str) -> Option<(u32, u32)> {
+        self.placeheld.lock().ok()?.get(key).copied()
+    }
+
+    /// Replaces an oversized raster image with a transparent SVG of the same
+    /// intrinsic size.
+    ///
+    /// Layout only needs the image's size and aspect ratio: our stylesheet caps
+    /// every image to the page, so an image larger than the page is always
+    /// scaled down. Carrying the real size on an SVG keeps that layout exact
+    /// while blitz holds no natural-size RGBA copy (a 1443x2048 photo is 11 MB
+    /// decoded). The pixels are painted from the original resource in
+    /// `cre_paint::draw_placed_images`.
+    ///
+    /// Small images are left alone: their absolute intrinsic size really is
+    /// used by layout, and they are cheap anyway.
+    ///
+    /// TODO(upstream): blitz's `NetHandler` only accepts bytes and decodes them
+    /// privately (`ImageHandler::parse`), so an image's intrinsic size and its
+    /// pixels cannot be supplied separately. crengine's `LVImageSource` does
+    /// exactly that (declared size + row-by-row decode into the target buffer);
+    /// with a similar API this placeholder/draw pair would collapse into one
+    /// image source and painting would not need `PlacedImage` at all.
+    fn placeholder(&self, key: &str, bytes: &[u8]) -> Option<Vec<u8>> {
+        if bytes.is_empty() || looks_like_svg(bytes) {
+            return None;
+        }
+        if !self.content.lock().ok()?.contains(key) {
+            return None;
+        }
+        let (width, height) = image_dimensions(bytes)?;
+        if width == 0 || height == 0 || (width <= self.max_width && height <= self.max_height) {
+            return None;
+        }
+        if let Ok(mut held) = self.placeheld.lock() {
+            held.insert(key.to_string(), (width, height));
+        }
+        let mut placeholders = self.placeholders.lock().ok()?;
+        if let Some(cached) = placeholders.get(&(width, height)) {
+            return Some((**cached).clone());
+        }
+        let svg = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\"></svg>"
+        )
+        .into_bytes();
+        let svg = Arc::new(svg);
+        if placeholders.len() >= 64 {
+            placeholders.clear();
+        }
+        placeholders.insert((width, height), svg.clone());
+        Some((*svg).clone())
     }
 
     fn rasterize(&self, key: &str, bytes: &[u8]) -> Option<Vec<u8>> {
@@ -7868,6 +8092,16 @@ fn looks_like_svg(bytes: &[u8]) -> bool {
     text.starts_with("<svg") || (text.starts_with("<?xml") && text.contains("<svg"))
 }
 
+/// Intrinsic pixel size of a raster image, read from its header. The pixels are
+/// not decoded (a large photo's header alone gives the layout size).
+fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
 fn encode_png(rgba: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     {
@@ -7882,7 +8116,7 @@ fn encode_png(rgba: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
 
 struct EpubNet {
     resource_provider: Arc<LazyResource>,
-    svg: Arc<SvgRaster>,
+    svg: Arc<ImageRaster>,
 }
 
 impl NetProvider for EpubNet {
@@ -7906,6 +8140,7 @@ impl NetProvider for EpubNet {
             bytes
         };
         let bytes = self.svg.rasterize(&key, &bytes).unwrap_or(bytes);
+        let bytes = self.svg.placeholder(&key, &bytes).unwrap_or(bytes);
         handler.bytes(request.url.to_string(), Bytes::from(bytes));
     }
 }
@@ -7914,7 +8149,7 @@ impl NetProvider for EpubNet {
 /// `binary/<name>` or a bare `<name>`.
 struct MapNet {
     resources: Arc<HashMap<String, Vec<u8>>>,
-    svg: Arc<SvgRaster>,
+    svg: Arc<ImageRaster>,
 }
 
 impl NetProvider for MapNet {
@@ -7926,6 +8161,7 @@ impl NetProvider for MapNet {
         let name = path.strip_prefix("binary/").unwrap_or(&path).to_string();
         let bytes = self.resources.get(&name).cloned().unwrap_or_default();
         let bytes = self.svg.rasterize(&name, &bytes).unwrap_or(bytes);
+        let bytes = self.svg.placeholder(&name, &bytes).unwrap_or(bytes);
         handler.bytes(request.url.to_string(), Bytes::from(bytes));
     }
 }
@@ -7935,7 +8171,7 @@ impl NetProvider for MapNet {
 /// stay inside that directory.
 struct FileNet {
     root: PathBuf,
-    svg: Arc<SvgRaster>,
+    svg: Arc<ImageRaster>,
 }
 
 impl NetProvider for FileNet {
@@ -7951,6 +8187,7 @@ impl NetProvider for FileNet {
             bytes = std::fs::read(&candidate).unwrap_or_default();
         }
         let bytes = self.svg.rasterize(&decoded, &bytes).unwrap_or(bytes);
+        let bytes = self.svg.placeholder(&decoded, &bytes).unwrap_or(bytes);
         handler.bytes(request.url.to_string(), Bytes::from(bytes));
     }
 }
@@ -8126,5 +8363,53 @@ body { font-size: 12px; }
         );
         assert_eq!(svg_view_box(r#"<svg width="10" height="10">"#), None);
         assert_eq!(svg_view_box(r#"<svg viewBox="0 0 0 10">"#), None);
+    }
+}
+
+#[cfg(test)]
+mod image_placeholder_tests {
+    use super::*;
+
+    /// A valid RGBA PNG of the given size, all pixels transparent.
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("png header");
+            writer
+                .write_image_data(&vec![0u8; (width * height * 4) as usize])
+                .expect("png data");
+        }
+        out
+    }
+
+    #[test]
+    fn oversized_content_image_becomes_a_size_placeholder() {
+        let images = ImageRaster::new(600, 800);
+        let bytes = png_bytes(1200, 1600);
+        // A CSS background image has no other painter: it keeps its pixels.
+        assert!(images.placeholder("background.png", &bytes).is_none());
+
+        images.set_content_images(["photo.png".to_string()]);
+        let placeholder = images
+            .placeholder("photo.png", &bytes)
+            .expect("oversized content image becomes a placeholder");
+        let text = String::from_utf8(placeholder).expect("placeholder is SVG");
+        assert!(text.contains(r#"width="1200""#), "{text}");
+        assert!(text.contains(r#"height="1600""#), "{text}");
+        assert_eq!(images.placeheld_size("photo.png"), Some((1200, 1600)));
+    }
+
+    #[test]
+    fn small_images_keep_their_pixels() {
+        let images = ImageRaster::new(600, 800);
+        images.set_content_images(["small.png".to_string()]);
+        let bytes = png_bytes(300, 400);
+        // Layout uses a small image's absolute intrinsic size, so replacing it
+        // would shrink it to the placeholder's pixel count.
+        assert!(images.placeholder("small.png", &bytes).is_none());
+        assert_eq!(images.placeheld_size("small.png"), None);
     }
 }
