@@ -4232,6 +4232,18 @@ impl Document {
         if pos <= 0 {
             return self.go_to_page(1);
         }
+        // The engine renders whole pages, so in continuous (scroll) view the
+        // reader's "scroll one screen" (`_gotoPos(pos + viewport)`) has to mean
+        // one page. Mapping the position against page starts instead skipped
+        // pages, because a page's document height is its content height and is
+        // not the viewport height: one screen then covered several pages.
+        let viewport = i64::from(self.height).max(1);
+        let delta = pos - start;
+        if delta.abs() <= viewport * 2 {
+            let steps = (delta as f64 / viewport as f64).round() as i64;
+            let target = (current as i64 + steps).clamp(1, page_count as i64) as usize;
+            return self.go_to_page(target);
+        }
         let mut page = 1usize;
         for candidate in 2..=page_count {
             let candidate_start = self.page_start_y(candidate);
