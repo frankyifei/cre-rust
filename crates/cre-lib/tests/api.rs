@@ -1078,7 +1078,7 @@ fn layout_can_be_deferred_to_the_first_read() {
 
 /// The reader's position (`getCurrentPos`) is the top of the page being shown,
 /// and it restores/refreshes it with `gotoPos(position)`. That round trip must
-/// stay on the page, in page and continuous view alike.
+/// stay on the page.
 #[test]
 fn goto_pos_returns_to_the_page_it_came_from() {
     require_resources();

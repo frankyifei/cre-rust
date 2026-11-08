@@ -93,8 +93,14 @@ struct Doc {
     page_map_stale: bool,
 }
 
+/// `cre.newDocView` view mode for page layout.
+///
+/// The reader passes 0 for continuous ("scroll") view and 1 for page view; the
+/// engine only supports page view (see [`Doc::new`] and [`doc_set_view_mode`]).
+const PAGE_VIEW_MODE: i32 = 1;
+
 impl Doc {
-    fn new(width: u32, height: u32, view_mode: i32) -> Self {
+    fn new(width: u32, height: u32, _view_mode: i32) -> Self {
         Self {
             inner: None,
             width: width.max(1),
@@ -110,7 +116,10 @@ impl Doc {
             last_boxes: Vec::new(),
             properties: HashMap::new(),
             alt_properties: HashMap::new(),
-            view_mode,
+            // The engine renders whole pages; continuous ("scroll") view cannot
+            // be honoured, so every document is laid out as page view even when
+            // the reader asks for scroll mode. See `doc_set_view_mode`.
+            view_mode: PAGE_VIEW_MODE,
             visible_page_count: 1,
             header_height: 0,
             interline: 100,
@@ -374,9 +383,9 @@ impl Doc {
                 true
             }
             "view.mode" => {
-                if value == 0 || value == 1 {
-                    self.view_mode = value as i32;
-                }
+                // Continuous (scroll) view is unsupported; see
+                // `doc_set_view_mode`.
+                self.view_mode = PAGE_VIEW_MODE;
                 false
             }
             "crengine.page.margin.left" => {
@@ -3071,13 +3080,9 @@ unsafe extern "C-unwind" fn doc_word_boxes_from_positions(l: *mut lua_State) -> 
             lua::lua_newtable(l);
             let mut cached_index = 0;
             for text_box in cached_boxes.iter() {
-                if let Some((x0, y0, x1, y1)) = window_rect_for_page_box(
-                    doc.view_mode,
-                    doc.visible_page_count,
-                    doc.height,
-                    inner,
-                    text_box,
-                ) {
+                if let Some((x0, y0, x1, y1)) =
+                    window_rect_for_page_box(doc.visible_page_count, inner, text_box)
+                {
                     cached_index += 1;
                     lua::lua_createtable(l, 0, 4);
                     for (key, value) in [("x0", x0), ("y0", y0), ("x1", x1), ("y1", y1)] {
@@ -3106,13 +3111,9 @@ unsafe extern "C-unwind" fn doc_word_boxes_from_positions(l: *mut lua_State) -> 
         lua::lua_newtable(l);
         let mut index = 0;
         for text_box in raw_boxes.iter() {
-            if let Some((x0, y0, x1, y1)) = window_rect_for_page_box(
-                doc.view_mode,
-                doc.visible_page_count,
-                doc.height,
-                inner,
-                text_box,
-            ) {
+            if let Some((x0, y0, x1, y1)) =
+                window_rect_for_page_box(doc.visible_page_count, inner, text_box)
+            {
                 index += 1;
                 lua::lua_createtable(l, 0, 4);
                 for (key, value) in [("x0", x0), ("y0", y0), ("x1", x1), ("y1", y1)] {
@@ -3495,11 +3496,12 @@ unsafe extern "C-unwind" fn doc_rerender_delayed(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn doc_set_view_mode(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let mode = arg_int(l, 2);
-        if let Some(doc) = doc_mut(l)
-            && (mode == 0 || mode == 1)
-        {
-            doc.view_mode = mode as i32;
+        if let Some(doc) = doc_mut(l) {
+            // Continuous (scroll) view is not supported: the engine renders
+            // whole pages, and half-supporting scroll mode made page numbers,
+            // selection and highlights disagree. Page view is used whatever the
+            // reader asks for, so `mode` (argument 2) is ignored.
+            doc.view_mode = PAGE_VIEW_MODE;
         }
     }
     0
@@ -4576,11 +4578,7 @@ unsafe extern "C-unwind" fn doc_get_page_map_visible(l: *mut lua_State) -> c_int
         let end_page = (start_page + visible_count).min(page_count + 1);
         let min_y = current_document_pos(inner);
         let max_y = min_y + i64::from(inner.page_height()) * i64::from(visible_count as u32);
-        let offset_y = if doc.view_mode == 1 {
-            i64::from(doc.header_height.max(0)) + inner.page_margin_y()
-        } else {
-            0
-        };
+        let offset_y = i64::from(doc.header_height.max(0)) + inner.page_margin_y();
         let start_index = doc
             .page_map_first_index_at_or_above(min_y)
             .unwrap_or(doc.page_map.len());

@@ -88,11 +88,11 @@ pub(crate) fn cfi_range_for_positions(
 
 /// Where the reader is in the document: the top of the page being shown.
 ///
-/// This used to add the page's first line offset, which made the scroll-mode
-/// highlight mapping subtract it as well: a word's box came out one line offset
-/// too high, and a box belonging to another page was shifted by whole pages
-/// (`3.epub` in continuous mode). The renderer draws a page from its start, so
-/// the page start is the position that matches both modes.
+/// This used to add the page's first line offset, which made the text-box
+/// mapping subtract it as well: a word's box came out one line offset too high,
+/// and a box belonging to another page was shifted by whole pages. The renderer
+/// draws a page from its start, so the page start is the position KOReader's
+/// `getCurrentPos`/`gotoPos` round trip must use.
 pub(crate) fn current_document_pos(inner: &Document) -> i64 {
     inner.page_start_y(inner.current_page())
 }
@@ -141,10 +141,13 @@ pub(crate) fn expand_to_visible_word_end(inner: &Document, xpointer: &str) -> St
         .unwrap_or(xpointer.to_string())
 }
 
+/// Maps a text box from its page's coordinates onto the window being shown.
+///
+/// The engine only renders page view (see `doc_set_view_mode`), so the window
+/// is always the current page — plus the next one when the reader shows two
+/// columns.
 pub(crate) fn window_rect_for_page_box(
-    view_mode: i32,
     visible_page_count: i32,
-    view_height: u32,
     inner: &Document,
     text_box: &TextBox,
 ) -> Option<(f32, f32, f32, f32)> {
@@ -159,35 +162,20 @@ pub(crate) fn window_rect_for_page_box(
         return None;
     }
 
-    if view_mode == 1 {
-        let current = inner.current_page();
-        let visible_count = visible_page_count.max(1) as usize;
-        if text_box.page < current || text_box.page >= current + visible_count {
-            return None;
-        }
-        let x_offset = if text_box.page == current {
-            0.0
-        } else {
-            inner.page_width() as f32
-        };
-        Some((
-            text_box.x + x_offset,
-            text_box.y,
-            text_box.x + text_box.width + x_offset,
-            text_box.y + text_box.height,
-        ))
-    } else {
-        let page_top = inner.page_start_y_or_invalid(text_box.page);
-        if page_top < 0 {
-            return None;
-        }
-        let current_pos = current_document_pos(inner);
-        let y0 = page_top as f32 + text_box.y - current_pos as f32;
-        let y1 = y0 + text_box.height;
-        let view_height = view_height.max(1) as f32;
-        if y1 <= 0.0 || y0 >= view_height {
-            return None;
-        }
-        Some((text_box.x, y0, text_box.x + text_box.width, y1))
+    let current = inner.current_page();
+    let visible_count = visible_page_count.max(1) as usize;
+    if text_box.page < current || text_box.page >= current + visible_count {
+        return None;
     }
+    let x_offset = if text_box.page == current {
+        0.0
+    } else {
+        inner.page_width() as f32
+    };
+    Some((
+        text_box.x + x_offset,
+        text_box.y,
+        text_box.x + text_box.width + x_offset,
+        text_box.y + text_box.height,
+    ))
 }
