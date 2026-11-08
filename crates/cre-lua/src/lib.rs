@@ -2217,9 +2217,6 @@ unsafe extern "C-unwind" fn doc_goto_pos(l: *mut lua_State) -> c_int {
             }
             let pos = arg_int(l, 2).max(0);
             let _ = inner.set_pos(pos);
-            // Only the continuous view scrolls inside a page; in paged view a
-            // position is a page start.
-            inner.set_scroll_pos((doc.view_mode == 0).then_some(pos));
         }
     }));
     // SAFETY: `l` is the active Lua state.
