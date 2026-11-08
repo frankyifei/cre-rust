@@ -1657,8 +1657,8 @@ impl Document {
         if page != self.current_page {
             return None;
         }
+        let meta = self.pages.get(page.checked_sub(1)?)?;
         let scale = self.viewport_scale.max(0.1);
-        let pos_css = pos as f32 / scale;
         let margin_top = (self.margins.top / scale).max(0.0);
         let margin_bottom = (self.margins.bottom / scale).max(0.0);
         let (_, page_height_css, _) = css_page_geometry(
@@ -1667,9 +1667,15 @@ impl Document {
             self.viewport_scale,
             self.page_margin,
         );
+        // `pos` is in the document space of `page_start_y`, which adds the top
+        // margin once per page; the page's own origin is `meta.local_start.top`.
+        // Convert the offset inside the page, then move the page origin.
+        let page_base = render_length_to_i64(meta.doc_top);
+        let delta_css = (pos - page_base) as f32 / scale;
+        let top = (meta.local_start.top + delta_css).max(0.0);
         let start = PageStart {
-            top: pos_css.max(0.0),
-            clip_top: pos_css + margin_top,
+            top,
+            clip_top: top + margin_top,
         };
         Some((start, start.top + page_height_css - margin_bottom))
     }
