@@ -944,6 +944,13 @@ pub struct Document {
     layout_height: u32,
     page_margin: f32,
     margins: PageMargins,
+    /// Continuous ("scroll") view: the page being shown is rendered as the
+    /// window that starts at this document position (device pixels) instead of
+    /// at the page's own start. `None` in paged view.
+    ///
+    /// This costs one `i64`: the window is derived from the active chunk's
+    /// lines on demand, so scrolling does not keep anything else resident.
+    scroll_pos: Option<i64>,
     font_css_size: f32,
     viewport_scale: f32,
     font_gamma: f32,
@@ -1463,6 +1470,7 @@ impl Document {
             layout_height: options.layout_height,
             page_margin: options.page_margin,
             margins: PageMargins::uniform(options.page_margin),
+            scroll_pos: None,
             stylesheet: options.stylesheet.clone(),
             embedded_styles_enabled: options.embedded_styles_enabled,
             font_css_size: options.font_size,
@@ -1620,6 +1628,50 @@ impl Document {
         self.stylesheet = options.stylesheet.clone();
         self.embedded_styles_enabled = options.embedded_styles_enabled;
         self.viewport_scale = options.viewport_scale;
+    }
+
+    /// Renders the current page from `pos` (device pixels) instead of from the
+    /// page's own start, for the reader's continuous view.
+    ///
+    /// The window is one page tall, so nothing extra is laid out or kept: only
+    /// the origin moves.
+    pub fn set_scroll_pos(&mut self, pos: Option<i64>) {
+        if self.scroll_pos == pos {
+            return;
+        }
+        self.scroll_pos = pos;
+        // Rendered bitmaps and text boxes are keyed by page number, which no
+        // longer identifies a window.
+        self.clear_page_image_cache();
+        *self.page_boxes_cache.borrow_mut() = None;
+    }
+
+    pub fn scroll_pos(&self) -> Option<i64> {
+        self.scroll_pos
+    }
+
+    /// The window `page` is rendered with when the reader scrolled inside it:
+    /// the page start and clip bottom to use, in CSS pixels.
+    fn scroll_window(&self, page: usize) -> Option<(PageStart, f32)> {
+        let pos = self.scroll_pos?;
+        if page != self.current_page {
+            return None;
+        }
+        let scale = self.viewport_scale.max(0.1);
+        let pos_css = pos as f32 / scale;
+        let margin_top = (self.margins.top / scale).max(0.0);
+        let margin_bottom = (self.margins.bottom / scale).max(0.0);
+        let (_, page_height_css, _) = css_page_geometry(
+            self.width,
+            self.height,
+            self.viewport_scale,
+            self.page_margin,
+        );
+        let start = PageStart {
+            top: pos_css.max(0.0),
+            clip_top: pos_css + margin_top,
+        };
+        Some((start, start.top + page_height_css - margin_bottom))
     }
 
     /// Sets the four page margins (device pixels) for the next layout.
@@ -2744,11 +2796,15 @@ impl Document {
             bail!("page {page} is outside 1..={}", self.page_count());
         };
         let chunk_index = snapshot.chunk;
-        let start = snapshot.local_start;
+        let (start, page_clip_bottom) = match self.scroll_window(page) {
+            Some(window) => window,
+            None => (snapshot.local_start, snapshot.local_clip_bottom),
+        };
         let clip_top = start.clip_top - start.top;
-        let clip_bottom = snapshot.local_clip_bottom - start.top;
+        let clip_bottom = page_clip_bottom - start.top;
+        let scrolling = self.scroll_pos.is_some();
 
-        if let Some(cached) = self.cached_page_image(page) {
+        if let Some(cached) = (!scrolling).then(|| self.cached_page_image(page)).flatten() {
             self.ensure_chunk(chunk_index)?;
             return Ok((
                 cached.bitmap.clone(),
@@ -4209,6 +4265,8 @@ impl Document {
         // number we report is a real one.
         let page = self.ensure_page_layout(page)?;
         self.current_page = page;
+        // An explicit page is a page start: drop any scroll origin.
+        self.set_scroll_pos(None);
         Ok(page)
     }
 
@@ -4226,25 +4284,30 @@ impl Document {
         let current = self.current_page.max(1).min(page_count);
         let start = self.page_start_y(current);
         let height = self.page_render_height(current).max(0);
-        if pos >= start && pos < start + height {
-            return Ok(current);
-        }
-        if pos <= 0 {
-            return self.go_to_page(1);
-        }
-        let mut page = 1usize;
-        for candidate in 2..=page_count {
-            let candidate_start = self.page_start_y(candidate);
-            if candidate_start <= 0 {
-                continue;
+        let page = if pos >= start && pos < start + height {
+            current
+        } else if pos <= 0 {
+            1
+        } else {
+            let mut page = 1usize;
+            for candidate in 2..=page_count {
+                let candidate_start = self.page_start_y(candidate);
+                if candidate_start <= 0 {
+                    continue;
+                }
+                if candidate_start <= pos {
+                    page = candidate;
+                } else {
+                    break;
+                }
             }
-            if candidate_start <= pos {
-                page = candidate;
-            } else {
-                break;
-            }
-        }
-        self.go_to_page(page)
+            page
+        };
+        let landed = self.go_to_page(page)?;
+        // `go_to_page` leaves continuous mode; a position is a scroll origin,
+        // so keep it: the page below it is rendered from exactly there.
+        self.set_scroll_pos(Some(pos.max(0)));
+        Ok(landed)
     }
 
     pub fn go_to_first_page(&mut self) -> usize {
@@ -4656,9 +4719,11 @@ impl Document {
             return Ok(cached.clone());
         }
         let meta = self.page_meta(page)?;
-        let (chunk_index, local_start, clip_bottom) =
-            (meta.chunk, meta.local_start, meta.local_clip_bottom);
-        let line_base = self.chunks[chunk_index].line_base;
+        let (chunk_index, line_base) = (meta.chunk, self.chunks[meta.chunk].line_base);
+        let (local_start, clip_bottom) = match self.scroll_window(page) {
+            Some(window) => window,
+            None => (meta.local_start, meta.local_clip_bottom),
+        };
         let boxes = self.with_active_chunk(chunk_index, |active| {
             let root = active.doc.root_element();
             Ok(snapshot_page_boxes(

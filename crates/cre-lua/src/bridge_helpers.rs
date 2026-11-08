@@ -94,6 +94,9 @@ pub(crate) fn cfi_range_for_positions(
 /// (`3.epub` in continuous mode). The renderer draws a page from its start, so
 /// the page start is the position that matches both modes.
 pub(crate) fn current_document_pos(inner: &Document) -> i64 {
+    if let Some(pos) = inner.scroll_pos() {
+        return pos;
+    }
     inner.page_start_y(inner.current_page())
 }
 
@@ -177,14 +180,14 @@ pub(crate) fn window_rect_for_page_box(
             text_box.y + text_box.height,
         ))
     } else {
-        let page_top = inner.page_start_y_or_invalid(text_box.page);
-        if page_top < 0 {
-            return None;
-        }
-        let current_pos = current_document_pos(inner);
-        let y0 = page_top as f32 + text_box.y - current_pos as f32;
-        let y1 = y0 + text_box.height;
+        // Continuous view: the engine rendered the window that starts at the
+        // scroll origin, so the box's y is already relative to the screen — the
+        // same convention as page view. Subtracting the position again (which
+        // this used to do) moved every highlight up by the page's first-line
+        // offset and by whole pages for boxes from another page.
         let view_height = view_height.max(1) as f32;
+        let y0 = text_box.y;
+        let y1 = y0 + text_box.height;
         if y1 <= 0.0 || y0 >= view_height {
             return None;
         }
