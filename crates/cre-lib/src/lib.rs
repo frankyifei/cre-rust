@@ -236,6 +236,19 @@ pub(crate) struct LineBox {
     pub(crate) top: f32,
     pub(crate) visual_top: f32,
     pub(crate) bottom: f32,
+    /// Vertical extent of the element's own box when it is smaller than the
+    /// line. A MathML token is an inline-block glyph inside the formula's line,
+    /// so its selection box is the glyph, not the whole formula.
+    pub(crate) box_top: f32,
+    pub(crate) box_bottom: f32,
+    /// Inside `<span class="cre-math">`: the tokens of one formula are joined
+    /// into one run of text instead of one line each.
+    pub(crate) math: bool,
+    /// The `.cre-math` block itself: its lines are the formula's real lines.
+    pub(crate) math_root: bool,
+    /// Ordering key for text extraction: the formula's line for a math token
+    /// (whose own line top differs by a few pixels), the line top otherwise.
+    pub(crate) sort_top: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -826,6 +839,46 @@ struct SnapshotLine {
     width: f32,
     height: f32,
     global_line: usize,
+    /// The visual line the box belongs to; a formula's tokens share it.
+    line_top: f32,
+    math: bool,
+}
+
+/// Where a text box sits for text building: the visual line it belongs to and
+/// whether it is part of a formula.
+#[derive(Clone, Copy)]
+struct PageTextLine {
+    line_top: f32,
+    math: bool,
+}
+
+/// Whether `current` continues the visual line `previous` is on. The tokens of
+/// one formula are separate boxes on the same line, so their text is joined
+/// instead of being split into one line per glyph.
+fn continues_same_line(previous: Option<PageTextLine>, current: PageTextLine) -> bool {
+    match previous {
+        Some(previous) => {
+            current.math && previous.math && (current.line_top - previous.line_top).abs() < 1.0
+        }
+        None => false,
+    }
+}
+
+/// Joins page text boxes: a newline per visual line, nothing inside a formula.
+fn join_text_boxes<'a>(items: impl Iterator<Item = (&'a str, PageTextLine)>) -> String {
+    let mut text = String::new();
+    let mut previous: Option<PageTextLine> = None;
+    for (part, line) in items {
+        if part.trim().is_empty() {
+            continue;
+        }
+        if !text.is_empty() && !continues_same_line(previous, line) {
+            text.push('\n');
+        }
+        text.push_str(part);
+        previous = Some(line);
+    }
+    text
 }
 
 pub enum ResourceSource {
@@ -2945,12 +2998,12 @@ impl Document {
     }
 
     pub fn page_text(&self, page: usize) -> Result<String> {
-        Ok(self
-            .page_text_boxes(page)?
-            .into_iter()
-            .map(|text_box| text_box.text)
-            .collect::<Vec<_>>()
-            .join("\n"))
+        let lines = self.page_text_lines(page)?;
+        Ok(join_text_boxes(
+            lines
+                .iter()
+                .map(|(_, text_box, line)| (text_box.text.as_str(), *line)),
+        ))
     }
 
     pub fn text_at(&self, position: PagePosition) -> Result<Option<String>> {
@@ -3744,8 +3797,9 @@ impl Document {
 
         let mut rects = Vec::new();
         let mut text = String::new();
+        let mut previous: Option<PageTextLine> = None;
         for page in start_hit.page..=end_hit.page {
-            for (line_index, mut rect) in self.page_text_boxes_with_lines(page)? {
+            for (line_index, mut rect, current) in self.page_text_lines(page)? {
                 if line_index < start_hit.line_index || line_index > end_hit.line_index {
                     continue;
                 }
@@ -3771,10 +3825,11 @@ impl Document {
                 if slice_start < slice_end {
                     let part = &rect.text[slice_start..slice_end];
                     if !part.trim().is_empty() {
-                        if !text.is_empty() {
+                        if !text.is_empty() && !continues_same_line(previous, current) {
                             text.push('\n');
                         }
                         text.push_str(part);
+                        previous = Some(current);
                     }
                 }
                 if rect.width > 0.0 {
@@ -4477,6 +4532,16 @@ impl Document {
     }
 
     fn page_text_boxes_with_lines(&self, page: usize) -> Result<Vec<(usize, TextBox)>> {
+        Ok(self
+            .page_text_lines(page)?
+            .into_iter()
+            .map(|(global_line, text_box, _)| (global_line, text_box))
+            .collect())
+    }
+
+    /// Text boxes with the visual line they sit on and whether they belong to a
+    /// formula, so a formula's tokens can be joined into one run of text.
+    fn page_text_lines(&self, page: usize) -> Result<Vec<(usize, TextBox, PageTextLine)>> {
         let Some(index) = page.checked_sub(1) else {
             bail!("page numbers are 1-based");
         };
@@ -4513,6 +4578,10 @@ impl Document {
                         y: y * scale,
                         width: width * scale,
                         height: height * scale,
+                    },
+                    PageTextLine {
+                        line_top: line.line_top * scale,
+                        math: line.math,
                     },
                 )
             })
@@ -4643,8 +4712,38 @@ fn resolve_font_path(options: &DocumentOptions) -> Result<PathBuf> {
 fn collect_lines(root: &Node) -> Vec<LineBox> {
     let mut lines = Vec::new();
     collect_lines_inner(root, &mut lines);
-    lines.sort_by(|a, b| a.top.total_cmp(&b.top));
+    // A formula's tokens are separate inline layouts whose tops differ by a few
+    // pixels, so sorting on their own top interleaves them (a subscript would
+    // read before its base). Fold every token onto the formula line that holds
+    // it, then keep that line's document order, which is the order the formula
+    // is written in: `Z = lim ... exp( ... )`.
+    let formula_lines: Vec<(f32, f32)> = lines
+        .iter()
+        .filter(|line| line.math_root)
+        .map(|line| (line.top, line.bottom))
+        .collect();
+    if !formula_lines.is_empty() {
+        for line in lines.iter_mut().filter(|line| line.math && !line.math_root) {
+            let center = (line.box_top + line.box_bottom) / 2.0;
+            if let Some((top, _)) = formula_lines
+                .iter()
+                .find(|(top, bottom)| center >= *top - 1.0 && center <= *bottom + 1.0)
+            {
+                line.sort_top = *top;
+            }
+        }
+    }
+    lines.sort_by(|a, b| a.sort_top.total_cmp(&b.sort_top));
     lines
+}
+
+/// `class` attribute of an element.
+fn element_class(node: &Node) -> Option<&str> {
+    node.element_data()?
+        .attrs()
+        .iter()
+        .find(|attr| attr.name.local.to_string() == "class")
+        .map(|attr| attr.value.as_str())
 }
 
 /// Text nodes that took part in a block's inline layout. Text outside every
@@ -4710,6 +4809,22 @@ fn collect_lines_inner(node: &Node, out: &mut Vec<LineBox>) {
                 top
             };
             let text_range = line.text_range();
+            let class = element_class(node);
+            let math = class
+                .map(|value| value.split_whitespace().any(|name| name.starts_with("cre-m")))
+                .unwrap_or(false);
+            let math_root = class
+                .map(|value| value.split_whitespace().any(|name| name == "cre-math"))
+                .unwrap_or(false);
+            // A math token's own inline layout is as tall as the formula; the
+            // glyph box is what a selection should cover.
+            let own_top = node.absolute_position(0.0, 0.0).y;
+            let own_bottom = own_top + root_layout.size.height;
+            let (box_top, box_bottom) = if math && own_bottom > own_top && own_bottom < bottom {
+                (own_top.max(top), own_bottom.max(top))
+            } else {
+                (top, bottom)
+            };
             out.push(LineBox {
                 node_id: node.id,
                 text_start: text_range.start,
@@ -4720,6 +4835,11 @@ fn collect_lines_inner(node: &Node, out: &mut Vec<LineBox>) {
                 top,
                 visual_top,
                 bottom,
+                box_top,
+                box_bottom,
+                math,
+                math_root,
+                sort_top: top,
             });
         }
     }
@@ -6779,14 +6899,24 @@ fn snapshot_page_boxes(
         if bottom <= top {
             continue;
         }
+        // Prose selections cover the line; a formula token only its glyph.
+        let box_top = line.box_top.max(top).max(lower);
+        let box_bottom = line.box_bottom.min(bottom).min(upper);
+        let (box_top, box_bottom) = if box_bottom > box_top {
+            (box_top, box_bottom)
+        } else {
+            (top, bottom)
+        };
 
         boxes.push(SnapshotLine {
             text,
             x: line.left,
-            y: top - start.top,
+            y: box_top - start.top,
             width: (line.right - line.left).max(0.0),
-            height: bottom - top,
+            height: box_bottom - box_top,
             global_line: line_base + local_line,
+            line_top: line.sort_top,
+            math: line.math,
         });
     }
     boxes
