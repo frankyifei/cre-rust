@@ -34,6 +34,10 @@ pub const CSS: &str = r#"
 .cre-mo-invisible { margin: 0; }
 .cre-mo-large { font-size: 1.35em; line-height: 1; vertical-align: middle; margin: 0 0.08em; }
 .cre-fence { margin: 0; display: inline-block; line-height: 1; vertical-align: middle; transform-origin: center; }
+/* A delimited group is one inline-block: the line breaker moves `( ... )` to
+   the next line as a unit instead of leaving the opening fence at the end of
+   the previous line with its content below. */
+.cre-fence-group { display: inline-block; vertical-align: baseline; white-space: nowrap; }
 .cre-script { white-space: nowrap; }
 .cre-sup, .cre-sub { display: inline-block; font-size: 0.7em; line-height: 1; }
 .cre-sup { vertical-align: 0.55em; }
@@ -516,6 +520,9 @@ fn render_row(node: Node<'_, '_>, ctx: Ctx) -> String {
     // marker, so the layout pass can measure that content and replace the
     // estimated height with the real one (see `fence_style_for_height`).
     let mut bodies: Vec<(usize, usize)> = Vec::new();
+    // The same range also names the atomic group `( open fence, content,
+    // close fence )` that the line breaker must not split.
+    let mut groups: Vec<(usize, usize)> = Vec::new();
     for (index, child) in children.iter().enumerate() {
         if !child.is_element() || !child.tag_name().name().eq_ignore_ascii_case("mo") {
             continue;
@@ -525,15 +532,34 @@ fn render_row(node: Node<'_, '_>, ctx: Ctx) -> String {
         }
         if let Some(range) = fence_covered(&children, index) {
             bodies.push(range);
+            let (start, end) = range;
+            if end < children.len() {
+                let open = start.saturating_sub(1);
+                if !groups.contains(&(open, end)) {
+                    groups.push((open, end));
+                }
+            }
         }
     }
     let mut out = String::from("<span class=\"cre-mrow\">");
     let mut opened: Vec<usize> = Vec::new();
+    let mut open_groups: Vec<usize> = Vec::new();
     let mut operator_context = true;
     for (index, child) in children.iter().enumerate() {
         while opened.last() == Some(&index) {
             out.push_str("</span>");
             opened.pop();
+        }
+        // A group opens in front of its fence, outer ranges first.
+        let mut group_starts: Vec<(usize, usize)> = groups
+            .iter()
+            .copied()
+            .filter(|(open, _)| *open == index)
+            .collect();
+        group_starts.sort_by_key(|(_, end)| std::cmp::Reverse(*end));
+        for (_, end) in group_starts {
+            out.push_str("<span class=\"cre-fence-group\">");
+            open_groups.push(end);
         }
         let mut starting: Vec<(usize, usize)> = bodies
             .iter()
@@ -569,8 +595,16 @@ fn render_row(node: Node<'_, '_>, ctx: Ctx) -> String {
             out.push_str(&render_node(*child, ctx));
             operator_context = false;
         }
+        // The group closes after its closing fence, which is this child.
+        while open_groups.last() == Some(&index) {
+            out.push_str("</span>");
+            open_groups.pop();
+        }
     }
     while opened.pop().is_some() {
+        out.push_str("</span>");
+    }
+    while open_groups.pop().is_some() {
         out.push_str("</span>");
     }
     out.push_str("</span>");
