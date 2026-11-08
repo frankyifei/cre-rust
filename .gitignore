@@ -5,3 +5,6 @@
 /.loopx/
 /tools/qemu-kindle/__pycache__/
 *.pgm
+# KOReader keeps reading position, bookmarks and per-book settings in a
+# `<book>.sdr/` directory next to the book; opening a fixture creates one.
+*.sdr/
