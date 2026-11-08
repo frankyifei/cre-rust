@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds the cre-lua crate as the LuaJIT loadable module for Kindle PW2
-# (ARMv7 Cortex-A9, softfp EABI, glibc 2.12) using the NiLuJe crosstool-NG
-# toolchain in ~/x-tools (override with X_TOOLS).
+# (ARMv7 Cortex-A9 + NEON, softfp EABI, glibc 2.12) using the NiLuJe
+# crosstool-NG toolchain in ~/x-tools (override with X_TOOLS).
 #
 # Target choice: armv7-unknown-linux-gnueabi (soft-float ABI) because the
 # toolchain is configured with -mfloat-abi=softfp, matching the device's
@@ -57,19 +57,21 @@ export CROSS_COMPILE="${TOOL_PREFIX}-"
 export LINUX=1
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target-${TOOL_PREFIX}}"
 
-# VFP vs soft-float:
+# VFP/NEON vs soft-float:
 #   The default rustc target is "+soft-float": every float op is a libgcc
-#   call. Removing that feature (with +vfp3) keeps the softfp ABI but emits
-#   VFP instructions - much faster. The softfp ABI only guarantees 8-byte
-#   alignment at public interfaces, and VFP loads fault on unaligned data,
-#   so plain VFP crashed on real hardware (SIGBUS). +strict-align makes the
-#   compiler align every VFP access, which keeps the speed and fixes the
-#   fault (validated under qemu's strict default CPU, which reproduced it).
+#   call. Removing that feature (with +vfp3,+neon) keeps the softfp ABI but
+#   emits VFP/NEON instructions - much faster, and it is what the device
+#   module is built with. The softfp ABI only guarantees 8-byte alignment at
+#   public interfaces, and VFP loads fault on unaligned data, so plain VFP
+#   crashed on real hardware (SIGBUS). +strict-align makes the compiler align
+#   every VFP access, which keeps the speed and fixes the fault (validated
+#   under qemu's strict default CPU, which reproduced it).
 #   Set CRE_NO_VFP=1 for the safe all-software-float build.
 if [ "${CRE_NO_VFP:-0}" = "1" ]; then
     echo "== building software-float variant (CRE_NO_VFP=1)"
 else
-    export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=cortex-a9 -C target-feature=+vfp3,-soft-float,+strict-align"
+    echo "== building VFP+NEON variant"
+    export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=cortex-a9 -C target-feature=+vfp3,+neon,-soft-float,+strict-align"
 fi
 
 # LTO + one codegen unit: the module is ~21 MB without it, which costs RSS
