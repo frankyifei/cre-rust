@@ -224,7 +224,8 @@ impl Doc {
                 "{text_elements} {{ line-height: {line_height:.3} !important; }}"
             ));
         }
-        if let Some(weight) = self.int_property("font.face.base.weight")
+        if let Some(weight) = self
+            .int_property("font.face.base.weight")
             .or_else(|| self.int_property("font.face.weight.embolden"))
             && (1..=1000).contains(&weight)
             && weight != 400
@@ -283,6 +284,10 @@ impl Doc {
         // Only the properties the layout actually reads may invalidate it.
         // Hashing the whole map meant a contrast, highlight-colour or battery
         // change re-parsed and re-paginated the book for nothing.
+        //
+        // Anything that becomes CSS is covered by `properties_css()` below, so
+        // a new typography property is picked up there without a second list to
+        // keep in sync.
         const LAYOUT_PROPERTIES: &[&str] = &[
             "crengine.font.fallback.faces",
             "crengine.font.family.faces",
@@ -290,6 +295,7 @@ impl Doc {
             "font.face.weight.embolden",
             "window.pages.two.visible.as.one.page.number",
         ];
+        let settings_css = self.properties_css();
         let properties = LAYOUT_PROPERTIES
             .iter()
             .filter_map(|key| {
@@ -304,7 +310,7 @@ impl Doc {
         // invalidate the layout: rebuilding the whole book for it was a
         // multi-second freeze that changed nothing on the page.
         format!(
-            "{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
+            "{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
             path,
             self.width,
             self.height,
@@ -323,6 +329,7 @@ impl Doc {
             self.scale_font_with_dpi,
             properties,
             alt_properties,
+            settings_css,
         )
     }
 
@@ -5282,7 +5289,11 @@ mod tests {
     #[test]
     fn typography_sliders_become_css() {
         let mut doc = reader_doc();
-        assert!(!doc.properties_css().iter().any(|rule| rule.contains("word-spacing")));
+        assert!(
+            !doc.properties_css()
+                .iter()
+                .any(|rule| rule.contains("word-spacing"))
+        );
 
         // Word Spacing: 150% of the normal space width, approximated as 0.5 of
         // the typical 0.25em space.
@@ -5320,5 +5331,18 @@ mod tests {
         // Same value twice is not a change.
         assert!(doc.apply_int_property("font.size", 20));
         assert!(!doc.apply_int_property("font.size", 20));
+    }
+
+    #[test]
+    fn typography_change_invalidates_the_layout() {
+        let mut doc = reader_doc();
+        let book = std::path::PathBuf::from("book.epub");
+        let before = doc.render_state_snapshot(book.clone());
+        assert!(doc.apply_int_property("crengine.style.max.added.letter.spacing.percent", 5));
+        let after = doc.render_state_snapshot(book);
+        assert_ne!(
+            before, after,
+            "a typography property must change the render state, or the reader skips the relayout"
+        );
     }
 }
