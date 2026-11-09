@@ -184,6 +184,40 @@ fn query_string_source_is_painted() {
     assert_image_visible("query", "../Images/query.jpg?cache=1", "query.jpg");
 }
 
+/// A page that is nothing but one picture is turned into a fixed-layout page
+/// by the EPUB normaliser. The colour path needs the picture there too: the
+/// on-screen reader uses colour rendering, and a missing collection step made
+/// those pages blank while the grayscale path looked fine.
+#[test]
+fn fixed_page_picture_is_painted_on_the_colour_path() {
+    let dir = std::env::temp_dir().join("cre-image-placeholder");
+    let body = "<div><img src=\"../Images/plate.jpg\" alt=\"\"/></div>";
+    let jpeg = black_jpeg(1200, 1600);
+    let path = write_epub(&dir, "fixed-plate.epub", body, &[("plate.jpg", &jpeg)]);
+
+    let mut document = Document::with_options(&path, &options()).expect("open book");
+    let (bitmap, image_count, image_surface) = document
+        .render_page_color_with_stats(1)
+        .expect("render colour page");
+    let dark = bitmap
+        .data
+        .chunks(4)
+        .filter(|pixel| pixel.len() == 4 && pixel[0] < 128 && pixel[1] < 128 && pixel[2] < 128)
+        .count();
+    assert!(
+        dark >= IMAGE_INK,
+        "the colour path must paint a fixed-page picture, dark={dark}"
+    );
+    assert!(
+        image_count >= 1,
+        "the picture must be counted: {image_count}"
+    );
+    assert!(
+        image_surface > 0,
+        "the picture must cover part of the page: {image_surface}"
+    );
+}
+
 #[test]
 fn corrupt_image_does_not_blank_the_page() {
     let dir = std::env::temp_dir().join("cre-image-placeholder");

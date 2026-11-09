@@ -3026,7 +3026,11 @@ impl Document {
                     self.font_gamma,
                     &placed,
                 );
-                (image_arc, paint_count, paint_surface)
+                (
+                    image_arc,
+                    paint_count + placed.len(),
+                    paint_surface + placed_image_area(&placed, self.width, self.height),
+                )
             } else {
                 let record_started = std::time::Instant::now();
                 active.doc.set_viewport_scroll(Point {
@@ -3083,13 +3087,16 @@ impl Document {
                     &placed,
                     &mut self.paint_cache.borrow_mut(),
                 );
+                let image_count = paint_count + placed.len();
+                let image_surface =
+                    paint_surface + placed_image_area(&placed, self.width, self.height);
                 if std::env::var_os("CRE_RENDER_PROFILE").is_some() {
                     eprintln!(
                         "render profile page {page}: paint={:.2}ms",
                         paint_started.elapsed().as_secs_f64() * 1000.0
                     );
                 }
-                (image_arc, paint_count, paint_surface)
+                (image_arc, image_count, image_surface)
             }
         };
         let image = PageImage {
@@ -3147,6 +3154,21 @@ impl Document {
                 (offset_x * viewport_scale).round().max(0.0) as u32,
                 (offset_y * viewport_scale).round().max(0.0) as u32,
             );
+            {
+                let root = active.doc.root_element();
+                collect_placed_images(
+                    &active.doc,
+                    root,
+                    f32::MAX,
+                    viewport_scale * fit,
+                    offset_x * viewport_scale,
+                    offset_y * viewport_scale,
+                    &self.images,
+                    &self.resources,
+                    &self.base_url,
+                    &mut placed,
+                );
+            }
             let (left, top, right, bottom) = self.fixed_page_rect(fixed);
             (left, right, top, bottom)
         } else {
@@ -3198,7 +3220,11 @@ impl Document {
             self.font_gamma,
             &placed,
         );
-        Ok((bitmap, image_count, image_surface))
+        Ok((
+            bitmap,
+            image_count + placed.len(),
+            image_surface + placed_image_area(&placed, self.width, self.height),
+        ))
     }
 
     pub fn render_current_page_color_with_stats(
@@ -5967,6 +5993,25 @@ fn find_image_data_at(
         }
     }
     None
+}
+
+/// Visible device-pixel area of the images the renderer paints itself.
+///
+/// `paint_page` reports how much of the page an image covers, and KOReader uses
+/// that to dither image pages and to request a full refresh. A placeholder is
+/// not in the scene, so its area has to be added back.
+fn placed_image_area(images: &[cre_paint::PlacedImage], width: u32, height: u32) -> usize {
+    let mut area = 0.0f64;
+    for image in images {
+        let left = f64::from(image.x).max(0.0);
+        let top = f64::from(image.y).max(0.0);
+        let right = (f64::from(image.x) + f64::from(image.width)).min(f64::from(width));
+        let bottom = (f64::from(image.y) + f64::from(image.height)).min(f64::from(height));
+        if right > left && bottom > top {
+            area += (right - left) * (bottom - top);
+        }
+    }
+    area.ceil() as usize
 }
 
 /// Collects the images a page carries only as a size placeholder, with the
