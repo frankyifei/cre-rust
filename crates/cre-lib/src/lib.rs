@@ -792,6 +792,46 @@ struct PageMeta {
     page_flow: i64,
 }
 
+/// Byte counts for what [`Document`] keeps resident between page renders.
+///
+/// Diagnostics only: `perf_probe` prints it so memory work can be measured
+/// instead of guessed. It does not include the active chunk's Blitz DOM and
+/// Parley layout, which the process RSS shows but this cannot enumerate.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryBreakdown {
+    /// Generated chunk HTML kept for relayouts.
+    pub source_bytes: usize,
+    /// Capacity of the same strings (what the allocator actually holds).
+    pub source_capacity: usize,
+    pub chunk_count: usize,
+    pub laid_out_chunks: usize,
+    pub page_count: usize,
+    /// Page metadata (start, clip, flow) of the laid-out chunks.
+    pub page_meta_bytes: usize,
+    /// One entry per laid-out line, used for page lookup.
+    pub line_entries: usize,
+    /// Page-start XPointers, the bulk of the page index strings.
+    pub xpointer_bytes: usize,
+    pub anchor_entries: usize,
+    pub glyph_cache_bytes: usize,
+    pub page_bitmap_bytes: usize,
+    /// Line boxes of the chunk currently activated (freed on chunk change).
+    pub active_line_boxes: usize,
+    pub active_text_nodes: usize,
+    /// Font files (mmapped; RSS counts only the pages touched).
+    pub font_bytes: usize,
+    /// Decompressed resources kept in the provider's LRU (images read to learn
+    /// their size, CSS, spine documents).
+    pub resource_cache_bytes: usize,
+    /// Engine-generated resources pinned for the session (rewritten spine
+    /// documents and image-only page wrappers).
+    pub pinned_bytes: usize,
+    /// Page-sized PNGs of SVG resources.
+    pub svg_cache_bytes: usize,
+    /// The text the page map was built from.
+    pub page_map_source_bytes: usize,
+}
+
 /// One chunk's layout, in the chunk's own coordinates.
 ///
 /// Keeping this per chunk (instead of only the flattened page list) is what
@@ -1123,6 +1163,7 @@ impl Document {
                     html_options.margin_x,
                     html_options.margin_y,
                 );
+                svg_raster.set_page_fit_images(std::mem::take(&mut book.page_fit_images));
                 let (text_budget, image_budget, layout_budget) =
                     chunk_budgets(available_memory_bytes());
                 let htmls = book.to_html_chunks_budgeted(
@@ -1431,7 +1472,7 @@ impl Document {
 
     #[allow(clippy::too_many_arguments)]
     fn build(
-        htmls: Vec<String>,
+        mut htmls: Vec<String>,
         base_url: &str,
         net: Arc<dyn NetProvider>,
         resources: ResourceSource,
@@ -1448,6 +1489,12 @@ impl Document {
         source_bytes: u64,
         chunk_image_bytes: u64,
     ) -> Result<Self> {
+        // Chunk HTML is built by appending, so a chunk string usually ends up
+        // with twice the capacity it needs. A large text book keeps all of it
+        // for relayouts, which made the whole book's HTML cost twice its size.
+        for html in &mut htmls {
+            html.shrink_to_fit();
+        }
         // A book that cannot fit is refused here, before the layout allocates
         // several copies of it; `cre-lua` turns the error into a page that
         // explains the shortfall instead of letting the reader be killed.
@@ -2512,6 +2559,61 @@ impl Document {
 
     pub fn page_count(&self) -> usize {
         self.pages.len().max(1)
+    }
+
+    /// What the document keeps resident, for diagnostics (`perf_probe`).
+    ///
+    /// The active chunk's DOM/layout is not counted here: it belongs to Blitz
+    /// and Parley, and is measured from the process RSS instead.
+    pub fn memory_breakdown(&self) -> MemoryBreakdown {
+        let mut breakdown = MemoryBreakdown {
+            chunk_count: self.sources.len(),
+            page_count: self.pages.len(),
+            font_bytes: self
+                .font_blobs
+                .iter()
+                .map(|blob| blob.as_ref().as_ref().len())
+                .sum(),
+            glyph_cache_bytes: self.paint_cache.borrow().cached_bytes(),
+            ..MemoryBreakdown::default()
+        };
+        for source in &self.sources {
+            breakdown.source_bytes += source.len();
+            breakdown.source_capacity += source.capacity();
+        }
+        for entry in &self.entries {
+            let Some(layout) = entry.layout.as_ref() else {
+                continue;
+            };
+            breakdown.laid_out_chunks += 1;
+            breakdown.line_entries += layout.lines.len();
+            breakdown.anchor_entries += layout.href_pages.len();
+            breakdown.page_meta_bytes += layout.pages.len() * std::mem::size_of::<LocalPage>();
+            for xpointer in &layout.xpointers {
+                breakdown.xpointer_bytes += xpointer.as_ref().map(String::len).unwrap_or(0);
+            }
+        }
+        for image in self.page_image_cache.borrow().values() {
+            breakdown.page_bitmap_bytes +=
+                image.bitmap.width as usize * image.bitmap.height as usize;
+        }
+        breakdown.svg_cache_bytes = self.images.cached_bytes();
+        breakdown.page_map_source_bytes = self.page_map_source.len();
+        match &self.resources {
+            ResourceSource::Epub(provider) => {
+                breakdown.resource_cache_bytes = provider.cache_stats().1;
+                breakdown.pinned_bytes = provider.pinned_bytes();
+            }
+            ResourceSource::Map(map) => {
+                breakdown.resource_cache_bytes = map.values().map(Vec::len).sum();
+            }
+            ResourceSource::Empty => {}
+        }
+        if let Some(active) = self.active.borrow().as_ref() {
+            breakdown.active_line_boxes = active.lines.len();
+            breakdown.active_text_nodes = active.rendered_text_nodes.len();
+        }
+        breakdown
     }
 
     pub fn page_width(&self) -> u32 {
@@ -5808,10 +5910,30 @@ fn collect_placed_images(
         };
         let (key, _) = href_key(&resolved);
         let key = key.strip_prefix("binary/").unwrap_or(&key);
-        if let Some((intrinsic_width, intrinsic_height)) = images.placeheld_size(key)
-            && let Some(bytes) = lookup_resource(resources, key)
-        {
-            let bytes = Arc::new(bytes);
+        // A plain oversized image is a size placeholder (painted with `fill`);
+        // a generated page-fit wrapper is a transparent page-sized SVG whose
+        // real picture is painted inside it with `contain`.
+        let placed = images
+            .placeheld_size(key)
+            .and_then(|(width, height)| {
+                lookup_resource(resources, key)
+                    .map(|bytes| (Arc::new(bytes), width, height, cre_paint::ImageFit::Fill))
+            })
+            .or_else(|| {
+                let fit = images.page_fit_image(key)?;
+                let bytes = lookup_resource(resources, &fit.source)?;
+                Some((
+                    Arc::new(bytes),
+                    fit.width,
+                    fit.height,
+                    if fit.contain {
+                        cre_paint::ImageFit::Contain
+                    } else {
+                        cre_paint::ImageFit::Fill
+                    },
+                ))
+            });
+        if let Some((bytes, intrinsic_width, intrinsic_height, fit)) = placed {
             for rect in doc.node_client_rects(node.id) {
                 let top = rect.y as f32;
                 let bottom = top + rect.height as f32;
@@ -5825,7 +5947,7 @@ fn collect_placed_images(
                     height: rect.height as f32 * scale,
                     intrinsic_width,
                     intrinsic_height,
-                    fit: cre_paint::ImageFit::Fill,
+                    fit,
                     bytes: bytes.clone(),
                 });
             }
@@ -7970,6 +8092,8 @@ struct ImageRaster {
     placeheld: std::sync::Mutex<HashMap<String, (u32, u32)>>,
     /// Transparent SVG of a given intrinsic size, used as a layout placeholder.
     placeholders: std::sync::Mutex<PlaceholderCache>,
+    /// Generated page-fit wrappers and the original image each stands for.
+    page_fit: std::sync::Mutex<HashMap<String, cre_epub::PageFitImage>>,
 }
 
 #[derive(Default)]
@@ -7992,6 +8116,7 @@ impl ImageRaster {
             content: std::sync::Mutex::new(std::collections::HashSet::new()),
             placeheld: std::sync::Mutex::new(HashMap::new()),
             placeholders: std::sync::Mutex::new(HashMap::new()),
+            page_fit: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -8001,6 +8126,23 @@ impl ImageRaster {
             content.clear();
             content.extend(keys);
         }
+    }
+
+    /// Bytes held by the page-sized SVG raster cache.
+    fn cached_bytes(&self) -> usize {
+        self.cache.lock().map(|cache| cache.bytes).unwrap_or(0)
+    }
+
+    /// Records the transparent page-fit wrappers generated at open.
+    fn set_page_fit_images(&self, images: HashMap<String, cre_epub::PageFitImage>) {
+        if let Ok(mut page_fit) = self.page_fit.lock() {
+            page_fit.extend(images);
+        }
+    }
+
+    /// The original image a page-fit wrapper paints, with its real size.
+    fn page_fit_image(&self, key: &str) -> Option<cre_epub::PageFitImage> {
+        self.page_fit.lock().ok()?.get(key).cloned()
     }
 
     /// The intrinsic size recorded when `key` was replaced by a placeholder.
@@ -8061,6 +8203,11 @@ impl ImageRaster {
     }
 
     fn rasterize(&self, key: &str, bytes: &[u8]) -> Option<Vec<u8>> {
+        // A page-fit wrapper is already a transparent vector of the page's
+        // size; rasterizing it would just cache a blank page.
+        if key.starts_with("cre-page-fit-") {
+            return None;
+        }
         if !looks_like_svg(bytes) {
             return None;
         }

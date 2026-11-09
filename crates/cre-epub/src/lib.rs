@@ -343,6 +343,26 @@ pub struct EpubBook {
     pub page_map: Vec<PageMapItem>,
     pub resource_provider: LazyResource,
     pub global_layout: SpineLayout,
+    /// Generated page-fit wrappers and the original image each stands for.
+    pub page_fit_images: HashMap<String, PageFitImage>,
+}
+
+/// A generated page-fit wrapper: a transparent SVG with the page's size whose
+/// pixels are painted from `source` by the renderer.
+///
+/// The wrapper used to inline the whole image as a base64 data URI, which kept
+/// a second copy of every picture-only page's payload in memory (12.epub:
+/// 10 MB). The layout only needs the wrapper's size, and painting goes through
+/// the same placeholder path as any other image.
+#[derive(Clone, Debug)]
+pub struct PageFitImage {
+    /// Original image resource, painted at draw time.
+    pub source: String,
+    pub width: u32,
+    pub height: u32,
+    /// False when the header could not be read: the picture then fills the
+    /// page box instead of being contained.
+    pub contain: bool,
 }
 
 impl EpubBook {
@@ -477,6 +497,7 @@ impl EpubBook {
             page_map,
             resource_provider: provider,
             global_layout,
+            page_fit_images: HashMap::new(),
         })
     }
 
@@ -566,15 +587,18 @@ impl EpubBook {
             // Pages with text keep the "never enlarge" behaviour of `max-width`.
             let image_only = document_is_single_image(&text);
             let mut generated = HashMap::new();
+            let mut page_fit = HashMap::new();
             let normalized = rewrite_full_page_image_tags(
                 &text,
                 parent_dir(&doc_key),
                 &self.resource_provider,
                 &mut generated,
+                &mut page_fit,
                 &mut generated_counter,
                 (available_width, available_height),
                 image_only,
             );
+            self.page_fit_images.extend(page_fit);
             if !generated.is_empty() || normalized != text {
                 updates.push((doc_key, normalized, generated));
             }
@@ -2917,11 +2941,13 @@ fn has_meaningful_text(text: &str) -> bool {
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rewrite_full_page_image_tags(
     html: &str,
     doc_dir: &str,
     provider: &LazyResource,
     generated: &mut HashMap<String, Arc<Vec<u8>>>,
+    page_fit: &mut HashMap<String, PageFitImage>,
     generated_counter: &mut usize,
     available: (f32, f32),
     image_only: bool,
@@ -2942,6 +2968,7 @@ fn rewrite_full_page_image_tags(
             doc_dir,
             provider,
             generated,
+            page_fit,
             generated_counter,
             available,
             image_only,
@@ -2957,11 +2984,13 @@ fn rewrite_full_page_image_tags(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn full_page_image_replacement(
     tag: &str,
     doc_dir: &str,
     provider: &LazyResource,
     generated: &mut HashMap<String, Arc<Vec<u8>>>,
+    page_fit: &mut HashMap<String, PageFitImage>,
     generated_counter: &mut usize,
     available: (f32, f32),
     image_only: bool,
@@ -3013,11 +3042,26 @@ fn full_page_image_replacement(
     if image_mime == "image/svg+xml" {
         return None;
     }
+    // The wrapper's size is the page's; the picture is contained in it when
+    // its own size is known (the normal case) and fills it otherwise.
+    let dimensions = image_dimensions(&image_bytes);
+    let (width, height) = dimensions.unwrap_or((
+        available_width.round().max(1.0) as u32,
+        available_height.round().max(1.0) as u32,
+    ));
     *generated_counter += 1;
     let generated_key = generated_full_page_image_key(*generated_counter);
-    let svg =
-        full_page_image_svg_document(available_width, available_height, image_mime, &image_bytes);
+    let svg = full_page_image_svg_document(available_width, available_height);
     generated.insert(generated_key.clone(), Arc::new(svg.into_bytes()));
+    page_fit.insert(
+        generated_key.clone(),
+        PageFitImage {
+            source: image_key.clone(),
+            width,
+            height,
+            contain: dimensions.is_some(),
+        },
+    );
 
     Some(full_page_image_tag(&generated_key, &attrs))
 }
@@ -3054,14 +3098,14 @@ fn generated_full_page_image_key(counter: usize) -> String {
     format!("cre-page-fit-{counter}.svg")
 }
 
-fn full_page_image_svg_document(width: f32, height: f32, mime: &str, image_bytes: &[u8]) -> String {
-    let encoded = base64_encode(image_bytes);
-    // Always `meet`: the image is scaled up to the page but the whole picture
-    // stays visible. `slice` looked "fuller" but cut the top/bottom off the
-    // cover of 3.epub / jk.epub.
-    let fit = "meet";
+/// A transparent SVG of the page's size standing in for an inlined picture.
+///
+/// The renderer paints the original image into this box with `contain`, the
+/// same fit the old `preserveAspectRatio="xMidYMid meet"` wrapper used, so the
+/// page looks identical without a base64 copy of the image in memory.
+fn full_page_image_svg_document(width: f32, height: f32) -> String {
     format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"{width:.0}\" height=\"{height:.0}\" viewBox=\"0 0 {width:.0} {height:.0}\"><image x=\"0\" y=\"0\" width=\"{width:.0}\" height=\"{height:.0}\" preserveAspectRatio=\"xMidYMid {fit}\" xlink:href=\"data:{mime};base64,{encoded}\" /></svg>"
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width:.0}\" height=\"{height:.0}\" viewBox=\"0 0 {width:.0} {height:.0}\"></svg>"
     )
 }
 
@@ -4032,8 +4076,19 @@ mod tests {
         let generated_key = "cre-page-fit-1.svg";
         let generated_svg = String::from_utf8(book.resource(generated_key).unwrap()).unwrap();
         assert!(generated_svg.contains("viewBox=\"0 0 520 736\""));
-        assert!(generated_svg.contains("preserveAspectRatio=\"xMidYMid meet\""));
-        assert!(generated_svg.contains("xlink:href=\"data:image/jpeg;base64,"));
+        assert!(
+            !generated_svg.contains("data:image"),
+            "the wrapper must not inline the picture: {generated_svg}"
+        );
+        let fit = book
+            .page_fit_images
+            .get(generated_key)
+            .expect("wrapper must map to the original image");
+        assert!(fit.source.ends_with("images/one.jpg"), "{:?}", fit.source);
+        // The fixture image has no readable header, so it falls back to
+        // filling the page box; real pictures keep their aspect ratio.
+        assert!(!fit.contain);
+        assert_eq!((fit.width, fit.height), (520, 736));
 
         let html = book.to_html(&HtmlOptions::default()).unwrap();
         assert!(html.contains(&format!("epub://book/{generated_key}")));

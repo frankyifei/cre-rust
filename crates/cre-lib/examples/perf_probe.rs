@@ -114,4 +114,29 @@ fn main() {
         },
         peak_kb()
     );
+    let memory = doc.memory_breakdown();
+    println!(
+        "memory source_kb={} source_capacity_kb={} chunks={} laid_out={} pages={} \
+         page_meta_kb={} line_entries={} xpointer_kb={} anchors={} glyphs_kb={} \
+         bitmaps_kb={} active_lines={} active_nodes={} fonts_kb={} \
+         res_cache_kb={} pinned_kb={} svg_cache_kb={} page_map_source_kb={}",
+        memory.source_bytes / 1024,
+        memory.source_capacity / 1024,
+        memory.chunk_count,
+        memory.laid_out_chunks,
+        memory.page_count,
+        memory.page_meta_bytes / 1024,
+        memory.line_entries,
+        memory.xpointer_bytes / 1024,
+        memory.anchor_entries,
+        memory.glyph_cache_bytes / 1024,
+        memory.page_bitmap_bytes / 1024,
+        memory.active_line_boxes,
+        memory.active_text_nodes,
+        memory.font_bytes / 1024,
+        memory.resource_cache_bytes / 1024,
+        memory.pinned_bytes / 1024,
+        memory.svg_cache_bytes / 1024,
+        memory.page_map_source_bytes / 1024,
+    );
 }
