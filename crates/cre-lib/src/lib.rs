@@ -570,7 +570,7 @@ impl TrimGuard {
 /// Shared state of the parallel layout pass, so every worker runs the same
 /// pull loop and the opening chunk can be laid out by the main thread.
 struct ChunkLayoutWork<'a> {
-    sources: &'a [String],
+    sources: &'a [ChunkSource],
     base_url: &'a str,
     net: Arc<dyn NetProvider>,
     font_context: Arc<FontContext>,
@@ -594,7 +594,7 @@ impl ChunkLayoutWork<'_> {
         index: usize,
     ) -> Result<(ChunkLayout, HtmlDocument, Vec<LineBox>, Vec<PageStart>)> {
         layout_chunk_html(
-            &self.sources[index],
+            &self.sources[index].text(),
             index,
             self.base_url,
             self.net.clone(),
@@ -799,10 +799,10 @@ struct PageMeta {
 /// Parley layout, which the process RSS shows but this cannot enumerate.
 #[derive(Debug, Clone, Default)]
 pub struct MemoryBreakdown {
-    /// Generated chunk HTML kept for relayouts.
+    /// Generated chunk HTML kept for relayouts (uncompressed size).
     pub source_bytes: usize,
-    /// Capacity of the same strings (what the allocator actually holds).
-    pub source_capacity: usize,
+    /// What the compressed chunk HTML actually holds.
+    pub compressed_source_bytes: usize,
     pub chunk_count: usize,
     pub laid_out_chunks: usize,
     pub page_count: usize,
@@ -847,6 +847,48 @@ struct LineEntry {
     /// Byte offset of the line's first character in the block's layout text.
     offset: u32,
     page: usize,
+}
+
+/// One chunk's generated HTML, kept compressed.
+///
+/// A large text book keeps the generated HTML of every chunk so a settings
+/// change can re-lay the book out without re-reading and re-splitting it. That
+/// copy is about the size of the book's text, which is tens of megabytes for a
+/// big novel, so each chunk is stored as an LZ4 block and decompressed only
+/// when that chunk is laid out (including a TOC jump straight to it). The
+/// compressor is fast enough that a layout does not notice it.
+struct ChunkSource {
+    compressed: Vec<u8>,
+    /// Uncompressed length, which the layout uses for its estimates.
+    text_len: usize,
+    /// `<img`/`<image` occurrences, used to pick the probe chunk.
+    images: usize,
+}
+
+impl ChunkSource {
+    fn new(html: String) -> Self {
+        let images = html
+            .match_indices("<img")
+            .count()
+            .saturating_add(html.match_indices("<image").count());
+        let text_len = html.len();
+        let mut compressed = lz4_flex::compress_prepend_size(html.as_bytes());
+        compressed.shrink_to_fit();
+        Self {
+            compressed,
+            text_len,
+            images,
+        }
+    }
+
+    fn text(&self) -> String {
+        match lz4_flex::decompress_size_prepended(&self.compressed) {
+            Ok(bytes) => String::from_utf8(bytes).unwrap_or_default(),
+            // The block was produced by `new` above; an error here would be a
+            // bug, and an empty chunk is the only safe thing to hand the parser.
+            Err(_) => String::new(),
+        }
+    }
 }
 
 struct ChunkLayout {
@@ -997,7 +1039,7 @@ pub struct Document {
     /// path list alone does not say whether the context is stale.
     font_blobs: Vec<FontBlob>,
     embedded_styles_enabled: bool,
-    sources: Vec<String>,
+    sources: Vec<ChunkSource>,
     /// Pre-paginated chunks and their own CSS viewport, parallel to `sources`.
     fixed_layouts: Vec<Option<FixedLayout>>,
     base_url: String,
@@ -1472,7 +1514,7 @@ impl Document {
 
     #[allow(clippy::too_many_arguments)]
     fn build(
-        mut htmls: Vec<String>,
+        htmls: Vec<String>,
         base_url: &str,
         net: Arc<dyn NetProvider>,
         resources: ResourceSource,
@@ -1489,12 +1531,6 @@ impl Document {
         source_bytes: u64,
         chunk_image_bytes: u64,
     ) -> Result<Self> {
-        // Chunk HTML is built by appending, so a chunk string usually ends up
-        // with twice the capacity it needs. A large text book keeps all of it
-        // for relayouts, which made the whole book's HTML cost twice its size.
-        for html in &mut htmls {
-            html.shrink_to_fit();
-        }
         // A book that cannot fit is refused here, before the layout allocates
         // several copies of it; `cre-lua` turns the error into a page that
         // explains the shortfall instead of letting the reader be killed.
@@ -1539,7 +1575,7 @@ impl Document {
             font_blobs: font_datas.to_vec(),
             viewport_scale: options.viewport_scale,
             font_gamma: 1.0,
-            sources: htmls,
+            sources: htmls.into_iter().map(ChunkSource::new).collect(),
             fixed_layouts,
             base_url: base_url.to_string(),
             resources,
@@ -1740,14 +1776,15 @@ impl Document {
         let html = self
             .sources
             .get(chunk_index)
-            .context("document chunk is missing")?;
+            .context("document chunk is missing")?
+            .text();
         let fixed_height = self
             .fixed_layouts
             .get(chunk_index)
             .and_then(|fixed| *fixed)
             .map(|fixed| self.fixed_size(fixed).1);
         layout_chunk_html(
-            html,
+            &html,
             chunk_index,
             &self.base_url,
             self.net.clone(),
@@ -2396,12 +2433,8 @@ impl Document {
         // next to it would add a whole chunk's layout to the peak for nothing.
         let probe_index = (1..count)
             .max_by_key(|&index| {
-                let html = &self.sources[index];
-                let images = html
-                    .match_indices("<img")
-                    .count()
-                    .saturating_add(html.match_indices("<image").count());
-                (images, html.len())
+                let source = &self.sources[index];
+                (source.images, source.text_len)
             })
             .unwrap_or(0);
         let rss_before = resident_bytes();
@@ -2427,7 +2460,11 @@ impl Document {
         trim_memory();
         let workers = layout_worker_count(
             count.saturating_sub(2),
-            self.sources.iter().map(String::len).max().unwrap_or(0),
+            self.sources
+                .iter()
+                .map(|source| source.text_len)
+                .max()
+                .unwrap_or(0),
             rss_before,
             rss_after,
         );
@@ -2582,8 +2619,8 @@ impl Document {
             ..MemoryBreakdown::default()
         };
         for source in &self.sources {
-            breakdown.source_bytes += source.len();
-            breakdown.source_capacity += source.capacity();
+            breakdown.source_bytes += source.text_len;
+            breakdown.compressed_source_bytes += source.compressed.len();
         }
         for entry in &self.entries {
             let Some(layout) = entry.layout.as_ref() else {
@@ -3209,7 +3246,7 @@ impl Document {
             .sources
             .get(index)
             .context("document chunk is missing")?;
-        let html = stored.clone();
+        let html = stored.text();
         // Free the current chunk before building the next one: both being
         // resident at once doubles the layout peak, which matters on a device
         // where a single layout is already tens of megabytes. The cached page

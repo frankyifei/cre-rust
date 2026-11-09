@@ -9,6 +9,9 @@ rust-version.workspace = true
 vello-cpu = ["cre-paint/vello-cpu"]
 
 [dependencies]
+# Chunk HTML is kept for relayouts; a large text book is mostly text, so a fast
+# block compressor cuts that resident copy in half.
+lz4_flex = "0.11"
 anyhow = "1"
 anyrender = "0.14"
 parley = { version = "=0.12.0", default-features = false, features = ["complex-scripts"] }

@@ -116,12 +116,12 @@ fn main() {
     );
     let memory = doc.memory_breakdown();
     println!(
-        "memory source_kb={} source_capacity_kb={} chunks={} laid_out={} pages={} \
+        "memory source_kb={} compressed_source_kb={} chunks={} laid_out={} pages={} \
          page_meta_kb={} line_entries={} xpointer_kb={} anchors={} glyphs_kb={} \
          bitmaps_kb={} active_lines={} active_nodes={} fonts_kb={} \
          res_cache_kb={} pinned_kb={} svg_cache_kb={} page_map_source_kb={}",
         memory.source_bytes / 1024,
-        memory.source_capacity / 1024,
+        memory.compressed_source_bytes / 1024,
         memory.chunk_count,
         memory.laid_out_chunks,
         memory.page_count,
