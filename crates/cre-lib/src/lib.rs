@@ -2488,6 +2488,10 @@ impl Document {
                 }
                 work.run();
             });
+            // The workers' chunks are gone, but glibc keeps their arenas. Trim
+            // before the opening chunk is laid out, so that memory is returned
+            // to the kernel instead of being pinned by the DOM we must keep.
+            trim_memory();
             // The opening chunk is laid out afterwards, on this thread: its DOM
             // stays resident for the first page, so laying it out while the
             // workers are still running would hold it next to theirs.
@@ -3009,8 +3013,9 @@ impl Document {
         self.cache_page_image(page, image);
         if profile {
             eprintln!(
-                "  render total page {page}: {:.2}ms",
-                call_started.elapsed().as_secs_f64() * 1000.0
+                "  render total page {page}: {:.2}ms rss={}kB",
+                call_started.elapsed().as_secs_f64() * 1000.0,
+                resident_bytes().unwrap_or(0) / 1024
             );
         }
         Ok(out)
