@@ -497,10 +497,25 @@ fn plan_chunk_bytes(total_html: usize, available: Option<usize>) -> usize {
 /// Returns freed heap pages to the OS. Building a chunk's DOM/parley layout
 /// allocates and frees tens of megabytes; glibc keeps those arenas resident,
 /// which matters on a 256 MB device where the next page render can then OOM.
+///
 fn trim_memory() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {
-        libc::malloc_trim(0);
+        // `CRE_NO_TRIM=1` isolates the cost of trimming on a device: glibc walks
+        // every arena and madvises the free spans.
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ENABLED.get_or_init(|| std::env::var_os("CRE_NO_TRIM").is_none()) {
+            let profile = std::env::var_os("CRE_LAYOUT_PROFILE").is_some();
+            let started = std::time::Instant::now();
+            libc::malloc_trim(0);
+            if profile {
+                eprintln!(
+                    "profile trim: {:.2}ms rss={}kB",
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    resident_bytes().unwrap_or(0) / 1024
+                );
+            }
+        }
     }
 }
 
@@ -1575,7 +1590,18 @@ impl Document {
             font_blobs: font_datas.to_vec(),
             viewport_scale: options.viewport_scale,
             font_gamma: 1.0,
-            sources: htmls.into_iter().map(ChunkSource::new).collect(),
+            sources: {
+                let started = std::time::Instant::now();
+                let sources: Vec<ChunkSource> = htmls.into_iter().map(ChunkSource::new).collect();
+                if std::env::var_os("CRE_LAYOUT_PROFILE").is_some() {
+                    eprintln!(
+                        "profile chunk html compress: {:.1}ms chunks={}",
+                        started.elapsed().as_secs_f64() * 1000.0,
+                        sources.len()
+                    );
+                }
+                sources
+            },
             fixed_layouts,
             base_url: base_url.to_string(),
             resources,
@@ -1773,11 +1799,19 @@ impl Document {
         &self,
         chunk_index: usize,
     ) -> Result<(ChunkLayout, HtmlDocument, Vec<LineBox>, Vec<PageStart>)> {
+        let decompress_started = std::time::Instant::now();
         let html = self
             .sources
             .get(chunk_index)
             .context("document chunk is missing")?
             .text();
+        if std::env::var_os("CRE_LAYOUT_PROFILE").is_some() {
+            eprintln!(
+                "profile chunk {chunk_index} decompress: {:.2}ms ({}kB)",
+                decompress_started.elapsed().as_secs_f64() * 1000.0,
+                html.len() / 1024
+            );
+        }
         let fixed_height = self
             .fixed_layouts
             .get(chunk_index)
@@ -2437,6 +2471,7 @@ impl Document {
                 (source.images, source.text_len)
             })
             .unwrap_or(0);
+        let pass_started = std::time::Instant::now();
         let rss_before = resident_bytes();
         let (probe_layout, doc, lines, page_starts) = self.layout_chunk(probe_index)?;
         // Measured before the DOM is released: this is what one chunk's layout
@@ -2558,6 +2593,12 @@ impl Document {
             self.rebuild_view();
             trim_memory();
             self.install_active(0, doc, lines, page_starts);
+            if std::env::var_os("CRE_LAYOUT_PROFILE").is_some() {
+                eprintln!(
+                    "profile layout pass: {:.1}ms chunks={count}",
+                    pass_started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
             return Ok(());
         }
         for chunk_index in 1..count {
@@ -2591,6 +2632,12 @@ impl Document {
         self.rebuild_view();
         trim_memory();
         self.install_active(0, doc, lines, page_starts);
+        if std::env::var_os("CRE_LAYOUT_PROFILE").is_some() {
+            eprintln!(
+                "profile layout pass: {:.1}ms chunks={count}",
+                pass_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         Ok(())
     }
 
