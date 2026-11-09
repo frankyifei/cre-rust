@@ -11,8 +11,8 @@
 //!
 //! This is deliberately a presentation subset: tokens, `mrow`, `mfenced`,
 //! `msup`/`msub`/`msubsup`, `munder`/`mover`/`munderover`, `mfrac`,
-//! `msqrt`/`mroot`, `mtable`, `mspace`, `mstyle`, `merror`, `mphantom`,
-//! `menclose`, `mmultiscripts` and `maction`.
+//! `msqrt`/`mroot`, `mtable`, `mspace`, `mpadded`, `mstyle`, `merror`,
+//! `mphantom`, `menclose`, `mmultiscripts` and `maction`.
 //!
 //! Scripts are positioned with CSS baseline shifts computed from the font's
 //! OpenType MATH constants, fences are measured against the content they cover
@@ -23,9 +23,14 @@
 //! the selected math font and falls back to the crengine/Chrome defaults when
 //! there is none.
 //!
-//! Remaining limits: `mpadded`, a full MathML operator dictionary, multi-glyph
-//! stretchy composition and the finest mtable/multiscript placement are not
-//! implemented; operator spacing uses CSS margins by operator class.
+//! Presentation attributes (`mathcolor`, `mathbackground`, `mathsize`,
+//! `mathvariant`) and the author's `class`/`style` are carried onto the
+//! generated HTML, so a book's MathML CSS applies to the rewritten boxes.
+//!
+//! Remaining limits: absolute `mpadded` sizes (only increments are honoured),
+//! a full MathML operator dictionary, multi-glyph stretchy composition and the
+//! finest mtable/multiscript placement are not implemented; operator spacing
+//! uses CSS margins by operator class.
 
 use roxmltree::{Document, Node};
 
@@ -86,6 +91,7 @@ pub const CSS: &str = r#"
 .cre-mtable tbody { background: transparent !important; }
 .cre-mtable td { border: none !important; background: transparent !important; padding: 0.12em 0.5em !important; text-align: center; vertical-align: middle; line-height: 1.15 !important; font-family: inherit !important; font-size: 1em !important; }
 .cre-mphantom { visibility: hidden; }
+.cre-mpadded { display: inline-block; }
 .cre-menclose { display: inline-block; line-height: 1.2; }
 .cre-strike-h, .cre-strike-v, .cre-strike-diag { position: absolute; background: currentColor; }
 .cre-strike-h { left: 0; right: 0; height: 1px; top: 50%; }
@@ -400,6 +406,7 @@ fn rewrite_fragment(fragment: &str, metrics: MathMetrics) -> Option<String> {
             display: false,
             metrics,
             script_level: 0,
+            variant: None,
         },
     ))
 }
@@ -413,6 +420,149 @@ struct Ctx {
     /// How deep inside scripts this subtree sits, so `mstyle scriptlevel` can
     /// size its content relative to it instead of double-shrinking it.
     script_level: u8,
+    /// `mathvariant` inherited from an enclosing `mstyle`.
+    variant: Option<MathVariant>,
+}
+
+/// The `mathvariant` values that change text weight or slope. The other
+/// MathML variants (double-struck, script, fraktur, ...) need glyphs the
+/// reader's fonts may not have and are left to the font.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MathVariant {
+    Normal,
+    Bold,
+    Italic,
+    BoldItalic,
+}
+
+impl MathVariant {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "normal" | "upright" | "sans-serif" => Some(Self::Normal),
+            "bold" => Some(Self::Bold),
+            "italic" => Some(Self::Italic),
+            "bold-italic" => Some(Self::BoldItalic),
+            _ => None,
+        }
+    }
+
+    fn css(self) -> &'static str {
+        match self {
+            Self::Normal => "font-weight:normal;font-style:normal",
+            Self::Bold => "font-weight:bold",
+            Self::Italic => "font-style:italic",
+            Self::BoldItalic => "font-weight:bold;font-style:italic",
+        }
+    }
+}
+
+/// The CSS `mathvariant` implies for a token, taking an enclosing `mstyle`
+/// into account.
+fn variant_css(node: Node<'_, '_>, ctx: Ctx) -> &'static str {
+    node.attribute("mathvariant")
+        .and_then(MathVariant::parse)
+        .or(ctx.variant)
+        .map(MathVariant::css)
+        .unwrap_or("")
+}
+
+fn push_decl(style: &mut String, property: &str, value: Option<&str>) {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    if !style.is_empty() {
+        style.push(';');
+    }
+    style.push_str(property);
+    style.push(':');
+    style.push_str(value);
+}
+
+/// Class and style for the HTML element that replaces a MathML element: the
+/// engine's own class, the author's classes (so book CSS keeps matching), and
+/// the presentation attributes MathML uses in place of CSS. The author's
+/// `style` goes last so it wins.
+fn element_attrs(node: Node<'_, '_>, cre_class: &str) -> (String, String) {
+    let mut classes = String::from(cre_class);
+    if let Some(author) = node.attribute("class") {
+        for token in author.split_whitespace() {
+            classes.push(' ');
+            classes.push_str(token);
+        }
+    }
+    let mut style = String::new();
+    push_decl(&mut style, "color", node.attribute("mathcolor"));
+    push_decl(
+        &mut style,
+        "background-color",
+        node.attribute("mathbackground"),
+    );
+    push_decl(&mut style, "font-size", node.attribute("mathsize"));
+    if let Some(author) = node.attribute("style") {
+        let author = author.trim();
+        if !author.is_empty() {
+            if !style.is_empty() {
+                style.push(';');
+            }
+            style.push_str(author);
+        }
+    }
+    (classes.trim().to_string(), style)
+}
+
+fn format_span(
+    node: Node<'_, '_>,
+    classes: String,
+    style: &str,
+    extra_attrs: &str,
+    content: &str,
+) -> String {
+    let mut attrs = String::new();
+    if !classes.is_empty() {
+        attrs.push_str(&format!("class=\"{}\"", escape_attr(&classes)));
+    }
+    if let Some(id) = node
+        .attribute("id")
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        if !attrs.is_empty() {
+            attrs.push(' ');
+        }
+        attrs.push_str(&format!("id=\"{}\"", escape_attr(id)));
+    }
+    if !extra_attrs.is_empty() {
+        if !attrs.is_empty() {
+            attrs.push(' ');
+        }
+        attrs.push_str(extra_attrs);
+    }
+    if !style.is_empty() {
+        if !attrs.is_empty() {
+            attrs.push(' ');
+        }
+        attrs.push_str(&format!("style=\"{}\"", escape_attr(style)));
+    }
+    format!("<span {attrs}>{content}</span>")
+}
+
+/// A span that carries `cre_class`, the author's classes and the MathML
+/// presentation attributes. `extra_style` is appended to those declarations.
+fn span_with(
+    node: Node<'_, '_>,
+    cre_class: &str,
+    extra_style: &str,
+    extra_attrs: &str,
+    content: &str,
+) -> String {
+    let (classes, mut style) = element_attrs(node, cre_class);
+    if !extra_style.is_empty() {
+        if !style.is_empty() {
+            style.push(';');
+        }
+        style.push_str(extra_style);
+    }
+    format_span(node, classes, &style, extra_attrs, content)
 }
 
 impl Ctx {
@@ -438,10 +588,26 @@ fn render_node(node: Node<'_, '_>, ctx: Ctx) -> String {
         "math" => {
             let display = node.attribute("display").unwrap_or("inline") == "block";
             let ctx = Ctx { display, ..ctx };
-            format!(
-                "<span class=\"cre-math\" data-display=\"{}\">{}</span>",
-                if display { "block" } else { "inline" },
-                render_row(node, ctx)
+            // Author CSS (a class, inline style or background) turns the
+            // formula into a box so its border and padding are laid out; an
+            // unstyled formula keeps the plain inline box it always had.
+            let styled = node.attribute("class").is_some()
+                || node.attribute("style").is_some()
+                || node.attribute("mathbackground").is_some();
+            let style = if styled && !display {
+                "display:inline-block;vertical-align:baseline"
+            } else {
+                ""
+            };
+            span_with(
+                node,
+                "cre-math",
+                style,
+                &format!(
+                    "data-display=\"{}\"",
+                    if display { "block" } else { "inline" }
+                ),
+                &render_row(node, ctx),
             )
         }
         "semantics" => node
@@ -452,16 +618,31 @@ fn render_node(node: Node<'_, '_>, ctx: Ctx) -> String {
         "annotation" | "annotation-xml" | "none" | "mprescripts" => String::new(),
         "mrow" => render_row(node, ctx),
         "mi" => render_mi(node, ctx),
-        "mn" => format!(
-            "<span class=\"cre-mn\">{}</span>",
-            escape_html(&token_text(node))
+        "mn" => span_with(
+            node,
+            "cre-mn",
+            variant_css(node, ctx),
+            "",
+            &escape_html(&token_text(node)),
         ),
         "mo" => render_mo(node, ctx, 1.0, 1.0, false, true),
-        "mtext" | "ms" => format!(
-            "<span class=\"cre-mtext\" style=\"white-space:pre\">{}</span>",
-            escape_html(&token_text(node))
-        ),
+        "mtext" | "ms" => {
+            let variant = variant_css(node, ctx);
+            let style = if variant.is_empty() {
+                "white-space:pre".to_string()
+            } else {
+                format!("white-space:pre;{variant}")
+            };
+            span_with(
+                node,
+                "cre-mtext",
+                &style,
+                "",
+                &escape_html(&token_text(node)),
+            )
+        }
         "mspace" => render_mspace(node),
+        "mpadded" => render_mpadded(node, ctx),
         "msup" => render_script(node, ctx, ScriptKind::Sup),
         "msub" => render_script(node, ctx, ScriptKind::Sub),
         "msubsup" => render_scripts(node, ctx),
@@ -718,28 +899,26 @@ fn is_close_fence(text: &str) -> bool {
     matches!(text, ")" | "]" | "}" | "⟩" | "⌉" | "⌋" | "⟧")
 }
 
-fn render_mi(node: Node<'_, '_>, _ctx: Ctx) -> String {
+fn render_mi(node: Node<'_, '_>, ctx: Ctx) -> String {
     let text = token_text(node);
-    let variant = node.attribute("mathvariant").unwrap_or("");
+    let variant = node
+        .attribute("mathvariant")
+        .and_then(MathVariant::parse)
+        .or(ctx.variant);
     let italic = match variant {
-        "normal" | "upright" | "bold" | "sans-serif" => false,
-        "italic" | "bold-italic" => true,
-        _ => text.chars().count() == 1,
+        Some(MathVariant::Normal | MathVariant::Bold) => false,
+        Some(MathVariant::Italic | MathVariant::BoldItalic) => true,
+        None => text.chars().count() == 1,
     };
     let class = if italic { "cre-mi" } else { "cre-mi-upright" };
-    if variant.contains("bold") {
-        let skew = if italic {
-            "transform:skewX(-10deg);"
-        } else {
-            ""
-        };
-        format!(
-            "<span class=\"{class}\" style=\"font-weight:bold;{skew}\">{}</span>",
-            escape_html(&text)
-        )
-    } else {
-        format!("<span class=\"{class}\">{}</span>", escape_html(&text))
-    }
+    // The `cre-mi` class draws the italic as a skew, so only the weight is
+    // added here; `font-style` would slant the glyph twice.
+    let style = match variant {
+        Some(MathVariant::Bold | MathVariant::BoldItalic) => "font-weight:bold",
+        Some(MathVariant::Normal) => "font-weight:normal",
+        Some(MathVariant::Italic) | None => "",
+    };
+    span_with(node, class, style, "", &escape_html(&text))
 }
 
 fn render_mo(
@@ -756,12 +935,18 @@ fn render_mo(
     } else {
         operator_class(&text)
     };
+    let variant = variant_css(node, ctx);
     if is_large_operator(&text) {
         let size = if ctx.display { 1.5 } else { 1.2 };
-        return format!(
-            "<span class=\"cre-mo cre-mo-large\" style=\"font-size:{size}em\">{}</span>",
-            escape_html(&text)
-        );
+        // An explicit mathsize wins over the display-style size.
+        let style = if node.attribute("mathsize").is_some() {
+            variant.to_string()
+        } else if variant.is_empty() {
+            format!("font-size:{size}em")
+        } else {
+            format!("{variant};font-size:{size}em")
+        };
+        return span_with(node, "cre-mo cre-mo-large", &style, "", &escape_html(&text));
     }
     if is_fence(&text) {
         // The fence's box is the height its content's line boxes reserve; the
@@ -773,14 +958,14 @@ fn render_mo(
         if target > 1.25 {
             return stretched_fence_html(&text, content, target, ctx.metrics, body_follows);
         }
-        return format!(
-            "<span class=\"cre-mo cre-fence\">{}</span>",
-            escape_html(&text)
-        );
+        return span_with(node, "cre-mo cre-fence", variant, "", &escape_html(&text));
     }
-    format!(
-        "<span class=\"cre-mo {class}\">{}</span>",
-        escape_html(&text)
+    span_with(
+        node,
+        &format!("cre-mo {class}"),
+        variant,
+        "",
+        &escape_html(&text),
     )
 }
 
@@ -1231,6 +1416,43 @@ fn render_mspace(node: Node<'_, '_>) -> String {
     format!("<span class=\"cre-mspace\" style=\"{style}\"></span>")
 }
 
+fn render_mpadded(node: Node<'_, '_>, ctx: Ctx) -> String {
+    let (classes, mut style) = element_attrs(node, "cre-mpadded");
+    if !style.is_empty() {
+        style.push(';');
+    }
+    style.push_str("display:inline-block");
+    // Only the incremental form (`width="+0.2em"`) is honoured: an absolute
+    // size needs the content's measured size, which the converter does not
+    // know. Positive increments become padding, negative ones margins.
+    for (attribute, grow, shrink) in [
+        ("height", "padding-top", "margin-top"),
+        ("depth", "padding-bottom", "margin-bottom"),
+        ("width", "padding-right", "margin-right"),
+    ] {
+        let Some(value) = node.attribute(attribute).map(str::trim) else {
+            continue;
+        };
+        let (direction, length) = if let Some(rest) = value.strip_prefix('+') {
+            (1, rest.trim())
+        } else if let Some(rest) = value.strip_prefix('-') {
+            (-1, rest.trim())
+        } else {
+            continue;
+        };
+        if length.is_empty() {
+            continue;
+        }
+        style.push(';');
+        if direction > 0 {
+            style.push_str(&format!("{grow}:{length}"));
+        } else {
+            style.push_str(&format!("{shrink}:-{length}"));
+        }
+    }
+    format_span(node, classes, &style, "", &render_children(node, ctx))
+}
+
 fn render_fraction(node: Node<'_, '_>, ctx: Ctx) -> String {
     let mut children = element_children(node);
     let numerator = children
@@ -1420,14 +1642,40 @@ fn render_table(node: Node<'_, '_>, ctx: Ctx) -> String {
         .collect();
     let row_spacing = node.attribute("rowspacing");
     let column_spacing = node.attribute("columnspacing");
-    let mut out =
-        String::from("<span class=\"cre-mtable-wrap\"><table class=\"cre-mtable\"><tbody>");
+    let (classes, mut wrapper_style) = element_attrs(node, "cre-mtable-wrap");
+    // MathML `frame` draws a border around the whole table; `rowlines` and
+    // `columnlines` are not implemented.
+    if let Some(frame) = node.attribute("frame").map(str::trim)
+        && matches!(frame, "solid" | "dashed")
+    {
+        if !wrapper_style.is_empty() {
+            wrapper_style.push(';');
+        }
+        wrapper_style.push_str(&format!("border:1px {frame}"));
+    }
+
+    let mut out = String::from("<table class=\"cre-mtable\"><tbody>");
     for row in node
         .children()
         .filter(|child| child.is_element())
         .filter(|child| child.tag_name().name().eq_ignore_ascii_case("mtr"))
     {
-        out.push_str("<tr>");
+        let (row_classes, row_style) = element_attrs(row, "");
+        let mut row_attrs = String::new();
+        if !row_classes.is_empty() {
+            row_attrs.push_str(&format!(" class=\"{}\"", escape_attr(&row_classes)));
+        }
+        if let Some(id) = row
+            .attribute("id")
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            row_attrs.push_str(&format!(" id=\"{}\"", escape_attr(id)));
+        }
+        if !row_style.is_empty() {
+            row_attrs.push_str(&format!(" style=\"{}\"", escape_attr(&row_style)));
+        }
+        out.push_str(&format!("<tr{row_attrs}>"));
         for (column, cell) in row
             .children()
             .filter(|child| child.is_element())
@@ -1453,15 +1701,31 @@ fn render_table(node: Node<'_, '_>, ctx: Ctx) -> String {
             if let Some(spacing) = row_spacing {
                 style.push_str(&format!(";padding-top:{spacing};padding-bottom:{spacing}"));
             }
+            let (cell_classes, cell_style) = element_attrs(cell, "");
+            if !cell_style.is_empty() {
+                style.push(';');
+                style.push_str(&cell_style);
+            }
+            let mut cell_attrs = format!(" style=\"{}\"", escape_attr(&style));
+            if !cell_classes.is_empty() {
+                cell_attrs.insert_str(0, &format!(" class=\"{}\"", escape_attr(&cell_classes)));
+            }
+            if let Some(id) = cell
+                .attribute("id")
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                cell_attrs.push_str(&format!(" id=\"{}\"", escape_attr(id)));
+            }
             out.push_str(&format!(
-                "<td style=\"{style}\">{}</td>",
+                "<td{cell_attrs}>{}</td>",
                 render_children(cell, ctx)
             ));
         }
         out.push_str("</tr>");
     }
-    out.push_str("</tbody></table></span>");
-    out
+    out.push_str("</tbody></table>");
+    format_span(node, classes, &wrapper_style, "", &out)
 }
 
 /// `menclose` with the common notations: box/roundedbox/circle, individual
@@ -1599,22 +1863,16 @@ fn render_style(node: Node<'_, '_>, ctx: Ctx) -> String {
         }
     }
 
-    let mut style = String::new();
-    for (attribute, property) in [
-        ("mathcolor", "color"),
-        ("mathbackground", "background-color"),
-        ("mathsize", "font-size"),
-    ] {
-        if let Some(value) = node.attribute(attribute) {
-            if !style.is_empty() {
-                style.push(';');
-            }
-            style.push_str(property);
-            style.push(':');
-            style.push_str(value);
+    let (classes, mut style) = element_attrs(node, "cre-mstyle");
+    // An inline box whose only children are inline-blocks does not get its
+    // background painted; give a styled `mstyle` a box of its own.
+    if node.attribute("mathbackground").is_some() {
+        if !style.is_empty() {
+            style.push(';');
         }
+        style.push_str("display:inline-block");
     }
-    if level_delta != 0 && !style.contains("font-size") {
+    if level_delta != 0 && node.attribute("mathsize").is_none() {
         let scale = ctx.metrics.script_scale.powi(level_delta);
         if !style.is_empty() {
             style.push(';');
@@ -1622,23 +1880,17 @@ fn render_style(node: Node<'_, '_>, ctx: Ctx) -> String {
         style.push_str(&format!("font-size:{scale:.3}em"));
     }
 
+    let variant = node
+        .attribute("mathvariant")
+        .and_then(MathVariant::parse)
+        .or(ctx.variant);
     let ctx = Ctx {
         display,
         script_level: level,
+        variant,
         ..ctx
     };
-    if style.is_empty() {
-        format!(
-            "<span class=\"cre-mstyle\">{}</span>",
-            render_children(node, ctx)
-        )
-    } else {
-        format!(
-            "<span class=\"cre-mstyle\" style=\"{}\">{}</span>",
-            escape_attr(&style),
-            render_children(node, ctx)
-        )
-    }
+    format_span(node, classes, &style, "", &render_children(node, ctx))
 }
 
 /// Rough content height in `em`, used to stretch fences and radicals. It only
@@ -2496,5 +2748,32 @@ mod tests {
         assert!(css.contains("vertical-align: 0.600em"), "{css}");
         assert!(css.contains("border-bottom-width: 0.040em"), "{css}");
         assert!(css.contains("font-family: \"Test Math\", serif"), "{css}");
+    }
+
+    #[test]
+    fn presentation_attributes_and_author_classes_are_kept() {
+        // The W3C `mathml-020` styling test and the `mathml-021` CSS test.
+        let html = r##"<math class="basic"><mtable mathbackground="#FFFFE0" frame="dashed"><mtr><mtd><mpadded width="+0.2em" height="+0.2em" depth="+0.2em"><mstyle mathcolor="#000000"><mrow><mn>2</mn><mo mathsize="150%">+</mo><mstyle mathbackground="green" mathcolor="white" mathvariant="bold"><mi class="test2">x</mi></mstyle></mrow></mstyle></mpadded></mtd></mtr></mtable></math>"##;
+        let out = rewrite_mathml(html);
+        assert!(out.contains("class=\"cre-math basic\""), "{out}");
+        assert!(out.contains("background-color:#FFFFE0"), "{out}");
+        assert!(out.contains("border:1px dashed"), "{out}");
+        assert!(out.contains("padding-right:0.2em"), "{out}");
+        assert!(out.contains("padding-top:0.2em"), "{out}");
+        assert!(out.contains("padding-bottom:0.2em"), "{out}");
+        assert!(out.contains("font-size:150%"), "{out}");
+        assert!(out.contains("background-color:green"), "{out}");
+        assert!(out.contains("color:white"), "{out}");
+        assert!(out.contains("font-weight:bold"), "{out}");
+        assert!(out.contains("class=\"cre-mi-upright test2\""), "{out}");
+    }
+
+    #[test]
+    fn author_classes_on_operators_survive() {
+        let out = rewrite_mathml(
+            r#"<math><mi>a</mi><mo class="test1">+</mo><mi class="test2">x</mi></math>"#,
+        );
+        assert!(out.contains("class=\"cre-mo cre-mo-bin test1\""), "{out}");
+        assert!(out.contains("class=\"cre-mi test2\""), "{out}");
     }
 }

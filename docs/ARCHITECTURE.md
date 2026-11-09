@@ -120,6 +120,10 @@ appends the generated stylesheet once per chunk:
 - `mstyle displaystyle` and `scriptlevel` are evaluated per subtree;
 - `maction` renders only its selected child.
 
+Presentation attributes (`mathcolor`, `mathbackground`, `mathsize`,
+`mathvariant`) and author classes/styles are copied onto the generated HTML, so
+book MathML CSS applies; `mpadded` honours incremental sizes.
+
 A formula stays inside one line. Display formulas are atomic for pagination; a
 matrix is currently not split between rows.
 

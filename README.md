@@ -36,8 +36,8 @@ expensively for a 256 MB e-ink reader. These pieces are ours.
 Blitz has no MathML support. `cre-mathml` translates a MathML presentation
 subset into plain HTML boxes that the normal layout engine understands:
 tokens, `mrow`, `mfenced`, scripts, `mfrac`, `msqrt`/`mroot`, `mtable`,
-`mspace`, `mstyle`, `merror`, `mphantom`, `menclose`, `mmultiscripts` and
-`maction`.
+`mspace`, `mpadded`, `mstyle`, `merror`, `mphantom`, `menclose`,
+`mmultiscripts` and `maction`.
 
 This follows the approach of crengine's `MathMLHelper`: turn MathML into
 ordinary HTML instead of adding a second math layout engine. We learned the
@@ -65,6 +65,10 @@ The parts we spent the most time on:
   `<msubsup>a k <mrow/></msubsup>` does not push its subscript onto the axis;
 - `maction` renders only the selected child, so tooltip text from the test
   suites stays out of the formula;
+- `mathcolor`, `mathbackground`, `mathsize` and `mathvariant` become CSS on the
+  generated boxes, and the author's `class`/`style` is kept, so a book's MathML
+  CSS applies (the W3C `mathml-020`/`021` styling tests); `mpadded` honours its
+  incremental sizes;
 - OpenType MATH constants (script scale, shifts, rule thickness, axis height)
   are read from the selected math font; KOReader's `font-family: math` choice
   is honoured, and the math font survives the "ignore publisher fonts" tweak.
