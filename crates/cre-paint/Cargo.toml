@@ -19,6 +19,9 @@ peniko = "0.6"
 tiny-skia = "0.11"
 # Decodes the original pixels of images whose page only carries a size
 # placeholder (see `PlacedImage`).
+# Decodes JPEGs at the size they are painted at (DCT scaling), instead of
+# decoding a 1443x2048 photo into 11 MB of RGBA to shrink it again.
+jpeg-decoder = { version = "0.3", default-features = false }
 image = { version = "0.25", default-features = false, features = [
     "png",
     "jpeg",

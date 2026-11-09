@@ -609,7 +609,7 @@ impl ChunkLayoutWork<'_> {
         index: usize,
     ) -> Result<(ChunkLayout, HtmlDocument, Vec<LineBox>, Vec<PageStart>)> {
         layout_chunk_html(
-            &self.sources[index].text(),
+            &self.sources[index].text()?,
             index,
             self.base_url,
             self.net.clone(),
@@ -896,13 +896,13 @@ impl ChunkSource {
         }
     }
 
-    fn text(&self) -> String {
-        match lz4_flex::decompress_size_prepended(&self.compressed) {
-            Ok(bytes) => String::from_utf8(bytes).unwrap_or_default(),
-            // The block was produced by `new` above; an error here would be a
-            // bug, and an empty chunk is the only safe thing to hand the parser.
-            Err(_) => String::new(),
-        }
+    /// Fails loudly: the block was produced by `new` a moment earlier, so an
+    /// error here is a bug, and a silently empty chunk would show as a blank
+    /// book instead of a diagnosable failure.
+    fn text(&self) -> anyhow::Result<String> {
+        let bytes = lz4_flex::decompress_size_prepended(&self.compressed)
+            .context("decompress chunk HTML")?;
+        String::from_utf8(bytes).context("chunk HTML is not UTF-8")
     }
 }
 
@@ -1804,7 +1804,7 @@ impl Document {
             .sources
             .get(chunk_index)
             .context("document chunk is missing")?
-            .text();
+            .text()?;
         if std::env::var_os("CRE_LAYOUT_PROFILE").is_some() {
             eprintln!(
                 "profile chunk {chunk_index} decompress: {:.2}ms ({}kB)",
@@ -2805,7 +2805,7 @@ impl Document {
     pub fn resource(&self, path: &str) -> Option<Vec<u8>> {
         let (key, _) = href_key(path);
         let key = key.strip_prefix("binary/").unwrap_or(&key);
-        lookup_resource(&self.resources, key)
+        lookup_resource(&self.resources, key).map(|data| (*data).clone())
     }
 
     pub fn image_data_at(&self, position: PagePosition) -> Result<Option<Vec<u8>>> {
@@ -3293,7 +3293,7 @@ impl Document {
             .sources
             .get(index)
             .context("document chunk is missing")?;
-        let html = stored.text();
+        let html = stored.text()?;
         // Free the current chunk before building the next one: both being
         // resident at once doubles the layout peak, which matters on a device
         // where a single layout is already tens of megabytes. The cached page
@@ -5895,14 +5895,13 @@ fn common_ancestor(root: &Node, left: NodeId, right: NodeId) -> Option<NodeId> {
     None
 }
 
-fn lookup_resource(resources: &ResourceSource, key: &str) -> Option<Vec<u8>> {
+fn lookup_resource(resources: &ResourceSource, key: &str) -> Option<Arc<Vec<u8>>> {
     match resources {
         ResourceSource::Empty => None,
-        ResourceSource::Map(map) => map.get(key).cloned(),
-        ResourceSource::Epub(provider) => {
-            let data = provider.get(key)?;
-            Some((*data).clone())
-        }
+        ResourceSource::Map(map) => map.get(key).map(|bytes| Arc::new(bytes.clone())),
+        // The provider already hands out `Arc`s; copying the bytes here made
+        // every page render clone the whole (compressed) picture.
+        ResourceSource::Epub(provider) => provider.get(key),
     }
 }
 
@@ -5945,7 +5944,7 @@ fn find_image_data_at(
             let (key, _) = href_key(&resolved);
             let key = key.strip_prefix("binary/").unwrap_or(&key);
             if let Some(data) = lookup_resource(resources, key) {
-                return Some(data);
+                return Some((*data).clone());
             }
         }
     }
@@ -6006,13 +6005,13 @@ fn collect_placed_images(
             .placeheld_size(key)
             .and_then(|(width, height)| {
                 lookup_resource(resources, key)
-                    .map(|bytes| (Arc::new(bytes), width, height, cre_paint::ImageFit::Fill))
+                    .map(|bytes| (bytes, width, height, cre_paint::ImageFit::Fill))
             })
             .or_else(|| {
                 let fit = images.page_fit_image(key)?;
                 let bytes = lookup_resource(resources, &fit.source)?;
                 Some((
-                    Arc::new(bytes),
+                    bytes,
                     fit.width,
                     fit.height,
                     if fit.contain {

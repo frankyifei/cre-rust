@@ -118,21 +118,23 @@ pub fn draw_placed_images(pixmap: &mut Pixmap, images: &[PlacedImage], clip_mask
     }
     let mut cache = ImageCache::default();
     for placed in images {
-        let Ok(decoded) = image::load_from_memory(&placed.bytes) else {
-            continue;
-        };
-        let rgba = decoded.into_rgba8();
-        let (image_width, image_height) = rgba.dimensions();
-        if image_width == 0 || image_height == 0 {
-            continue;
-        }
-        let (x, y, width, height) = object_fit_rect(placed, image_width, image_height);
+        // The fit box comes from the image's real size, which the page already
+        // knows; the decoded copy may be smaller (see `decode_image`).
+        let (x, y, width, height) =
+            object_fit_rect(placed, placed.intrinsic_width, placed.intrinsic_height);
         if width < 1.0 || height < 1.0 {
             continue;
         }
+        let target_width = (width.ceil() as u32).max(1);
+        let target_height = (height.ceil() as u32).max(1);
+        let Some((data, image_width, image_height)) =
+            decode_image(&placed.bytes, target_width, target_height)
+        else {
+            continue;
+        };
         let brush = peniko::ImageBrush {
             image: peniko::ImageData {
-                data: peniko::Blob::new(Arc::new(rgba.into_raw())),
+                data: peniko::Blob::new(Arc::new(data)),
                 format: peniko::ImageFormat::Rgba8,
                 width: image_width,
                 height: image_height,
@@ -188,6 +190,88 @@ pub fn draw_placed_images(pixmap: &mut Pixmap, images: &[PlacedImage], clip_mask
             mask.as_ref(),
             &mut cache,
         );
+    }
+}
+
+/// Decodes `bytes` into RGBA at (about) the size it will be painted.
+///
+/// A photo on a 758x1024 page is painted at roughly a quarter of its pixels, so
+/// decoding 1443x2048 into 11 MB of RGBA and shrinking it again is wasted work
+/// and memory. JPEG supports decoding at 1/1..1/8 through DCT scaling, which
+/// measured ~30% faster and a fifth of the memory; everything else falls back
+/// to a full decode.
+fn decode_image(bytes: &[u8], max_width: u32, max_height: u32) -> Option<(Vec<u8>, u32, u32)> {
+    // Testing knob: compare DCT-scaled decoding with a full decode.
+    static SCALED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let scaled = *SCALED.get_or_init(|| std::env::var_os("CRE_NO_SCALED_DECODE").is_none());
+    if scaled
+        && bytes.starts_with(&[0xFF, 0xD8, 0xFF])
+        && let Some(decoded) = decode_jpeg_scaled(bytes, max_width, max_height)
+    {
+        return Some(decoded);
+    }
+    let rgba = image::load_from_memory(bytes).ok()?.into_rgba8();
+    let (width, height) = rgba.dimensions();
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some((rgba.into_raw(), width, height))
+}
+
+fn decode_jpeg_scaled(
+    bytes: &[u8],
+    max_width: u32,
+    max_height: u32,
+) -> Option<(Vec<u8>, u32, u32)> {
+    let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(bytes));
+    let width = max_width.min(u32::from(u16::MAX)) as u16;
+    let height = max_height.min(u32::from(u16::MAX)) as u16;
+    decoder.scale(width, height).ok()?;
+    let pixels = decoder.decode().ok()?;
+    let info = decoder.info()?;
+    let (width, height) = (u32::from(info.width), u32::from(info.height));
+    let count = (width as usize).checked_mul(height as usize)?;
+    if count == 0 {
+        return None;
+    }
+    match info.pixel_format {
+        // Greyscale: one byte per pixel.
+        jpeg_decoder::PixelFormat::L8 => {
+            if pixels.len() < count {
+                return None;
+            }
+            let mut rgba = pixels;
+            rgba.resize(count * 4, 255);
+            // Expand backwards: the destination offset is always ahead of the
+            // source, so already-written pixels are never read again.
+            for index in (0..count).rev() {
+                let value = rgba[index];
+                rgba[index * 4] = value;
+                rgba[index * 4 + 1] = value;
+                rgba[index * 4 + 2] = value;
+                rgba[index * 4 + 3] = 255;
+            }
+            Some((rgba, width, height))
+        }
+        jpeg_decoder::PixelFormat::RGB24 => {
+            if pixels.len() < count * 3 {
+                return None;
+            }
+            let mut rgba = pixels;
+            rgba.resize(count * 4, 255);
+            for index in (0..count).rev() {
+                let red = rgba[index * 3];
+                let green = rgba[index * 3 + 1];
+                let blue = rgba[index * 3 + 2];
+                rgba[index * 4] = red;
+                rgba[index * 4 + 1] = green;
+                rgba[index * 4 + 2] = blue;
+                rgba[index * 4 + 3] = 255;
+            }
+            Some((rgba, width, height))
+        }
+        // CMYK and 16-bit JPEGs are rare; let the `image` crate handle them.
+        _ => None,
     }
 }
 
