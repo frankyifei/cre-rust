@@ -1892,12 +1892,17 @@ fn image_sources(body: &str, doc_dir: &str) -> Vec<String> {
             if let Some(quote @ ('"' | '\'')) = rest.chars().next()
                 && let Some(close) = rest[1..].find(quote)
             {
-                let value = rest[1..1 + close].split('#').next().unwrap_or("");
-                if let Some(relative) = value.strip_prefix("epub://book/") {
+                let value = rest[1..1 + close].split(['#', '?']).next().unwrap_or("");
+                // Percent-encoded names must be decoded: that is the key the
+                // provider is asked for when the picture is fetched.
+                let decoded = percent_decode_str(value).decode_utf8_lossy();
+                if let Some(relative) = decoded.strip_prefix("epub://book/") {
                     out.push(normalize_path(relative));
-                } else if !value.is_empty() && !value.starts_with("data:") && !value.contains("://")
+                } else if !decoded.is_empty()
+                    && !decoded.starts_with("data:")
+                    && !decoded.contains("://")
                 {
-                    out.push(normalize_path(&format!("{doc_dir}{value}")));
+                    out.push(normalize_path(&format!("{doc_dir}{decoded}")));
                 }
             }
         }
@@ -3236,7 +3241,8 @@ fn is_external(value: &str) -> bool {
 }
 
 fn value_without_fragment(value: &str) -> String {
-    value.split('#').next().unwrap_or(value).to_string()
+    // A fragment and a query are both metadata: the zip entry is the path.
+    value.split(['#', '?']).next().unwrap_or(value).to_string()
 }
 
 pub fn resolve_href(base_dir: &str, href: &str) -> String {

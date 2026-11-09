@@ -818,6 +818,9 @@ pub struct MemoryBreakdown {
     pub source_bytes: usize,
     /// What the compressed chunk HTML actually holds.
     pub compressed_source_bytes: usize,
+    /// Images replaced by a size placeholder (their pixels are painted from
+    /// the original at draw time).
+    pub placeheld_images: usize,
     pub chunk_count: usize,
     pub laid_out_chunks: usize,
     pub page_count: usize,
@@ -2685,6 +2688,7 @@ impl Document {
             breakdown.page_bitmap_bytes +=
                 image.bitmap.width as usize * image.bitmap.height as usize;
         }
+        breakdown.placeheld_images = self.images.placeheld_count();
         breakdown.svg_cache_bytes = self.images.cached_bytes();
         breakdown.page_map_source_bytes = self.page_map_source.len();
         match &self.resources {
@@ -7494,7 +7498,11 @@ fn href_key(href: &str) -> (String, Option<String>) {
     let (path, fragment) = split_toc_href(href);
     let path = if path.contains("://") {
         url::Url::parse(path)
-            .map(|url| url.path().trim_start_matches('/').to_string())
+            .map(|url| {
+                percent_decode_str(url.path().trim_start_matches('/'))
+                    .decode_utf8_lossy()
+                    .into_owned()
+            })
             .unwrap_or_else(|_| path.to_string())
     } else {
         percent_decode_str(path).decode_utf8_lossy().into_owned()
@@ -8216,6 +8224,11 @@ impl ImageRaster {
         }
     }
 
+    /// Images the renderer paints itself from the original resource.
+    fn placeheld_count(&self) -> usize {
+        self.placeheld.lock().map(|held| held.len()).unwrap_or(0)
+    }
+
     /// Bytes held by the page-sized SVG raster cache.
     fn cached_bytes(&self) -> usize {
         self.cache.lock().map(|cache| cache.bytes).unwrap_or(0)
@@ -8638,6 +8651,28 @@ mod image_placeholder_tests {
         assert!(text.contains(r#"width="1200""#), "{text}");
         assert!(text.contains(r#"height="1600""#), "{text}");
         assert_eq!(images.placeheld_size("photo.png"), Some((1200, 1600)));
+    }
+
+    #[test]
+    fn chunk_html_survives_compression() {
+        let html = "<p>中文 mixed with emoji 📚 and 0 bytes</p>".repeat(200);
+        let source = ChunkSource::new(html.clone());
+        assert_eq!(source.text_len, html.len());
+        assert_eq!(source.text().expect("decompress"), html);
+    }
+
+    #[test]
+    fn an_empty_page_fit_svg_keeps_the_page_size() {
+        // The generated wrapper has no content; layout relies on usvg reading
+        // its width/height, so a parse failure would collapse the page.
+        let (rgba, width, height) = render_svg_image_fit(
+            b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"520\" height=\"736\"></svg>",
+            520,
+            736,
+        )
+        .expect("an empty SVG with a size must parse");
+        assert_eq!((width, height), (520, 736));
+        assert_eq!(rgba.len(), 520 * 736 * 4);
     }
 
     #[test]

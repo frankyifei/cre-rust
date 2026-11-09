@@ -52,3 +52,7 @@ resvg = { version = "0.48.1", default-features = false, features = [
     "raster-images",
 ] }
 url = "2"
+
+[dev-dependencies]
+# Building small EPUBs on the fly for the image-placeholder tests.
+zip = "4"
