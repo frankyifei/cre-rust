@@ -1549,17 +1549,6 @@ impl Document {
         source_bytes: u64,
         chunk_image_bytes: u64,
     ) -> Result<Self> {
-        // A book that cannot fit is refused here, before the layout allocates
-        // several copies of it; `cre-lua` turns the error into a page that
-        // explains the shortfall instead of letting the reader be killed.
-        if let Some(page) = memory_report::low_memory_page(
-            &htmls,
-            source_bytes,
-            chunk_image_bytes,
-            metadata.title.as_deref(),
-        ) {
-            return Err(anyhow::Error::new(LowMemory { page }));
-        }
         let font_context = Arc::new(build_font_ctx_with_fallbacks(
             font_datas,
             options.font_family.as_deref(),
@@ -1579,6 +1568,30 @@ impl Document {
                     .flat_map(|html| cre_epub::image_sources_in(html)),
             );
         }
+        // The chunks are compressed before the memory check so it can count the
+        // text the document actually keeps resident (one LZ4 block per chunk)
+        // instead of the generated HTML it is made from. The compression pass
+        // runs on every open anyway, so this adds no work to a book that fits.
+        let compression_started = std::time::Instant::now();
+        let sources: Vec<ChunkSource> = htmls.into_iter().map(ChunkSource::new).collect();
+        if std::env::var_os("CRE_LAYOUT_PROFILE").is_some() {
+            eprintln!(
+                "profile chunk html compress: {:.1}ms chunks={}",
+                compression_started.elapsed().as_secs_f64() * 1000.0,
+                sources.len()
+            );
+        }
+        // A book that cannot fit is refused here, before the layout allocates
+        // several copies of it; `cre-lua` turns the error into a page that
+        // explains the shortfall instead of letting the reader be killed.
+        if let Some(page) = memory_report::low_memory_page(
+            &sources,
+            source_bytes,
+            chunk_image_bytes,
+            metadata.title.as_deref(),
+        ) {
+            return Err(anyhow::Error::new(LowMemory { page }));
+        }
         let mut document = Self {
             metadata,
             width: options.width,
@@ -1593,18 +1606,7 @@ impl Document {
             font_blobs: font_datas.to_vec(),
             viewport_scale: options.viewport_scale,
             font_gamma: 1.0,
-            sources: {
-                let started = std::time::Instant::now();
-                let sources: Vec<ChunkSource> = htmls.into_iter().map(ChunkSource::new).collect();
-                if std::env::var_os("CRE_LAYOUT_PROFILE").is_some() {
-                    eprintln!(
-                        "profile chunk html compress: {:.1}ms chunks={}",
-                        started.elapsed().as_secs_f64() * 1000.0,
-                        sources.len()
-                    );
-                }
-                sources
-            },
+            sources,
             fixed_layouts,
             base_url: base_url.to_string(),
             resources,
