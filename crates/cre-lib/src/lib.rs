@@ -8011,15 +8011,12 @@ impl ImageRaster {
     /// Replaces an oversized raster image with a transparent SVG of the same
     /// intrinsic size.
     ///
-    /// Layout only needs the image's size and aspect ratio: our stylesheet caps
-    /// every image to the page, so an image larger than the page is always
-    /// scaled down. Carrying the real size on an SVG keeps that layout exact
-    /// while blitz holds no natural-size RGBA copy (a 1443x2048 photo is 11 MB
-    /// decoded). The pixels are painted from the original resource in
-    /// `cre_paint::draw_placed_images`.
-    ///
-    /// Small images are left alone: their absolute intrinsic size really is
-    /// used by layout, and they are cheap anyway.
+    /// Layout only needs the image's size and aspect ratio, and the placeholder
+    /// declares the exact intrinsic size the raster had, so the element box is
+    /// unchanged. blitz therefore holds no natural-size RGBA copy (a 1443x2048
+    /// photo is 11 MB decoded) and a page with many small images stops keeping
+    /// one decoded copy per image. The pixels are painted from the original
+    /// resource in `cre_paint::draw_placed_images`.
     ///
     /// TODO(upstream): blitz's `NetHandler` only accepts bytes and decodes them
     /// privately (`ImageHandler::parse`), so an image's intrinsic size and its
@@ -8031,11 +8028,17 @@ impl ImageRaster {
         if bytes.is_empty() || looks_like_svg(bytes) {
             return None;
         }
+        // A vector resource has already been rasterized at page size by
+        // `rasterize`, so its bytes are a small PNG now; it must keep them.
+        let lower = key.to_ascii_lowercase();
+        if lower.ends_with(".svg") || lower.ends_with(".svgz") {
+            return None;
+        }
         if !self.content.lock().ok()?.contains(key) {
             return None;
         }
         let (width, height) = image_dimensions(bytes)?;
-        if width == 0 || height == 0 || (width <= self.max_width && height <= self.max_height) {
+        if width == 0 || height == 0 {
             return None;
         }
         if let Ok(mut held) = self.placeheld.lock() {
@@ -8403,13 +8406,18 @@ mod image_placeholder_tests {
     }
 
     #[test]
-    fn small_images_keep_their_pixels() {
+    fn small_content_images_keep_their_intrinsic_size() {
         let images = ImageRaster::new(600, 800);
         images.set_content_images(["small.png".to_string()]);
         let bytes = png_bytes(300, 400);
-        // Layout uses a small image's absolute intrinsic size, so replacing it
-        // would shrink it to the placeholder's pixel count.
-        assert!(images.placeholder("small.png", &bytes).is_none());
-        assert_eq!(images.placeheld_size("small.png"), None);
+        // The placeholder declares the raster's own size, so a small image is
+        // replaced too: layout still sees 300x400.
+        let placeholder = images
+            .placeholder("small.png", &bytes)
+            .expect("small content image becomes a placeholder");
+        let text = String::from_utf8(placeholder).expect("placeholder is SVG");
+        assert!(text.contains(r#"width="300""#), "{text}");
+        assert!(text.contains(r#"height="400""#), "{text}");
+        assert_eq!(images.placeheld_size("small.png"), Some((300, 400)));
     }
 }
