@@ -193,6 +193,65 @@ impl LazyResource {
         }
     }
 
+    /// Opens the archive and reports why when it is not a readable zip.
+    ///
+    /// Reading the whole file first would put the book in memory just to
+    /// validate it, which is exactly the kind of spike a low-memory device
+    /// cannot afford; the zip directory is enough.
+    pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let path = PathBuf::from(path.as_ref());
+        let zip_archive = open_zip_archive(path.clone())
+            .with_context(|| format!("open epub zip {}", path.display()))?;
+        Ok(LazyResource {
+            epub_path: Some(path),
+            cache: Arc::new(Mutex::new(ResourceCache::new(resource_cache_bytes()))),
+            pinned: Arc::new(Mutex::new(HashMap::new())),
+            zip_archive: Arc::new(Mutex::new(Some(zip_archive))),
+        })
+    }
+
+    /// Uncompressed size of a resource without reading it.
+    ///
+    /// The zip directory has the size of every entry, and resources the engine
+    /// generated are already in memory, so the open-time estimate can add up
+    /// how much XHTML the spine holds without decompressing the book.
+    pub fn uncompressed_size(&self, key: &str) -> Option<u64> {
+        let key = normalize_path(key);
+        if let Ok(pinned) = self.pinned.lock()
+            && let Some(value) = pinned.get(&key)
+        {
+            return Some(value.len() as u64);
+        }
+        if let Ok(cache) = self.cache.lock()
+            && let Some(value) = cache.entries.get(&key)
+        {
+            return Some(value.len() as u64);
+        }
+        let mut maybe_archive = self.zip_archive.lock().ok()?;
+        let archive = maybe_archive.as_mut()?;
+        let index = (match archive.index_for_name(&key) {
+            Some(index) => Some(index),
+            None => {
+                let mut found: Option<usize> = None;
+                for i in 0..archive.len() {
+                    let Some(name) = archive.name_for_index(i) else {
+                        continue;
+                    };
+                    if normalize_path(name) == key {
+                        found = Some(i);
+                        break;
+                    }
+                }
+                found
+            }
+        })?;
+        let entry = archive.by_index_raw(index).ok()?;
+        if entry.is_dir() {
+            return None;
+        }
+        Some(entry.size())
+    }
+
     pub fn from_map(resources: HashMap<String, Vec<u8>>) -> Self {
         let mut cache = ResourceCache::new(resource_cache_bytes());
         for (key, value) in resources.into_iter() {
@@ -367,11 +426,7 @@ pub struct PageFitImage {
 
 impl EpubBook {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path_ref = path.as_ref();
-        let data =
-            std::fs::read(path_ref).with_context(|| format!("read epub {}", path_ref.display()))?;
-        zip::ZipArchive::new(Cursor::new(data)).context("open epub zip")?;
-        Self::from_provider(LazyResource::new(path_ref))
+        Self::from_provider(LazyResource::open(path.as_ref())?)
     }
 
     pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
@@ -617,6 +672,20 @@ impl EpubBook {
             changed += generated_count.max(1);
         }
         changed
+    }
+
+    /// Uncompressed bytes of XHTML in the spine, from the archive directory.
+    ///
+    /// This is the size the generated chunk HTML is made from, and it is
+    /// available without decompressing or parsing anything, so the opening
+    /// memory estimate can use it before the book is read.
+    pub fn spine_text_bytes(&self) -> u64 {
+        self.spine
+            .iter()
+            .filter(|item| item.linear || item.media_type.to_ascii_lowercase().contains("html"))
+            .filter(|item| is_html_resource(&item.media_type, &item.href))
+            .filter_map(|item| self.resource_provider.uncompressed_size(&item.href))
+            .sum()
     }
 
     pub fn spine_documents(&self) -> Result<Vec<SpineDocument>> {

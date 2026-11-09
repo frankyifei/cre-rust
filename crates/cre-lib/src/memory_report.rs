@@ -33,6 +33,15 @@ const PAGE_INDEX_BYTES: u64 = 700;
 /// up to a factor of two.
 const HTML_BYTES_PER_PAGE: u64 = 2000;
 
+/// Generated HTML per byte of source XHTML: the section wrappers and the head
+/// add a little. Repacking `zyj.epub` into a 24 MB text book gave 24.0 MB of
+/// XHTML and 24.9 MB of generated HTML (1.04); 1.10 is the upper bound here.
+const HTML_PER_SOURCE_BYTE: f64 = 1.10;
+
+/// LZ4 size per byte of generated HTML. Real prose compresses to 0.54-0.57;
+/// 0.62 leaves room so an early refusal is never a close call.
+const LZ4_PER_HTML_BYTE: f64 = 0.62;
+
 /// The diagnostic page itself is smaller than this; it is never re-checked.
 const DIAGNOSTIC_PAGE_LIMIT: usize = 64 * 1024;
 
@@ -59,6 +68,8 @@ pub(crate) struct MemoryReport {
     pub available_source: &'static str,
     pub resident: Option<u64>,
     pub source_bytes: u64,
+    /// Spine XHTML size, when the report was estimated before parsing.
+    pub source_text_bytes: u64,
     /// Generated HTML before compression, used to estimate the page count.
     pub html_bytes: u64,
     /// Bytes the chunk text actually keeps resident: one LZ4 block per chunk.
@@ -73,6 +84,8 @@ pub(crate) struct MemoryReport {
     pub index_bytes: u64,
     pub reserve: u64,
     pub need: u64,
+    /// True when the figures come from the spine size instead of measurement.
+    pub estimated: bool,
 }
 
 impl MemoryReport {
@@ -124,6 +137,7 @@ pub(crate) fn measure(
         available_source,
         resident: resident_bytes(),
         source_bytes,
+        source_text_bytes: 0,
         html_bytes,
         stored_bytes,
         chunks,
@@ -134,7 +148,89 @@ pub(crate) fn measure(
         index_bytes,
         reserve,
         need: stored_bytes + dom_bytes + image_bytes + index_bytes + reserve,
+        estimated: false,
     }
+}
+
+/// An estimated refusal, before the book is parsed.
+///
+/// The exact check needs the whole book decompressed, converted to chunk HTML,
+/// split and compressed first, which is seconds of waiting before the page
+/// appears on a Kindle. The spine's XHTML size is in the zip directory, so a
+/// book that cannot possibly fit can be refused immediately.
+///
+/// The ratios are upper bounds and images are not counted, so only an estimate
+/// clearly over the device's memory becomes a refusal; a borderline book still
+/// gets the exact check after compression.
+pub(crate) fn preflight(
+    spine_bytes: u64,
+    source_bytes: u64,
+    text_budget: usize,
+    title: Option<&str>,
+) -> Option<String> {
+    if spine_bytes == 0 || std::env::var_os("CRE_IGNORE_LOW_MEMORY").is_some() {
+        return None;
+    }
+    let (available, available_source) = memory_available_detail()?;
+    let force = std::env::var_os("CRE_FORCE_LOW_MEMORY").is_some();
+    preflight_with(
+        spine_bytes,
+        source_bytes,
+        text_budget,
+        available,
+        available_source,
+        title,
+        force,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preflight_with(
+    spine_bytes: u64,
+    source_bytes: u64,
+    text_budget: usize,
+    available: u64,
+    available_source: &'static str,
+    title: Option<&str>,
+    force: bool,
+) -> Option<String> {
+    let html_bytes = (spine_bytes as f64 * HTML_PER_SOURCE_BYTE) as u64;
+    let stored_bytes = (html_bytes as f64 * LZ4_PER_HTML_BYTE) as u64;
+    // Chunks are filled up to the text budget, so the largest DOM that will
+    // exist is one budget's worth.
+    let largest_chunk = text_budget as u64;
+    let dom_bytes = largest_chunk.saturating_mul(LAYOUT_BYTES_PER_HTML_BYTE as u64);
+    let pages = html_bytes / HTML_BYTES_PER_PAGE.max(1);
+    let index_bytes = pages.saturating_mul(PAGE_INDEX_BYTES);
+    let reserve = LAYOUT_MEMORY_RESERVE as u64;
+    let need = stored_bytes + dom_bytes + index_bytes + reserve;
+    // The ratios above over-state the result by roughly 10%; allow another
+    // 10% before refusing, so a book that would only just fit is measured
+    // exactly instead of turned away by a guess.
+    if !force && need <= available.saturating_mul(12) / 10 {
+        return None;
+    }
+    let chunks = (html_bytes / largest_chunk.max(1)).max(1) as usize;
+    let report = MemoryReport {
+        total: memory_total_bytes(),
+        available: Some(available),
+        available_source,
+        resident: resident_bytes(),
+        source_bytes,
+        source_text_bytes: spine_bytes,
+        html_bytes,
+        stored_bytes,
+        chunks,
+        largest_chunk,
+        dom_bytes,
+        image_bytes: 0,
+        pages,
+        index_bytes,
+        reserve,
+        need,
+        estimated: true,
+    };
+    Some(render_page(&report, title))
 }
 
 /// The page that explains that `sources` does not fit, or `None` when it does.
@@ -222,22 +318,38 @@ td.value { text-align: right; }\
     html.push_str("<h2>This book</h2><table>");
     html.push_str(&row("Title", &title));
     html.push_str(&row("File size", &mb(report.source_bytes)));
-    html.push_str(&row(
-        "Generated HTML",
-        &format!(
-            "{} ({} chunks, largest {})",
-            mb(report.html_bytes),
-            report.chunks,
-            kb(report.largest_chunk)
-        ),
-    ));
+    if report.estimated {
+        html.push_str(&row(
+            "Text (XHTML, from the zip)",
+            &mb(report.source_text_bytes),
+        ));
+    } else {
+        html.push_str(&row(
+            "Generated HTML",
+            &format!(
+                "{} ({} chunks, largest {})",
+                mb(report.html_bytes),
+                report.chunks,
+                kb(report.largest_chunk)
+            ),
+        ));
+    }
     html.push_str(&row("Text stored (LZ4)", &mb(report.stored_bytes)));
     html.push_str("</table>");
 
-    html.push_str("<h2>Estimated need when opening</h2><table>");
+    let heading = if report.estimated {
+        "Estimated need before parsing the book"
+    } else {
+        "Estimated need when opening"
+    };
+    html.push_str(&format!("<h2>{heading}</h2><table>"));
     html.push_str(&row("Text (LZ4)", &mb(report.stored_bytes)));
     html.push_str(&row("Page layout (one chunk)", &mb(report.dom_bytes)));
-    html.push_str(&row("Images (one chunk, decoded)", &mb(report.image_bytes)));
+    if report.estimated {
+        html.push_str(&row("Images (one chunk, decoded)", "not counted"));
+    } else {
+        html.push_str(&row("Images (one chunk, decoded)", &mb(report.image_bytes)));
+    }
     html.push_str(&row(
         "Page index",
         &format!("{} (~{} pages)", mb(report.index_bytes), report.pages),
@@ -246,6 +358,13 @@ td.value { text-align: right; }\
     html.push_str(&row("Total", &mb(report.need)));
     html.push_str("</table>");
 
+    if report.estimated {
+        html.push_str(
+            "<p class=\"small\">Estimated from the size of the book's XHTML in the \
+EPUB, before the book was read. Images are not counted, so the real need is \
+at least this much.</p>",
+        );
+    }
     html.push_str(
         "<p class=\"small\">The text of every chunk is kept compressed; only the \
 chunk being read is decompressed and laid out, and the page index grows as \
@@ -253,8 +372,10 @@ chunks are laid out.</p>",
     );
 
     if shortfall > 0 {
+        let at_least = if report.estimated { "at least " } else { "" };
         html.push_str(&format!(
-            "<p>Short by {}. Free some memory and try again, or open a smaller book.</p>",
+            "<p>Short by {}{}. Free some memory and try again, or open a smaller book.</p>",
+            at_least,
             mb(shortfall)
         ));
     } else {
@@ -312,6 +433,43 @@ mod tests {
             report.stored_bytes + report.dom_bytes + report.index_bytes + report.reserve
         );
         assert!(report.need > report.stored_bytes + report.dom_bytes);
+    }
+
+    #[test]
+    fn a_big_book_is_refused_from_its_xhtml_size_without_being_parsed() {
+        let page = preflight_with(
+            24 * 1024 * 1024,
+            24 * 1024 * 1024,
+            64 * 1024,
+            22 * 1024 * 1024,
+            "CRE_AVAILABLE_MB",
+            Some("Big Book"),
+            false,
+        )
+        .expect("a 24 MB book cannot fit in 22 MB");
+        assert!(page.contains("Big Book"));
+        assert!(page.contains("Estimated need before parsing the book"));
+        assert!(page.contains("Text (XHTML, from the zip)"));
+        assert!(page.contains("not counted"));
+        assert!(page.contains("Short by at least"));
+    }
+
+    #[test]
+    fn an_early_estimate_lets_a_book_that_clearly_fits_through() {
+        // The estimate exists to avoid reading a book that cannot fit; it
+        // must never turn away one that obviously can.
+        assert!(
+            preflight_with(
+                1_000_000,
+                1_000_000,
+                64 * 1024,
+                2048 * 1024 * 1024,
+                "CRE_AVAILABLE_MB",
+                Some("Small"),
+                false,
+            )
+            .is_none()
+        );
     }
 
     #[test]

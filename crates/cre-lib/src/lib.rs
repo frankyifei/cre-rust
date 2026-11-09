@@ -1198,6 +1198,20 @@ impl Document {
         match format {
             DocumentFormat::Epub => {
                 let mut book = EpubBook::open(path)?;
+                let (text_budget, image_budget, layout_budget) =
+                    chunk_budgets(available_memory_bytes());
+                // The zip directory says how much XHTML the spine holds, so a
+                // book that cannot fit is refused before it is decompressed,
+                // converted, split and compressed. The exact check still runs
+                // after compression for books in the grey zone.
+                if let Some(page) = memory_report::preflight(
+                    book.spine_text_bytes(),
+                    source_bytes,
+                    text_budget,
+                    book.title.as_deref(),
+                ) {
+                    return Err(anyhow::Error::new(LowMemory { page }));
+                }
                 let _ = book.normalize_inline_svg_images();
                 let raw_toc = std::mem::take(&mut book.toc);
                 let raw_page_map_source = std::mem::take(&mut book.page_map_source);
@@ -1224,8 +1238,6 @@ impl Document {
                     html_options.margin_y,
                 );
                 svg_raster.set_page_fit_images(std::mem::take(&mut book.page_fit_images));
-                let (text_budget, image_budget, layout_budget) =
-                    chunk_budgets(available_memory_bytes());
                 let htmls = book.to_html_chunks_budgeted(
                     &html_options,
                     text_budget,
