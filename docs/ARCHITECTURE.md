@@ -9,8 +9,8 @@ The goal is a drop-in replacement for the KOReader `cre` module
 (`libkoreader-cre.so`). KOReader must not change. The module keeps the Lua API
 and the side effects that KOReader expects.
 
-The implementation uses Rust and existing rendering libraries. It does not
-copy the crengine C++ code.
+The implementation is Rust code written on existing rendering libraries,
+learning from crengine's design and behaviour.
 
 ## Non-goals
 
@@ -123,18 +123,28 @@ appends the generated stylesheet once per chunk:
 A formula stays inside one line. Display formulas are atomic for pagination; a
 matrix is currently not split between rows.
 
+The translate-to-HTML strategy is learned from crengine's `MathMLHelper`:
+crengine hooks its DOM builder and stretches operators while laying out a line,
+while `cre-mathml` runs before Blitz parses the chunk and gets the measured
+content height back from the engine.
+
 ## Chunking and memory
 
-The chunk size is a function of the available memory. `CRE_AVAILABLE_MB` and
-`CRE_CHUNK_BYTES` override the estimate. The image payload of a chunk is also
-bounded, because Blitz decodes images during layout.
+The chunk size is a function of the available memory. `CRE_AVAILABLE_MB`
+simulates a device for testing. The image payload of a chunk is also bounded,
+because Blitz decodes images during layout.
 
 The current chunk is the only resident layout. When the reader moves to
-another chunk, the old layout is dropped and the new chunk is laid out.
+another chunk, the old layout is dropped and the new chunk is laid out. The
+generated HTML of every chunk stays resident as one LZ4 block per chunk and is
+decompressed when that chunk is laid out.
 
 Resource caches are byte-bounded. Resources that the engine generates
 (rewritten XHTML, page-fit SVG wrappers) are **pinned** for the session. They
 have no zip entry to read again.
+
+The cost model, the open-time worker policy, trimming, the low-memory refusal
+and its measurements are in [MEMORY.md](MEMORY.md).
 
 ## Partial relayout
 
@@ -170,6 +180,12 @@ A font collection holds several families in one file. The selected family is
 passed down as `DocumentOptions::font_family`. If only the family changes, the
 engine rebuilds the font context from the same blobs.
 
+Fonts embedded in the book work through Blitz's `@font-face` support: the CSS
+`url()` is rewritten to an `epub://book/...` path and the document's net
+provider serves the bytes, so the declared family, weight and style are
+registered without a separate font list. TTF, OTF, WOFF and WOFF2 are decoded
+(the `woff` feature is enabled). `local()` sources are skipped upstream.
+
 ## Images
 
 The format crates rewrite image references to `epub://book/<path>` URLs. The
@@ -181,6 +197,11 @@ drawing.
 
 A full-page `<img>` with `height:100%` is wrapped in a generated SVG. The SVG
 keeps the image aspect ratio and makes the image fill the page box.
+
+A raster `<img>` is served to Blitz as a transparent SVG with the real
+intrinsic size, and the original is painted by `cre-paint` at the size it is
+drawn (JPEG decoded with DCT scaling). The placeholder, the page-fit wrapper,
+the resource cache and the painting paths are in [IMAGES.md](IMAGES.md).
 
 ## The Lua bridge
 
@@ -199,21 +220,29 @@ Some methods only store settings. KOReader can call them without an error.
 
 - The engine has no on-disk cache.
 - The DOM is not the full book. One chunk is resident.
+- A chunk's DOM costs ~128 bytes per HTML byte, so very low free memory
+  (below the 24 MB reserve) refuses the book instead of swapping to disk.
 - `TextPosition` strings are compatible, but the internal position model is
   different.
 - EPUB CFI output is simplified.
 - Vertical writing is not supported. Blitz does not lay out vertical text.
+- BiDi is not supported yet: `direction`/`unicode-bidi` are not honoured
+  end-to-end and text is laid out left-to-right. This waits on upstream Blitz.
 - Hyphenation is not applied.
-- Embedded `@font-face` fonts are not used.
 
 ## Diagnostics
 
 | Variable | Use |
 |---|---|
-| `CRE_LAYOUT_TIMING=1` | Find slow chunks |
+| `CRE_LAYOUT_PROFILE=1` | Per-chunk stages, compression, trimming, workers |
+| `CRE_RENDER_PROFILE=1` | Record / raster / convert split per page |
 | `CRE_LUA_TRACE_PATH=FILE` | See which Lua calls KOReader makes |
-| `CRE_SNAPSHOT_DEBUG=1` | See which setting caused a relayout |
 | `CRE_RESOURCE_CACHE_KB=N` | Test resource cache pressure |
-| `CRE_XP_POINT_DEBUG=1` | Find XPointers that do not map to a line |
+| `CRE_NO_TRIM=1` | A/B the heap trimming |
+| `CRE_NO_SCALED_DECODE=1` | A/B scaled image decoding |
+| `CRE_AVAILABLE_MB=N` | Simulate the device's free memory |
+| `CRE_IGNORE_LOW_MEMORY=1` | Open a book the device would refuse |
 
 The QEMU harness also sets `CRE_LIB_TRACE` for the shim, not for the module.
+See [MEMORY.md](MEMORY.md) and [PERFORMANCE.md](PERFORMANCE.md) for the
+measured numbers.

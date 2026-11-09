@@ -58,7 +58,7 @@ The method names are complete. The main work is the behavior behind the names.
 
 ### Embedded fonts and CSS
 
-- Use EPUB embedded fonts (`@font-face`) or report that they are ignored.
+- Test embedded fonts across more books (WOFF/WOFF2, weight/style ranges).
 - Apply `crengine.doc.embedded.styles.enabled` to the chunk HTML.
 - Support more CSS properties as Blitz adds them.
 
@@ -94,8 +94,8 @@ The method names are complete. The main work is the behavior behind the names.
 ## Engine gaps that Blitz owns
 
 - Vertical writing (`writing-mode`). Blitz supports block-level layout only.
-- Full bidi control (`unicode-bidi`). Blitz supports text reordering but not
-  all controls.
+- BiDi (`direction`/`unicode-bidi`). Blitz does not pass the paragraph
+  direction through to the shaper yet; waiting on upstream.
 - Table layout. Blitz emulates tables with CSS Grid.
 - Some CSS properties. See <https://blitz.is/status/css>.
 

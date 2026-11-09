@@ -3,16 +3,29 @@
 //! Blitz has no MathML layout. The approach here follows crengine's
 //! `MathMLHelper`: transform the MathML tree into ordinary HTML boxes that the
 //! existing HTML layout understands (inline blocks, `sup`/`sub`, tables and
-//! borders), instead of implementing a separate math layout engine.
+//! borders), instead of implementing a separate math layout engine. We learned
+//! the approach from crengine, which does the rewrite inside its DOM builder
+//! and stretches operators while laying out a line; here the rewrite runs
+//! before Blitz parses the chunk and the engine reports the measured content
+//! height back.
 //!
 //! This is deliberately a presentation subset: tokens, `mrow`, `mfenced`,
 //! `msup`/`msub`/`msubsup`, `munder`/`mover`/`munderover`, `mfrac`,
-//! `msqrt`/`mroot`, `mtable`, `mspace`, `mstyle`, `merror`, `mphantom` and
-//! `menclose`. Scripts are positioned with CSS baseline shifts, fences are
-//! stretched with CSS transforms (which the tiny-skia painter applies as glyph
-//! transforms) and radical signs are drawn from strokes plus the wrapper's top
-//! border; large operators use display-style limits. OpenType MATH metrics and
-//! the finer mtable/multiscript rules remain future work.
+//! `msqrt`/`mroot`, `mtable`, `mspace`, `mstyle`, `merror`, `mphantom`,
+//! `menclose`, `mmultiscripts` and `maction`.
+//!
+//! Scripts are positioned with CSS baseline shifts computed from the font's
+//! OpenType MATH constants, fences are measured against the content they cover
+//! and stretched with CSS transforms (the tiny-skia painter applies those as
+//! glyph transforms), and radical signs are drawn from strokes plus a separate
+//! vinculum element, so they do not depend on the font's `√` glyph. Large
+//! operators use display-style limits. [`MathMetrics`] reads the MATH table of
+//! the selected math font and falls back to the crengine/Chrome defaults when
+//! there is none.
+//!
+//! Remaining limits: `mpadded`, a full MathML operator dictionary, multi-glyph
+//! stretchy composition and the finest mtable/multiscript placement are not
+//! implemented; operator spacing uses CSS margins by operator class.
 
 use roxmltree::{Document, Node};
 

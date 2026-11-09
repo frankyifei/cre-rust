@@ -10,9 +10,10 @@ engine. KOReader keeps its Lua API and does not change: drop the resulting
 module into `koreader/libs/` and the reader opens EPUB, FB2, MOBI, AZW, HTML and
 plain text exactly as before.
 
-This is not a direct port of crengine. No crengine code is directly used; the 
-layout model, the pagination, the painter and the MathML translator are new code written
-against Rust libraries. It references crengine heavily for its behaviour.
+cre-rust learns from crengine: its page model, XPointer format, pagination
+rules and rendering quirks guided this implementation. The layout model, the
+pagination, the painter and the MathML translator are new Rust code written by
+DeepSeek V4.1 Flash against existing libraries.
 
 ## Status
 
@@ -23,12 +24,12 @@ Tested with KOReader v2026.07.1:
 - with an x86_64 desktop KOReader build.
 
 The module exposes about 124 document methods and 24 module functions, and the
-workspace has 32 test targets.
+workspace has 34 test targets.
 
 ## Highlights
 
-The interesting work is the part Blitz does not provide. These pieces are
-ours.
+The interesting work is what Blitz does not provide, or provides too
+expensively for a 256 MB e-ink reader. These pieces are ours.
 
 ### MathML rendering (`cre-mathml`)
 
@@ -38,7 +39,14 @@ tokens, `mrow`, `mfenced`, scripts, `mfrac`, `msqrt`/`mroot`, `mtable`,
 `mspace`, `mstyle`, `merror`, `mphantom`, `menclose`, `mmultiscripts` and
 `maction`.
 
-The parts that took real work:
+This follows the approach of crengine's `MathMLHelper`: turn MathML into
+ordinary HTML instead of adding a second math layout engine. We learned the
+strategy from crengine, which does the rewrite inside its DOM builder and
+stretches operators during line layout; here the rewrite happens before Blitz
+parses the chunk, and the measuring pass, the drawn radicals and the OpenType
+MATH constants are our own work.
+
+The parts we spent the most time on:
 
 - radical signs are **drawn**, not scaled glyphs: the vinculum is its own
   element that starts exactly where the surd's tip ends, and the surd is two
@@ -108,10 +116,67 @@ the page list is rebased around it. Measured in the QEMU harness:
 | `juliet.epub` | 4.1 s | 0.47 s |
 | `zyj.epub` | 7.3 s | 0.71 s |
 
+### Memory: one chunk, kept compressed
+
+A big text book keeps the generated HTML of every chunk so a settings change
+does not have to read and split it again. That copy is stored as **one LZ4
+block per chunk** and decompressed only when that chunk is laid out — opening,
+a TOC jump into another part, and a relayout each decompress one chunk, never
+the whole book. Real prose compresses to about 55%, so a book that would keep
+25 MB of text resident keeps ~14 MB.
+
+Blitz decodes every image of a chunk while it parses it. A raster `<img>` is
+therefore served to Blitz as a transparent SVG that carries the real intrinsic
+size, and the real pixels are painted by `cre-paint` at the size they are
+actually drawn; JPEGs are decoded with DCT scaling at that size. A full-page
+picture goes through a page-fit wrapper that paints the original with
+`contain`. Layout never holds the decoded pixels. See
+[docs/IMAGES.md](docs/IMAGES.md).
+
+Other bounds, all measured:
+
+- the resource cache is a 4 MB LRU, with engine-generated resources pinned;
+- a chunk's budget covers its text DOM **and** its decoded images;
+- the open-time layout pass runs chunks on several cores when memory allows,
+  but the worker count comes from the measured cost of one chunk, and the
+  opening chunk is laid out last;
+- the workers' arenas are released with `malloc_trim` before the opening chunk
+  is laid out, and trimming only runs when the heap grew.
+
+A book that still cannot fit is refused with a page that explains the
+shortfall. The estimate counts the LZ4 text, one chunk's layout, the heaviest
+chunk's images and the page index. It is computed from the XHTML size in the
+EPUB zip **before** the book is read, so a refusal appears in milliseconds
+instead of after a full parse. See [docs/MEMORY.md](docs/MEMORY.md).
+
+### Paint speed on a single-core e-ink device
+
+Text pages render 2-3x faster than the first version. Transparent fills are
+dropped, the RGBA-to-gray pass runs in place, pixel-aligned solid fills use
+`fill_rect`, glyph masks and the font collection are shared across pages, and
+the page pixmap is reused between renders. Minified images are pre-scaled with
+a parallel box filter and blitted 1:1; 32-bit ARM has a fixed-point bilinear
+sampler for the remaining image fills, which closed most of the gap to the
+`vello_cpu` backend. See [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+
+### Running on the Kindle's glibc 2.12
+
+The Paperwhite 2 ships glibc 2.12 and a soft-float ABI, while the prebuilt
+Rust standard library targets glibc 2.17. The module is linked against the
+device's 2.12 sysroot, keeps VFP3 instructions without leaving the softfp ABI,
+and ships a small `getauxval` shim because Rust's thread setup calls it and
+glibc only exported it from 2.16. The build script audits the result: the
+highest required `GLIBC_*` symbol is 2.12, no non-libc symbol is left
+undefined, and the Lua API symbols stay undefined for the host LuaJIT. Thin
+LTO and stripping keep the module around 19.7 MB. See
+[docs/KINDLE.md](docs/KINDLE.md).
+
 ### Fonts
 
 - TTF, OTF, TTC and OTC files, with face selection inside a collection (Noto
   Serif CJK JP/KR/SC/TC/HK and similar);
+- fonts embedded in the book (`@font-face`, TTF/OTF/WOFF/WOFF2) through the
+  same resource provider, with the declared family, weight and style;
 - generic family lists, fallback chains, font bias, and the reader's
   `font-family: math` slot;
 - bold and italic synthesis;
@@ -129,15 +194,58 @@ the page list is rebased around it. Measured in the QEMU harness:
 
 The format is detected from the file content, not from the extension.
 
+## Pros and cons
+
+**Pros**
+
+- A real CSS engine: Stylo, Taffy and Parley provide selectors, cascade,
+  fonts, complex-script shaping and inline layout, so publisher CSS behaves
+  like a browser instead of a hand-written subset.
+- Memory scales with one chunk, not with the book: a 15-photo book went from
+  105 MB to 33 MB of engine RSS at open, and a 24 MB text book from 66 MB to
+  41 MB. Text layout is unchanged; image pages keep their ink within ~1%.
+- Positions, selection, search and TOC are page-accurate, with rectangles per
+  line segment; the XPointer model round-trips.
+- Fast paint on e-ink, including an ARM-specific path, and a settings change
+  that only re-lays out the current chunk.
+- The engine is Rust throughout: no C++ toolchain and no unsafe layout code.
+- The same code runs on x86 and ARMv7 (hard and soft float), with 34 test
+  targets, a 51-book reading regression used during development, and a QEMU
+  harness that drives the real KOReader.
+- Runs on a stock Kindle Paperwhite 2: softfp ABI, VFP3 instructions, a
+  glibc 2.12 symbol set and a `getauxval` shim, all audited by the build
+  script (see [docs/KINDLE.md](docs/KINDLE.md)).
+
+**Cons**
+
+- The Blitz DOM costs about **128 bytes per byte of HTML**. One 128 KB chunk
+  needs ~14 MB while it is laid out, so the floor is much higher than
+  crengine's paged DOM, which keeps 8-byte node handles in RAM and pages the
+  rest to disk.
+- Blitz cannot serialize or restore a DOM, so there is no on-disk cache or
+  swap. Opening a book again re-lays it out, and at very low free memory this
+  engine cannot match crengine with a small `cre_storage_size_factor`.
+- Page breaks can differ from crengine when a book has to be split into chunks;
+  chunk boundaries always start a page.
+- Engine features are missing: vertical writing, `text-shadow`, bidi
+  (`direction`/`unicode-bidi`), hyphenation, and full `object-fit` in reflow.
+- MathML is a presentation subset; MOBI/KF8 support is partial; EPUB CFI is
+  simplified.
+- The Lua API is not complete: some `cre.cpp` methods return fixed values (see
+  [TODO.md](TODO.md)).
+- A very large book still takes seconds to open on a Paperwhite 2, and the
+  memory gate reserves a fixed 24 MB, so a device with less free memory
+  refuses even small books (being tuned).
+- Blitz does not support complex CJK layout yet, although there are recent pull 
+  requests in upstream
+
 ## Limits
 
 - Vertical writing (`writing-mode: vertical-rl`) is not supported. Blitz lays
   out horizontal text only.
-- RTL text uses Parley bidi reordering. `direction` is partial and
-  `unicode-bidi` is not supported.
+- BiDi is not supported yet: `direction` and `unicode-bidi` are not honoured
+  end-to-end and text is laid out left-to-right. This waits on upstream Blitz.
 - Text hyphenation is not applied. The module stores the dictionary name only.
-- Embedded `@font-face` fonts are not used. KOReader must register the font
-  files.
 - `text-shadow` is not painted: Blitz does not parse it, so the paint stream
   carries no shadow for glyph runs. `box-shadow`, filters, `opacity` and
   `clip-path` (on block boxes) do work.
@@ -226,8 +334,14 @@ The default build uses VFP3 instructions, but keeps the softfp ABI:
 `+strict-align` is necessary. VFP loads fail on unaligned addresses. The
 softfp ABI guarantees only 8-byte alignment at public interfaces.
 
-The build also needs glibc 2.12 symbols. The build script checks the maximum
-GLIBC symbol version and prints it.
+The prebuilt Rust standard library targets glibc 2.17, but the module is
+linked against the toolchain's glibc 2.12 sysroot. The one link-time gap,
+`getauxval` (Rust calls it during thread setup, and glibc only exports it from
+2.16), is covered by the `old-glibc` cargo feature that the Kindle build
+enables. The script then checks the highest required `GLIBC_*` version, the
+`NEEDED` libraries and the undefined symbols; both the VFP and the
+software-float builds stay at `GLIBC_2.4`/`GLIBC_2.12`. See
+[docs/KINDLE.md](docs/KINDLE.md) for the full compatibility notes.
 
 ### Steps
 
@@ -258,6 +372,13 @@ GLIBC symbol version and prints it.
    CRE_NO_VFP=1 bash scripts/build-cre-lua-luajit-module-arm-kindlepw2.sh
    ```
 
+6. The current device build enables NEON; it uses the same script with
+   `CRE_NEON=1` and writes to a `-neon` target directory:
+
+   ```sh
+   CRE_NEON=1 bash scripts/build-cre-lua-luajit-module-arm-kindlepw2.sh
+   ```
+
 The output is:
 
 ```text
@@ -271,8 +392,9 @@ Reference sizes:
 
 | Variant | Size |
 |---|---|
-| VFP, strict align | about 18.9 MB |
-| Software float | about 18.9 MB |
+| VFP, strict align | about 19.7 MB |
+| NEON (current device build) | about 19.8 MB |
+| Software float | about 19 MB |
 
 ### Deploy to the device
 
@@ -302,7 +424,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-The test suite has 32 targets.
+The test suite has 34 targets.
 
 Some tests need the DejaVu fonts. Some tests use the books in
 `fixtures/koreader-test-data/`. Install the fonts and keep the books before you
@@ -325,15 +447,17 @@ convert /tmp/pages/page-001.pgm /tmp/page-001.png
 
 | Variable | Effect |
 |---|---|
-| `CRE_LAYOUT_TIMING=1` | Log the time for each chunk layout |
-| `CRE_CHUNK_BYTES=N` | Force the chunk size in bytes |
-| `CRE_AVAILABLE_MB=N` | Set the memory budget for chunk sizes |
-| `CRE_RESOURCE_CACHE_KB=N` | Set the resource cache size |
+| `CRE_AVAILABLE_MB=N` | Pretend the device has N MB free (chunk planner and low-memory gate) |
+| `CRE_IGNORE_LOW_MEMORY=1` | Open a book the device would refuse, to measure it |
+| `CRE_FORCE_LOW_MEMORY=1` | Show the low-memory diagnostic page |
+| `CRE_LAYOUT_PROFILE=1` | Time the open pass: chunk stages, LZ4 compression, trimming, workers |
+| `CRE_LAYOUT_WORKERS=N` | Force the number of parallel chunk layouts |
+| `CRE_NO_TRIM=1` | Do not return freed heap to the OS (A/B the trim cost) |
+| `CRE_RENDER_PROFILE=1` | Split page render time into record / raster / convert |
+| `CRE_NO_SCALED_DECODE=1` | Decode images at full size (A/B DCT scaling) |
+| `CRE_RESOURCE_CACHE_KB=N` | Resource cache size in KB (default 4096) |
+| `CRE_PAINT_BACKEND=tiny\|vello` | Painter backend in a build with `vello-cpu` |
 | `CRE_LUA_TRACE_PATH=FILE` | Write a trace of the Lua API calls |
-| `CRE_SNAPSHOT_DEBUG=1` | Log settings that cause a relayout |
-| `CRE_XP_POINT_DEBUG=1` | Log XPointer positions that have no line |
-| `CRE_MATH_DEBUG=1` | Log the math font that was picked for math content |
-| `CRE_PAINT_BACKEND=tiny\|vello` | Choose the paint backend in a build with `vello-cpu` |
 
 ## Run KOReader with QEMU
 
