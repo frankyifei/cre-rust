@@ -67,8 +67,11 @@ The parts we spent the most time on:
   suites stays out of the formula;
 - `mathcolor`, `mathbackground`, `mathsize` and `mathvariant` become CSS on the
   generated boxes, and the author's `class`/`style` is kept, so a book's MathML
-  CSS applies (the W3C `mathml-020`/`021` styling tests); `mpadded` honours its
-  incremental sizes;
+  CSS applies (the W3C `mathml-020`/`021` styling tests);
+- `mtable` draws its `frame`, `rowlines` and `columnlines` and applies
+  `rowalign`/`columnalign`; the rules between cells are 1px gradients because
+  Blitz does not paint a border on only one side of a shared cell edge;
+- `mpadded` honours its incremental sizes;
 - OpenType MATH constants (script scale, shifts, rule thickness, axis height)
   are read from the selected math font; KOReader's `font-family: math` choice
   is honoured, and the math font survives the "ignore publisher fonts" tweak.

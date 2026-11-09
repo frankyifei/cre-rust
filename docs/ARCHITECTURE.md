@@ -122,7 +122,10 @@ appends the generated stylesheet once per chunk:
 
 Presentation attributes (`mathcolor`, `mathbackground`, `mathsize`,
 `mathvariant`) and author classes/styles are copied onto the generated HTML, so
-book MathML CSS applies; `mpadded` honours incremental sizes.
+book MathML CSS applies; `mpadded` honours incremental sizes. `mtable` keeps its
+frame, row/column rules and alignment; rules between cells are drawn as 1px
+gradients because Blitz does not paint a border on only one side of a shared
+cell edge.
 
 A formula stays inside one line. Display formulas are atomic for pagination; a
 matrix is currently not split between rows.

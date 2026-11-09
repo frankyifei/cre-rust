@@ -26,6 +26,9 @@
 //! Presentation attributes (`mathcolor`, `mathbackground`, `mathsize`,
 //! `mathvariant`) and the author's `class`/`style` are carried onto the
 //! generated HTML, so a book's MathML CSS applies to the rewritten boxes.
+//! `mtable` keeps its frame, row/column rules and row/column alignment; the
+//! rules are 1px background gradients because Blitz does not paint a border
+//! on only one side of a shared cell edge.
 //!
 //! Remaining limits: absolute `mpadded` sizes (only increments are honoured),
 //! a full MathML operator dictionary, multi-glyph stretchy composition and the
@@ -1633,6 +1636,68 @@ fn render_fenced(node: Node<'_, '_>, ctx: Ctx) -> String {
     out
 }
 
+fn table_line(spec: Option<&str>, gap: usize) -> Option<&'static str> {
+    let values: Vec<&str> = spec?.split_whitespace().collect();
+    // MathML repeats the last value for the remaining gaps.
+    match *values.get(gap).or_else(|| values.last())? {
+        "solid" => Some("solid"),
+        "dashed" => Some("dashed"),
+        _ => None,
+    }
+}
+
+fn vertical_align(value: &str) -> &'static str {
+    match value {
+        "top" => "top",
+        "bottom" => "bottom",
+        "baseline" => "baseline",
+        _ => "middle",
+    }
+}
+
+fn cell_lines(row: Option<&'static str>, column: Option<&'static str>) -> String {
+    // Blitz's table paint does not reliably draw a border that exists on only
+    // one side of a shared cell edge (a rule between two rows, or two
+    // columns). A 1px background gradient on the cell paints every time and
+    // supports the dashed style too.
+    let mut images = Vec::new();
+    let mut sizes = Vec::new();
+    let mut positions = Vec::new();
+    if let Some(style) = row {
+        images.push(match style {
+            // The background box is 1px tall, so a dashed rule has to vary
+            // along the line (left to right); a top-to-bottom pattern would
+            // never leave the "on" part of the 1px strip.
+            "dashed" => {
+                "repeating-linear-gradient(to right, currentColor 0 2px, transparent 2px 4px)"
+            }
+            _ => "linear-gradient(to bottom, currentColor 0 1px, transparent 1px)",
+        });
+        sizes.push("100% 1px");
+        positions.push("left top");
+    }
+    if let Some(style) = column {
+        images.push(match style {
+            "dashed" => {
+                "repeating-linear-gradient(to bottom, currentColor 0 2px, transparent 2px 4px)"
+            }
+            _ => "linear-gradient(to right, currentColor 0 1px, transparent 1px)",
+        });
+        sizes.push("1px 100%");
+        positions.push("left top");
+    }
+    if images.is_empty() {
+        return String::new();
+    }
+    format!(
+        "background-image:{} !important;background-repeat:no-repeat !important;\
+         background-size:{} !important;background-position:{} !important",
+        images.join(","),
+        sizes.join(","),
+        positions.join(",")
+    )
+}
+
 fn render_table(node: Node<'_, '_>, ctx: Ctx) -> String {
     let alignments: Vec<String> = node
         .attribute("columnalign")
@@ -1640,11 +1705,20 @@ fn render_table(node: Node<'_, '_>, ctx: Ctx) -> String {
         .split_whitespace()
         .map(|value| value.to_string())
         .collect();
+    let row_alignments: Vec<&str> = node
+        .attribute("rowalign")
+        .unwrap_or("")
+        .split_whitespace()
+        .collect();
+    let rowlines = node.attribute("rowlines");
+    let columnlines = node.attribute("columnlines");
     let row_spacing = node.attribute("rowspacing");
     let column_spacing = node.attribute("columnspacing");
+    let display = node.attribute("displaystyle").map(str::trim) == Some("true");
+    let ctx = Ctx { display, ..ctx };
     let (classes, mut wrapper_style) = element_attrs(node, "cre-mtable-wrap");
-    // MathML `frame` draws a border around the whole table; `rowlines` and
-    // `columnlines` are not implemented.
+    // `frame` is the outer border; `rowlines`/`columnlines` are the internal
+    // ones, drawn on the cells below.
     if let Some(frame) = node.attribute("frame").map(str::trim)
         && matches!(frame, "solid" | "dashed")
     {
@@ -1655,11 +1729,23 @@ fn render_table(node: Node<'_, '_>, ctx: Ctx) -> String {
     }
 
     let mut out = String::from("<table class=\"cre-mtable\"><tbody>");
-    for row in node
+    for (row_index, row) in node
         .children()
         .filter(|child| child.is_element())
         .filter(|child| child.tag_name().name().eq_ignore_ascii_case("mtr"))
+        .enumerate()
     {
+        let row_line = if row_index > 0 {
+            table_line(rowlines, row_index - 1)
+        } else {
+            None
+        };
+        let row_align = row_alignments
+            .get(row_index)
+            .or_else(|| row_alignments.last())
+            .copied()
+            .unwrap_or("center");
+        let vertical = vertical_align(row_align);
         let (row_classes, row_style) = element_attrs(row, "");
         let mut row_attrs = String::new();
         if !row_classes.is_empty() {
@@ -1685,6 +1771,11 @@ fn render_table(node: Node<'_, '_>, ctx: Ctx) -> String {
             })
             .enumerate()
         {
+            let column_line = if column > 0 {
+                table_line(columnlines, column - 1)
+            } else {
+                None
+            };
             let align = alignments
                 .get(column)
                 .or_else(|| alignments.last())
@@ -1694,12 +1785,20 @@ fn render_table(node: Node<'_, '_>, ctx: Ctx) -> String {
                     _ => "center",
                 })
                 .unwrap_or("center");
-            let mut style = format!("text-align:{align}");
+            let mut style = format!("text-align:{align};vertical-align:{vertical}");
             if let Some(spacing) = column_spacing {
-                style.push_str(&format!(";padding-left:{spacing};padding-right:{spacing}"));
+                style.push_str(&format!(
+                    ";padding-left:{spacing} !important;padding-right:{spacing} !important"
+                ));
             }
             if let Some(spacing) = row_spacing {
-                style.push_str(&format!(";padding-top:{spacing};padding-bottom:{spacing}"));
+                style.push_str(&format!(
+                    ";padding-top:{spacing} !important;padding-bottom:{spacing} !important"
+                ));
+            }
+            if row_line.is_some() || column_line.is_some() {
+                style.push(';');
+                style.push_str(&cell_lines(row_line, column_line));
             }
             let (cell_classes, cell_style) = element_attrs(cell, "");
             if !cell_style.is_empty() {
@@ -2775,5 +2874,39 @@ mod tests {
         );
         assert!(out.contains("class=\"cre-mo cre-mo-bin test1\""), "{out}");
         assert!(out.contains("class=\"cre-mi test2\""), "{out}");
+    }
+
+    #[test]
+    fn table_frame_rowlines_and_columnlines_are_emitted() {
+        // The W3C mathml-060/061 tables: an outer frame plus internal row and
+        // column rules, with the value list repeated for the remaining gaps.
+        let out = rewrite_mathml(
+            r#"<math><mtable frame="solid" rowlines="dashed" columnlines="dashed none none"><mtr><mtd><mn>1</mn></mtd><mtd><mn>2</mn></mtd><mtd><mn>3</mn></mtd></mtr><mtr><mtd><mn>4</mn></mtd><mtd><mn>5</mn></mtd><mtd><mn>6</mn></mtd></mtr></mtable></math>"#,
+        );
+        assert!(out.contains("border:1px solid"), "{out}");
+        assert!(
+            out.contains(
+                "repeating-linear-gradient(to right, currentColor 0 2px, transparent 2px 4px)"
+            ),
+            "{out}"
+        );
+        assert_eq!(
+            out.matches(
+                "repeating-linear-gradient(to bottom, currentColor 0 2px, transparent 2px 4px)"
+            )
+            .count(),
+            2,
+            "the first column gap is dashed in both rows: {out}"
+        );
+        assert!(!out.contains("border-left:1px none"), "{out}");
+    }
+
+    #[test]
+    fn table_rowalign_is_applied_per_row() {
+        let out = rewrite_mathml(
+            r#"<math><mtable rowalign="top bottom"><mtr><mtd><mn>1</mn></mtd></mtr><mtr><mtd><mn>2</mn></mtd></mtr></mtable></math>"#,
+        );
+        assert!(out.contains("vertical-align:top"), "{out}");
+        assert!(out.contains("vertical-align:bottom"), "{out}");
     }
 }
