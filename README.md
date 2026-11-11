@@ -132,6 +132,12 @@ a TOC jump into another part, and a relayout each decompress one chunk, never
 the whole book. Real prose compresses to about 55%, so a book that would keep
 25 MB of text resident keeps ~14 MB.
 
+The EPUB generator streams the chunks: it decodes one spine document at a
+time and hands each finished chunk to the compressor as soon as it is built,
+so the whole book's chunk HTML is never materialized. On a 24 MB text book at
+a 38 MB budget this cut the open peak from 132 MB to 64 MB (the steady
+document stayed at 63 MB), with the same chunk split and page count.
+
 Blitz decodes every image of a chunk while it parses it. A raster `<img>` is
 therefore served to Blitz as a transparent SVG that carries the real intrinsic
 size, and the real pixels are painted by `cre-paint` at the size they are

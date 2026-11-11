@@ -1238,24 +1238,44 @@ impl Document {
                     html_options.margin_y,
                 );
                 svg_raster.set_page_fit_images(std::mem::take(&mut book.page_fit_images));
-                let htmls = book.to_html_chunks_budgeted(
+                // Stream the chunks through the compressor instead of returning
+                // every chunk's HTML. On a 24 MB book the old path held the
+                // whole book two or three times before compression.
+                let mut sources: Vec<ChunkSource> = Vec::new();
+                let mut fixed_layouts: Vec<Option<FixedLayout>> = Vec::new();
+                let mut content_images: Vec<String> = Vec::new();
+                let mut chunk_image_bytes = 0u64;
+                let compression_started = std::time::Instant::now();
+                book.to_html_chunks_budgeted_stream(
                     &html_options,
                     text_budget,
                     image_budget,
                     layout_budget,
+                    |html| {
+                        fixed_layouts.push(parse_fixed_layout(&html));
+                        content_images.extend(cre_epub::image_sources_in(&html));
+                        chunk_image_bytes =
+                            chunk_image_bytes
+                                .max(cre_epub::chunk_image_bytes(&book.resource_provider, &html)
+                                    as u64);
+                        sources.push(ChunkSource::new(html));
+                        Ok(())
+                    },
                 )?;
-                // Decoded images dominate an illustrated book's footprint, and
-                // they cannot be seen in the HTML size.
-                let chunk_image_bytes = htmls
-                    .iter()
-                    .map(|html| cre_epub::chunk_image_bytes(&book.resource_provider, html))
-                    .max()
-                    .unwrap_or(0) as u64;
+                if std::env::var_os("CRE_LAYOUT_PROFILE").is_some() {
+                    eprintln!(
+                        "profile chunk html compress: {:.1}ms chunks={}",
+                        compression_started.elapsed().as_secs_f64() * 1000.0,
+                        sources.len()
+                    );
+                }
                 let cover_image = epub_cover_image(&book);
                 let has_non_linear_flows = book.spine.iter().any(|item| !item.linear);
                 let resource_provider = Arc::new(book.resource_provider);
-                Self::build(
-                    htmls,
+                Self::build_from_sources(
+                    sources,
+                    fixed_layouts,
+                    content_images,
                     "epub://book/",
                     Arc::new(EpubNet {
                         svg: svg_raster.clone(),
@@ -1561,25 +1581,19 @@ impl Document {
         source_bytes: u64,
         chunk_image_bytes: u64,
     ) -> Result<Self> {
-        let font_context = Arc::new(build_font_ctx_with_fallbacks(
-            font_datas,
-            options.font_family.as_deref(),
-        ));
-        // Only the EPUB generator emits chunk HTML without the layout settings
-        // in it, which is what allows a relayout instead of a reopen.
-        let layout_independent_sources = matches!(metadata.format, DocumentFormat::Epub);
         let fixed_layouts: Vec<Option<FixedLayout>> =
             htmls.iter().map(|html| parse_fixed_layout(html)).collect();
         // Only images an `<img>` element references may become a size
         // placeholder: a CSS background image has no other painter, and a
         // fixed-layout page draws its images through its own transform.
-        if !matches!(resources, ResourceSource::Empty) {
-            images.set_content_images(
-                htmls
-                    .iter()
-                    .flat_map(|html| cre_epub::image_sources_in(html)),
-            );
-        }
+        let content_images: Vec<String> = if matches!(resources, ResourceSource::Empty) {
+            Vec::new()
+        } else {
+            htmls
+                .iter()
+                .flat_map(|html| cre_epub::image_sources_in(html))
+                .collect()
+        };
         // The chunks are compressed before the memory check so it can count the
         // text the document actually keeps resident (one LZ4 block per chunk)
         // instead of the generated HTML it is made from. The compression pass
@@ -1592,6 +1606,63 @@ impl Document {
                 compression_started.elapsed().as_secs_f64() * 1000.0,
                 sources.len()
             );
+        }
+        Self::build_from_sources(
+            sources,
+            fixed_layouts,
+            content_images,
+            base_url,
+            net,
+            resources,
+            images,
+            cover_image,
+            has_non_linear_flows,
+            metadata,
+            raw_toc,
+            page_map_source,
+            page_map_items,
+            options,
+            font_datas,
+            defer_layout,
+            source_bytes,
+            chunk_image_bytes,
+        )
+    }
+
+    /// Builds a document from already compressed chunks.
+    ///
+    /// The EPUB path fills `sources`, `fixed_layouts` and `content_images` while
+    /// the chunker streams, so the whole book's generated HTML never exists.
+    #[allow(clippy::too_many_arguments)]
+    fn build_from_sources(
+        sources: Vec<ChunkSource>,
+        fixed_layouts: Vec<Option<FixedLayout>>,
+        content_images: Vec<String>,
+        base_url: &str,
+        net: Arc<dyn NetProvider>,
+        resources: ResourceSource,
+        images: Arc<ImageRaster>,
+        cover_image: Option<Vec<u8>>,
+        has_non_linear_flows: bool,
+        metadata: DocumentMetadata,
+        raw_toc: Vec<RawTocItem>,
+        page_map_source: String,
+        page_map_items: Vec<RawPageMapItem>,
+        options: &DocumentOptions,
+        font_datas: &[FontBlob],
+        defer_layout: bool,
+        source_bytes: u64,
+        chunk_image_bytes: u64,
+    ) -> Result<Self> {
+        let font_context = Arc::new(build_font_ctx_with_fallbacks(
+            font_datas,
+            options.font_family.as_deref(),
+        ));
+        // Only the EPUB generator emits chunk HTML without the layout settings
+        // in it, which is what allows a relayout instead of a reopen.
+        let layout_independent_sources = matches!(metadata.format, DocumentFormat::Epub);
+        if !content_images.is_empty() {
+            images.set_content_images(content_images);
         }
         // A book that cannot fit is refused here, before the layout allocates
         // several copies of it; `cre-lua` turns the error into a page that

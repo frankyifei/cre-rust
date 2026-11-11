@@ -252,6 +252,11 @@ impl LazyResource {
         Some(entry.size())
     }
 
+    /// Whether a resource exists, without reading (or decompressing) it.
+    pub fn contains(&self, key: &str) -> bool {
+        self.uncompressed_size(key).is_some()
+    }
+
     pub fn from_map(resources: HashMap<String, Vec<u8>>) -> Self {
         let mut cache = ResourceCache::new(resource_cache_bytes());
         for (key, value) in resources.into_iter() {
@@ -690,139 +695,149 @@ impl EpubBook {
 
     pub fn spine_documents(&self) -> Result<Vec<SpineDocument>> {
         let mut docs = Vec::new();
-        for (index, item) in self.spine.iter().enumerate() {
-            let nonlinear = !item.linear;
-            let include = item.linear || item.media_type.to_ascii_lowercase().contains("html");
-            if !include {
-                continue;
+        for index in 0..self.spine.len() {
+            if let Some(doc) = self.spine_document_at(index)? {
+                docs.push(doc);
             }
-            // A package can list documents that are not in the archive at all
-            // (the Readium epub30-test-230 case). Refusing the whole book hides
-            // everything else in it, so skip the missing item; its slot keeps
-            // its spine index, so the items after it still map correctly.
-            let Some(bytes) = self.resource_provider.get(&item.href) else {
-                eprintln!("cre-epub: spine document missing: {}", item.href);
-                continue;
-            };
-            let text = decode_text(&bytes);
-            let layout = spine_layout(&item.properties, self.global_layout);
-            // A pre-paginated XHTML page declares its initial containing block
-            // with `meta name=viewport`; an SVG page uses its `viewBox` (or its
-            // width/height) instead. A page with neither falls back to 800x600.
-            let viewport = if layout == SpineLayout::PrePaginated {
-                let svg_viewport = if is_svg_resource(&item.media_type, &item.href) {
-                    parse_svg_viewport(&text)
-                } else {
-                    None
-                };
-                Some(
-                    parse_viewport(&text)
-                        .or(svg_viewport)
-                        .unwrap_or(FixedViewport::Size(800.0, 600.0)),
-                )
-            } else {
-                None
-            };
-            let html_body = extract_body(&text);
-            // A spine item does not have to be an XHTML document. EPUB allows
-            // SVG and raster images (and, rarely, foreign XML/JSON) directly in
-            // the spine. Turning the whole book into an open error because of
-            // one such item makes otherwise readable books unusable. Render
-            // images as an image page, and fall back to a placeholder for
-            // foreign resources so the rest of the publication remains
-            // accessible.
-            let (mut body, has_html_body) = if let Some(body) = html_body {
-                (body, true)
-            } else if is_image_resource(&item.media_type, &item.href) {
-                let file = item.href.rsplit('/').next().unwrap_or(&item.href);
-                // A fixed-layout image page is its own viewport, so the image
-                // has to fill it. In reflow the existing fit behaviour is kept.
-                let style = if layout == SpineLayout::PrePaginated {
-                    " style=\"width:100%;height:auto\""
-                } else {
-                    ""
-                };
-                (
-                    format!(
-                        "<div class=\"cre-image-spine\"><img src=\"{}\"{style} alt=\"\"/></div>",
-                        escape_attr(file)
-                    ),
-                    false,
-                )
-            } else if nonlinear {
-                continue;
-            } else {
-                (
-                    format!(
-                        "<p class=\"cre-unsupported\">Unsupported spine item: {}</p>",
-                        escape_html(&item.href)
-                    ),
-                    false,
-                )
-            };
-            if let Some(viewport) = viewport {
-                // The marker lets cre-lib give this chunk its own layout
-                // viewport. The page must remain a single chunk: mixing a
-                // pre-paginated page into a reflow chunk would make all its
-                // absolutely-positioned children share one containing block.
-                let attrs = body_attributes(&text);
-                let mut style = attrs.get("style").cloned().unwrap_or_default();
-                if !style.trim().is_empty() && !style.trim_end().ends_with(';') {
-                    style.push(';');
-                }
-                let (marker, sizing) = match viewport {
-                    FixedViewport::Size(width, height) => (
-                        format!("{width:.0}x{height:.0}"),
-                        format!("width:{width:.0}px;height:{height:.0}px;"),
-                    ),
-                    FixedViewport::Device => {
-                        ("device".to_string(), "width:100%;height:100%;".into())
-                    }
-                };
-                style.push_str(&format!(
-                    "position:absolute;left:0;top:0;{sizing}overflow:hidden;"
-                ));
-                let mut class = String::from("cre-fxl-page");
-                if let Some(original) = attrs.get("class") {
-                    class.push(' ');
-                    class.push_str(original);
-                }
-                let id = attrs
-                    .get("id")
-                    .map(|id| format!(" id=\"{}\"", escape_attr(id)))
-                    .unwrap_or_default();
-                body = format!(
-                    "<div class=\"{}\"{} data-cre-fixed-layout=\"{marker}\" style=\"{}\">{body}</div>",
-                    escape_attr(&class),
-                    id,
-                    escape_attr(&style)
-                );
-            }
-            let (css_urls, inline_styles) = if has_html_body {
-                extract_styles(&text, &self.opf_dir, &item.href)
-            } else {
-                (Vec::new(), Vec::new())
-            };
-            let body_attrs = body_attributes(&text);
-            docs.push(SpineDocument {
-                index,
-                id: item.idref.clone(),
-                href: item.href.clone(),
-                media_type: item.media_type.clone(),
-                body_class: body_attrs.get("class").cloned(),
-                body_style: body_attrs.get("style").cloned(),
-                body_html: rewrite_urls(&body, parent_dir(&item.href), &self.opf_dir),
-                css_urls,
-                inline_styles,
-                nonlinear,
-                layout,
-                viewport,
-            });
         }
         if docs.is_empty() {
             bail!("no readable spine document");
         }
         Ok(docs)
+    }
+
+    /// Decodes one spine item on demand, or `None` when it is not part of the
+    /// reading order or is missing from the archive.
+    ///
+    /// The open path uses this instead of [`Self::spine_documents`] so the
+    /// book is never held as one `Vec` of every document's body.
+    fn spine_document_at(&self, index: usize) -> Result<Option<SpineDocument>> {
+        let item = &self.spine[index];
+        let nonlinear = !item.linear;
+        let include = item.linear || item.media_type.to_ascii_lowercase().contains("html");
+        if !include {
+            return Ok(None);
+        }
+        // A package can list documents that are not in the archive at all
+        // (the Readium epub30-test-230 case). Refusing the whole book hides
+        // everything else in it, so skip the missing item; its slot keeps
+        // its spine index, so the items after it still map correctly.
+        let Some(bytes) = self.resource_provider.get(&item.href) else {
+            eprintln!("cre-epub: spine document missing: {}", item.href);
+            return Ok(None);
+        };
+        let text = decode_text(&bytes);
+        let layout = spine_layout(&item.properties, self.global_layout);
+        // A pre-paginated XHTML page declares its initial containing block
+        // with `meta name=viewport`; an SVG page uses its `viewBox` (or its
+        // width/height) instead. A page with neither falls back to 800x600.
+        let viewport = if layout == SpineLayout::PrePaginated {
+            let svg_viewport = if is_svg_resource(&item.media_type, &item.href) {
+                parse_svg_viewport(&text)
+            } else {
+                None
+            };
+            Some(
+                parse_viewport(&text)
+                    .or(svg_viewport)
+                    .unwrap_or(FixedViewport::Size(800.0, 600.0)),
+            )
+        } else {
+            None
+        };
+        let html_body = extract_body(&text);
+        // A spine item does not have to be an XHTML document. EPUB allows
+        // SVG and raster images (and, rarely, foreign XML/JSON) directly in
+        // the spine. Turning the whole book into an open error because of
+        // one such item makes otherwise readable books unusable. Render
+        // images as an image page, and fall back to a placeholder for
+        // foreign resources so the rest of the publication remains
+        // accessible.
+        let (mut body, has_html_body) = if let Some(body) = html_body {
+            (body, true)
+        } else if is_image_resource(&item.media_type, &item.href) {
+            let file = item.href.rsplit('/').next().unwrap_or(&item.href);
+            // A fixed-layout image page is its own viewport, so the image
+            // has to fill it. In reflow the existing fit behaviour is kept.
+            let style = if layout == SpineLayout::PrePaginated {
+                " style=\"width:100%;height:auto\""
+            } else {
+                ""
+            };
+            (
+                format!(
+                    "<div class=\"cre-image-spine\"><img src=\"{}\"{style} alt=\"\"/></div>",
+                    escape_attr(file)
+                ),
+                false,
+            )
+        } else if nonlinear {
+            return Ok(None);
+        } else {
+            (
+                format!(
+                    "<p class=\"cre-unsupported\">Unsupported spine item: {}</p>",
+                    escape_html(&item.href)
+                ),
+                false,
+            )
+        };
+        if let Some(viewport) = viewport {
+            // The marker lets cre-lib give this chunk its own layout
+            // viewport. The page must remain a single chunk: mixing a
+            // pre-paginated page into a reflow chunk would make all its
+            // absolutely-positioned children share one containing block.
+            let attrs = body_attributes(&text);
+            let mut style = attrs.get("style").cloned().unwrap_or_default();
+            if !style.trim().is_empty() && !style.trim_end().ends_with(';') {
+                style.push(';');
+            }
+            let (marker, sizing) = match viewport {
+                FixedViewport::Size(width, height) => (
+                    format!("{width:.0}x{height:.0}"),
+                    format!("width:{width:.0}px;height:{height:.0}px;"),
+                ),
+                FixedViewport::Device => ("device".to_string(), "width:100%;height:100%;".into()),
+            };
+            style.push_str(&format!(
+                "position:absolute;left:0;top:0;{sizing}overflow:hidden;"
+            ));
+            let mut class = String::from("cre-fxl-page");
+            if let Some(original) = attrs.get("class") {
+                class.push(' ');
+                class.push_str(original);
+            }
+            let id = attrs
+                .get("id")
+                .map(|id| format!(" id=\"{}\"", escape_attr(id)))
+                .unwrap_or_default();
+            body = format!(
+                "<div class=\"{}\"{} data-cre-fixed-layout=\"{marker}\" style=\"{}\">{body}</div>",
+                escape_attr(&class),
+                id,
+                escape_attr(&style)
+            );
+        }
+        let (css_urls, inline_styles) = if has_html_body {
+            extract_styles(&text, &self.opf_dir, &item.href)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let body_attrs = body_attributes(&text);
+        Ok(Some(SpineDocument {
+            index,
+            id: item.idref.clone(),
+            href: item.href.clone(),
+            media_type: item.media_type.clone(),
+            body_class: body_attrs.get("class").cloned(),
+            body_style: body_attrs.get("style").cloned(),
+            body_html: rewrite_urls(&body, parent_dir(&item.href), &self.opf_dir),
+            css_urls,
+            inline_styles,
+            nonlinear,
+            layout,
+            viewport,
+        }))
     }
 
     pub fn to_html(&self, options: &HtmlOptions) -> Result<String> {
@@ -855,29 +870,97 @@ impl EpubBook {
         image_budget: Option<usize>,
         layout_bytes: usize,
     ) -> Result<Vec<String>> {
-        let docs = self.spine_documents()?;
+        let mut chunks = Vec::new();
+        self.to_html_chunks_budgeted_stream(
+            options,
+            max_bytes,
+            image_budget,
+            layout_bytes,
+            |chunk| {
+                chunks.push(chunk);
+                Ok(())
+            },
+        )?;
+        Ok(chunks)
+    }
 
-        // One "piece" is a spine document, or one part of a document that is
-        // larger than a chunk on its own.
-        struct Piece<'a> {
-            doc: &'a SpineDocument,
-            body: std::borrow::Cow<'a, str>,
-            slot: u32,
-            continuation: bool,
-        }
-        let mut pieces: Vec<Piece<'_>> = Vec::new();
-        let mut next_extra_slot = docs.len() as u32 + 1;
-        for doc in &docs {
-            let real_slot = doc.index as u32 + 1;
-            if doc.body_html.len() <= max_bytes || doc.layout == SpineLayout::PrePaginated {
-                pieces.push(Piece {
-                    doc,
-                    body: std::borrow::Cow::Borrowed(doc.body_html.as_str()),
-                    slot: real_slot,
-                    continuation: false,
-                });
+    /// Streams the chunk HTML to `emit` one chunk at a time.
+    ///
+    /// The open path uses this so the book is never held as one `Vec` of every
+    /// document's body. Each spine document is decoded on demand; only the
+    /// current document and the chunk being assembled are resident before
+    /// `emit` takes the chunk (and compresses it).
+    pub fn to_html_chunks_budgeted_stream<F>(
+        &self,
+        options: &HtmlOptions,
+        max_bytes: usize,
+        image_budget: Option<usize>,
+        layout_bytes: usize,
+        emit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(String) -> Result<()>,
+    {
+        let mut builder = ChunkBuilder {
+            book: self,
+            options,
+            max_bytes,
+            image_budget,
+            layout_bytes,
+            body: String::new(),
+            body_images: 0,
+            chunk_docs: Vec::new(),
+            emitted: 0,
+            emit,
+        };
+        let mut next_extra_slot = self.included_spine_count() as u32 + 1;
+        let mut any = false;
+        for index in 0..self.spine.len() {
+            let Some(doc) = self.spine_document_at(index)? else {
                 continue;
+            };
+            any = true;
+            let doc = Arc::new(doc);
+            let pieces = self.spine_pieces(&doc, max_bytes, layout_bytes, &mut next_extra_slot);
+            for (piece, images) in pieces {
+                builder.push(&doc, &piece, images)?;
             }
+        }
+        if !any {
+            bail!("no readable spine document");
+        }
+        builder.finish()
+    }
+
+    /// Number of spine documents that will be read, matching the length of
+    /// [`Self::spine_documents`] without decompressing the archive.
+    fn included_spine_count(&self) -> usize {
+        self.spine
+            .iter()
+            .filter(|item| item.linear || item.media_type.to_ascii_lowercase().contains("html"))
+            .filter(|item| self.resource_provider.contains(&item.href))
+            .count()
+    }
+
+    /// Splits one document into the pieces the chunker packs: itself, or its
+    /// text/layout parts when it is larger than a chunk.
+    fn spine_pieces<'a>(
+        &self,
+        doc: &'a SpineDocument,
+        max_bytes: usize,
+        layout_bytes: usize,
+        next_extra_slot: &mut u32,
+    ) -> Vec<(Piece<'a>, usize)> {
+        let real_slot = doc.index as u32 + 1;
+        let mut pieces: Vec<Piece<'a>> = Vec::new();
+        if doc.body_html.len() <= max_bytes || doc.layout == SpineLayout::PrePaginated {
+            pieces.push(Piece {
+                doc,
+                body: std::borrow::Cow::Borrowed(doc.body_html.as_str()),
+                slot: real_slot,
+                continuation: false,
+            });
+        } else {
             for (part_index, part) in split_body_html(&doc.body_html, max_bytes)
                 .into_iter()
                 .enumerate()
@@ -885,8 +968,8 @@ impl EpubBook {
                 let slot = if part_index == 0 {
                     real_slot
                 } else {
-                    let slot = next_extra_slot;
-                    next_extra_slot += 1;
+                    let slot = *next_extra_slot;
+                    *next_extra_slot += 1;
                     slot
                 };
                 pieces.push(Piece {
@@ -898,23 +981,16 @@ impl EpubBook {
             }
         }
 
-        // Estimated decoded bytes of each piece's images, so a chunk can be
-        // capped by image payload as well as by text size.
-        let piece_image_bytes = |piece: &Piece<'_>| -> usize {
-            let dir = parent_dir(&piece.doc.href);
-            image_sources(&piece.body, dir)
-                .iter()
-                .filter_map(|key| self.resource_provider.estimated_decoded_bytes(key))
-                .sum()
-        };
-        let mut piece_images: Vec<usize> = pieces.iter().map(piece_image_bytes).collect();
+        let mut piece_images: Vec<usize> = pieces
+            .iter()
+            .map(|piece| self.piece_image_bytes(piece))
+            .collect();
 
-        // The caps above only stop documents from being merged. One document
-        // that is heavy on its own (a gallery page, a comic with several
-        // images in one XHTML) would still be decoded in one go, so split it
-        // between its images, which is where a page break already falls.
+        // A piece that is heavy on its own (a gallery page, a comic with
+        // several images in one XHTML) is split between its images, which is
+        // where a page break already falls.
         if layout_bytes != usize::MAX {
-            let mut expanded: Vec<Piece<'_>> = Vec::new();
+            let mut expanded: Vec<Piece<'a>> = Vec::new();
             let mut expanded_images: Vec<usize> = Vec::new();
             let mut split_pending = false;
             for (piece, images) in pieces.into_iter().zip(piece_images) {
@@ -932,8 +1008,8 @@ impl EpubBook {
                             let slot = if part_index == 0 {
                                 piece.slot
                             } else {
-                                let slot = next_extra_slot;
-                                next_extra_slot += 1;
+                                let slot = *next_extra_slot;
+                                *next_extra_slot += 1;
                                 slot
                             };
                             split_pending |= part_index == 0;
@@ -954,7 +1030,7 @@ impl EpubBook {
             if split_pending {
                 for (index, piece) in expanded.iter().enumerate() {
                     if expanded_images[index] == 0 {
-                        expanded_images[index] = piece_image_bytes(piece);
+                        expanded_images[index] = self.piece_image_bytes(piece);
                     }
                 }
             }
@@ -962,67 +1038,15 @@ impl EpubBook {
             piece_images = expanded_images;
         }
 
-        let mut chunks = Vec::new();
-        let mut body = String::new();
-        let mut body_images = 0usize;
-        let mut chunk_docs: Vec<&SpineDocument> = Vec::new();
-        let flush =
-            |body: &mut String, chunks: &mut Vec<String>, chunk_docs: &mut Vec<&SpineDocument>| {
-                let head = self.html_head(options, chunk_docs);
-                let mut html = head;
-                html.push_str(body);
-                html.push_str("</body></html>");
-                chunks.push(html);
-                body.clear();
-                chunk_docs.clear();
-            };
-        for (index, piece) in pieces.iter().enumerate() {
-            let fixed_layout = piece.doc.layout == SpineLayout::PrePaginated;
-            if fixed_layout && !body.is_empty() {
-                flush(&mut body, &mut chunks, &mut chunk_docs);
-                body_images = 0;
-            }
-            let mut section = String::new();
-            let body_html = svg_hrefs_to_book_paths(&piece.body, parent_dir(&piece.doc.href));
-            let body_html = std::borrow::Cow::Owned(body_html);
-            push_section_html(
-                &mut section,
-                piece.doc,
-                piece.slot,
-                &body_html,
-                piece.continuation,
-            );
-            if !chunk_docs.iter().any(|doc| std::ptr::eq(*doc, piece.doc)) {
-                chunk_docs.push(piece.doc);
-            }
-            let images = piece_images.get(index).copied().unwrap_or(0);
-            let over_text = !body.is_empty() && body.len() + section.len() > max_bytes;
-            let over_images = image_budget.is_some_and(|budget| {
-                !body.is_empty() && body_images > 0 && body_images + images > budget
-            });
-            // The text and image caps are separate, but a chunk holds both at
-            // the same time: bound their sum against the layout budget too.
-            let over_layout = layout_bytes != usize::MAX
-                && !body.is_empty()
-                && (body.len() + section.len()) * DOM_BYTES_PER_HTML_BYTE + body_images + images
-                    > layout_bytes;
-            if over_text || over_images || over_layout {
-                flush(&mut body, &mut chunks, &mut chunk_docs);
-                body_images = 0;
-            }
-            body.push_str(&section);
-            body_images += images;
-            // A part that was split out is already at the size limit; keep it
-            // in its own chunk so the layout budget holds.
-            if fixed_layout || piece.continuation || piece.body.len() >= max_bytes {
-                flush(&mut body, &mut chunks, &mut chunk_docs);
-                body_images = 0;
-            }
-        }
-        if !body.is_empty() || chunks.is_empty() {
-            flush(&mut body, &mut chunks, &mut chunk_docs);
-        }
-        Ok(chunks)
+        pieces.into_iter().zip(piece_images).collect()
+    }
+
+    fn piece_image_bytes(&self, piece: &Piece<'_>) -> usize {
+        let dir = parent_dir(&piece.doc.href);
+        image_sources(&piece.body, dir)
+            .iter()
+            .filter_map(|key| self.resource_provider.estimated_decoded_bytes(key))
+            .sum()
     }
 
     fn html_head(&self, options: &HtmlOptions, docs: &[&SpineDocument]) -> String {
@@ -1088,6 +1112,100 @@ impl EpubBook {
         ));
         html.push_str("</style></head><body>");
         html
+    }
+}
+
+/// One chunk-sized unit: a spine document, or one part of a document that is
+/// larger than a chunk on its own.
+struct Piece<'a> {
+    doc: &'a SpineDocument,
+    body: std::borrow::Cow<'a, str>,
+    slot: u32,
+    continuation: bool,
+}
+
+/// Greedily packs pieces into chunk HTML and hands each finished chunk to
+/// `emit`. Holding the builder (not a `Vec<String>`) is what keeps the open
+/// peak at one document plus one chunk.
+struct ChunkBuilder<'a, F> {
+    book: &'a EpubBook,
+    options: &'a HtmlOptions,
+    max_bytes: usize,
+    image_budget: Option<usize>,
+    layout_bytes: usize,
+    body: String,
+    body_images: usize,
+    chunk_docs: Vec<Arc<SpineDocument>>,
+    emitted: usize,
+    emit: F,
+}
+
+impl<F> ChunkBuilder<'_, F>
+where
+    F: FnMut(String) -> Result<()>,
+{
+    fn flush(&mut self) -> Result<()> {
+        let docs: Vec<&SpineDocument> = self.chunk_docs.iter().map(|doc| doc.as_ref()).collect();
+        let mut html = self.book.html_head(self.options, &docs);
+        html.push_str(&self.body);
+        html.push_str("</body></html>");
+        (self.emit)(html)?;
+        self.body.clear();
+        self.chunk_docs.clear();
+        self.emitted += 1;
+        Ok(())
+    }
+
+    fn push(&mut self, doc: &Arc<SpineDocument>, piece: &Piece<'_>, images: usize) -> Result<()> {
+        let fixed_layout = piece.doc.layout == SpineLayout::PrePaginated;
+        if fixed_layout && !self.body.is_empty() {
+            self.flush()?;
+            self.body_images = 0;
+        }
+        let mut section = String::new();
+        let body_html = svg_hrefs_to_book_paths(&piece.body, parent_dir(&piece.doc.href));
+        push_section_html(
+            &mut section,
+            piece.doc,
+            piece.slot,
+            &body_html,
+            piece.continuation,
+        );
+        if !self.chunk_docs.iter().any(|known| Arc::ptr_eq(known, doc)) {
+            self.chunk_docs.push(Arc::clone(doc));
+        }
+        let over_text = !self.body.is_empty() && self.body.len() + section.len() > self.max_bytes;
+        let over_images = self.image_budget.is_some_and(|budget| {
+            !self.body.is_empty() && self.body_images > 0 && self.body_images + images > budget
+        });
+        // The text and image caps are separate, but a chunk holds both at the
+        // same time: bound their sum against the layout budget too.
+        let over_layout = self.layout_bytes != usize::MAX
+            && !self.body.is_empty()
+            && (self.body.len() + section.len()) * DOM_BYTES_PER_HTML_BYTE
+                + self.body_images
+                + images
+                > self.layout_bytes;
+        if over_text || over_images || over_layout {
+            self.flush()?;
+            self.body_images = 0;
+        }
+        self.body.push_str(&section);
+        self.body_images += images;
+        // A part that was split out is already at the size limit; keep it in
+        // its own chunk so the layout budget holds.
+        if fixed_layout || piece.continuation || piece.body.len() >= self.max_bytes {
+            self.flush()?;
+            self.body_images = 0;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<()> {
+        if !self.body.is_empty() || self.emitted == 0 {
+            self.flush()?;
+        }
+        Ok(())
     }
 }
 

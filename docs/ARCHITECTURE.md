@@ -146,6 +146,10 @@ another chunk, the old layout is dropped and the new chunk is laid out. The
 generated HTML of every chunk stays resident as one LZ4 block per chunk and is
 decompressed when that chunk is laid out.
 
+The EPUB generator streams: it decodes one spine document at a time and hands
+each finished chunk to the compressor, so the whole book's chunk HTML is never
+materialized before compression.
+
 Resource caches are byte-bounded. Resources that the engine generates
 (rewritten XHTML, page-fit SVG wrappers) are **pinned** for the session. They
 have no zip entry to read again.

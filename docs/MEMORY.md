@@ -67,6 +67,19 @@ does not read and split the book again. Each chunk is stored as its own **LZ4
 block** and decompressed only when it is laid out: opening, a TOC jump straight
 into a chunk and a relayout all decompress exactly one chunk.
 
+### Generation streams into the compressor
+
+The EPUB generator decodes one spine document at a time and the chunker emits
+each finished chunk to the compressor; only the current document and the chunk
+being assembled exist as plaintext. Before this, `spine_documents()` held every
+body, the splitter kept `Cow::Owned` copies, and the whole chunk vector was
+returned before compression: 132 MB peak on the 24 MB book at a 38 MB budget.
+Streamed, the same book opens with a **64 MB peak** (63 MB steady, 401 chunks,
+15 557 pages, the same LZ4 blocks and line table). A single spine document
+larger than a chunk is still split as a whole (`split_body_html` returns its
+parts), so that case peaks at one document plus its parts, not at the whole
+book.
+
 Measured on real books, LZ4 gives 0.54-0.57 of the HTML size (CJK and Latin
 alike). The synthetic test book repeats one paragraph and compresses much
 better, so do not use it as a ratio.
@@ -74,9 +87,10 @@ better, so do not use it as a ratio.
 A block that fails to decompress is an explicit error, never an empty chunk: a
 blank book is worse than a diagnosable failure.
 
-The chunk strings are built by appending, so each one used to keep twice its
-size; they are shrunk after generation. A 24 MB text book dropped from 80.7 to
-66.1 MB of RSS (string capacity 50.2 -> 25.1 MB) before the LZ4 change above.
+Chunk strings are built by appending; streaming keeps only one at a time and
+takes the LZ4 block before dropping the plaintext. The earlier 80.7 -> 66.1 MB
+change was shrinking the whole chunk vector before it was compressed; that
+vector no longer exists on the EPUB path.
 
 ## The open-time layout pass
 
@@ -169,6 +183,7 @@ open is unchanged at 123 ms.
 | `15.epub` engine RSS, open / peak | 105 / 127 MB | 33 / 45 MB |
 | `15.epub` reader process, open / peak | 153 / 169 MB | 102 / 119 MB |
 | 24 MB text book RSS (LZ4) | 66.1 MB | 41.5 MB |
+| 24 MB text book, 38 MB budget, open peak | 132 MB | 64 MB |
 | `zyj.epub` open / peak (arena trim) | 42.5 / 73.5 MB | 36.4 / 42.4 MB |
 | 8 full-page JPEGs, 64 MB budget, peak | 126 MB | 56 MB |
 | 60-image book, RSS after open (LRU) | 40.1 MB | 35.6 MB |
