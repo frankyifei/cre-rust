@@ -313,12 +313,34 @@ struct TocAnchorId {
 /// Resident cost of keeping a book laid out, per byte of generated HTML
 /// (DOM nodes, computed styles and parley line boxes). Measured whole-book
 /// layouts: 251 kB of XHTML cost 28 MB, 579 kB cost 44 MB. 128 B/B is the
-/// safe upper bound.
+/// safe upper bound, and chunk *sizing* keeps using it so it errs towards
+/// smaller chunks.
 const LAYOUT_BYTES_PER_HTML_BYTE: usize = 128;
+
+/// What one laid-out chunk is measured to cost, per byte of generated HTML.
+///
+/// Chunk-sized layouts measure about 50 B/B (128 KB of plain text -> 7 MB,
+/// 512 KB -> 25.8 MB), far below the whole-book 128 B/B: a chunk's computed
+/// styles and line boxes do not grow with the book. The low-memory check and
+/// the worker estimate use this figure, so a book is not refused because its
+/// chunks were priced as whole documents.
+const CHUNK_DOM_BYTES_PER_HTML_BYTE: usize = 64;
 
 /// Memory left untouched for KOReader's own post-open work (widgets, caches,
 /// thumbnails) and for the page bitmap handed back to it.
+///
+/// This is the ceiling for [`layout_reserve`]; the chunk planner uses it as
+/// is, because a smaller chunk only ever costs a relayout.
 const LAYOUT_MEMORY_RESERVE: usize = 24 * 1024 * 1024;
+
+/// The reserve the low-memory check assumes, scaled to the device.
+///
+/// The fixed 24 MB was most of a 38 MB budget, so a book that needed 30 MB was
+/// refused although it fit. A device with little free memory gets an 8 MB
+/// floor instead; a roomy one keeps the old 24 MB.
+fn layout_reserve(available: usize) -> usize {
+    (available / 8).clamp(8 * 1024 * 1024, LAYOUT_MEMORY_RESERVE)
+}
 
 /// Bounds for a layout chunk: below a page's worth of text chunking only adds
 /// relayouts; above this a single layout is both slow (blitz's layout cost
@@ -827,11 +849,11 @@ impl LayoutMemoryGate {
 
 /// How many chunk layouts to run at once during the open-time pass.
 ///
-/// One chunk's layout costs roughly `LAYOUT_BYTES_PER_HTML_BYTE` per byte of its
-/// generated HTML, and the pass now holds that many DOMs at the same time, so
-/// the count is bounded by the free memory the chunk planner saw (half of it,
-/// leaving room for the page bitmap and the reader). It is also capped at four:
-/// past that the pass is bound by memory bandwidth, not cores.
+/// One chunk's layout costs roughly `CHUNK_DOM_BYTES_PER_HTML_BYTE` per byte
+/// of its generated HTML, and the pass holds that many DOMs at the same time,
+/// so the count is bounded by the free memory the chunk planner saw (half of
+/// it, leaving room for the page bitmap and the reader). It is also capped at
+/// four: past that the pass is bound by memory bandwidth, not cores.
 fn layout_worker_count(
     remaining: usize,
     largest_html: usize,
@@ -856,7 +878,7 @@ fn layout_worker_count(
     // One chunk's layout is planned to fit in what is left after the reserve
     // the reader keeps; running several at once must not eat into it.
     let usable = available.saturating_sub(LAYOUT_MEMORY_RESERVE);
-    let estimated = largest_html.saturating_mul(LAYOUT_BYTES_PER_HTML_BYTE);
+    let estimated = largest_html.saturating_mul(CHUNK_DOM_BYTES_PER_HTML_BYTE);
     let observed = rss_after.saturating_sub(rss_before.unwrap_or(rss_after)) as usize;
     let per_chunk = estimated.max(observed).max(1);
     let headroom = usable.saturating_sub(rss_after as usize);

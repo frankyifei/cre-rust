@@ -165,10 +165,13 @@ Other bounds, all measured:
   is laid out, and trimming only runs when the heap grew.
 
 A book that still cannot fit is refused with a page that explains the
-shortfall. The estimate counts the LZ4 text, one chunk's layout, the heaviest
-chunk's images and the page index. It is computed from the XHTML size in the
-EPUB zip **before** the book is read, so a refusal appears in milliseconds
-instead of after a full parse. See [docs/MEMORY.md](docs/MEMORY.md).
+shortfall. The estimate counts one chunk's layout (at the measured ~64 B per
+HTML byte, not the whole-book 128), the heaviest chunk's images and the page
+index, plus a reserve that scales with the device. The compressed text is not
+counted: it is already resident when the check runs. The estimate is computed
+from the XHTML size in the EPUB zip **before** the book is read, so a refusal
+appears in milliseconds instead of after a full parse. See
+[docs/MEMORY.md](docs/MEMORY.md).
 
 ### Paint speed on a single-core e-ink device
 
@@ -254,9 +257,9 @@ The format is detected from the file content, not from the extension.
   simplified.
 - The Lua API is not complete: some `cre.cpp` methods return fixed values (see
   [TODO.md](TODO.md)).
-- A very large book still takes seconds to open on a Paperwhite 2, and the
-  memory gate reserves a fixed 24 MB, so a device with less free memory
-  refuses even small books (being tuned).
+- A very large book still takes seconds to open on a Paperwhite 2; the
+  low-memory check scales its reserve with the device (8-24 MB) instead of
+  holding a fixed 24 MB, so a book that fits is not refused.
 - Blitz does not support complex CJK layout yet, although there are recent pull 
   requests in upstream
 

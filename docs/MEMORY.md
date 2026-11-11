@@ -187,12 +187,22 @@ chunks: peak 63.8 -> 46.4 MB. On `zyj.epub`: open RSS 42.5 -> 36.4 MB, peak
 After compression, the engine knows the exact stored size and estimates:
 
 ```text
-need = LZ4 text
-     + largest chunk x 128            (the one DOM that exists at a time)
+need = largest chunk x 64             (the one DOM that exists at a time)
      + decoded images of the heaviest chunk
      + pages x 700                    (line table, page metadata, XPointer)
-     + 24 MB                          (reserved for KOReader after the open)
+     + reserve
 ```
+
+The 64 B/HTML byte is the measured cost of a *chunk-sized* layout (~50 B/B,
+rounded up); the 128 B/B figure is the whole-book measurement and is only used
+to size chunks, where being conservative is free.
+
+The LZ4 text is **not** in `need`: the chunks were compressed before this check,
+so their blocks are already resident and already missing from `available`.
+Counting them again made a book that needed 30 MB look like it needed 44 MB.
+
+`reserve` scales with the device: `clamp(available / 8, 8 MB, 24 MB)`. The old
+fixed 24 MB was most of a 38 MB budget, so a book that fit was refused.
 
 `pages` is estimated from the generated HTML at 2000 bytes per page, the middle
 of the measured 1494 (Latin plain text) to 3030 (tightly set Chinese) range.
@@ -216,7 +226,9 @@ LZ4 text       = HTML x 0.62         (measured 0.54-0.57)
 Images are not counted, so this estimate is a lower bound. To avoid refusing a
 book that would fit, the early check only fires when the estimate is more than
 20% over the free memory; anything closer is measured exactly after
-compression.
+compression. It uses the same 64 B/HTML byte chunk cost and the same scaled
+reserve as the exact check (the compressed text counts here, because nothing is
+allocated yet).
 
 Measured on the 24 MB book with `CRE_AVAILABLE_MB=22`: refusal in **under
 10 ms** with 8.4 MB max RSS, instead of 6.0 s and 132 MB. A normal `15.epub`
@@ -238,6 +250,8 @@ open is unchanged at 123 ms.
 | 8 full-page JPEGs, 64 MB budget, peak | 126 MB | 56 MB |
 | 60-image book, RSS after open (LRU) | 40.1 MB | 35.6 MB |
 | 24 MB book at 22 MB free, time to refuse | 6.0 s | < 10 ms |
+| 43 MB AZW3, smallest free memory it opens at (open peak) | 36 MB (33.4 MB) | 20 MB (32.5 MB) |
+| 24 MB text book, smallest free memory it opens at (open peak) | 62 MB (65.1 MB) | 32 MB (58.8 MB) |
 
 Open time: compression costs about 60 ms, under 1% of a 6.4 s open pass, and
 nothing to a page turn (a chunk is decompressed once when it becomes active).
@@ -262,9 +276,9 @@ nothing to a page turn (a chunk is decompressed once when it becomes active).
 - Blitz has no DOM serialization, so there is no disk cache or swap. A reopen
   repeats the layout, and below roughly 30-40 MB free this engine cannot open
   a book that crengine with `cre_storage_size_factor=1` can.
-- The 24 MB reserve is fixed: with less free memory than that, every book is
-  refused, including small ones. Scaling the reserve with the available memory
-  is still open work.
+- The 24 MB reserve the *chunk planner* uses is fixed; the low-memory check
+  scales it (8-24 MB), so a book that fits is no longer refused, but chunk
+  sizing at very low free memory is still conservative.
 - Splitting starts a new page at every chunk boundary, so pagination can
   differ from crengine when a book does not fit whole.
 - The page index is kept in RAM for the session; only the chunk text is
@@ -287,7 +301,8 @@ nothing to a page turn (a chunk is decompressed once when it becomes active).
 
 - No on-disk cache: the generated HTML, the page index and the layout are
   rebuilt on every open.
-- A device with 22 MB free is below the reserve, so the engine refuses every
-  book there by design right now.
+- A device with 22 MB free still refuses a book that needs more than the 8 MB
+  reserve plus its chunks; small books open, big ones are refused with the
+  explanation page.
 - Vertical writing and hyphenation do not exist yet, and both would change the
   layout cost model.

@@ -234,8 +234,10 @@ Some methods only store settings. KOReader can call them without an error.
 
 - The engine has no on-disk cache.
 - The DOM is not the full book. One chunk is resident.
-- A chunk's DOM costs ~128 bytes per HTML byte, so very low free memory
-  (below the 24 MB reserve) refuses the book instead of swapping to disk.
+- A chunk's DOM costs ~128 bytes per HTML byte when it is sized, and measures
+  ~64 bytes per HTML byte laid out. Very low free memory refuses the book
+  instead of swapping to disk; the check scales its reserve (8-24 MB) so a book
+  that fits is not turned away.
 - `TextPosition` strings are compatible, but the internal position model is
   different.
 - EPUB CFI output is simplified.

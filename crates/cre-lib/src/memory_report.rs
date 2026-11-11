@@ -10,8 +10,8 @@
 use std::fmt;
 
 use crate::{
-    ChunkSource, LAYOUT_BYTES_PER_HTML_BYTE, LAYOUT_MEMORY_RESERVE, memory_available_detail,
-    memory_total_bytes, resident_bytes,
+    CHUNK_DOM_BYTES_PER_HTML_BYTE, ChunkSource, LAYOUT_MEMORY_RESERVE, layout_reserve,
+    memory_available_detail, memory_total_bytes, resident_bytes,
 };
 
 /// Bytes a page needs in the page index (line entries, page metadata and the
@@ -123,14 +123,20 @@ pub(crate) fn measure(
     let chunks = sources.len();
     // One chunk's DOM at a time: it is dropped as soon as the next chunk is
     // laid out, and the chunk planner already sized it to fit.
-    let dom_bytes = largest_chunk.saturating_mul(LAYOUT_BYTES_PER_HTML_BYTE as u64);
+    let dom_bytes = largest_chunk.saturating_mul(CHUNK_DOM_BYTES_PER_HTML_BYTE as u64);
     let pages: u64 = html_bytes / HTML_BYTES_PER_PAGE.max(1);
     let index_bytes = pages.saturating_mul(PAGE_INDEX_BYTES);
-    let reserve = LAYOUT_MEMORY_RESERVE as u64;
     let (available, available_source) = match memory_available_detail() {
         Some((bytes, source)) => (Some(bytes), source),
         None => (None, "unavailable"),
     };
+    let reserve = available
+        .map(|bytes| layout_reserve(bytes as usize) as u64)
+        .unwrap_or(LAYOUT_MEMORY_RESERVE as u64);
+    // `stored_bytes` is not part of `need`: the chunks were compressed before
+    // this check, so their LZ4 blocks are already part of this process (and
+    // already missing from `available`). Counting them again made a book that
+    // needs ~30 MB look like it needs ~44 MB.
     MemoryReport {
         total: memory_total_bytes(),
         available,
@@ -147,7 +153,7 @@ pub(crate) fn measure(
         pages,
         index_bytes,
         reserve,
-        need: stored_bytes + dom_bytes + image_bytes + index_bytes + reserve,
+        need: dom_bytes + image_bytes + index_bytes + reserve,
         estimated: false,
     }
 }
@@ -199,10 +205,12 @@ fn preflight_with(
     // Chunks are filled up to the text budget, so the largest DOM that will
     // exist is one budget's worth.
     let largest_chunk = text_budget as u64;
-    let dom_bytes = largest_chunk.saturating_mul(LAYOUT_BYTES_PER_HTML_BYTE as u64);
+    let dom_bytes = largest_chunk.saturating_mul(CHUNK_DOM_BYTES_PER_HTML_BYTE as u64);
     let pages = html_bytes / HTML_BYTES_PER_PAGE.max(1);
     let index_bytes = pages.saturating_mul(PAGE_INDEX_BYTES);
-    let reserve = LAYOUT_MEMORY_RESERVE as u64;
+    let reserve = layout_reserve(available as usize) as u64;
+    // Nothing is allocated yet, so the compressed text counts here (unlike the
+    // exact check, which runs after compression).
     let need = stored_bytes + dom_bytes + index_bytes + reserve;
     // The ratios above over-state the result by roughly 10%; allow another
     // 10% before refusing, so a book that would only just fit is measured
@@ -343,7 +351,16 @@ td.value { text-align: right; }\
         "Estimated need when opening"
     };
     html.push_str(&format!("<h2>{heading}</h2><table>"));
-    html.push_str(&row("Text (LZ4)", &mb(report.stored_bytes)));
+    if report.estimated {
+        html.push_str(&row("Text (LZ4)", &mb(report.stored_bytes)));
+    } else {
+        // The chunks were compressed before this check, so their blocks are
+        // already resident and already missing from `available`.
+        html.push_str(&row(
+            "Text (LZ4, already resident)",
+            &mb(report.stored_bytes),
+        ));
+    }
     html.push_str(&row("Page layout (one chunk)", &mb(report.dom_bytes)));
     if report.estimated {
         html.push_str(&row("Images (one chunk, decoded)", "not counted"));
@@ -406,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn the_estimate_covers_text_layout_index_and_reserve() {
+    fn the_estimate_covers_layout_index_and_reserve() {
         let htmls = ["x".repeat(100 * 1024), "x".repeat(120 * 1024)];
         let sources = chunks(&[htmls[0].as_str(), htmls[1].as_str()]);
         let report = measure(&sources, 5000, 0);
@@ -423,16 +440,61 @@ mod tests {
                 .map(|source| source.compressed.len() as u64)
                 .sum()
         );
-        // Only one chunk's DOM is resident.
+        // One chunk's DOM is priced at the chunk cost, not a whole book's.
         assert_eq!(
             report.dom_bytes,
-            120 * 1024 * LAYOUT_BYTES_PER_HTML_BYTE as u64
+            120 * 1024 * CHUNK_DOM_BYTES_PER_HTML_BYTE as u64
         );
+        assert_eq!(report.dom_bytes, 7_680 * 1024);
+        // The compressed text is already resident when this check runs, so it
+        // is not part of what the open still needs.
         assert_eq!(
             report.need,
-            report.stored_bytes + report.dom_bytes + report.index_bytes + report.reserve
+            report.dom_bytes + report.index_bytes + report.reserve
         );
-        assert!(report.need > report.stored_bytes + report.dom_bytes);
+        assert!(report.need > report.dom_bytes);
+    }
+
+    #[test]
+    fn the_reserve_scales_with_the_device() {
+        const MB: usize = 1024 * 1024;
+        assert_eq!(layout_reserve(24 * MB), 8 * MB);
+        assert_eq!(layout_reserve(38 * MB), 8 * MB);
+        assert_eq!(layout_reserve(100 * MB), 12 * MB + MB / 2);
+        assert_eq!(layout_reserve(400 * MB), LAYOUT_MEMORY_RESERVE);
+    }
+
+    #[test]
+    fn a_book_that_needs_less_than_is_available_fits() {
+        // A 43 MB AZW3 measured 34 MB peak at a 38 MB budget: its 112 KB
+        // chunks, page index and reserve must stay under that.
+        let report = MemoryReport {
+            total: Some(256 * 1024 * 1024),
+            available: Some(38 * 1024 * 1024),
+            available_source: "CRE_AVAILABLE_MB",
+            resident: Some(10 * 1024 * 1024),
+            source_bytes: 43 * 1024 * 1024,
+            source_text_bytes: 0,
+            html_bytes: 700 * 1024,
+            stored_bytes: 400 * 1024,
+            chunks: 25,
+            largest_chunk: 112 * 1024,
+            dom_bytes: 112 * 1024 * CHUNK_DOM_BYTES_PER_HTML_BYTE as u64,
+            image_bytes: 0,
+            pages: 286,
+            index_bytes: 286 * PAGE_INDEX_BYTES,
+            reserve: layout_reserve(38 * 1024 * 1024) as u64,
+            need: 112 * 1024 * CHUNK_DOM_BYTES_PER_HTML_BYTE as u64
+                + 286 * PAGE_INDEX_BYTES
+                + layout_reserve(38 * 1024 * 1024) as u64,
+            estimated: false,
+        };
+        assert!(
+            report.fits(),
+            "need {} available {:?}",
+            report.need,
+            report.available
+        );
     }
 
     #[test]
@@ -486,7 +548,7 @@ mod tests {
             "A Book",
             "Generated HTML",
             "Text stored (LZ4)",
-            "Text (LZ4)",
+            "Text (LZ4, already resident)",
             "Page layout (one chunk)",
             "Page index",
             "Reserved for the reader",
