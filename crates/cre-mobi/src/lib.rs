@@ -18,7 +18,10 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use cre_pdb::html::{self, AnchorTarget, Tag};
-use cre_pdb::{Encoding, MobiHeader, NULL_INDEX, Pdb, extract_text, image_extension, read_index};
+use cre_pdb::{
+    BookResources, Encoding, MobiHeader, NULL_INDEX, Pdb, ResourceRange, extract_text,
+    image_extension, read_index,
+};
 
 /// One table of contents entry. `href` is a fragment in the generated document.
 #[derive(Clone, Debug, PartialEq)]
@@ -54,8 +57,11 @@ pub struct MobiBook {
     pub description: Option<String>,
     pub keywords: Option<String>,
     pub identifiers: Option<String>,
-    /// Resource name (`mobi-image-N`) to image bytes.
-    pub resources: HashMap<String, Vec<u8>>,
+    /// Resource name (`mobi-image-N`) to its range in the PalmDB file.
+    ///
+    /// The bytes are sliced from the mapped file when a page paints them, so a
+    /// 25 MB comic costs no anonymous memory for its pictures.
+    pub resources: BookResources,
     pub toc: Vec<MobiTocItem>,
     pub cover_image: Option<Vec<u8>>,
     /// Number of spine sections (chapter breaks) in the assembled document.
@@ -134,8 +140,8 @@ impl MobiBook {
         //    `DocFragment` indices work like they do for EPUB spine items.
         let (body, section_count) = wrap_sections(&body);
 
-        // 5. Images and other resources.
-        let (resources, cover_image) = build_resources(&pdb, &header);
+        // 5. Images and other resources: ranges into the PalmDB, not copies.
+        let (resource_ranges, cover_image) = build_resources(&pdb, &header);
 
         // 6. Metadata.
         let encoding = header.encoding;
@@ -166,6 +172,17 @@ impl MobiBook {
         if toc.is_empty() {
             toc = section_toc(&body);
         }
+
+        // 8. Keep the file bytes and the record ranges, so a picture is sliced
+        //    out of the file when a page paints it instead of being copied at
+        //    open time.
+        let mut resources = BookResources::new(pdb.into_backing());
+        for (name, range) in resource_ranges {
+            resources.insert_range(name, range);
+        }
+        // The parse just faulted in the text and index records; none of them
+        // are needed again, so leave them in the page cache instead of RSS.
+        resources.drop_pages();
 
         Ok(Self {
             title,
@@ -422,8 +439,8 @@ fn split_on<'a>(data: &'a [u8], separator: &[u8]) -> Vec<&'a [u8]> {
 
 /// Builds the resource map: `mobi-image-N` for record N-1 after the first image
 /// record, which is how `recindex` numbers them.
-fn build_resources(pdb: &Pdb, header: &MobiHeader) -> (HashMap<String, Vec<u8>>, Option<Vec<u8>>) {
-    let mut resources = HashMap::new();
+fn build_resources(pdb: &Pdb, header: &MobiHeader) -> (Vec<ResourceRange>, Option<Vec<u8>>) {
+    let mut resources = Vec::new();
     let mut cover = None;
     let first = header.first_image_index;
     if first == NULL_INDEX || first as usize >= pdb.records() {
@@ -440,12 +457,16 @@ fn build_resources(pdb: &Pdb, header: &MobiHeader) -> (HashMap<String, Vec<u8>>,
         if image_extension(data).is_none() {
             continue;
         }
+        let Some(range) = pdb.record_range(record_index) else {
+            break;
+        };
         let index = (record_index - first as usize) + 1;
         let name = format!("mobi-image-{index}");
         if cover_index == Some((index - 1) as u32) {
+            // The reader UI asks for the cover as bytes; copy just this one.
             cover = Some(data.to_vec());
         }
-        resources.insert(name, data.to_vec());
+        resources.push((name, range));
     }
     (resources, cover)
 }

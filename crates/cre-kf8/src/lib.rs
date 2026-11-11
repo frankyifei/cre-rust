@@ -19,8 +19,8 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use cre_pdb::html::{self, AnchorTarget, Tag};
 use cre_pdb::{
-    Index, MobiHeader, NULL_INDEX, Pdb, extract_text, image_extension, is_known_non_image_record,
-    read_index,
+    BookResources, Index, MobiHeader, NULL_INDEX, Pdb, ResourceRange, extract_text,
+    image_extension, is_known_non_image_record, read_index,
 };
 
 /// One table of contents entry; `href` is a fragment in the generated document.
@@ -58,7 +58,11 @@ pub struct Kf8Book {
     pub keywords: Option<String>,
     pub identifiers: Option<String>,
     /// Resource name (`mobi-image-N`) to image bytes.
-    pub resources: HashMap<String, Vec<u8>>,
+    /// Resource name (`mobi-image-N`) to its range in the PalmDB file.
+    ///
+    /// The bytes are sliced from the mapped file when a page paints them, so a
+    /// 25 MB comic costs no anonymous memory for its pictures.
+    pub resources: BookResources,
     pub toc: Vec<Kf8TocItem>,
     pub cover_image: Option<Vec<u8>>,
     /// Number of XHTML parts (spine sections) in the book.
@@ -189,8 +193,8 @@ impl Kf8Book {
             bail!("KF8 produced no text");
         }
 
-        // 6. Resources and cover.
-        let (resources, cover_image) = build_resources(&pdb, &header);
+        // 6. Resources and cover: ranges into the PalmDB, not copies.
+        let (resource_ranges, cover_image) = build_resources(&pdb, &header);
 
         // 7. Metadata.
         let encoding = header.encoding;
@@ -220,6 +224,17 @@ impl Kf8Book {
         if toc.is_empty() {
             toc = section_toc(&body);
         }
+
+        // 9. Keep the file bytes and the record ranges, so a picture is sliced
+        //    out of the file when a page paints it instead of being copied at
+        //    open time.
+        let mut resources = BookResources::new(pdb.into_backing());
+        for (name, range) in resource_ranges {
+            resources.insert_range(name, range);
+        }
+        // The parse just faulted in the text and index records; none of them
+        // are needed again, so leave them in the page cache instead of RSS.
+        resources.drop_pages();
 
         Ok(Self {
             title,
@@ -810,8 +825,8 @@ fn kf8_toc(
     toc
 }
 
-fn build_resources(pdb: &Pdb, header: &MobiHeader) -> (HashMap<String, Vec<u8>>, Option<Vec<u8>>) {
-    let mut resources = HashMap::new();
+fn build_resources(pdb: &Pdb, header: &MobiHeader) -> (Vec<ResourceRange>, Option<Vec<u8>>) {
+    let mut resources = Vec::new();
     let mut cover = None;
     let start = if header.first_image_index == NULL_INDEX || header.first_image_index == 0 {
         header.text_record_count + 1
@@ -831,10 +846,14 @@ fn build_resources(pdb: &Pdb, header: &MobiHeader) -> (HashMap<String, Vec<u8>>,
         if is_known_non_image_record(data) || image_extension(data).is_none() {
             continue;
         }
+        let Some(range) = pdb.record_range(record_index) else {
+            break;
+        };
         if cover_offset == Some((index - 1) as u32) {
+            // The reader UI asks for the cover as bytes; copy just this one.
             cover = Some(data.to_vec());
         }
-        resources.insert(format!("mobi-image-{index}"), data.to_vec());
+        resources.push((format!("mobi-image-{index}"), range));
     }
     (resources, cover)
 }

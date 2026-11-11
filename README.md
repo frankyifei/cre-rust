@@ -140,10 +140,11 @@ document stayed at 63 MB), with the same chunk split and page count.
 
 MOBI, AZW3/KF8 and FB2 get the same treatment: the PalmDB is memory-mapped so
 only the records the parser reads are faulted in (an AZW3's unused compressed
-image records never enter RSS), and the generator hands out one chunk at a
-time instead of building the whole document and then splitting it. A 43 MB
-AZW3 opened at a 38 MB budget peaked at 34 MB instead of 61 MB. See
-[docs/MEMORY.md](docs/MEMORY.md).
+image records never enter RSS), images are indexed by record range instead of
+copied into a map, and the generator hands out one chunk at a time instead of
+building the whole document and then splitting it. A 43 MB AZW3 opened at a
+38 MB budget peaked at 34 MB instead of 61 MB and settled at 25 MB instead of
+32 MB. See [docs/MEMORY.md](docs/MEMORY.md).
 
 Blitz decodes every image of a chunk while it parses it. A raster `<img>` is
 therefore served to Blitz as a transparent SVG that carries the real intrinsic

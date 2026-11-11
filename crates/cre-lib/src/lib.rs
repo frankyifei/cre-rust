@@ -1141,12 +1141,76 @@ fn join_text_boxes<'a>(items: impl Iterator<Item = (&'a str, PageTextLine)>) -> 
     text
 }
 
+/// Resources of a format read from one file (FB2 binaries, MOBI/KF8 images).
+///
+/// FB2 decodes its pictures from base64 into memory; MOBI/KF8 keep them in the
+/// PalmDB and are indexed by range, so a picture is sliced out of the mapped
+/// file when a page paints it instead of being copied at open time.
 #[derive(Clone)]
+pub enum MapResources {
+    Owned(Arc<HashMap<String, Vec<u8>>>),
+    Mapped(Arc<cre_pdb::BookResources>),
+}
+
+impl MapResources {
+    pub fn get(&self, key: &str) -> Option<&[u8]> {
+        match self {
+            Self::Owned(map) => map.get(key).map(Vec::as_slice),
+            Self::Mapped(index) => index.get(key),
+        }
+    }
+
+    pub fn contains_key(&self, key: &str) -> bool {
+        match self {
+            Self::Owned(map) => map.contains_key(key),
+            Self::Mapped(index) => index.contains_key(key),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Owned(map) => map.len(),
+            Self::Mapped(index) => index.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Bytes of the resources the index can reach. For a mapped PalmDB these
+    /// are file pages, not anonymous memory.
+    pub fn bytes(&self) -> usize {
+        match self {
+            Self::Owned(map) => map.values().map(Vec::len).sum(),
+            Self::Mapped(index) => index.bytes(),
+        }
+    }
+
+    /// Drops the mapped pages the open pass faulted in; a page that paints a
+    /// picture faults it back in from the page cache.
+    pub fn drop_pages(&self) {
+        if let Self::Mapped(index) = self {
+            index.drop_pages();
+        }
+    }
+}
+
 pub enum ResourceSource {
     Empty,
-    /// Resources carried in memory, by name (FB2 binaries, MOBI/KF8 images).
-    Map(Arc<HashMap<String, Vec<u8>>>),
+    /// Resources carried in memory or indexed in the book file.
+    Map(MapResources),
     Epub(Arc<LazyResource>),
+}
+
+impl ResourceSource {
+    /// Drops the book file's pages after the open pass; see
+    /// [`MapResources::drop_pages`].
+    fn drop_pages(&self) {
+        if let Self::Map(map) = self {
+            map.drop_pages();
+        }
+    }
 }
 
 pub struct Document {
@@ -1439,7 +1503,8 @@ impl Document {
                 // second copy of every base64-decoded image.
                 let cover_image = book.binary.values().next().cloned();
                 let binary = Arc::new(std::mem::take(&mut book.binary));
-                let resource_source = ResourceSource::Map(binary.clone());
+                let resources = MapResources::Owned(binary);
+                let resource_source = ResourceSource::Map(resources.clone());
                 let mut sink = ChunkSink::new();
                 stream_single_document_chunks(&head, &body, &resource_source, |html| {
                     sink.push(html)
@@ -1454,7 +1519,7 @@ impl Document {
                     sink.content_images,
                     "fb2://book/",
                     Arc::new(MapNet {
-                        resources: binary.clone(),
+                        resources: resources.clone(),
                         svg: svg_raster.clone(),
                     }),
                     resource_source,
@@ -1500,7 +1565,7 @@ impl Document {
                     .collect();
                 let head = book.html_head(&html_options);
                 let cover_image = book.cover_image.take();
-                let resources = Arc::new(std::mem::take(&mut book.resources));
+                let resources = MapResources::Mapped(Arc::new(std::mem::take(&mut book.resources)));
                 let resource_source = ResourceSource::Map(resources.clone());
                 let mut sink = ChunkSink::new();
                 stream_single_document_chunks(&head, book.body_html(), &resource_source, |html| {
@@ -1559,7 +1624,7 @@ impl Document {
                     .collect();
                 let head = book.html_head(&html_options);
                 let cover_image = book.cover_image.take();
-                let resources = Arc::new(std::mem::take(&mut book.resources));
+                let resources = MapResources::Mapped(Arc::new(std::mem::take(&mut book.resources)));
                 let resource_source = ResourceSource::Map(resources.clone());
                 let mut sink = ChunkSink::new();
                 stream_single_document_chunks(&head, book.body_html(), &resource_source, |html| {
@@ -1864,6 +1929,7 @@ impl Document {
         if !defer_layout {
             document.ensure_layout()?;
         }
+        document.resources.drop_pages();
         Ok(document)
     }
 
@@ -2102,7 +2168,7 @@ fn layout_chunk_html(
         let inlined = |key: &str| -> Option<Arc<Vec<u8>>> {
             match resources {
                 ResourceSource::Epub(provider) => provider.get(key),
-                ResourceSource::Map(map) => map.get(key).map(|data| Arc::new(data.clone())),
+                ResourceSource::Map(map) => map.get(key).map(|data| Arc::new(data.to_vec())),
                 ResourceSource::Empty => None,
             }
         };
@@ -2923,7 +2989,7 @@ impl Document {
                 breakdown.pinned_bytes = provider.pinned_bytes();
             }
             ResourceSource::Map(map) => {
-                breakdown.resource_cache_bytes = map.values().map(Vec::len).sum();
+                breakdown.resource_cache_bytes = map.bytes();
             }
             ResourceSource::Empty => {}
         }
@@ -6154,7 +6220,7 @@ fn common_ancestor(root: &Node, left: NodeId, right: NodeId) -> Option<NodeId> {
 fn lookup_resource(resources: &ResourceSource, key: &str) -> Option<Arc<Vec<u8>>> {
     match resources {
         ResourceSource::Empty => None,
-        ResourceSource::Map(map) => map.get(key).map(|bytes| Arc::new(bytes.clone())),
+        ResourceSource::Map(map) => map.get(key).map(|bytes| Arc::new(bytes.to_vec())),
         // The provider already hands out `Arc`s; copying the bytes here made
         // every page render clone the whole (compressed) picture.
         ResourceSource::Epub(provider) => provider.get(key),
@@ -8670,7 +8736,7 @@ impl NetProvider for EpubNet {
 /// Serves resources held in memory (FB2 binaries, MOBI/KF8 images), under
 /// `binary/<name>` or a bare `<name>`.
 struct MapNet {
-    resources: Arc<HashMap<String, Vec<u8>>>,
+    resources: MapResources,
     svg: Arc<ImageRaster>,
 }
 
@@ -8681,9 +8747,20 @@ impl NetProvider for MapNet {
             .trim_start_matches('/')
             .to_string();
         let name = path.strip_prefix("binary/").unwrap_or(&path).to_string();
-        let bytes = self.resources.get(&name).cloned().unwrap_or_default();
-        let bytes = self.svg.rasterize(&name, &bytes).unwrap_or(bytes);
-        let bytes = self.svg.placeholder(&name, &bytes).unwrap_or(bytes);
+        // Slice the resource instead of copying it: the placeholder only needs
+        // the header to learn the intrinsic size, and copying the whole record
+        // here would fault every picture's pages in during the layout pass.
+        let original = self.resources.get(&name);
+        let bytes = match original.and_then(|bytes| self.svg.rasterize(&name, bytes)) {
+            Some(png) => png,
+            None => match original {
+                Some(bytes) => self
+                    .svg
+                    .placeholder(&name, bytes)
+                    .unwrap_or_else(|| bytes.to_vec()),
+                None => Vec::new(),
+            },
+        };
         handler.bytes(request.url.to_string(), Bytes::from(bytes));
     }
 }

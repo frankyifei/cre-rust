@@ -13,6 +13,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 
@@ -31,8 +32,8 @@ const PDB_HEADER_LEN: usize = 78;
 /// file only faults in the records that are touched, and the pages it does
 /// touch stay in the page cache, which the kernel can reclaim.
 enum PdbData {
-    Owned(Vec<u8>),
-    Mapped(memmap2::Mmap),
+    Owned(Arc<[u8]>),
+    Mapped(Arc<memmap2::Mmap>),
 }
 
 impl std::ops::Deref for PdbData {
@@ -43,6 +44,130 @@ impl std::ops::Deref for PdbData {
             Self::Owned(data) => data,
             Self::Mapped(mapped) => mapped,
         }
+    }
+}
+
+/// The bytes a [`BookResources`] slices its records from.
+///
+/// The reader keeps this alive for the session instead of copying every image
+/// out of the file: on a mapped file the pictures stay page cache, so a
+/// 25 MB comic costs no anonymous memory until a page actually paints one.
+pub enum ResourceBacking {
+    Owned(Arc<[u8]>),
+    Mapped(Arc<memmap2::Mmap>),
+}
+
+impl std::ops::Deref for ResourceBacking {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Owned(data) => data,
+            Self::Mapped(mapped) => mapped,
+        }
+    }
+}
+
+impl ResourceBacking {
+    /// Drops the mapped pages this process has faulted in.
+    ///
+    /// The parse touches the text records, the index records and the headers
+    /// of every image record, and the open-time layout pass touches the
+    /// pictures again to learn their intrinsic size. None of those pages are
+    /// needed after the book is assembled: the index holds offsets, and the
+    /// first page that paints a picture faults it back in from the page cache.
+    /// Measured on a 43 MB AZW3: 25 MB of resident file pages drop to none.
+    pub fn drop_pages(&self) {
+        if let Self::Mapped(mapped) = self {
+            // Resource reads are individual records, so readahead and
+            // fault-around would drag neighbouring pictures into RSS for
+            // nothing.
+            let _ = mapped.advise(memmap2::Advice::Random);
+            // SAFETY: the caller only runs this after the book is assembled,
+            // when no slice borrowed from the mapping is alive; the ranges in
+            // the index are offsets, and the next `get` faults the pages back
+            // in from the page cache.
+            let _ = unsafe { mapped.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
+        }
+    }
+}
+
+/// A named byte range of the book file, for the resource index.
+pub type ResourceRange = (String, std::ops::Range<usize>);
+
+/// Resource name to record range (or owned bytes), backed by the book file.
+///
+/// MOBI and KF8 images are PalmDB records that are still in the file, so the
+/// index only records where each one starts and ends. `get` slices the mapped
+/// file on demand; nothing is copied at open time except the cover.
+#[derive(Default)]
+pub struct BookResources {
+    backing: Option<ResourceBacking>,
+    ranges: HashMap<String, std::ops::Range<usize>>,
+    owned: HashMap<String, Arc<[u8]>>,
+}
+
+impl BookResources {
+    pub fn new(backing: ResourceBacking) -> Self {
+        Self {
+            backing: Some(backing),
+            ..Self::default()
+        }
+    }
+
+    /// Records that a resource lives at `range` of the backing bytes.
+    pub fn insert_range(&mut self, name: impl Into<String>, range: std::ops::Range<usize>) {
+        self.ranges.insert(name.into(), range);
+    }
+
+    /// Records a resource the reader generated (no range in the file).
+    pub fn insert_owned(&mut self, name: impl Into<String>, bytes: Arc<[u8]>) {
+        self.owned.insert(name.into(), bytes);
+    }
+
+    pub fn get(&self, name: &str) -> Option<&[u8]> {
+        if let Some(bytes) = self.owned.get(name) {
+            return Some(bytes);
+        }
+        let range = self.ranges.get(name)?;
+        self.backing.as_deref()?.get(range.clone())
+    }
+
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.owned.contains_key(name) || self.ranges.contains_key(name)
+    }
+
+    pub fn len(&self) -> usize {
+        self.owned.len() + self.ranges.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Bytes of the resources the index can reach.
+    ///
+    /// For a mapped file these are page-cache bytes, not anonymous memory.
+    pub fn bytes(&self) -> usize {
+        self.owned.values().map(|bytes| bytes.len()).sum::<usize>()
+            + self
+                .ranges
+                .values()
+                .map(|range| range.end.saturating_sub(range.start))
+                .sum::<usize>()
+    }
+
+    /// Drops the file pages the parse faulted in; pictures are re-read from
+    /// the page cache when a page paints them.
+    pub fn drop_pages(&self) {
+        if let Some(backing) = self.backing.as_ref() {
+            backing.drop_pages();
+        }
+    }
+
+    /// Whether the pictures come from the file mapping rather than copies.
+    pub fn is_mapped(&self) -> bool {
+        matches!(self.backing, Some(ResourceBacking::Mapped(_)))
     }
 }
 
@@ -65,14 +190,34 @@ impl Pdb {
         if let Ok(file) = std::fs::File::open(path)
             && let Ok(mapped) = unsafe { memmap2::Mmap::map(&file) }
         {
-            return Self::from_data(PdbData::Mapped(mapped));
+            return Self::from_data(PdbData::Mapped(Arc::new(mapped)));
         }
         let data = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-        Self::from_data(PdbData::Owned(data))
+        Self::from_data(PdbData::Owned(Arc::from(data)))
     }
 
     pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
-        Self::from_data(PdbData::Owned(data))
+        Self::from_data(PdbData::Owned(Arc::from(data)))
+    }
+
+    /// Hands the file bytes to a [`BookResources`] index, so records can be
+    /// sliced for the rest of the session without being copied.
+    pub fn into_backing(self) -> ResourceBacking {
+        match self.data {
+            PdbData::Owned(data) => ResourceBacking::Owned(data),
+            PdbData::Mapped(mapped) => ResourceBacking::Mapped(mapped),
+        }
+    }
+
+    /// Byte range of one record in the file.
+    pub fn record_range(&self, index: usize) -> Option<std::ops::Range<usize>> {
+        let start = *self.offsets.get(index)?;
+        let end = self
+            .offsets
+            .get(index + 1)
+            .copied()
+            .unwrap_or(self.data.len());
+        (start <= end && end <= self.data.len()).then_some(start..end)
     }
 
     fn from_data(data: PdbData) -> Result<Self> {
@@ -907,6 +1052,48 @@ mod tests {
         assert_eq!(mapped.record(1), Some(&b"defg"[..]));
         drop(mapped);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn resource_ranges_slice_the_backing_bytes() {
+        let mut data = vec![0u8; PDB_HEADER_LEN];
+        data[60..68].copy_from_slice(b"BOOKMOBI");
+        data[76..78].copy_from_slice(&2u16.to_be_bytes());
+        let first_record = PDB_HEADER_LEN + 2 * 8;
+        data.resize(first_record, 0);
+        for (index, offset) in [first_record, first_record + 5].into_iter().enumerate() {
+            let at = PDB_HEADER_LEN + index * 8;
+            data[at..at + 4].copy_from_slice(&(offset as u32).to_be_bytes());
+        }
+        data.extend_from_slice(b"abcde");
+        data.extend_from_slice(b"fghij");
+
+        let pdb = Pdb::from_bytes(data).expect("pdb");
+        let ranges: Vec<ResourceRange> = (0..pdb.records())
+            .map(|index| {
+                (
+                    format!("image-{index}"),
+                    pdb.record_range(index).expect("range"),
+                )
+            })
+            .collect();
+        let mut resources = BookResources::new(pdb.into_backing());
+        for (name, range) in ranges {
+            resources.insert_range(name, range);
+        }
+        resources.insert_owned("generated", Arc::from(&b"svg"[..]));
+
+        assert_eq!(resources.get("image-0"), Some(&b"abcde"[..]));
+        assert_eq!(resources.get("image-1"), Some(&b"fghij"[..]));
+        assert_eq!(resources.get("generated"), Some(&b"svg"[..]));
+        assert_eq!(resources.get("missing"), None);
+        assert!(resources.contains_key("image-1"));
+        assert_eq!(resources.len(), 3);
+        assert_eq!(resources.bytes(), 13);
+        assert!(!resources.is_mapped());
+        // Dropping pages is a no-op for owned bytes.
+        resources.drop_pages();
+        assert_eq!(resources.get("image-0"), Some(&b"abcde"[..]));
     }
 
     fn write_temp(name: &str, data: &[u8]) -> std::path::PathBuf {

@@ -473,6 +473,7 @@ dependencies = [
  "cre-mathml",
  "cre-mobi",
  "cre-paint",
+ "cre-pdb",
  "cre-text",
  "image",
  "libc",
