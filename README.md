@@ -138,6 +138,13 @@ so the whole book's chunk HTML is never materialized. On a 24 MB text book at
 a 38 MB budget this cut the open peak from 132 MB to 64 MB (the steady
 document stayed at 63 MB), with the same chunk split and page count.
 
+MOBI, AZW3/KF8 and FB2 get the same treatment: the PalmDB is memory-mapped so
+only the records the parser reads are faulted in (an AZW3's unused compressed
+image records never enter RSS), and the generator hands out one chunk at a
+time instead of building the whole document and then splitting it. A 43 MB
+AZW3 opened at a 38 MB budget peaked at 34 MB instead of 61 MB. See
+[docs/MEMORY.md](docs/MEMORY.md).
+
 Blitz decodes every image of a chunk while it parses it. A raster `<img>` is
 therefore served to Blitz as a transparent SVG that carries the real intrinsic
 size, and the real pixels are painted by `cre-paint` at the size they are

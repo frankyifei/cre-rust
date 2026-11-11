@@ -148,7 +148,9 @@ decompressed when that chunk is laid out.
 
 The EPUB generator streams: it decodes one spine document at a time and hands
 each finished chunk to the compressor, so the whole book's chunk HTML is never
-materialized before compression.
+materialized before compression. MOBI, AZW3/KF8 and FB2 do the same from their
+generated body, and their PalmDB is memory-mapped so only the records the
+parser reads are faulted in.
 
 Resource caches are byte-bounded. Resources that the engine generates
 (rewritten XHTML, page-fit SVG wrappers) are **pinned** for the session. They

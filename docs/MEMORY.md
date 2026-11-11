@@ -92,6 +92,34 @@ takes the LZ4 block before dropping the plaintext. The earlier 80.7 -> 66.1 MB
 change was shrinking the whole chunk vector before it was compressed; that
 vector no longer exists on the EPUB path.
 
+### MOBI, AZW3/KF8 and FB2
+
+These formats are generated as one document instead of a spine, and they used
+to read the whole file, copy every image, build the whole HTML and then split
+it, with all of those alive at once.
+
+- **The PalmDB is mapped, not read.** `Pdb::open` memory-maps the file instead
+  of `fs::read`, so only the records the parser touches are faulted in. A
+  43 MB AZW3 holds 36 MB of `CRES` image records that this engine does not use;
+  they never enter the process's RSS, and the pages that are touched are file
+  backed and reclaimable. This cut the open peak at a 38 MB budget from
+  **60.8 MB to 34.4 MB** (the steady document stayed at 31.7 MB); a 23 MB AZW3
+  went from 43.0 MB to 37.2 MB. `Pdb::from_bytes` keeps the owned-bytes path
+  for callers that already have a `Vec<u8>`.
+- **Chunks stream out of the generator.** `to_body_html_with_toc` /
+  `html_head` / `body_html` give cre-lib the document head and body separately,
+  and `stream_single_document_chunks` emits one chunk at a time (the same
+  `<section>` packing and budgets as `split_single_document`). The whole
+  generated document, its lowercased copy and the split parts no longer exist
+  together; each chunk is compressed as soon as it is built, like EPUB.
+- The image map and the cover are moved out of the book instead of cloned, and
+  the parsed book is dropped before the layout starts.
+
+A raster `<img>` is still served to Blitz as a transparent SVG placeholder, so
+those resources cost one compressed copy in memory plus a transient clone per
+placed image when a page is painted; the low-memory estimate counts no decoded
+image bytes for them (`MAP_CHUNK_IMAGE_BYTES`).
+
 ## The open-time layout pass
 
 Every chunk has to be laid out once to learn the page count. The pass:
@@ -184,6 +212,8 @@ open is unchanged at 123 ms.
 | `15.epub` reader process, open / peak | 153 / 169 MB | 102 / 119 MB |
 | 24 MB text book RSS (LZ4) | 66.1 MB | 41.5 MB |
 | 24 MB text book, 38 MB budget, open peak | 132 MB | 64 MB |
+| 43 MB AZW3, 38 MB budget, open peak | 60.8 MB | 34.4 MB |
+| 23 MB AZW3, 38 MB budget, open peak | 43.0 MB | 37.2 MB |
 | `zyj.epub` open / peak (arena trim) | 42.5 / 73.5 MB | 36.4 / 42.4 MB |
 | 8 full-page JPEGs, 64 MB budget, peak | 126 MB | 56 MB |
 | 60-image book, RSS after open (LRU) | 40.1 MB | 35.6 MB |

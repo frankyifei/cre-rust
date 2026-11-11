@@ -23,9 +23,32 @@ pub const NULL_INDEX: u32 = 0xFFFF_FFFF;
 
 const PDB_HEADER_LEN: usize = 78;
 
+/// The file bytes a [`Pdb`] reads its records from.
+///
+/// A MOBI/AZW3 holds every image and font in the PalmDB, but a reader only
+/// decodes the pictures a page actually shows. Reading the file into a `Vec`
+/// put all of it on the anonymous heap for the length of the parse; a mapped
+/// file only faults in the records that are touched, and the pages it does
+/// touch stay in the page cache, which the kernel can reclaim.
+enum PdbData {
+    Owned(Vec<u8>),
+    Mapped(memmap2::Mmap),
+}
+
+impl std::ops::Deref for PdbData {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Owned(data) => data,
+            Self::Mapped(mapped) => mapped,
+        }
+    }
+}
+
 /// A Palm Database file: header fields plus the record table.
 pub struct Pdb {
-    data: Vec<u8>,
+    data: PdbData,
     offsets: Vec<usize>,
     pub name: String,
     /// 4-byte type and creator, e.g. `BOOK`/`MOBI`.
@@ -36,11 +59,23 @@ pub struct Pdb {
 impl Pdb {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        // Only the records the reader asks for are faulted in, so the 36 MB of
+        // compressed resources in a typical AZW3 never join the open's RSS.
+        // Mapping also avoids a whole-file `read` on an anonymous heap.
+        if let Ok(file) = std::fs::File::open(path)
+            && let Ok(mapped) = unsafe { memmap2::Mmap::map(&file) }
+        {
+            return Self::from_data(PdbData::Mapped(mapped));
+        }
         let data = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-        Self::from_bytes(data)
+        Self::from_data(PdbData::Owned(data))
     }
 
     pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
+        Self::from_data(PdbData::Owned(data))
+    }
+
+    fn from_data(data: PdbData) -> Result<Self> {
         if data.len() < PDB_HEADER_LEN {
             bail!("not a PalmDB file: only {} bytes", data.len());
         }
@@ -841,5 +876,42 @@ mod tests {
         assert_eq!(strip_trailing_entries(data, 0), &data[..]);
         // 0x00 low bits 0 -> one byte removed in total.
         assert_eq!(strip_trailing_entries(&b"html\x00"[..], 1), b"html");
+    }
+
+    #[test]
+    fn a_mapped_file_yields_the_same_records_as_owned_bytes() {
+        // `open` maps the file instead of reading it; the record table and the
+        // records themselves must come out identical.
+        let mut data = vec![0u8; PDB_HEADER_LEN];
+        data[..4].copy_from_slice(b"book");
+        data[60..68].copy_from_slice(b"BOOKMOBI");
+        data[76..78].copy_from_slice(&2u16.to_be_bytes());
+        let first_record = PDB_HEADER_LEN + 2 * 8;
+        data.resize(first_record, 0);
+        for (index, offset) in [first_record, first_record + 3].into_iter().enumerate() {
+            let at = PDB_HEADER_LEN + index * 8;
+            data[at..at + 4].copy_from_slice(&(offset as u32).to_be_bytes());
+        }
+        data.extend_from_slice(b"abc");
+        data.extend_from_slice(b"defg");
+
+        let path = write_temp("mapped.pdb", &data);
+        let mapped = Pdb::open(&path).expect("open mapped");
+        let owned = Pdb::from_bytes(data).expect("open owned");
+        assert_eq!(mapped.name, owned.name);
+        assert_eq!(mapped.book_type, owned.book_type);
+        assert_eq!(mapped.records(), owned.records());
+        for index in 0..owned.records() {
+            assert_eq!(mapped.record(index), owned.record(index));
+        }
+        assert_eq!(mapped.record(1), Some(&b"defg"[..]));
+        drop(mapped);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn write_temp(name: &str, data: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("cre-pdb-{}-{name}", std::process::id()));
+        std::fs::write(&path, data).expect("write temp");
+        path
     }
 }

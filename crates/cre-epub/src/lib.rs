@@ -1274,29 +1274,33 @@ pub fn split_html_document(html: &str, limit: usize) -> Vec<String> {
     if limit == 0 || html.len() <= limit {
         return vec![html.to_string()];
     }
-    let lower = html.to_ascii_lowercase();
-    let Some(body_start) = lower.find("<body") else {
+    let Some((head, body, tail)) = html_body_parts(html) else {
         return vec![html.to_string()];
     };
-    let Some(body_open_end) = lower[body_start..]
-        .find('>')
-        .map(|end| body_start + end + 1)
-    else {
-        return vec![html.to_string()];
-    };
-    let Some(body_close) = lower.rfind("</body>") else {
-        return vec![html.to_string()];
-    };
-    if body_close < body_open_end {
-        return vec![html.to_string()];
-    }
-    let body = &html[body_open_end..body_close];
-    let tail = &html[body_close..];
-    let parts = split_body_html(body, limit);
+    let parts = split_html_body_parts(body, limit);
     if parts.len() <= 1 {
         return vec![html.to_string()];
     }
-    let head = &html[..body_open_end];
+    parts
+        .into_iter()
+        .map(|part| format!("{head}{part}{tail}"))
+        .collect()
+}
+
+/// Splits the `<body>` content of a document into parts of at most `limit`
+/// bytes, giving every part but the first its own `data-spine-index` range.
+///
+/// This is [`split_html_document`] without the head and tail, for a caller
+/// that already holds the generated body and wants to build one chunk at a
+/// time instead of materializing the whole document first.
+pub fn split_html_body_parts(body: &str, limit: usize) -> Vec<String> {
+    if limit == 0 || body.len() <= limit {
+        return vec![body.to_string()];
+    }
+    let parts = split_body_html(body, limit);
+    if parts.len() <= 1 {
+        return vec![body.to_string()];
+    }
     parts
         .into_iter()
         .enumerate()
@@ -1307,14 +1311,33 @@ pub fn split_html_document(html: &str, limit: usize) -> Vec<String> {
             // in two chunks, so the second one could never resolve; give every
             // part its own slot range. (Only EPUB uses these attributes today,
             // but single-document formats use this splitter.)
-            let part = if index == 0 {
+            if index == 0 {
                 part
             } else {
                 renumber_spine_indices(&part, index)
-            };
-            format!("{head}{part}{tail}")
+            }
         })
         .collect()
+}
+
+/// The `<head>…<body>` prefix, the body content and the `</body>…` tail of a
+/// generated document.
+///
+/// A generator that keeps its body separately can hand its parts here instead
+/// of building the whole document, so the complete HTML never exists.
+pub fn html_body_parts(html: &str) -> Option<(&str, &str, &str)> {
+    let lower = html.to_ascii_lowercase();
+    let body_start = lower.find("<body")?;
+    let body_open_end = body_start + lower[body_start..].find('>')? + 1;
+    let body_close = lower.rfind("</body>")?;
+    if body_close < body_open_end {
+        return None;
+    }
+    Some((
+        &html[..body_open_end],
+        &html[body_open_end..body_close],
+        &html[body_close..],
+    ))
 }
 
 /// Splits a single-document book at its `<section class="cre-spine">` parts.
@@ -1364,9 +1387,82 @@ where
         return None;
     }
     let body = &html[body_open_end..body_close];
-    let lower_body = &lower[body_open_end..body_close];
+    let (prefix_end, sections) = section_ranges_in(body, &lower[body_open_end..body_close])?;
+    let head = &html[..body_open_end];
+    let tail = &html[body_close..];
 
-    let mut sections: Vec<&str> = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
+    pack_sections(
+        body,
+        prefix_end,
+        &sections,
+        head,
+        tail,
+        limit,
+        image_limit,
+        layout_limit,
+        dom_factor,
+        cost,
+        |part| parts.push(part),
+    )?;
+    Some(parts)
+}
+
+/// Splits a generated body at its `<section>` parts, handing one finished
+/// chunk document to `emit` at a time.
+///
+/// `head` and `tail` are the parts of the document around the body
+/// ([`html_body_parts`]); every chunk is `head + prefix + sections + tail`, so
+/// the caller never holds the whole document. Returns `false` when the body is
+/// not a run of sections, or when one section alone is larger than `limit`; the
+/// caller then falls back to [`split_html_body_parts`].
+#[allow(clippy::too_many_arguments)]
+pub fn stream_html_document_at_sections_with<F, G>(
+    head: &str,
+    body: &str,
+    tail: &str,
+    limit: usize,
+    image_limit: usize,
+    layout_limit: usize,
+    dom_factor: usize,
+    cost: F,
+    mut emit: G,
+) -> bool
+where
+    F: Fn(&str) -> (usize, usize),
+    G: FnMut(String),
+{
+    if limit == 0 {
+        return false;
+    }
+    let Some((prefix_end, sections)) = section_ranges(body) else {
+        return false;
+    };
+    pack_sections(
+        body,
+        prefix_end,
+        &sections,
+        head,
+        tail,
+        limit,
+        image_limit,
+        layout_limit,
+        dom_factor,
+        cost,
+        &mut emit,
+    )
+    .is_some()
+}
+
+/// Byte ranges of a body that is a run of `<section>` parts, plus the end of
+/// the repeated prefix before the first one.
+fn section_ranges(body: &str) -> Option<(usize, Vec<std::ops::Range<usize>>)> {
+    let lower = body.to_ascii_lowercase();
+    section_ranges_in(body, &lower)
+}
+
+fn section_ranges_in(body: &str, lower_body: &str) -> Option<(usize, Vec<std::ops::Range<usize>>)> {
+    let mut sections = Vec::new();
     let mut cursor = 0usize;
     let mut prefix_end = 0usize;
     let mut first = true;
@@ -1386,7 +1482,7 @@ where
         }
         let close = lower_body[start..].find("</section>")? + start;
         let end = close + "</section>".len();
-        sections.push(&body[start..end]);
+        sections.push(start..end);
         cursor = end;
     }
     if sections.is_empty() {
@@ -1395,21 +1491,44 @@ where
     if !body[cursor..].trim().is_empty() {
         return None;
     }
+    Some((prefix_end, sections))
+}
+
+/// Packs sections into chunks and emits one finished document per chunk.
+#[allow(clippy::too_many_arguments)]
+fn pack_sections<F, G>(
+    body: &str,
+    prefix_end: usize,
+    sections: &[std::ops::Range<usize>],
+    head: &str,
+    tail: &str,
+    limit: usize,
+    image_limit: usize,
+    layout_limit: usize,
+    dom_factor: usize,
+    cost: F,
+    mut emit: G,
+) -> Option<()>
+where
+    F: Fn(&str) -> (usize, usize),
+    G: FnMut(String),
+{
     // A section too big for the *text* budget has to be cut by the generic
     // splitter, which can cut inside it; the caller falls back then. An image
     // overrun is not a reason to fall back: a section is indivisible here (it
     // carries a spine index), so it simply gets a chunk of its own.
-    if sections.iter().any(|section| cost(section).0 > limit) {
+    if sections
+        .iter()
+        .any(|range| cost(&body[range.clone()]).0 > limit)
+    {
         return None;
     }
 
     let prefix = &body[..prefix_end];
-    let head = &html[..body_open_end];
-    let tail = &html[body_close..];
-    let mut parts: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut current_images = 0usize;
-    for section in sections {
+    for range in sections {
+        let section = &body[range.clone()];
         let (text, images) = cost(section);
         let over_text = prefix.len() + current.len() + text > limit;
         let over_images = current_images + images > image_limit;
@@ -1417,7 +1536,7 @@ where
             (prefix.len() + current.len() + text) * dom_factor + current_images + images
                 > layout_limit;
         if !current.is_empty() && (over_text || over_images || over_layout) {
-            parts.push(format!("{head}{prefix}{current}{tail}"));
+            emit(format!("{head}{prefix}{current}{tail}"));
             current.clear();
             current_images = 0;
         }
@@ -1425,9 +1544,9 @@ where
         current_images += images;
     }
     if !current.is_empty() {
-        parts.push(format!("{head}{prefix}{current}{tail}"));
+        emit(format!("{head}{prefix}{current}{tail}"));
     }
-    Some(parts)
+    Some(())
 }
 
 /// True when a fragment holds only `<style>`/`<script>` blocks and whitespace.
@@ -3938,6 +4057,43 @@ mod tests {
         assert_eq!(parts.len(), 2, "{parts:?}");
         for part in &parts {
             assert!(part.contains("<style>p{color:red}</style>"), "{part}");
+        }
+    }
+
+    #[test]
+    fn streaming_sections_match_the_collected_split() {
+        // The streaming variant is what the MOBI/KF8/FB2 open path uses; it
+        // must produce exactly the chunks the collecting splitter would.
+        let cases = [
+            "<html><head><title>t</title></head><body>\
+             <section class=\"cre-spine\" data-spine-index=\"1\"><p>one</p></section>\
+             <section class=\"cre-spine\" data-spine-index=\"2\"><p>two</p></section>\
+             <section class=\"cre-spine\" data-spine-index=\"3\"><p>three</p></section>\
+             </body></html>",
+            "<html><body><style>p{color:red}</style>\
+             <section class=\"cre-spine\"><p>one</p></section>\
+             <section class=\"cre-spine\"><p>two</p></section>\
+             </body></html>",
+        ];
+        for html in cases {
+            let (head, body, tail) = super::html_body_parts(html).expect("body parts");
+            for limit in [110, 150, 1000] {
+                let collected =
+                    super::split_html_document_at_sections(html, limit).expect("sections");
+                let mut streamed = Vec::new();
+                assert!(super::stream_html_document_at_sections_with(
+                    head,
+                    body,
+                    tail,
+                    limit,
+                    usize::MAX,
+                    usize::MAX,
+                    128,
+                    |section| (section.len(), 0),
+                    |chunk| streamed.push(chunk),
+                ));
+                assert_eq!(collected, streamed, "limit {limit}");
+            }
         }
     }
 

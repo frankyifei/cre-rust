@@ -93,6 +93,38 @@ impl Fb2Book {
     }
 
     pub fn to_html_with_toc(&self, opts: &Fb2HtmlOptions) -> Result<(String, Vec<Fb2TocItem>)> {
+        let (body, toc) = self.to_body_html_with_toc(opts)?;
+        let html = format!("{}{body}</body></html>", self.html_head(opts));
+        Ok((html, toc))
+    }
+
+    /// The document prefix through the `<body>` open tag.
+    ///
+    /// [`Self::to_body_html_with_toc`] + this + `"</body></html>"` is exactly
+    /// [`Self::to_html_with_toc`], which lets a caller build one chunk at a
+    /// time instead of materializing the whole generated document.
+    pub fn html_head(&self, opts: &Fb2HtmlOptions) -> String {
+        let css = format!(
+            "/* cre-render-base */\nbody {{ font-family: serif; font-size: {}px; line-height: {}; padding: {}px {}px; background: white; color: black; }}
+img {{ max-width: 100%; height: auto; }}
+h1,h2,h3,h4,h5,h6 {{ font-family: sans-serif; }}
+blockquote {{ border-left: 3px solid #888; padding-left: 1em; margin: 1em 0; font-style: italic; }}
+.cre-author {{ font-style: italic; text-align: right; }}
+.cre-annotation {{ background: #f0f0f0; padding: 0.5em; margin-bottom: 1em; }}
+.poem {{ font-style: normal; }}",
+            opts.font_size, opts.line_height, opts.margin_y, opts.margin_x,
+        );
+        let title_html = escape_html(self.title.as_deref().unwrap_or(""));
+        format!(
+            "<!DOCTYPE html><html lang=\"{}\"><head><meta charset=\"utf-8\"><title>{title_html}</title><style>{css}</style></head><body>",
+            self.language.as_deref().unwrap_or("und"),
+        )
+    }
+
+    pub fn to_body_html_with_toc(
+        &self,
+        _opts: &Fb2HtmlOptions,
+    ) -> Result<(String, Vec<Fb2TocItem>)> {
         let doc = roxmltree::Document::parse(&self.fb2_xml)?;
         let root = doc.root_element();
 
@@ -130,20 +162,6 @@ impl Fb2Book {
             body_html.push_str("</section>\n");
         }
 
-        let css = format!(
-            "/* cre-render-base */\nbody {{ font-family: serif; font-size: {}px; line-height: {}; padding: {}px {}px; background: white; color: black; }}
-img {{ max-width: 100%; height: auto; }}
-h1,h2,h3,h4,h5,h6 {{ font-family: sans-serif; }}
-blockquote {{ border-left: 3px solid #888; padding-left: 1em; margin: 1em 0; font-style: italic; }}
-.cre-author {{ font-style: italic; text-align: right; }}
-.cre-annotation {{ background: #f0f0f0; padding: 0.5em; margin-bottom: 1em; }}
-.poem {{ font-style: normal; }}",
-            opts.font_size,
-            opts.line_height,
-            opts.margin_y,
-            opts.margin_x,
-        );
-
         let title_html = escape_html(self.title.as_deref().unwrap_or(""));
         let meta_html = if let Some(ref author) = self.creator {
             format!(
@@ -154,11 +172,7 @@ blockquote {{ border-left: 3px solid #888; padding-left: 1em; margin: 1em 0; fon
             format!("<h1 class=\"cre-title\">{title_html}</h1>")
         };
 
-        let html = format!(
-            "<!DOCTYPE html><html lang=\"{}\"><head><meta charset=\"utf-8\"><title>{title_html}</title><style>{css}</style></head><body>{meta_html}{body_html}</body></html>",
-            self.language.as_deref().unwrap_or("und"),
-        );
-        Ok((html, toc))
+        Ok((format!("{meta_html}{body_html}"), toc))
     }
 }
 

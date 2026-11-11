@@ -426,6 +426,117 @@ fn split_single_document(html: String, resources: &ResourceSource) -> Vec<String
     cre_epub::split_html_document(&html, text_limit)
 }
 
+/// Streams the chunks of a format generated as one document body (MOBI,
+/// AZW3/KF8, FB2).
+///
+/// The generators keep their body separately, so this takes the document head
+/// and body and hands one finished chunk at a time to `emit`; the full
+/// generated document never exists. Chunk boundaries are the same as
+/// [`split_single_document`] would produce.
+fn stream_single_document_chunks<F>(
+    head: &str,
+    body: &str,
+    resources: &ResourceSource,
+    mut emit: F,
+) -> Result<()>
+where
+    F: FnMut(String) -> Result<()>,
+{
+    const TAIL: &str = "</body></html>";
+    let available = available_memory_bytes();
+    let html_len = head.len() + body.len() + TAIL.len();
+    let target = plan_chunk_bytes(html_len, available);
+    if target == usize::MAX || html_len <= target {
+        emit(format!("{head}{body}{TAIL}"))?;
+        return Ok(());
+    }
+    // The same budgets the EPUB chunker uses: decoded images dominate a
+    // chunk's footprint, and they cannot be seen in the HTML size. A KF8
+    // photo page can be 100 kB of JPEG and 20 MB decoded.
+    let (text_budget, image_budget, layout_budget) = chunk_budgets(available);
+    let text_limit = target.min(text_budget).max(MIN_CHUNK_BYTES);
+    let image_budget = image_budget.unwrap_or(usize::MAX);
+    let cost = |section: &str| -> (usize, usize) {
+        let images = cre_epub::image_sources_in(section)
+            .into_iter()
+            .filter_map(|key| resource_image_bytes(resources, &key))
+            .sum();
+        (section.len(), images)
+    };
+    // MOBI/KF8 bodies are a run of `<section class="cre-spine">` parts; cutting
+    // between them keeps each chunk a whole number of parts. A book whose part
+    // is bigger than the budget falls back to the generic splitter, which can
+    // only respect the text budget.
+    let mut failure: Option<anyhow::Error> = None;
+    let handled = cre_epub::stream_html_document_at_sections_with(
+        head,
+        body,
+        TAIL,
+        text_limit,
+        image_budget,
+        layout_budget,
+        LAYOUT_BYTES_PER_HTML_BYTE,
+        cost,
+        |chunk| {
+            if failure.is_none()
+                && let Err(error) = emit(chunk)
+            {
+                failure = Some(error);
+            }
+        },
+    );
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if handled {
+        return Ok(());
+    }
+    for part in cre_epub::split_html_body_parts(body, text_limit) {
+        emit(format!("{head}{part}{TAIL}"))?;
+    }
+    Ok(())
+}
+
+/// Decoded image bytes that live next to one chunk's DOM on the in-memory
+/// resource path (MOBI, AZW3/KF8, FB2).
+///
+/// Blitz is served a transparent SVG that carries the intrinsic size for every
+/// raster `<img>` (see `docs/IMAGES.md`), so laying a chunk out decodes no
+/// image bytes; the pictures are decoded with DCT scaling when they are
+/// painted. The map's own bytes are already resident when the memory check
+/// runs, so counting them again would refuse books that open with room to
+/// spare (measured: an AZW3 refused at 38 MB while its open peaked at 35 MB).
+const MAP_CHUNK_IMAGE_BYTES: u64 = 0;
+
+/// Collects what [`Document::build_from_sources`] needs while a format that is
+/// generated as one document (MOBI, AZW3/KF8, FB2) streams its chunks.
+///
+/// This is the same work the EPUB callback does: fixed-layout detection and
+/// the `<img>` keys that may become size placeholders.
+struct ChunkSink {
+    sources: Vec<ChunkSource>,
+    fixed_layouts: Vec<Option<FixedLayout>>,
+    content_images: Vec<String>,
+}
+
+impl ChunkSink {
+    fn new() -> Self {
+        Self {
+            sources: Vec::new(),
+            fixed_layouts: Vec::new(),
+            content_images: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, html: String) -> Result<()> {
+        self.fixed_layouts.push(parse_fixed_layout(&html));
+        self.content_images
+            .extend(cre_epub::image_sources_in(&html));
+        self.sources.push(ChunkSource::new(html));
+        Ok(())
+    }
+}
+
 /// Estimated decoded size of one resource, for the chunk image budget.
 fn resource_image_bytes(resources: &ResourceSource, key: &str) -> Option<usize> {
     match resources {
@@ -1030,6 +1141,7 @@ fn join_text_boxes<'a>(items: impl Iterator<Item = (&'a str, PageTextLine)>) -> 
     text
 }
 
+#[derive(Clone)]
 pub enum ResourceSource {
     Empty,
     /// Resources carried in memory, by name (FB2 binaries, MOBI/KF8 images).
@@ -1297,7 +1409,7 @@ impl Document {
                 )
             }
             DocumentFormat::Fb2 => {
-                let book = Fb2Book::open(path)?;
+                let mut book = Fb2Book::open(path)?;
                 let metadata = DocumentMetadata {
                     format,
                     title: book.title.clone(),
@@ -1313,7 +1425,7 @@ impl Document {
                     font_size: options.font_size.max(1.0) as u32,
                     ..Fb2HtmlOptions::default()
                 };
-                let (html, fb2_toc) = book.to_html_with_toc(&html_options)?;
+                let (body, fb2_toc) = book.to_body_html_with_toc(&html_options)?;
                 let raw_toc = fb2_toc
                     .into_iter()
                     .map(|item| RawTocItem {
@@ -1322,11 +1434,24 @@ impl Document {
                         depth: item.depth,
                     })
                     .collect();
+                let head = book.html_head(&html_options);
+                // Move the pictures and the cover out instead of cloning a
+                // second copy of every base64-decoded image.
                 let cover_image = book.binary.values().next().cloned();
-                let binary = Arc::new(book.binary);
+                let binary = Arc::new(std::mem::take(&mut book.binary));
                 let resource_source = ResourceSource::Map(binary.clone());
-                Self::build(
-                    split_single_document(html, &resource_source),
+                let mut sink = ChunkSink::new();
+                stream_single_document_chunks(&head, &body, &resource_source, |html| {
+                    sink.push(html)
+                })?;
+                // The parsed XML is no longer needed: drop it before the
+                // layout so the book is not resident next to its chunks.
+                drop(book);
+                drop(body);
+                Self::build_from_sources(
+                    sink.sources,
+                    sink.fixed_layouts,
+                    sink.content_images,
                     "fb2://book/",
                     Arc::new(MapNet {
                         resources: binary.clone(),
@@ -1344,11 +1469,11 @@ impl Document {
                     font_datas,
                     defer_layout,
                     source_bytes,
-                    0,
+                    MAP_CHUNK_IMAGE_BYTES,
                 )
             }
             DocumentFormat::Mobi => {
-                let book = MobiBook::open(path)?;
+                let mut book = MobiBook::open(path)?;
                 let metadata = DocumentMetadata {
                     format,
                     title: book.title.clone(),
@@ -1364,7 +1489,7 @@ impl Document {
                     font_size: options.font_size.max(1.0),
                     ..MobiHtmlOptions::default()
                 };
-                let (html, toc) = book.to_html_with_toc(&html_options);
+                let toc = book.toc.clone();
                 let raw_toc = toc
                     .into_iter()
                     .map(|item| RawTocItem {
@@ -1373,11 +1498,19 @@ impl Document {
                         depth: item.depth,
                     })
                     .collect();
-                let cover_image = book.cover_image.clone();
-                let resources = Arc::new(book.resources);
+                let head = book.html_head(&html_options);
+                let cover_image = book.cover_image.take();
+                let resources = Arc::new(std::mem::take(&mut book.resources));
                 let resource_source = ResourceSource::Map(resources.clone());
-                Self::build(
-                    split_single_document(html, &resource_source),
+                let mut sink = ChunkSink::new();
+                stream_single_document_chunks(&head, book.body_html(), &resource_source, |html| {
+                    sink.push(html)
+                })?;
+                drop(book);
+                Self::build_from_sources(
+                    sink.sources,
+                    sink.fixed_layouts,
+                    sink.content_images,
                     "mobi://book/",
                     Arc::new(MapNet {
                         resources: resources.clone(),
@@ -1395,11 +1528,11 @@ impl Document {
                     font_datas,
                     defer_layout,
                     source_bytes,
-                    0,
+                    MAP_CHUNK_IMAGE_BYTES,
                 )
             }
             DocumentFormat::Azw3 => {
-                let book = Kf8Book::open(path)?;
+                let mut book = Kf8Book::open(path)?;
                 let metadata = DocumentMetadata {
                     format,
                     title: book.title.clone(),
@@ -1415,7 +1548,7 @@ impl Document {
                     font_size: options.font_size.max(1.0),
                     ..Kf8HtmlOptions::default()
                 };
-                let (html, toc) = book.to_html_with_toc(&html_options);
+                let toc = book.toc.clone();
                 let raw_toc = toc
                     .into_iter()
                     .map(|item| RawTocItem {
@@ -1424,11 +1557,19 @@ impl Document {
                         depth: item.depth,
                     })
                     .collect();
-                let cover_image = book.cover_image.clone();
-                let resources = Arc::new(book.resources);
+                let head = book.html_head(&html_options);
+                let cover_image = book.cover_image.take();
+                let resources = Arc::new(std::mem::take(&mut book.resources));
                 let resource_source = ResourceSource::Map(resources.clone());
-                Self::build(
-                    split_single_document(html, &resource_source),
+                let mut sink = ChunkSink::new();
+                stream_single_document_chunks(&head, book.body_html(), &resource_source, |html| {
+                    sink.push(html)
+                })?;
+                drop(book);
+                Self::build_from_sources(
+                    sink.sources,
+                    sink.fixed_layouts,
+                    sink.content_images,
                     "azw3://book/",
                     Arc::new(MapNet {
                         resources: resources.clone(),
@@ -1446,7 +1587,7 @@ impl Document {
                     font_datas,
                     defer_layout,
                     source_bytes,
-                    0,
+                    MAP_CHUNK_IMAGE_BYTES,
                 )
             }
             DocumentFormat::Txt => {

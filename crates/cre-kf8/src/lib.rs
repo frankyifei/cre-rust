@@ -68,13 +68,16 @@ pub struct Kf8Book {
 
 impl Kf8Book {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let data = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-        Self::from_bytes(data)
+        // `Pdb::open` maps the file, so a book's unused image records never
+        // enter the open's RSS.
+        Self::from_pdb(Pdb::open(path)?)
     }
 
     pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
-        let pdb = Pdb::from_bytes(data)?;
+        Self::from_pdb(Pdb::from_bytes(data)?)
+    }
+
+    fn from_pdb(pdb: Pdb) -> Result<Self> {
         if !pdb.is_mobi() {
             bail!(
                 "not a MOBI/KF8 file (type {} creator {})",
@@ -242,15 +245,23 @@ impl Kf8Book {
     }
 
     pub fn to_html_with_toc(&self, options: &Kf8HtmlOptions) -> (String, Vec<Kf8TocItem>) {
+        let html = format!("{}{}</body></html>", self.html_head(options), self.body);
+        (html, self.toc.clone())
+    }
+
+    /// The document prefix through the `<body>` open tag.
+    ///
+    /// [`Self::body_html`] + this + `"</body></html>"` is exactly
+    /// [`Self::to_html_with_toc`], which lets a caller build one chunk at a
+    /// time instead of materializing the whole generated document.
+    pub fn html_head(&self, options: &Kf8HtmlOptions) -> String {
         let css = base_css(options);
         let title = escape_html(self.title.as_deref().unwrap_or(""));
         let language = escape_html(self.language.as_deref().unwrap_or("und"));
-        let html = format!(
+        format!(
             "<!DOCTYPE html><html lang=\"{language}\"><head><meta charset=\"utf-8\">\
-             <title>{title}</title><style>{css}</style></head><body>{}</body></html>",
-            self.body
-        );
-        (html, self.toc.clone())
+             <title>{title}</title><style>{css}</style></head><body>"
+        )
     }
 }
 
