@@ -186,6 +186,52 @@ are rebuilt); it stays under 6 ms even for 18 000 pages. On a device the worker
 takes the same time a full layout would (15-30 s for a 17 MB book), spread over
 the reading session instead of blocking it.
 
+### Telling KOReader the pass is over
+
+A page total that changes without a full rerendering is invisible to the Reader
+modules: `ReaderFooter` caches `self.pages` and only re-reads it on
+`DocumentRerendered` (`TocReset`), and the TOC caches its page numbers the same
+way. crengine gets that event from its background subprocess, which reloads the
+document; we lay the chunks out in this process, so nothing signals the end.
+
+The immediate total after `relayout` is also only an estimate: the chunks that
+keep their old pages are scaled by the ratio the current chunk saw. When the
+chunk under the reader keeps its page count (a part-title image page does, at
+any font size) the ratio is 1.0 and the estimate is exactly the old total, so
+the reader shows no change at all until the chunks are really laid out.
+
+Two small pieces close this:
+
+- `hasPendingRerendering()` (cre-lua) answers whether the worker still has
+  chunks to lay out. cre.cpp has no equivalent, hence the extra entry —
+  crengine's subprocess makes the question unnecessary.
+- `tools/koreader-plugins/crebackgroundlayout.koplugin` uses it from a KOReader
+  plugin (no frontend patch, so upstream updates keep working): it re-reads the
+  page total on every `PageUpdate`/`PosUpdate` and sends `TocReset` when it
+  moved, which is what makes `ReaderFooter` re-read it; and while that flag is
+  true it polls once a second (reading the page count installs the ready chunks,
+  so the pass also advances while the reader is idle) and sends one
+  `DocumentRerendered` when the pass is over, which is the event a full
+  rerendering sends — the TOC cache, the progress markers and the book's saved
+  page count are rebuilt once.
+
+`hasPendingRerendering()` is reached through `document._document`, because
+adding the method to the `CreDocument` wrapper would mean editing
+`frontend/document/credocument.lua`, which is what the plugin avoids.
+
+Measured in the x86 emulator (21.epub, font +8 px, background on):
+
+| | Live total | Footer shows |
+|---|---|---|
+| right after the change (estimate) | 2007 | — |
+| 2 of 18 chunks installed | 2003 | `1658 / 2003` |
+| 14 of 18 | 1979 | `1659 / 1979` |
+| converged | 1977 | `1660 / 1977`, one more `DocumentRerendered` |
+
+Without the plugin the footer stays on 2003/2007 for the rest of the session,
+and the TOC keeps the page numbers computed at layout time.
+
+
 Measured on x86_64 release (interleaved runs):
 
 | Book | Open before | Open after | Peak before | Peak after |

@@ -3497,6 +3497,27 @@ unsafe extern "C-unwind" fn doc_partial_count(l: *mut lua_State) -> c_int {
     1
 }
 
+/// Whether the engine still has stale chunks to lay out for the current
+/// settings (a relayout that is finishing in the background).
+///
+/// cre.cpp has no equivalent: crengine's background rerendering runs in a
+/// subprocess and signals completion by reloading the document, which KOReader
+/// sees as a new document. We lay the chunks out in this process, so KOReader
+/// needs a pollable state to know when the page numbering is final (and to drop
+/// its cached page total and ToC then).
+unsafe extern "C-unwind" fn doc_has_pending_rerendering(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state. Not synced, for the same reason as
+    // doc_partial_count: this is a state query, and syncing would apply a
+    // pending settings change as a side effect of asking.
+    unsafe {
+        let pending = doc_lazy_ref(l)
+            .and_then(|doc| doc.inner.as_ref())
+            .is_some_and(|inner| inner.has_background_layout());
+        push_bool(l, pending);
+    }
+    1
+}
+
 unsafe extern "C-unwind" fn doc_rerender_delayed(l: *mut lua_State) -> c_int {
     // Always false: answering true here does not mean "skip the render", it
     // starts ReaderRolling's background-rerendering automation (wait 3 s,
@@ -4962,6 +4983,7 @@ const DOC_METHODS: &[lua::luaL_Reg] = &regs![
     ("isPartialRerenderingEnabled", doc_is_partial_enabled),
     ("enablePartialRerendering", doc_enable_partial),
     ("getPartialRerenderingsCount", doc_partial_count),
+    ("hasPendingRerendering", doc_has_pending_rerendering),
     ("isRerenderingDelayed", doc_rerender_delayed),
     ("getPages", doc_pages),
     ("getCurrentPage", doc_current_page),
