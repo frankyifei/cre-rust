@@ -153,6 +153,39 @@ Every chunk has to be laid out once to learn the page count. The pass:
 4. returns the workers' arenas to the OS (`malloc_trim`) **before** the opening
    chunk is laid out.
 
+### A settings change lays the rest out in the background
+
+Font, line-spacing and margin changes only need a relayout, not a re-read: the
+chunk HTML does not embed those settings. The chunk under the reader is laid
+out immediately, so the page is usable at once; a worker thread then lays out
+the remaining chunks **in reading order** and hands each `ChunkLayout` back
+through a channel. The reader's thread installs what is ready at the start of
+the next page draw, keeps the reading position on the same `(chunk, local
+page)`, and rebuilds the page table, so the page index, the TOC page numbers
+and the total converge to the real layout.
+
+Page numbers are a prefix sum of chunk pages, so the chunks must be done from
+the first one; a result installed for an earlier chunk shifts the numbers after
+it. KOReader notices the changed `getPartialRerenderingsCount()` after a draw
+and puts the reader back on its XPointer (`handlePartialRerendering`), so the
+content does not jump even though the numbers move. The worker holds its own
+`Arc`s (sources, fonts, net, resources) and builds its own Blitz documents;
+`Document` itself is not `Send`. A generation counter stops the worker on the
+next chunk when the settings change again, and `Drop` stops it on close.
+
+Measured on x86_64 release, `relayout` from 26 px to 30 px (all chunks
+converge to exactly the page count and page hashes of a fresh open):
+
+| Book | Chunks | Partial (current chunk only) | Converged | Slowest install |
+|---|---|---|---|---|
+| 21.epub (1.7 MB HTML) | 18 | 637 -> 779 pages | 801 pages in 260 ms | 0.8 ms |
+| 24 MB text book | 268 | 16 719 -> 18 413 pages | 18 639 pages in 5.3 s | 5.3 ms |
+
+The install cost is one `rebuild_view` per draw (the page table and the TOC
+are rebuilt); it stays under 6 ms even for 18 000 pages. On a device the worker
+takes the same time a full layout would (15-30 s for a 17 MB book), spread over
+the reading session instead of blocking it.
+
 Measured on x86_64 release (interleaved runs):
 
 | Book | Open before | Open after | Peak before | Peak after |

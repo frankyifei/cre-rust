@@ -115,13 +115,19 @@ canvas:
 ### Chunked layout with partial relayout
 
 A book is laid out in chunks sized from a memory budget, one DOM at a time.
-Changing a font, margin or font-family lays out only the current chunk, and
-the page list is rebased around it. Measured in the QEMU harness:
+Changing a font, margin or font-family lays out the current chunk immediately,
+then finishes the rest on a background worker in reading order, so the page
+index, the page total and the TOC page numbers converge to the real layout
+without blocking the reader. Measured in the QEMU harness:
 
 | Book | Full relayout | Partial relayout |
 |---|---|---|
 | `juliet.epub` | 4.1 s | 0.47 s |
 | `zyj.epub` | 7.3 s | 0.71 s |
+
+On x86 a 24 MB text book converges in 5.3 s while the reader keeps turning
+pages (the install costs 5 ms per draw), and a 1.7 MB book in 260 ms; the page
+count and page hashes end up identical to a fresh open.
 
 ### Memory: one chunk, kept compressed
 

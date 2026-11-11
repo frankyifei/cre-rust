@@ -587,6 +587,11 @@ impl Doc {
             self.rebuild_with_current_settings();
         }
         self.layout_now();
+        // Layouts finished by the background worker change page numbers; the
+        // next page draw must see them.
+        if let Some(inner) = self.inner.as_mut() {
+            inner.drain_background_layouts();
+        }
     }
 
     /// Applies the settings that were changed since the last layout.
@@ -2495,7 +2500,11 @@ unsafe extern "C-unwind" fn doc_page_margins(l: *mut lua_State) -> c_int {
 unsafe extern "C-unwind" fn doc_toc(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let Some(inner) = doc_ref(l).and_then(|doc| doc.inner.as_ref()) else {
+        let Some(doc) = doc_mut_synced(l) else {
+            lua::lua_newtable(l);
+            return 1;
+        };
+        let Some(inner) = doc.inner.as_ref() else {
             lua::lua_newtable(l);
             return 1;
         };
@@ -3476,7 +3485,13 @@ unsafe extern "C-unwind" fn doc_partial_count(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state. Not synced, for the same reason as
     // doc_rerender_delayed.
     unsafe {
-        let count = doc_lazy_ref(l).map_or(0, |doc| doc.rerender_count as i64);
+        let count = doc_lazy_ref(l).map_or(0, |doc| {
+            doc.rerender_count as i64
+                + doc
+                    .inner
+                    .as_ref()
+                    .map_or(0, |inner| inner.background_installs())
+        });
         push_int(l, count);
     }
     1

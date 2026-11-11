@@ -1217,6 +1217,7 @@ impl MapResources {
     }
 }
 
+#[derive(Clone)]
 pub enum ResourceSource {
     Empty,
     /// Resources carried in memory or indexed in the book file.
@@ -1254,7 +1255,9 @@ pub struct Document {
     /// path list alone does not say whether the context is stale.
     font_blobs: Vec<FontBlob>,
     embedded_styles_enabled: bool,
-    sources: Vec<ChunkSource>,
+    /// Kept behind an `Arc` so the background layout worker can hold it while
+    /// the reader keeps using the document.
+    sources: Arc<[ChunkSource]>,
     /// Pre-paginated chunks and their own CSS viewport, parallel to `sources`.
     fixed_layouts: Vec<Option<FixedLayout>>,
     base_url: String,
@@ -1297,6 +1300,36 @@ pub struct Document {
     /// Glyph masks reused across page renders. Cleared when the font context
     /// changes, because the masks carry the face's outlines.
     paint_cache: RefCell<cre_paint::PaintCache>,
+    /// Chunks being laid out again after a settings change, in reading order.
+    /// Filled by [`Document::start_background_layout`] and installed by
+    /// [`Document::drain_background_layouts`] on the reader's thread.
+    background: Option<BackgroundLayout>,
+    /// Incremented on every new settings change; a worker with an older value
+    /// stops at its next chunk, and dropping the document stops it too.
+    background_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Layouts installed by the background worker, so `cre-lua` can report a
+    /// changed `getPartialRerenderingsCount()` to KOReader.
+    background_installs: i64,
+}
+
+/// A background layout job: one worker, laying chunks out in reading order.
+///
+/// Page numbers are cumulative, so the chunks must be done from the first one;
+/// installing them in order keeps every page number exact as soon as its own
+/// chunk is done. The worker builds its own Blitz documents (the DOM is not
+/// `Send`), so the document it belongs to keeps its active chunk untouched.
+struct BackgroundLayout {
+    total: usize,
+    done: usize,
+    receiver: std::sync::mpsc::Receiver<(usize, ChunkLayout)>,
+}
+
+impl Drop for Document {
+    fn drop(&mut self) {
+        // A detached worker would otherwise keep laying the book out after the
+        // book was closed.
+        self.stop_background_layout();
+    }
 }
 
 impl Document {
@@ -1916,7 +1949,7 @@ impl Document {
             font_blobs: font_datas.to_vec(),
             viewport_scale: options.viewport_scale,
             font_gamma: 1.0,
-            sources,
+            sources: Arc::from(sources),
             fixed_layouts,
             base_url: base_url.to_string(),
             resources,
@@ -1946,6 +1979,9 @@ impl Document {
             page_cache_order: RefCell::new(Vec::new()),
             page_boxes_cache: RefCell::new(None),
             paint_cache: RefCell::new(cre_paint::PaintCache::new()),
+            background: None,
+            background_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            background_installs: 0,
         };
         if !defer_layout {
             document.ensure_layout()?;
@@ -2663,7 +2699,202 @@ impl Document {
         self.current_page = first_page + anchor_local.min(page_count.saturating_sub(1));
         self.layout_done = true;
         trim_memory();
+        // The current chunk is laid out, so the page under the reader is
+        // usable; the rest are laid out in the background, in reading order,
+        // and installed as they finish.
+        self.start_background_layout();
         Ok(true)
+    }
+
+    /// Lays the remaining stale chunks out on a worker thread, in reading
+    /// order, and hands each layout back over a channel.
+    ///
+    /// The worker gets owned `Arc`s (sources, fonts, net, resources), so the
+    /// document can keep rendering pages; `Document` itself is not `Send` and
+    /// is never touched by the worker.
+    fn start_background_layout(&mut self) {
+        // Testing knob: keep the old behaviour (only the chunk under the reader
+        // is laid out) so the two can be compared on a device.
+        if std::env::var_os("CRE_NO_BACKGROUND_LAYOUT").is_some() {
+            return;
+        }
+        let indices: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.stale)
+            .map(|(index, _)| index)
+            .collect();
+        if indices.is_empty() {
+            return;
+        }
+        let generation = self
+            .background_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let generation_source = Arc::clone(&self.background_generation);
+        let sources = Arc::clone(&self.sources);
+        let base_url = self.base_url.clone();
+        let net = self.net.clone();
+        let font_context = Arc::clone(&self.font_context);
+        let font_blobs = self.font_blobs.clone();
+        let resources = self.resources.clone();
+        let options: Vec<DocumentOptions> = indices
+            .iter()
+            .map(|&index| self.layout_options_for_chunk(index))
+            .collect();
+        let margins: Vec<PageMargins> = indices
+            .iter()
+            .map(|&index| self.chunk_margins(index))
+            .collect();
+        let fixed_heights: Vec<Option<f32>> = indices
+            .iter()
+            .map(|&index| {
+                self.fixed_layouts
+                    .get(index)
+                    .and_then(|fixed| *fixed)
+                    .map(|fixed| self.fixed_size(fixed).1)
+            })
+            .collect();
+        let total = indices.len();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for (slot, &index) in indices.iter().enumerate() {
+                if generation_source.load(std::sync::atomic::Ordering::SeqCst) != generation {
+                    break;
+                }
+                let Ok(html) = sources[index].text() else {
+                    break;
+                };
+                let laid_out = layout_chunk_html(
+                    &html,
+                    index,
+                    &base_url,
+                    net.clone(),
+                    Arc::clone(&font_context),
+                    &font_blobs,
+                    &options[slot],
+                    margins[slot],
+                    fixed_heights[slot],
+                    &resources,
+                );
+                let Ok((layout, doc, lines, page_starts)) = laid_out else {
+                    break;
+                };
+                // The DOM belongs to the worker; only the page metadata is
+                // needed on the reader's side.
+                drop(doc);
+                drop(lines);
+                drop(page_starts);
+                if sender.send((index, layout)).is_err() {
+                    break;
+                }
+            }
+        });
+        self.background = Some(BackgroundLayout {
+            total,
+            done: 0,
+            receiver,
+        });
+    }
+
+    /// Installs the layouts the background worker has finished.
+    ///
+    /// The reader's position is kept on the same chunk and local page, so the
+    /// page numbers can move under it without the content jumping. Returns
+    /// whether the page table changed.
+    pub fn drain_background_layouts(&mut self) -> bool {
+        let mut received = Vec::new();
+        let mut finished = false;
+        let none_left;
+        {
+            let Some(job) = self.background.as_mut() else {
+                return false;
+            };
+            loop {
+                match job.receiver.try_recv() {
+                    Ok(item) => received.push(item),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        finished = true;
+                        break;
+                    }
+                }
+            }
+            none_left = finished || job.done >= job.total;
+        }
+        // Remember where the reader is by (chunk, local page): the page numbers
+        // of the earlier chunks change as their layouts are installed.
+        let anchor = self
+            .pages
+            .get(self.current_page.saturating_sub(1))
+            .map(|page| {
+                let first = self
+                    .chunks
+                    .get(page.chunk)
+                    .map(|meta| meta.first_page)
+                    .unwrap_or(1);
+                (page.chunk, self.current_page.saturating_sub(first))
+            });
+        let mut installed = 0usize;
+        for (index, layout) in received {
+            if !self.entries.get(index).is_some_and(|entry| entry.stale) {
+                continue;
+            }
+            self.entries[index].layout = Some(layout);
+            self.entries[index].stale = false;
+            installed += 1;
+        }
+        if installed == 0 {
+            if none_left {
+                self.background = None;
+            }
+            return false;
+        }
+        self.rebuild_view();
+        if let Some((chunk, local)) = anchor {
+            let first = self
+                .chunks
+                .get(chunk)
+                .map(|meta| meta.first_page)
+                .unwrap_or(1);
+            let count = self
+                .entries
+                .get(chunk)
+                .and_then(|entry| entry.layout.as_ref())
+                .map(|layout| layout.pages.len())
+                .unwrap_or(1);
+            self.current_page = first + local.min(count.saturating_sub(1));
+        }
+        // KOReader polls this to notice that page numbers changed and to put
+        // the reader back on its XPointer (ReaderRolling:handlePartialRerendering).
+        self.background_installs = self.background_installs.saturating_add(installed as i64);
+        let mut stop = false;
+        if let Some(job) = self.background.as_mut() {
+            job.done += installed;
+            stop = finished || job.done >= job.total;
+        }
+        if stop {
+            self.background = None;
+        }
+        true
+    }
+
+    /// Number of layouts installed by the background worker.
+    pub fn background_installs(&self) -> i64 {
+        self.background_installs
+    }
+
+    /// Whether the background worker still has chunks to lay out.
+    pub fn has_background_layout(&self) -> bool {
+        self.background.is_some()
+    }
+
+    /// Stops the background worker, if any (a new settings change or a close).
+    fn stop_background_layout(&mut self) {
+        self.background = None;
+        self.background_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Remaps the page indices that move when chunk `chunk` is laid out again and
@@ -2979,7 +3210,7 @@ impl Document {
             glyph_cache_bytes: self.paint_cache.borrow().cached_bytes(),
             ..MemoryBreakdown::default()
         };
-        for source in &self.sources {
+        for source in self.sources.iter() {
             breakdown.source_bytes += source.text_len;
             breakdown.compressed_source_bytes += source.compressed.len();
         }
@@ -3260,6 +3491,9 @@ impl Document {
         &mut self,
         page: usize,
     ) -> Result<(Arc<PageBitmap>, usize, usize)> {
+        // Page numbers may have moved while the background worker laid the
+        // rest of the book out; install what is ready before using them.
+        self.drain_background_layouts();
         let profile = std::env::var_os("CRE_RENDER_PROFILE").is_some();
         let call_started = std::time::Instant::now();
         // A chunk that has not been laid out since the last settings change only
