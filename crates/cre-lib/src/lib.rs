@@ -914,7 +914,6 @@ struct PageMeta {
     local_clip_bottom: f32,
     doc_top: f32,
     render_height: f32,
-    xpointer: Option<String>,
     page_flow: i64,
 }
 
@@ -2463,10 +2462,12 @@ impl Document {
                 for (local_index, page) in layout.pages.iter().enumerate() {
                     let doc_top = running_doc_top;
                     running_doc_top += page.render_height;
-                    let xpointer = layout.xpointers.get(local_index).cloned().flatten();
-                    if let Some(xpointer) = xpointer.as_ref() {
+                    // The XPointer stays in the chunk layout (one copy for the
+                    // page table and one as the reverse-map key); copying it
+                    // into the flattened page list as well was a third copy.
+                    if let Some(xpointer) = layout.xpointers.get(local_index).cloned().flatten() {
                         self.xpointer_pages
-                            .insert(xpointer.clone(), first_page + local_index);
+                            .insert(xpointer, first_page + local_index);
                     }
                     self.pages.push(PageMeta {
                         chunk: chunk_index,
@@ -2474,7 +2475,6 @@ impl Document {
                         local_clip_bottom: page.clip_bottom,
                         doc_top,
                         render_height: page.render_height,
-                        xpointer,
                         page_flow: page.page_flow,
                     });
                 }
@@ -2506,11 +2506,7 @@ impl Document {
             .iter()
             .map(|item| {
                 let page = page_for_href(&self.href_pages, &item.href).ok();
-                let xpointer = page.and_then(|page| {
-                    self.pages
-                        .get(page.saturating_sub(1))
-                        .and_then(|snapshot| snapshot.xpointer.clone())
-                });
+                let xpointer = page.and_then(|page| self.page_xpointer(page));
                 TocEntry {
                     title: item.title.clone(),
                     href: item.href.clone(),
@@ -2527,9 +2523,10 @@ impl Document {
             .iter()
             .filter_map(|item| {
                 let page = page_for_href(&self.href_pages, &item.href).ok()?;
-                let snapshot = self.pages.get(page.saturating_sub(1));
-                let xpointer = snapshot.and_then(|snapshot| snapshot.xpointer.clone());
-                let doc_y = snapshot
+                let xpointer = self.page_xpointer(page);
+                let doc_y = self
+                    .pages
+                    .get(page.saturating_sub(1))
                     .map(|snapshot| snapshot.doc_top.max(0.0).round() as i64)
                     .unwrap_or(page.saturating_sub(1) as i64 * self.height as i64);
                 Some(PageMapEntry {
@@ -4876,8 +4873,8 @@ impl Document {
         let Some(snapshot) = self.pages.get(index) else {
             bail!("page {page} is outside 1..={}", self.page_count());
         };
-        if let Some(xpointer) = &snapshot.xpointer {
-            return Ok(xpointer.clone());
+        if let Some(xpointer) = self.page_xpointer(page) {
+            return Ok(xpointer);
         }
 
         let chunk_index = snapshot.chunk;
@@ -4894,6 +4891,21 @@ impl Document {
                 page_margin,
             )
         })
+    }
+
+    /// The page-start XPointer of a page, read from the chunk layout that owns
+    /// it.
+    ///
+    /// It is stored once per page in the chunk layout; copying it into the
+    /// flattened page list as well cost one heap string per page (15 557 pages
+    /// and ~1.3 MB on the 24 MB text book). A page that is in the list always
+    /// has a laid-out chunk, so this is a lookup, never a layout.
+    fn page_xpointer(&self, page: usize) -> Option<String> {
+        let snapshot = self.pages.get(page.checked_sub(1)?)?;
+        let first_page = self.chunks.get(snapshot.chunk)?.first_page;
+        let local = page.checked_sub(first_page)?;
+        let layout = self.entries.get(snapshot.chunk)?.layout.as_ref()?;
+        layout.xpointers.get(local).cloned().flatten()
     }
 
     pub fn page_from_xpointer(&self, xpointer: &str) -> Result<usize> {

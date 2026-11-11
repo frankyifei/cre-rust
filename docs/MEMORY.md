@@ -60,6 +60,13 @@ A 24.9 MB Chinese book with 401 chunks and 297 455 lines keeps about 8.5 MB of
 layout metadata in total, i.e. ~21 KB per chunk. That is why the *retained*
 layout is small while a chunk's *transient* DOM is 10+ MB.
 
+A page-start XPointer is one short heap string per page, and it used to exist
+three times: in the chunk layout, copied into the flattened page list, and
+again as the reverse map's key. The flattened list no longer copies it
+(`page_xpointer` reads the chunk layout), which drops ~1.1 MB on the 24 MB
+book (15 557 pages). The reverse map still needs its own key for a constant
+time `page_from_xpointer`; dropping it is measured as a separate step.
+
 ## Compressed chunk text
 
 The generated HTML of every chunk is kept for the session so a settings change
@@ -223,6 +230,7 @@ open is unchanged at 123 ms.
 | `15.epub` reader process, open / peak | 153 / 169 MB | 102 / 119 MB |
 | 24 MB text book RSS (LZ4) | 66.1 MB | 41.5 MB |
 | 24 MB text book, 38 MB budget, open peak | 132 MB | 64 MB |
+| 24 MB text book RSS after open (one XPointer per page) | 63.8 MB | 62.0 MB |
 | 43 MB AZW3, 38 MB budget, open peak | 60.8 MB | 34.1 MB |
 | 43 MB AZW3, 38 MB budget, steady | 31.7 MB | 25.0 MB |
 | 23 MB AZW3, 38 MB budget, open peak | 43.0 MB | 37.0 MB |
