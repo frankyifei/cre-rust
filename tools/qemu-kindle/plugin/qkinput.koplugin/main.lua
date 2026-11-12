@@ -116,7 +116,11 @@ end
 function QkInput:emit(ges)
     ges.time = time.s(self:nowMs() / 1000)
     logger.dbg("qkinput: emit", ges.ges, ges.direction or "", ges.pos and ges.pos.x, ges.pos and ges.pos.y)
-    UIManager:broadcastEvent(Event:new("Gesture", ges))
+    -- `sendEvent` is how the platform delivers a gesture: topmost widget first,
+    -- propagation stops when a handler accepts it. `broadcastEvent` hands the
+    -- same tap to every window-level widget (a menu and the page underneath, a
+    -- toast and the reader...), so one click acted several times.
+    UIManager:sendEvent(Event:new("Gesture", ges))
 end
 
 function QkInput:emitTap(x, y)
