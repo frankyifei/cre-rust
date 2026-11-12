@@ -7,3 +7,4 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow = "1"
+cre-css = { path = "../cre-css" }

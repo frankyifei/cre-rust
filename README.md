@@ -118,7 +118,10 @@ A book is laid out in chunks sized from a memory budget, one DOM at a time.
 Changing a font, margin or font-family lays out the current chunk immediately,
 then finishes the rest on a background worker in reading order, so the page
 index, the page total and the TOC page numbers converge to the real layout
-without blocking the reader. Measured in the QEMU harness:
+without blocking the reader. This holds for every format: the chunk HTML never
+contains the layout settings (they are `cre-css` tokens filled in when a chunk is
+laid out), so a settings change re-lays out the chunks a book already has instead
+of reopening it. Measured in the QEMU harness:
 
 | Book | Full relayout | Partial relayout |
 |---|---|---|

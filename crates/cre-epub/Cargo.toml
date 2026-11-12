@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow = "1"
+cre-css = { path = "../cre-css" }
 percent-encoding = "2"
 roxmltree = "0.21"
 url = "2"

@@ -1351,10 +1351,6 @@ pub struct Document {
     font_context: Arc<FontContext>,
     /// Every chunk's own layout, parallel to `sources`.
     entries: Vec<ChunkEntry>,
-    /// True when the chunk HTML carries no layout settings of its own, so new
-    /// settings can be applied by laying the existing chunks out again instead
-    /// of regenerating (and possibly re-chunking) the document.
-    layout_independent_sources: bool,
     chunks: Vec<ChunkMeta>,
     pages: Vec<PageMeta>,
     xpointer_pages: HashMap<String, usize>,
@@ -1572,10 +1568,7 @@ impl Document {
                     identifiers: book.identifiers.clone(),
                     item_count: book.spine.len(),
                 };
-                let html_options = HtmlOptions {
-                    font_size: options.font_size,
-                    ..HtmlOptions::default()
-                };
+                let html_options = HtmlOptions::default();
                 let images_started = std::time::Instant::now();
                 let _ = book.normalize_full_page_images(
                     options.width as f32 / options.viewport_scale.max(0.1),
@@ -1659,10 +1652,7 @@ impl Document {
                     identifiers: book.isbn.clone().map(|isbn| format!("ISBN: {isbn}")),
                     item_count: book.binary.len(),
                 };
-                let html_options = Fb2HtmlOptions {
-                    font_size: options.font_size.max(1.0) as u32,
-                    ..Fb2HtmlOptions::default()
-                };
+                let html_options = Fb2HtmlOptions::default();
                 let (body, fb2_toc) = book.to_body_html_with_toc(&html_options)?;
                 let raw_toc = fb2_toc
                     .into_iter()
@@ -1725,10 +1715,7 @@ impl Document {
                     identifiers: book.identifiers.clone(),
                     item_count: book.section_count,
                 };
-                let html_options = MobiHtmlOptions {
-                    font_size: options.font_size.max(1.0),
-                    ..MobiHtmlOptions::default()
-                };
+                let html_options = MobiHtmlOptions::default();
                 let toc = book.toc.clone();
                 let raw_toc = toc
                     .into_iter()
@@ -1785,10 +1772,7 @@ impl Document {
                     identifiers: book.identifiers.clone(),
                     item_count: book.section_count,
                 };
-                let html_options = Kf8HtmlOptions {
-                    font_size: options.font_size.max(1.0),
-                    ..Kf8HtmlOptions::default()
-                };
+                let html_options = Kf8HtmlOptions::default();
                 let toc = book.toc.clone();
                 let raw_toc = toc
                     .into_iter()
@@ -1845,10 +1829,7 @@ impl Document {
                     identifiers: None,
                     item_count: 1,
                 };
-                let html_options = TextHtmlOptions {
-                    font_size: options.font_size.max(1.0) as u32,
-                    ..TextHtmlOptions::default()
-                };
+                let html_options = TextHtmlOptions::default();
                 let html = book.to_html(&html_options);
                 Self::build(
                     split_single_document(html, &ResourceSource::Empty),
@@ -1879,23 +1860,20 @@ impl Document {
                 // Mirror the generators: give bare HTML the same base
                 // typography and page padding EPUB/FB2 chunks get, so margins
                 // and font size behave the same and the first line is not
-                // laid out above the page's top margin.
-                let (_, _, page_margin_css) = css_page_geometry(
-                    options.width,
-                    options.height,
-                    options.viewport_scale,
-                    options.page_margin,
-                );
+                // laid out above the page's top margin. Both values are layout
+                // settings, so they go in as tokens and are filled in when the
+                // chunk is laid out (a font or margin change is then a
+                // relayout, not a reopen).
                 insert_style(
                     &mut html,
                     &format!(
                         "/* cre-render-base */\n\
                          html, body {{ margin: 0; padding: 0; }}\n\
                          body {{ font-family: serif; font-size: {}px; line-height: 1.2; \
-                         padding: {:.3}px; }}\n\
+                         padding: {}px; }}\n\
                          img {{ max-width: 100%; height: auto; }}",
-                        options.font_size,
-                        page_margin_css.max(0.0)
+                        cre_css::FONT_SIZE,
+                        cre_css::PAGE_MARGIN
                     ),
                 );
                 let directory = path
@@ -2046,9 +2024,6 @@ impl Document {
             font_datas,
             options.font_family.as_deref(),
         ));
-        // Only the EPUB generator emits chunk HTML without the layout settings
-        // in it, which is what allows a relayout instead of a reopen.
-        let layout_independent_sources = matches!(metadata.format, DocumentFormat::Epub);
         if !content_images.is_empty() {
             images.set_content_images(content_images);
         }
@@ -2087,7 +2062,6 @@ impl Document {
             net,
             font_context,
             entries: Vec::new(),
-            layout_independent_sources,
             chunks: Vec::new(),
             pages: Vec::new(),
             xpointer_pages: HashMap::new(),
@@ -2790,13 +2764,15 @@ impl Document {
 
     /// True when these settings can be applied without regenerating the chunk
     /// HTML, i.e. [`Self::relayout`] can do the work.
+    ///
+    /// Every format qualifies: the layout settings a chunk needs (font size,
+    /// page margin) are tokens filled in when the chunk is laid out, see
+    /// `cre-css`. The page *size* is different: image normalisation and the
+    /// page-size CSS are baked into the chunk HTML, so it needs a reopen.
     pub fn can_relayout_with(&self, options: &DocumentOptions) -> bool {
-        self.layout_independent_sources
-            && self.layout_done
+        self.layout_done
             && !self.sources.is_empty()
             && !self.entries.is_empty()
-            // Image normalisation and the page-size CSS are baked into the chunk
-            // HTML, so a different page size needs a reopen.
             && options.width == self.width
             && options.height == self.height
     }
@@ -7864,16 +7840,15 @@ fn create_document(
         "<style>h1:empty, h2:empty, h3:empty, h4:empty, h5:empty, h6:empty \
          { display: none !important; }</style>",
     );
-    // The generators leave the base font size as a token so the chunk HTML (and
+    // The generators leave the layout values as tokens so the chunk HTML (and
     // the chunk boundaries that page numbers derive from) does not change with
-    // it; the layout settings are applied here instead.
-    let html_source = if html_source.contains(cre_epub::FONT_SIZE_TOKEN) {
-        html_source.replace(
-            cre_epub::FONT_SIZE_TOKEN,
-            &format!("{:.2}", options.font_size),
-        )
-    } else {
-        html_source
+    // them; the current settings are applied here instead. That is what lets a
+    // font or margin change relayout the existing chunks instead of reopening
+    // the book, for every format.
+    let page_margin_css = options.page_margin / options.viewport_scale.max(0.1);
+    let html_source = match cre_css::substitute(&html_source, options.font_size, page_margin_css) {
+        std::borrow::Cow::Borrowed(_) => html_source,
+        std::borrow::Cow::Owned(substituted) => substituted,
     };
     let from_html_at = started.elapsed().as_secs_f64() * 1000.0;
     let mut doc = HtmlDocument::from_html(html_source.as_str(), config);

@@ -33,7 +33,6 @@ pub struct MobiTocItem {
 
 /// HTML generation options, mirroring `cre_fb2::Fb2HtmlOptions`.
 pub struct MobiHtmlOptions {
-    pub font_size: f32,
     pub line_height: f64,
     pub margin_x: u32,
     pub margin_y: u32,
@@ -42,7 +41,6 @@ pub struct MobiHtmlOptions {
 impl Default for MobiHtmlOptions {
     fn default() -> Self {
         Self {
-            font_size: 18.0,
             line_height: 1.5,
             margin_x: 40,
             margin_y: 32,
@@ -237,7 +235,10 @@ fn base_css(options: &MobiHtmlOptions) -> String {
          h1, h2, h3, h4, h5, h6 {{ font-family: sans-serif; }}\n\
          .cre-spine {{ display: block; page-break-before: always; }}\n\
          .cre-pagebreak {{ page-break-before: always; }}",
-        options.font_size, options.line_height, options.margin_y, options.margin_x
+        cre_css::FONT_SIZE,
+        options.line_height,
+        options.margin_y,
+        options.margin_x
     )
 }
 

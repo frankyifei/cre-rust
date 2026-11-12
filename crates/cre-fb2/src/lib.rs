@@ -112,7 +112,7 @@ blockquote {{ border-left: 3px solid #888; padding-left: 1em; margin: 1em 0; fon
 .cre-author {{ font-style: italic; text-align: right; }}
 .cre-annotation {{ background: #f0f0f0; padding: 0.5em; margin-bottom: 1em; }}
 .poem {{ font-style: normal; }}",
-            opts.font_size, opts.line_height, opts.margin_y, opts.margin_x,
+            cre_css::FONT_SIZE, opts.line_height, opts.margin_y, opts.margin_x,
         );
         let title_html = escape_html(self.title.as_deref().unwrap_or(""));
         format!(
@@ -184,7 +184,6 @@ pub struct Fb2TocItem {
 }
 
 pub struct Fb2HtmlOptions {
-    pub font_size: u32,
     pub line_height: f64,
     pub margin_x: u32,
     pub margin_y: u32,
@@ -193,7 +192,6 @@ pub struct Fb2HtmlOptions {
 impl Default for Fb2HtmlOptions {
     fn default() -> Self {
         Self {
-            font_size: 18,
             line_height: 1.5,
             margin_x: 40,
             margin_y: 32,

@@ -1225,3 +1225,54 @@ fn deferred_open_takes_the_lazy_path_too() {
     let full = Document::with_options(fixture("juliet.epub"), &options).unwrap();
     assert_eq!(doc.page_count(), full.page_count());
 }
+
+/// A font change is a relayout for every format, not just EPUB: the chunk HTML
+/// carries no layout settings (they are `cre-css` tokens), so the chunks can be
+/// laid out again instead of the book being reopened.
+#[test]
+fn font_change_relayouts_every_format() {
+    require_resources();
+    let options = DocumentOptions {
+        width: 600,
+        height: 800,
+        font_size: 18.0,
+        page_margin: 32.0,
+        ..Default::default()
+    };
+    let bigger = DocumentOptions {
+        font_size: 30.0,
+        ..options.clone()
+    };
+    for book in ["sample.fb2", "sample.txt"] {
+        let mut doc = Document::with_options(fixture(book), &options).unwrap();
+        let before = doc.page_count();
+        assert!(
+            doc.relayout(&bigger).unwrap(),
+            "{book}: a font change must relayout the existing chunks, not reopen"
+        );
+        if doc.memory_breakdown().chunk_count > 1 {
+            assert!(
+                doc.has_background_layout(),
+                "{book}: the chunks after the current one must be laid out in the background"
+            );
+        }
+        let mut rounds = 0;
+        while doc.has_background_layout() && rounds < 100_000 {
+            if !doc.drain_background_layouts() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            rounds += 1;
+        }
+        assert!(
+            doc.page_count() > before,
+            "{book}: a bigger font must need more pages (was {before}, now {})",
+            doc.page_count()
+        );
+        let fresh = Document::with_options_exact(fixture(book), &bigger).unwrap();
+        assert_eq!(
+            doc.page_count(),
+            fresh.page_count(),
+            "{book}: the relayout must match a fresh open at the new size"
+        );
+    }
+}

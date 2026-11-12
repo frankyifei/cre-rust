@@ -164,6 +164,14 @@ the next page draw, keeps the reading position on the same `(chunk, local
 page)`, and rebuilds the page table, so the page index, the TOC page numbers
 and the total converge to the real layout.
 
+**Every format qualifies**, not only EPUB. The layout settings a chunk needs are
+never written into it: the generators emit `cre-css` tokens (`FONT_SIZE`, and
+`PAGE_MARGIN` for the standalone-HTML path) and `layout_chunk_html` fills them in
+with the settings in use. A new format gets the relayout path by following that
+one rule, and `can_relayout_with` no longer looks at the format at all. Only a
+change of *page size* forces a reopen, because image normalisation and the
+page-size CSS are baked into the chunks.
+
 Page numbers are a prefix sum of chunk pages, so the chunks must be done from
 the first one; a result installed for an earlier chunk shifts the numbers after
 it. KOReader notices the changed `getPartialRerenderingsCount()` after a draw

@@ -81,6 +81,35 @@ fn main() {
         doc.toc().len()
     );
 
+    // `CRE_RELAYOUT=<font size>` changes the font and checks the relayout path:
+    // it must be accepted (no reopen), keep the position, and converge to a
+    // fresh open at the new size.
+    if let Ok(size) = std::env::var("CRE_RELAYOUT") {
+        let new_size: f32 = size.parse().expect("CRE_RELAYOUT");
+        let new_options = DocumentOptions {
+            font_size: new_size,
+            ..options.clone()
+        };
+        let accepted = doc.relayout(&new_options).expect("relayout");
+        println!(
+            "relayout {font_size} -> {new_size}: accepted={accepted} pages={} pending={}",
+            doc.page_count(),
+            doc.has_background_layout()
+        );
+        while doc.has_background_layout() {
+            if !doc.drain_background_layouts() {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        let fresh = Document::with_options_exact(book, &new_options).expect("fresh");
+        println!(
+            "  converged pages={} fresh pages={} equal={}",
+            doc.page_count(),
+            fresh.page_count(),
+            doc.page_count() == fresh.page_count()
+        );
+    }
+
     // Jump to the last page while the background pass is still running: the
     // chunk must be laid out on demand and the page must render.
     let last_page = doc.page_count();

@@ -30,7 +30,10 @@ impl TextBook {
             "/* cre-render-base */\nhtml {{ font-size: {}px; }}\n\
              body {{ font-family: serif; font-size: 1em; line-height: {}; padding: {}px {}px; background: white; color: black; text-align: justify; }}\n\
              .cre-heading {{ font-weight: bold; font-size: 1.2em; }}",
-            opts.font_size, opts.line_height, opts.margin_y, opts.margin_x,
+            cre_css::FONT_SIZE,
+            opts.line_height,
+            opts.margin_y,
+            opts.margin_x,
         );
         let title = self.title.as_deref().unwrap_or("");
         let title_html = escape_html(title);
@@ -106,7 +109,6 @@ fn escape_html(s: &str) -> String {
 }
 
 pub struct TextHtmlOptions {
-    pub font_size: u32,
     pub line_height: f64,
     pub margin_x: u32,
     pub margin_y: u32,
@@ -115,7 +117,6 @@ pub struct TextHtmlOptions {
 impl Default for TextHtmlOptions {
     fn default() -> Self {
         Self {
-            font_size: 18,
             line_height: 1.5,
             margin_x: 40,
             margin_y: 32,

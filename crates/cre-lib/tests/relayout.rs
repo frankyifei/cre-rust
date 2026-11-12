@@ -74,13 +74,19 @@ fn font_change_relayouts_only_the_chunk_being_read() {
 }
 
 #[test]
-fn relayout_is_refused_when_the_chunk_html_would_change() {
-    // FB2 and plain-text chunks embed the font size in their HTML, so they take
-    // the reopen path; a different page size changes the chunk HTML of every
-    // format.
-    let doc = Document::with_options(fixture("sample.fb2"), &options(18.0)).unwrap();
-    assert!(!doc.can_relayout_with(&options(24.0)));
+fn relayout_is_allowed_for_every_format() {
+    // Every format leaves the layout settings out of its chunk HTML (they are
+    // `cre-css` tokens), so a font change is a relayout, not a reopen.
+    for book in ["sample.fb2", "sample.txt", "juliet.epub"] {
+        let doc = Document::with_options(fixture(book), &options(18.0)).unwrap();
+        assert!(
+            doc.can_relayout_with(&options(24.0)),
+            "{book}: a font change must be applied without reopening"
+        );
+    }
 
+    // The page *size* still changes the chunk HTML (image normalisation, the
+    // page-size CSS), so it needs a reopen.
     let epub = Document::with_options(fixture("juliet.epub"), &options(18.0)).unwrap();
     let wider = DocumentOptions {
         width: 700,
