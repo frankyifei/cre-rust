@@ -115,7 +115,11 @@ end
 
 function QkInput:emit(ges)
     ges.time = time.s(self:nowMs() / 1000)
-    logger.dbg("qkinput: emit", ges.ges, ges.direction or "", ges.pos and ges.pos.x, ges.pos and ges.pos.y)
+    if os.getenv("QK_TAP_LOG") then
+        -- One line per delivered gesture, so a "one click acted twice" report
+        -- can be traced to either the bridge or KOReader's own handlers.
+        logger.info("qkinput: emit", ges.ges, ges.direction or "", ges.pos and ges.pos.x, ges.pos and ges.pos.y)
+    end
     -- `sendEvent` is how the platform delivers a gesture: topmost widget first,
     -- propagation stops when a handler accepts it. `broadcastEvent` hands the
     -- same tap to every window-level widget (a menu and the page underneath, a
