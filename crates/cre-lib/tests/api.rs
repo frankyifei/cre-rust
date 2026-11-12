@@ -1182,3 +1182,46 @@ fn lazy_open_converges_to_the_full_layout() {
         );
     }
 }
+
+/// cre-lua parses on `loadDocument` and lays out on `renderDocument`
+/// (`with_options_with_font_data_parsed` + `ensure_layout`), which is the path
+/// every real reader takes: the lazy/full decision has to happen there too.
+#[test]
+fn deferred_open_takes_the_lazy_path_too() {
+    require_resources();
+
+    let options = DocumentOptions {
+        width: 600,
+        height: 800,
+        font_size: 18.0,
+        page_margin: 32.0,
+        ..Default::default()
+    };
+    let font_datas = cre_lib::load_font_datas(&cre_lib::resolve_font_paths(&options).unwrap());
+    let mut doc =
+        Document::with_options_with_font_data_parsed(fixture("juliet.epub"), &options, &font_datas)
+            .unwrap();
+    assert!(
+        !doc.has_background_layout(),
+        "parsing alone does not lay anything out"
+    );
+
+    // Force it so the fixture's size does not matter, then do what the reader
+    // does on renderDocument.
+    doc.set_lazy_open(Some(true));
+    doc.ensure_layout().unwrap();
+    assert!(
+        doc.has_background_layout(),
+        "a deferred open must take the lazy path, not fall back to the full pass"
+    );
+
+    let mut rounds = 0;
+    while doc.has_background_layout() && rounds < 100_000 {
+        if !doc.drain_background_layouts() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        rounds += 1;
+    }
+    let full = Document::with_options(fixture("juliet.epub"), &options).unwrap();
+    assert_eq!(doc.page_count(), full.page_count());
+}

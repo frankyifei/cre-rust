@@ -1371,6 +1371,11 @@ pub struct Document {
     raw_page_map_items: Vec<RawPageMapItem>,
     /// False until the pages have been laid out by [`Document::ensure_layout`].
     layout_done: bool,
+    /// What the caller asked for: `Some(true)`/`Some(false)` force the lazy or
+    /// the full open, `None` decides by book size. The decision is taken in
+    /// [`Document::ensure_layout`], because the reader parses on `loadDocument`
+    /// and lays out on `renderDocument` (see `cre-lua`).
+    lazy_open: Option<bool>,
     active: RefCell<Option<ActiveChunk>>,
     current_page: usize,
     background_color: u32,
@@ -1507,7 +1512,9 @@ impl Document {
     }
 
     /// `lazy`: `Some(true)`/`Some(false)` force the lazy/full open path, `None`
-    /// decides by book size (see [`Self::open_lazily`]).
+    /// decides by book size (see [`Self::prefers_lazy_open`]). The decision is
+    /// taken in [`Self::ensure_layout`], because a reader that parses on load
+    /// and lays out later (cre-lua) only gets there then.
     fn open_inner(
         path: impl AsRef<Path>,
         options: &DocumentOptions,
@@ -1532,7 +1539,9 @@ impl Document {
         let svg_raster = Arc::new(ImageRaster::new(content_width, content_height));
         match format {
             DocumentFormat::Epub => {
+                let phase_started = std::time::Instant::now();
                 let mut book = EpubBook::open(path)?;
+                let open_book_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
                 let (text_budget, image_budget, layout_budget) =
                     chunk_budgets(available_memory_bytes());
                 // The zip directory says how much XHTML the spine holds, so a
@@ -1548,6 +1557,7 @@ impl Document {
                     return Err(anyhow::Error::new(LowMemory { page }));
                 }
                 let _ = book.normalize_inline_svg_images();
+                let svg_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
                 let raw_toc = std::mem::take(&mut book.toc);
                 let raw_page_map_source = std::mem::take(&mut book.page_map_source);
                 let raw_page_map = std::mem::take(&mut book.page_map);
@@ -1566,12 +1576,14 @@ impl Document {
                     font_size: options.font_size,
                     ..HtmlOptions::default()
                 };
+                let images_started = std::time::Instant::now();
                 let _ = book.normalize_full_page_images(
                     options.width as f32 / options.viewport_scale.max(0.1),
                     options.height as f32 / options.viewport_scale.max(0.1),
                     html_options.margin_x,
                     html_options.margin_y,
                 );
+                let images_ms = images_started.elapsed().as_secs_f64() * 1000.0;
                 svg_raster.set_page_fit_images(std::mem::take(&mut book.page_fit_images));
                 // Stream the chunks through the compressor instead of returning
                 // every chunk's HTML. On a 24 MB book the old path held the
@@ -1599,7 +1611,9 @@ impl Document {
                 )?;
                 if std::env::var_os("CRE_LAYOUT_PROFILE").is_some() {
                     eprintln!(
-                        "profile chunk html compress: {:.1}ms chunks={}",
+                        "profile epub open: book={open_book_ms:.1}ms svg={:.1}ms images={images_ms:.1}ms \
+                         stream+compress={:.1}ms chunks={}",
+                        svg_ms - open_book_ms,
                         compression_started.elapsed().as_secs_f64() * 1000.0,
                         sources.len()
                     );
@@ -2086,6 +2100,7 @@ impl Document {
             raw_toc,
             raw_page_map_items: page_map_items,
             layout_done: false,
+            lazy_open: lazy,
             active: RefCell::new(None),
             current_page: 1,
             background_color: 0xFF_FFFF,
@@ -2098,11 +2113,7 @@ impl Document {
             background_installs: 0,
         };
         if !defer_layout {
-            if document.open_lazily(lazy) {
-                document.begin_lazy_open()?;
-            } else {
-                document.ensure_layout()?;
-            }
+            document.ensure_layout()?;
         }
         document.resources.drop_pages();
         Ok(document)
@@ -2115,8 +2126,8 @@ impl Document {
     /// Only big books take the lazy path: their full pass is the expensive one,
     /// and the page numbers in between are an estimate. A small book lays out in
     /// well under a second, so it keeps exact numbers from the first draw.
-    fn open_lazily(&self, requested: Option<bool>) -> bool {
-        if let Some(requested) = requested {
+    fn prefers_lazy_open(&self) -> bool {
+        if let Some(requested) = self.lazy_open {
             return requested;
         }
         match std::env::var("CRE_LAZY_OPEN").ok().as_deref() {
@@ -2126,6 +2137,18 @@ impl Document {
         }
         let bytes: usize = self.sources.iter().map(|source| source.text_len).sum();
         bytes >= LAZY_OPEN_MIN_BYTES
+    }
+
+    /// Overrides the lazy/full open policy for a document that has not been laid
+    /// out yet.
+    ///
+    /// `None` is the default (decide by size, or by `CRE_LAZY_OPEN`);
+    /// `Some(false)` forces the full pass, which is what a caller wanting exact
+    /// page numbers from the first draw asks for.
+    pub fn set_lazy_open(&mut self, lazy: Option<bool>) {
+        if !self.layout_done {
+            self.lazy_open = lazy;
+        }
     }
 
     /// The options used to lay chunk HTML out, built from the current settings.
@@ -3302,11 +3325,19 @@ impl Document {
         }
     }
 
-    /// Lays out every chunk, building the page list, TOC page numbers and page
+    /// Lays out the book, building the page list, TOC page numbers and page
     /// map. Cheap to call more than once.
+    ///
+    /// This is where the open decides between the full pass and the lazy one:
+    /// the reader parses on `loadDocument` and lays out on `renderDocument`
+    /// (cre-lua's deferred open), so a decision taken in the constructor would
+    /// never run there.
     pub fn ensure_layout(&mut self) -> Result<()> {
         if self.layout_done {
             return Ok(());
+        }
+        if self.prefers_lazy_open() {
+            return self.begin_lazy_open();
         }
         self.layout_done = true;
         self.entries = (0..self.sources.len())

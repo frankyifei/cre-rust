@@ -51,7 +51,19 @@ fn main() {
     let options = options(font_size);
 
     let started = Instant::now();
-    let mut doc = Document::with_options(book, &options).expect("open");
+    // `CRE_DEFER=1` does what cre-lua does: parse on load, lay out at
+    // renderDocument, which is the path every real reader takes.
+    let mut doc = if std::env::var_os("CRE_DEFER").is_some() {
+        let font_datas =
+            cre_lib::load_font_datas(&cre_lib::resolve_font_paths(&options).expect("fonts"));
+        let mut document =
+            Document::with_options_with_font_data_parsed(book, &options, &font_datas)
+                .expect("parse");
+        document.ensure_layout().expect("layout");
+        document
+    } else {
+        Document::with_options(book, &options).expect("open")
+    };
     let open_ms = started.elapsed().as_secs_f64() * 1000.0;
     println!(
         "open {open_ms:.1}ms pages={} pending={}",
@@ -72,9 +84,14 @@ fn main() {
     // Jump to the last page while the background pass is still running: the
     // chunk must be laid out on demand and the page must render.
     let last_page = doc.page_count();
+    let jump_started = Instant::now();
     let jumped = doc.go_to_page(last_page).expect("goto last page");
+    println!(
+        "jumped to {jumped} of {last_page} in {:.1}ms",
+        jump_started.elapsed().as_secs_f64() * 1000.0
+    );
     let jumped_xp = doc.xpointer_from_page(jumped).ok();
-    println!("jumped to {jumped} of {last_page} xp={jumped_xp:?}");
+    println!("  xp={jumped_xp:?}");
 
     let mut drains = 0;
     let mut slowest = 0.0f64;

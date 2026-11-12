@@ -27,6 +27,42 @@
 
 static unsigned long last_hash = 0;
 
+/* Window pixel -> framebuffer pixel.
+ *
+ * The window can be resized by the window manager (or scaled by the compositor,
+ * e.g. WSLg on a HiDPI screen), so the mapping must use the window's *current*
+ * size rather than the scale the window was created with; otherwise clicks land
+ * on the wrong menu item. */
+static int map_x(int x, int win_w)
+{
+    if (win_w <= 0) {
+        return 0;
+    }
+    int fb_x = (int)((double)x * FB_WIDTH / (double)win_w);
+    if (fb_x < 0) {
+        fb_x = 0;
+    }
+    if (fb_x >= FB_WIDTH) {
+        fb_x = FB_WIDTH - 1;
+    }
+    return fb_x;
+}
+
+static int map_y(int y, int win_h)
+{
+    if (win_h <= 0) {
+        return 0;
+    }
+    int fb_y = (int)((double)y * FB_HEIGHT / (double)win_h);
+    if (fb_y < 0) {
+        fb_y = 0;
+    }
+    if (fb_y >= FB_HEIGHT) {
+        fb_y = FB_HEIGHT - 1;
+    }
+    return fb_y;
+}
+
 static unsigned long frame_hash(const unsigned char *data, size_t size)
 {
     unsigned long hash = 1469598103934665603UL;
@@ -113,6 +149,15 @@ int main(int argc, char **argv)
     XSelectInput(dpy, win, ExposureMask | ButtonPressMask | ButtonReleaseMask |
                   Button1MotionMask | PointerMotionMask | StructureNotifyMask | KeyPressMask);
     XMapRaised(dpy, win);
+    /* The window manager (or WSLg's compositor) may change the size we asked
+     * for; the mapping and the drawing both have to follow the real one. */
+    {
+        XWindowAttributes attrs;
+        if (XGetWindowAttributes(dpy, win, &attrs) && attrs.width > 0 && attrs.height > 0) {
+            win_w = attrs.width;
+            win_h = attrs.height;
+        }
+    }
 
     fprintf(stderr, "viewer: window mapped on %s (%dx%d, scale %.2f)\n",
             DisplayString(dpy), win_w, win_h, scale);
@@ -130,7 +175,6 @@ int main(int argc, char **argv)
     long last_motion_ms = 0;
     int last_mx = -1, last_my = -1;
     int press_x = -1, press_y = -1;
-    long press_ms = 0;
     int moved = 0;
     while (running) {
         fd_set fds;
@@ -143,32 +187,25 @@ int main(int argc, char **argv)
             XNextEvent(dpy, &ev);
             if (ev.type == Expose) {
                 needs_redraw = 1;
+            } else if (ev.type == ConfigureNotify) {
+                if (ev.xconfigure.width != win_w || ev.xconfigure.height != win_h) {
+                    win_w = ev.xconfigure.width;
+                    win_h = ev.xconfigure.height;
+                    needs_redraw = 1;
+                }
             } else if (ev.type == ButtonPress && ev.xbutton.button == Button1) {
-                int fb_x = (int)(ev.xbutton.x / scale);
-                int fb_y = (int)(ev.xbutton.y / scale);
-                if (fb_x < 0) fb_x = 0;
-                if (fb_y < 0) fb_y = 0;
-                if (fb_x >= FB_WIDTH) fb_x = FB_WIDTH - 1;
-                if (fb_y >= FB_HEIGHT) fb_y = FB_HEIGHT - 1;
+                int fb_x = map_x(ev.xbutton.x, win_w);
+                int fb_y = map_y(ev.xbutton.y, win_h);
                 dragging = 1;
                 moved = 0;
                 press_x = fb_x;
                 press_y = fb_y;
-                {
-                    struct timespec press_now;
-                    clock_gettime(CLOCK_MONOTONIC, &press_now);
-                    press_ms = press_now.tv_sec * 1000L + press_now.tv_nsec / 1000000L;
-                }
                 last_mx = fb_x;
                 last_my = fb_y;
                 send_cmd(tap_path, 'd', fb_x, fb_y);
             } else if (ev.type == MotionNotify && dragging) {
-                int fb_x = (int)(ev.xmotion.x / scale);
-                int fb_y = (int)(ev.xmotion.y / scale);
-                if (fb_x < 0) fb_x = 0;
-                if (fb_y < 0) fb_y = 0;
-                if (fb_x >= FB_WIDTH) fb_x = FB_WIDTH - 1;
-                if (fb_y >= FB_HEIGHT) fb_y = FB_HEIGHT - 1;
+                int fb_x = map_x(ev.xmotion.x, win_w);
+                int fb_y = map_y(ev.xmotion.y, win_h);
                 struct timespec now;
                 clock_gettime(CLOCK_MONOTONIC, &now);
                 long now_ms = now.tv_sec * 1000L + now.tv_nsec / 1000000L;
@@ -184,12 +221,8 @@ int main(int argc, char **argv)
                 }
             } else if (ev.type == ButtonRelease && ev.xbutton.button == Button1) {
                 if (dragging) {
-                    int fb_x = (int)(ev.xbutton.x / scale);
-                    int fb_y = (int)(ev.xbutton.y / scale);
-                    if (fb_x < 0) fb_x = 0;
-                    if (fb_y < 0) fb_y = 0;
-                    if (fb_x >= FB_WIDTH) fb_x = FB_WIDTH - 1;
-                    if (fb_y >= FB_HEIGHT) fb_y = FB_HEIGHT - 1;
+                    int fb_x = map_x(ev.xbutton.x, win_w);
+                    int fb_y = map_y(ev.xbutton.y, win_h);
                     if (moved) {
                         send_cmd(tap_path, 'm', fb_x, fb_y);
                         send_cmd(tap_path, 'u', 0, 0);

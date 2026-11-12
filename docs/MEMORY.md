@@ -242,6 +242,15 @@ to the same worker a settings change uses. The first page is on screen in ~70 ms
 instead of 206 ms for 21.epub, and in ~400 ms instead of 5.6 s for a 24 MB book
 (x86; the device divides the layout part by 4-6).
 
+The decision is taken in `ensure_layout`, not in the constructor: the reader
+parses on `loadDocument` and lays out on `renderDocument` (`cre-lua` opens with
+`with_options_with_font_data_parsed`), so a decision made while parsing would
+never run and every real open would fall back to the full pass. That was the
+case in the first version of this change, and it looked exactly like "the lazy
+open does not work on the device": 100 s to the first page and the exact page
+count straight away. `deferred_open_takes_the_lazy_path_too` now covers the
+deferred path.
+
 The reading position does not depend on that pass:
 
 - KOReader restores `last_xpointer`, and `go_to_xpointer` /
