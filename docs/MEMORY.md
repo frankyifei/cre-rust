@@ -254,6 +254,15 @@ The reading position does not depend on that pass:
 - Bookmarks, highlights and annotation restore all go through XPointers, so
   they land on the right text too.
 
+Restoring a position in the *last* chunk does not make opening proportional to
+where the reader stopped: the open lays out the first chunk, and the restore
+lays out the one chunk the saved XPointer points into. Measured on x86_64
+release, that second chunk costs 7.8 ms on the 24 MB book and 21.7 ms on
+21.epub (the latter also rebuilds the page table and re-bases the reading
+position), i.e. 0.1-0.3 s on a PW2, on top of an open that is already a fraction
+of the old one. What *is* estimated when opening at the end is the page number
+shown for that position, until the pass ends.
+
 What holds this together (the invariants worth keeping):
 
 - `ChunkEntry.layout` is the page table for the current settings; while it is
