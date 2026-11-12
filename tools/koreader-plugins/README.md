@@ -25,6 +25,11 @@ The plugin closes that hole using only events and the document API:
 - on `PageUpdate` / `PosUpdate` it re-reads the page total and sends `TocReset`
   when it moved, which is what makes `ReaderFooter:onTocReset` re-read it, and it
   starts the watch if a pass is running that it has not seen start;
+- when the event alone does not update the footer (the footer lives on
+  `ReaderView`, and an event that walks the window stack does not always reach
+  it), it writes `footer.pages` and repaints exactly as `onTocReset` would. The
+  `CREBG_LOG=1` line `publish ... footer before a after event b now c` says which
+  of the two paths did the work;
 - it watches after `onReaderReady` **and** after `DocumentRerendered`, and the
   reader-ready hook re-arms every time: a style change reloads the document, so a
   hook that runs once leaves that style change unwatched;

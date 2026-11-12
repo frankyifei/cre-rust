@@ -87,11 +87,36 @@ function BackgroundLayout:observe()
     if pages ~= self.pages then
         log("page total", self.pages, "->", pages)
         self.pages = pages
-        -- ReaderFooter:onTocReset() re-reads the page count, rebuilds its
-        -- progress markers and repaints, which is exactly what has to happen.
-        self.ui:handleEvent(Event:new("TocReset"))
+        self:publish(pages)
     end
     return inner:hasPendingRerendering()
+end
+
+--- Tells the reader modules the total moved.
+---
+--- `TocReset` is the event `ReaderFooter:onTocReset()` listens for, and it also
+--- rebuilds the footer's progress markers, so it is the documented path. The
+--- footer itself lives on `ReaderView`, though, and an event that only walks the
+--- window stack does not always reach it (reported from a device: the current
+--- page followed the pass, the total did not). Writing the footer's own field
+--- and repainting is exactly what its handler would do, so do both.
+function BackgroundLayout:publish(pages)
+    local footer = self.ui.view and self.ui.view.footer
+    local before = footer and footer.pages
+    self.ui:handleEvent(Event:new("TocReset"))
+    local after_event = footer and footer.pages
+    if footer and after_event ~= pages then
+        footer.pages = pages
+        if footer.onUpdateFooter then
+            footer:onUpdateFooter()
+        end
+    end
+    log(
+        "publish", pages,
+        "footer before", tostring(before),
+        "after event", tostring(after_event),
+        "now", tostring(footer and footer.pages)
+    )
 end
 
 --- (Re)starts watching a document. Safe to call more than once.

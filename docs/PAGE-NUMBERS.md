@@ -84,6 +84,15 @@ would never look again.
 1. **Follow the total.** On every `PageUpdate` / `PosUpdate`, re-read the page
    total; if it moved, send `TocReset`. `ReaderFooter:onTocReset()` then re-reads
    it, rebuilds its progress markers and repaints.
+
+   That event is the documented path, but it is not enough on every build: the
+   footer lives on `ReaderView` (`self.ui.view.footer`), and an event that walks
+   the window stack does not always reach it. Reported from a device: the current
+   page followed the pass, the total did not. So the plugin also writes
+   `footer.pages` and calls `footer:onUpdateFooter()` when the event did not move
+   it -- exactly what `onTocReset` would have done. The `CREBG_LOG=1` line
+   `publish <total> footer before <a> after event <b> now <c>` shows which path
+   did the work.
 2. **Watch the pass.** After `onReaderReady` and after `DocumentRerendered`,
    check whether a pass is running (after the page-count read above) and poll
    once a second until it ends. Polling also advances the pass, so a reader who
