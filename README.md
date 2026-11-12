@@ -24,7 +24,35 @@ Tested with KOReader v2026.07.1:
 - with an x86_64 desktop KOReader build.
 
 The module exposes about 124 document methods and 24 module functions, and the
-workspace has 34 test targets.
+workspace has 36 test targets.
+
+## Performance highlights
+
+Opening a book used to cost one layout per chunk, because every page number is a
+prefix sum over them. On a 13.6 MB, 320-chunk EPUB that was **1 min 40 s on a
+Kindle PW2** before the first page appeared. Now the reader lays out the opening
+chunk, draws the first page, and lays the rest out in reading order on a
+background worker: the same book is on screen in about **2 seconds**, and the
+page total and TOC page numbers settle while the reader is already reading.
+
+| Case | Before | Now |
+|---|---|---|
+| First page, 13.6 MB EPUB / 320 chunks, Kindle PW2 | 1 min 40 s | ~2 s |
+| First page, same book, x86_64 | 4.8 s | 0.43 s |
+| First page, 24 MB text book, x86_64 | 5.6 s | 0.4 s |
+| First page, 24 MB text book, ARM (QEMU) | 64 s | 3.6 s |
+| Font change, 24 MB book | 5.6 s blocking | page is instant, 5.3 s in the background |
+
+The result is not an approximation: the converged page count and the page hashes
+are identical to a full layout, on both a 1.7 MB book and a 24 MB one. The
+reading position is restored by XPointer, so it is exact from the first draw; a
+TOC or bookmark jump into a chunk that has not been laid out yet costs one chunk,
+not the book. The same machinery makes a font, line-spacing or margin change a
+relayout for **every format** (the layout settings are kept out of the chunk
+HTML as `cre-css` tokens), instead of reopening and re-parsing the book.
+
+Details and measurements: [Chunked layout](#chunked-layout-with-partial-relayout),
+[Opening a big book](#opening-a-big-book), [docs/MEMORY.md](docs/MEMORY.md).
 
 ## Highlights
 
@@ -138,16 +166,24 @@ The same worker opens the book: above 3 MB of chunk HTML, `open` lays out the
 first chunk only, so the first page is on screen in a fraction of the time while
 the rest is laid out in reading order. The reading position is restored by
 XPointer, which lays out exactly the chunk it points into, so the content is
-right immediately; page numbers settle when the pass ends.
+right immediately; page numbers settle when the pass ends. Small books (below
+the threshold) keep the full pass, which costs about a second and gives exact
+numbers from the first draw; `CRE_LAZY_OPEN=1`/`0` forces either path.
 
-| Book | Open before | Open now | Page numbers exact after |
+| Book | Full layout at open | First chunk now | Converged |
 |---|---|---|---|
-| 21.epub (1.7 MB) | 206 ms | 70 ms | 0.3 s |
-| 24 MB text book | 5.6 s | 0.4 s | 5.6 s |
+| 21.epub (1.7 MB HTML) | 206 ms | 70 ms | 637 pages in 0.3 s |
+| 13.6 MB / 27 MB HTML / 320 chunks, x86 | 4 766 ms | **425 ms** | 8 310 pages in 4.4 s |
+| the same book on ARM (QEMU) | 50.2 s | **3.4 s** | 4.4 s of background work |
+| 24 MB text book, x86 | 5 627 ms | **396 ms** | 16 719 pages in 5.6 s |
+| 24 MB text book, ARM (QEMU) | 63.9 s | **3.6 s** | 68 s of background work |
 
-The converged page count and page hashes are identical to a full open (there is
-a test for that), and a TOC or bookmark jump into a chunk that has not been laid
-out yet costs one chunk, not the book. Page-number jumps land near the target
+The converged page count and page hashes are identical to a full open (there are
+tests for that), and a TOC or bookmark jump into a chunk that has not been laid
+out yet costs one chunk, not the book. Restoring a position at the very end of a
+book does not cost more than restoring one at the start: the open lays out the
+first chunk and the restore lays out the single chunk the XPointer names (+8 to
++22 ms on x86, ~0.1-0.3 s on a PW2). Page-number jumps land near the target
 until the pass ends; XPointer jumps are exact from the first draw.
 
 Until it ends, page numbers, the progress percentage and the TOC page numbers

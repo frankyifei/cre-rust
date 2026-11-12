@@ -250,6 +250,13 @@ to the same worker a settings change uses. The first page is on screen in ~70 ms
 instead of 206 ms for 21.epub, and in ~400 ms instead of 5.6 s for a 24 MB book
 (x86; the device divides the layout part by 4-6).
 
+Measured on the device that motivated this: a 13.6 MB, 320-chunk EPUB (27 MB of
+generated HTML) needed **1 min 40 s** to show its first page and now shows it in
+about **2 s**; the background pass then finishes while the reader reads, and the
+page count and TOC converge to exactly what the full pass produced. On x86 the
+same book opens in 425 ms instead of 4 766 ms, and in QEMU-on-ARM in 3.4 s
+instead of 50.2 s.
+
 The decision is taken in `ensure_layout`, not in the constructor: the reader
 parses on `loadDocument` and lays out on `renderDocument` (`cre-lua` opens with
 `with_options_with_font_data_parsed`), so a decision made while parsing would
