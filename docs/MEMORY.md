@@ -223,6 +223,17 @@ Two small pieces close this:
   rerendering sends — the TOC cache, the progress markers and the book's saved
   page count are rebuilt once.
 
+  Two details make it reliable rather than lucky. The watch is (re)armed on
+  every `onReaderReady`, not once: a style change closes and reopens the
+  document, and a hook that runs once would leave that pass unwatched (no final
+  event, so `ReaderToc` keeps the page numbers it read at layout time). And
+  `watch()` reads the page count *before* it trusts `hasPendingRerendering()`,
+  because the engine defers a settings change to the next document call: at the
+  moment `DocumentRerendered` arrives the worker may not have started, the flag
+  reads false, and the whole pass would go unnoticed. `CREBG_LOG=1` logs each
+  decision (`page total a -> b`, `pass started`, `pass finished`), which is what
+  to look at when a total "did not change".
+
 `hasPendingRerendering()` is reached through `document._document`, because
 adding the method to the `CreDocument` wrapper would mean editing
 `frontend/document/credocument.lua`, which is what the plugin avoids.
