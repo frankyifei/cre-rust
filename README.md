@@ -129,6 +129,29 @@ On x86 a 24 MB text book converges in 5.3 s while the reader keeps turning
 pages (the install costs 5 ms per draw), and a 1.7 MB book in 260 ms; the page
 count and page hashes end up identical to a fresh open.
 
+### Opening a big book
+
+The same worker opens the book: above 3 MB of chunk HTML, `open` lays out the
+first chunk only, so the first page is on screen in a fraction of the time while
+the rest is laid out in reading order. The reading position is restored by
+XPointer, which lays out exactly the chunk it points into, so the content is
+right immediately; page numbers settle when the pass ends.
+
+| Book | Open before | Open now | Page numbers exact after |
+|---|---|---|---|
+| 21.epub (1.7 MB) | 206 ms | 70 ms | 0.3 s |
+| 24 MB text book | 5.6 s | 0.4 s | 5.6 s |
+
+The converged page count and page hashes are identical to a full open (there is
+a test for that), and a TOC or bookmark jump into a chunk that has not been laid
+out yet costs one chunk, not the book. Page-number jumps land near the target
+until the pass ends; XPointer jumps are exact from the first draw.
+
+Until it ends, page numbers, the progress percentage and the TOC page numbers
+are estimates — the same degraded state crengine's partial rerendering has.
+KOReader is told when it ends (see `docs/MEMORY.md`), which is what refreshes
+the footer total and the TOC.
+
 ### Memory: one chunk, kept compressed
 
 A big text book keeps the generated HTML of every chunk so a settings change

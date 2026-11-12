@@ -47,6 +47,16 @@ const SEARCH_FLAGS_MULTILINE: i32 = 1 << 3;
 const SEARCH_FLAGS_LITERAL: i32 = 1 << 4;
 const SEARCH_FLAGS_DOTALL: i32 = 1 << 5;
 
+/// Chunk HTML above which opening lays out the first chunk only.
+///
+/// The open-time pass is proportional to this. Measured on x86_64 release:
+/// 1.7 MB of chunk HTML (18 chunks) lays out in ~0.25 s, 25 MB (268 chunks) in
+/// 6.1 s; a PW2 takes roughly 4-6x that. Below this threshold the whole book is
+/// laid out at open, which keeps page numbers exact from the first draw and
+/// costs at most a second on the device; above it the reader gets the first page
+/// in a fraction of the time and the rest arrives in the background.
+const LAZY_OPEN_MIN_BYTES: usize = 3 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DocumentFormat {
     Epub,
@@ -1007,12 +1017,33 @@ struct LineEntry {
 /// big novel, so each chunk is stored as an LZ4 block and decompressed only
 /// when that chunk is laid out (including a TOC jump straight to it). The
 /// compressor is fast enough that a layout does not notice it.
+/// A spine section carried by a chunk's HTML, read from the markup rather than
+/// from a layout.
+///
+/// It is the chunk → `DocFragment` map an XPointer needs, and it is available
+/// before the chunk has ever been laid out. That matters when a book is opened
+/// lazily: the reader restores its position (an XPointer) before the chunk that
+/// holds it has been laid out, and the jump would otherwise have no the map.
+#[derive(Clone, Debug)]
+struct SpineSection {
+    /// XPointer section number (`data-spine-index + 1`, see
+    /// `xpointer::spine_index_for_node`).
+    slot: u32,
+    /// Value the XPointer text uses for this section.
+    real: u32,
+    /// Resource path of the section, used to give a TOC entry a page before its
+    /// chunk is laid out.
+    href: Option<String>,
+}
+
 struct ChunkSource {
     compressed: Vec<u8>,
     /// Uncompressed length, which the layout uses for its estimates.
     text_len: usize,
     /// `<img`/`<image` occurrences, used to pick the probe chunk.
     images: usize,
+    /// Sections in this chunk, in document order.
+    spine: Vec<SpineSection>,
 }
 
 impl ChunkSource {
@@ -1022,12 +1053,14 @@ impl ChunkSource {
             .count()
             .saturating_add(html.match_indices("<image").count());
         let text_len = html.len();
+        let spine = scan_spine_sections(&html);
         let mut compressed = lz4_flex::compress_prepend_size(html.as_bytes());
         compressed.shrink_to_fit();
         Self {
             compressed,
             text_len,
             images,
+            spine,
         }
     }
 
@@ -1041,6 +1074,50 @@ impl ChunkSource {
     }
 }
 
+/// Reads the spine sections a chunk's HTML carries, without parsing it.
+///
+/// The generators wrap every spine document in a `<section>` that names its
+/// `DocFragment`; that markup is what an XPointer needs to find the chunk it
+/// points into, so it must be known before the chunk has a layout (a lazily
+/// opened book restores its position first). Scanning the attributes is the
+/// same information [`collect_spine_chunks`] used to gather from the parsed
+/// DOM, at string-search cost instead of a layout.
+fn scan_spine_sections(html: &str) -> Vec<SpineSection> {
+    const NEEDLE: &str = "data-spine-index=\"";
+    let mut sections: Vec<SpineSection> = Vec::new();
+    let mut rest = html;
+    while let Some(position) = rest.find(NEEDLE) {
+        let after = &rest[position + NEEDLE.len()..];
+        let Some(quote) = after.find('"') else {
+            break;
+        };
+        let Ok(index) = after[..quote].parse::<u32>() else {
+            rest = after;
+            continue;
+        };
+        // The other attributes live in the same tag; look them up there.
+        let tag_start = rest[..position].rfind('<').unwrap_or(0);
+        let tag_end = rest[position..]
+            .find('>')
+            .map(|offset| position + offset)
+            .unwrap_or(rest.len());
+        let tag = &rest[tag_start..tag_end];
+        let slot = index + 1;
+        let real = attr_value(tag, "data-spine-real-index")
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(slot);
+        let href = attr_value(tag, "data-spine-href");
+        if !sections.iter().any(|section| section.slot == slot) {
+            sections.push(SpineSection { slot, real, href });
+        }
+        rest = &rest[tag_end.max(position + NEEDLE.len())..];
+        if rest.is_empty() {
+            break;
+        }
+    }
+    sections
+}
+
 struct ChunkLayout {
     pages: Vec<LocalPage>,
     /// Every line of the chunk, sorted in document order (by text node id, then
@@ -1050,8 +1127,6 @@ struct ChunkLayout {
     xpointers: Vec<Option<String>>,
     /// Anchors found in this chunk, to a 0-based local page.
     href_pages: HashMap<(String, Option<String>), usize>,
-    /// (spine slot, real spine index) of every spine item in this chunk.
-    spine_slots: Vec<(u32, u32)>,
     line_count: usize,
     max_flow: i64,
 }
@@ -1099,9 +1174,14 @@ impl ChunkLayout {
 struct ChunkEntry {
     /// `None` before this chunk has ever been laid out.
     layout: Option<ChunkLayout>,
-    /// True when `layout` predates the current settings: its pages still stand
-    /// in for real ones, but the chunk is laid out again when it is next used.
+    /// True when `layout` does not reflect the current settings: it is either
+    /// missing (a lazily opened book) or was laid out before a settings change.
+    /// The chunk is laid out again when it is next used.
     stale: bool,
+    /// Pages assumed for this chunk while it has no layout for the current
+    /// settings. Set when a book is opened lazily; zero when there is nothing
+    /// to assume.
+    provisional_pages: usize,
 }
 
 /// Absolute vertical extent of a replaced element (image) inside a chunk's
@@ -1347,7 +1427,28 @@ impl Document {
         options: &DocumentOptions,
         font_datas: &[FontBlob],
     ) -> Result<Self> {
-        Self::open_inner(path, options, font_datas, false)
+        Self::open_inner(path, options, font_datas, false, None)
+    }
+
+    /// Opens a book with only its first chunk laid out and finishes the rest on
+    /// the background worker, whatever the book's size.
+    ///
+    /// [`Self::with_options`] already does this for big books; this forces it,
+    /// which is what the tests and the A/B runs use. Until
+    /// [`Self::has_background_layout`] turns false, the page numbers are an
+    /// estimate (the reader's position is an XPointer, so it is exact either
+    /// way).
+    pub fn with_options_lazy(path: impl AsRef<Path>, options: &DocumentOptions) -> Result<Self> {
+        let font_datas = collect_font_datas(options)?;
+        Self::open_inner(path, options, &font_datas, false, Some(true))
+    }
+
+    /// Opens a book and lays every chunk out before returning, so page numbers
+    /// are exact from the first draw even for a book big enough to open lazily
+    /// by default.
+    pub fn with_options_exact(path: impl AsRef<Path>, options: &DocumentOptions) -> Result<Self> {
+        let font_datas = collect_font_datas(options)?;
+        Self::open_inner(path, options, &font_datas, false, Some(false))
     }
 
     /// Parses the document but defers laying out its pages to
@@ -1391,6 +1492,7 @@ impl Document {
             options,
             font_datas,
             false,
+            None,
             html.len() as u64,
             0,
         )
@@ -1401,14 +1503,17 @@ impl Document {
         options: &DocumentOptions,
         font_datas: &[FontBlob],
     ) -> Result<Self> {
-        Self::open_inner(path, options, font_datas, true)
+        Self::open_inner(path, options, font_datas, true, None)
     }
 
+    /// `lazy`: `Some(true)`/`Some(false)` force the lazy/full open path, `None`
+    /// decides by book size (see [`Self::open_lazily`]).
     fn open_inner(
         path: impl AsRef<Path>,
         options: &DocumentOptions,
         font_datas: &[FontBlob],
         defer_layout: bool,
+        lazy: Option<bool>,
     ) -> Result<Self> {
         validate_options(options)?;
         let path = path.as_ref();
@@ -1522,6 +1627,7 @@ impl Document {
                     options,
                     font_datas,
                     defer_layout,
+                    lazy,
                     source_bytes,
                     chunk_image_bytes,
                 )
@@ -1587,6 +1693,7 @@ impl Document {
                     options,
                     font_datas,
                     defer_layout,
+                    lazy,
                     source_bytes,
                     MAP_CHUNK_IMAGE_BYTES,
                 )
@@ -1646,6 +1753,7 @@ impl Document {
                     options,
                     font_datas,
                     defer_layout,
+                    lazy,
                     source_bytes,
                     MAP_CHUNK_IMAGE_BYTES,
                 )
@@ -1705,6 +1813,7 @@ impl Document {
                     options,
                     font_datas,
                     defer_layout,
+                    lazy,
                     source_bytes,
                     MAP_CHUNK_IMAGE_BYTES,
                 )
@@ -1742,6 +1851,7 @@ impl Document {
                     options,
                     font_datas,
                     defer_layout,
+                    lazy,
                     source_bytes,
                     0,
                 )
@@ -1815,6 +1925,7 @@ impl Document {
                     options,
                     font_datas,
                     defer_layout,
+                    lazy,
                     source_bytes,
                     0,
                 )
@@ -1838,6 +1949,7 @@ impl Document {
         options: &DocumentOptions,
         font_datas: &[FontBlob],
         defer_layout: bool,
+        lazy: Option<bool>,
         source_bytes: u64,
         chunk_image_bytes: u64,
     ) -> Result<Self> {
@@ -1884,6 +1996,7 @@ impl Document {
             options,
             font_datas,
             defer_layout,
+            lazy,
             source_bytes,
             chunk_image_bytes,
         )
@@ -1911,6 +2024,7 @@ impl Document {
         options: &DocumentOptions,
         font_datas: &[FontBlob],
         defer_layout: bool,
+        lazy: Option<bool>,
         source_bytes: u64,
         chunk_image_bytes: u64,
     ) -> Result<Self> {
@@ -1984,10 +2098,34 @@ impl Document {
             background_installs: 0,
         };
         if !defer_layout {
-            document.ensure_layout()?;
+            if document.open_lazily(lazy) {
+                document.begin_lazy_open()?;
+            } else {
+                document.ensure_layout()?;
+            }
         }
         document.resources.drop_pages();
         Ok(document)
+    }
+
+    /// Whether this book is worth opening lazily: laying out every chunk before
+    /// the first page is shown costs time the reader would rather spend reading,
+    /// and the background pass produces exactly the same pages.
+    ///
+    /// Only big books take the lazy path: their full pass is the expensive one,
+    /// and the page numbers in between are an estimate. A small book lays out in
+    /// well under a second, so it keeps exact numbers from the first draw.
+    fn open_lazily(&self, requested: Option<bool>) -> bool {
+        if let Some(requested) = requested {
+            return requested;
+        }
+        match std::env::var("CRE_LAZY_OPEN").ok().as_deref() {
+            Some("0") => return false,
+            Some("1") => return true,
+            _ => {}
+        }
+        let bytes: usize = self.sources.iter().map(|source| source.text_len).sum();
+        bytes >= LAZY_OPEN_MIN_BYTES
     }
 
     /// The options used to lay chunk HTML out, built from the current settings.
@@ -2421,23 +2559,6 @@ fn layout_chunk_html(
             }
         }
         timer.mark("hrefs");
-        let mut spine_slots = Vec::new();
-        {
-            let mut spine_to_chunk = HashMap::new();
-            let mut spine_real_index = HashMap::new();
-            collect_spine_chunks(
-                root,
-                chunk_index,
-                &mut spine_to_chunk,
-                &mut spine_real_index,
-            );
-            spine_slots.extend(
-                spine_to_chunk
-                    .keys()
-                    .map(|slot| (*slot, *spine_real_index.get(slot).unwrap_or(slot))),
-            );
-            spine_slots.sort_unstable();
-        }
         let mut pages = Vec::with_capacity(page_starts.len());
         let mut previous_page_flow = 0;
         for (local_index, start) in page_starts.iter().enumerate() {
@@ -2470,7 +2591,6 @@ fn layout_chunk_html(
             lines: line_positions,
             xpointers,
             href_pages,
-            spine_slots,
             line_count: lines.len(),
             max_flow,
         };
@@ -2488,6 +2608,7 @@ impl Document {
             *entry = ChunkEntry {
                 layout: Some(layout),
                 stale: false,
+                provisional_pages: 0,
             };
         }
         *self.active.borrow_mut() = Some(ActiveChunk {
@@ -2514,6 +2635,9 @@ impl Document {
         let mut line_base = 0usize;
         let mut running_doc_top = 0.0f32;
         let mut max_flow = 0i64;
+        // First page of the chunk each spine resource lives in. Only used for
+        // navigation targets whose chunk has no layout yet (lazy open).
+        let mut href_first_page: HashMap<String, usize> = HashMap::new();
         for (chunk_index, entry) in self.entries.iter().enumerate() {
             let first_page = self.pages.len() + 1;
             if let Some(layout) = entry.layout.as_ref() {
@@ -2541,11 +2665,45 @@ impl Document {
                         .entry(key.clone())
                         .or_insert(first_page + local_page);
                 }
-                for (slot, real) in layout.spine_slots.iter() {
-                    self.spine_to_chunk.insert(*slot, chunk_index);
-                    self.spine_real_index.insert(*slot, *real);
-                }
                 max_flow = max_flow.max(layout.max_flow);
+            } else {
+                // Never laid out (a lazily opened book, or a chunk the worker
+                // has not reached yet): stand in with the estimated page count
+                // so that page numbers, the total and navigation exist from the
+                // first draw. `ensure_page_layout` replaces them with real ones.
+                for _ in 0..entry.provisional_pages.max(1) {
+                    self.pages.push(PageMeta {
+                        chunk: chunk_index,
+                        local_start: PageStart {
+                            top: 0.0,
+                            clip_top: 0.0,
+                        },
+                        local_clip_bottom: 0.0,
+                        doc_top: running_doc_top,
+                        render_height: 0.0,
+                        page_flow: 0,
+                    });
+                    running_doc_top += self.height as f32;
+                }
+            }
+            // The chunk → spine map is read from the chunk's markup, so it is
+            // available whether or not the chunk has a layout. That is what lets
+            // an XPointer jump into a chunk that has not been laid out yet.
+            for section in self
+                .sources
+                .get(chunk_index)
+                .map(|s| s.spine.as_slice())
+                .unwrap_or(&[])
+            {
+                self.spine_to_chunk
+                    .entry(section.slot)
+                    .or_insert(chunk_index);
+                self.spine_real_index
+                    .entry(section.slot)
+                    .or_insert(section.real);
+                if let Some(href) = section.href.as_ref() {
+                    href_first_page.entry(href.clone()).or_insert(first_page);
+                }
             }
             self.chunks.push(ChunkMeta {
                 first_page,
@@ -2563,7 +2721,9 @@ impl Document {
             .raw_toc
             .iter()
             .map(|item| {
-                let page = page_for_href(&self.href_pages, &item.href).ok();
+                let page = page_for_href(&self.href_pages, &item.href)
+                    .ok()
+                    .or_else(|| provisional_page_for_href(&href_first_page, &item.href));
                 let xpointer = page.and_then(|page| self.page_xpointer(page));
                 TocEntry {
                     title: item.title.clone(),
@@ -2580,7 +2740,9 @@ impl Document {
             .raw_page_map_items
             .iter()
             .filter_map(|item| {
-                let page = page_for_href(&self.href_pages, &item.href).ok()?;
+                let page = page_for_href(&self.href_pages, &item.href)
+                    .ok()
+                    .or_else(|| provisional_page_for_href(&href_first_page, &item.href))?;
                 let xpointer = self.page_xpointer(page);
                 let doc_y = self
                     .pages
@@ -2647,8 +2809,11 @@ impl Document {
             None => (0, 0),
         };
         self.apply_options(options);
+        // Every chunk has to be laid out for the new settings. A chunk that
+        // already has a layout keeps it as a provisional page list until it is
+        // laid out again; a chunk that never had one keeps its estimate.
         for entry in self.entries.iter_mut() {
-            entry.stale = entry.layout.is_some();
+            entry.stale = true;
         }
         *self.page_boxes_cache.borrow_mut() = None;
         self.clear_page_image_cache();
@@ -2673,12 +2838,18 @@ impl Document {
                 let ratio = new_anchor_pages as f32 / old_anchor_pages as f32;
                 if (ratio - 1.0).abs() > 0.02 {
                     for entry in self.entries.iter_mut() {
-                        if entry.stale
-                            && let Some(layout) = entry.layout.as_mut()
-                        {
+                        if !entry.stale {
+                            continue;
+                        }
+                        if let Some(layout) = entry.layout.as_mut() {
                             let target =
                                 (layout.pages.len() as f32 * ratio).round().max(1.0) as usize;
                             layout.resample(target);
+                        } else if entry.provisional_pages > 0 {
+                            // A chunk that was never laid out: scale its estimate
+                            // the same way, so the total moves by the same factor.
+                            entry.provisional_pages =
+                                (entry.provisional_pages as f32 * ratio).round().max(1.0) as usize;
                         }
                     }
                 }
@@ -2843,6 +3014,7 @@ impl Document {
             }
             self.entries[index].layout = Some(layout);
             self.entries[index].stale = false;
+            self.entries[index].provisional_pages = 0;
             installed += 1;
         }
         if installed == 0 {
@@ -2975,6 +3147,161 @@ impl Document {
         Ok(())
     }
 
+    /// The chunk and local page the reader is on, which is what survives page
+    /// numbers moving under it (installing a chunk before the current one shifts
+    /// every number after it).
+    fn current_anchor(&self) -> Option<(usize, usize)> {
+        let page = self.pages.get(self.current_page.saturating_sub(1))?;
+        let first = self
+            .chunks
+            .get(page.chunk)
+            .map(|meta| meta.first_page)
+            .unwrap_or(1);
+        Some((page.chunk, self.current_page.saturating_sub(first)))
+    }
+
+    /// Puts the reader back on the `(chunk, local page)` from
+    /// [`Self::current_anchor`], wherever that chunk starts now.
+    fn restore_anchor(&mut self, anchor: (usize, usize)) {
+        let (chunk, local) = anchor;
+        let first = self
+            .chunks
+            .get(chunk)
+            .map(|meta| meta.first_page)
+            .unwrap_or(1);
+        let count = self
+            .entries
+            .get(chunk)
+            .and_then(|entry| {
+                entry
+                    .layout
+                    .as_ref()
+                    .map(|layout| layout.pages.len())
+                    .or(Some(entry.provisional_pages))
+            })
+            .unwrap_or(1)
+            .max(1);
+        self.current_page = first + local.min(count.saturating_sub(1));
+    }
+
+    /// Lays out every chunk that still lacks a layout for the current settings,
+    /// synchronously.
+    ///
+    /// Whole-book queries that cannot work from estimates call this: full-text
+    /// search walks every page. It is exactly the background pass's work, so it
+    /// is only worth calling when the answer has to be complete right now.
+    pub fn ensure_layout_complete(&mut self) -> Result<()> {
+        let missing: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.stale || entry.layout.is_none())
+            .map(|(index, _)| index)
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let anchor = self.current_anchor();
+        for index in missing {
+            let (layout, doc, lines, page_starts) = self.layout_chunk(index)?;
+            // Only the page metadata is needed here; the DOM of the chunk that
+            // is on screen stays the active one.
+            drop(doc);
+            drop(lines);
+            drop(page_starts);
+            self.entries[index] = ChunkEntry {
+                layout: Some(layout),
+                stale: false,
+                provisional_pages: 0,
+            };
+        }
+        self.rebuild_view();
+        if let Some(anchor) = anchor {
+            self.restore_anchor(anchor);
+        }
+        Ok(())
+    }
+
+    /// Opens a big book with only its first chunk laid out.
+    ///
+    /// The full open-time pass costs one layout per chunk before the first page
+    /// is shown, which is most of the "opening" a reader waits for on a large
+    /// book. Here the opening chunk is laid out (its DOM stays active, so the
+    /// first page draws without parsing it again), every other chunk stands in
+    /// with a page estimate, and the background worker lays them out in reading
+    /// order. The reader's position is restored by XPointer, which
+    /// [`Self::ensure_xpointer_layout`] turns into "lay out that one chunk", so
+    /// the content is right immediately; the page numbers are estimates until
+    /// the pass ends (cre-lua reports that through `hasPendingRerendering`, and
+    /// KOReader's plugin refreshes page totals and the TOC then).
+    fn begin_lazy_open(&mut self) -> Result<()> {
+        self.layout_done = true;
+        let count = self.sources.len();
+        self.entries = (0..count)
+            .map(|_| ChunkEntry {
+                layout: None,
+                stale: true,
+                provisional_pages: 0,
+            })
+            .collect();
+        if count == 0 {
+            self.rebuild_view();
+            return Ok(());
+        }
+        let (layout, doc, lines, page_starts) = self.layout_chunk(0)?;
+        let opening_pages = layout.pages.len();
+        self.entries[0] = ChunkEntry {
+            layout: Some(layout),
+            stale: false,
+            provisional_pages: 0,
+        };
+        self.estimate_provisional_pages(opening_pages);
+        self.rebuild_view();
+        trim_memory();
+        self.install_active(0, doc, lines, page_starts);
+        self.start_background_layout();
+        Ok(())
+    }
+
+    /// Fills in the page count assumed for every chunk that has no layout yet,
+    /// from the pages the opening chunk really got.
+    ///
+    /// Pages are roughly proportional to the HTML a chunk holds, so the opening
+    /// chunk's bytes-per-page scales the rest; a pre-paginated chunk is always
+    /// one page. The number only has to be close: it decides the page index, the
+    /// total and the progress bar until the worker replaces it, and the reader
+    /// is positioned by XPointer, not by page number.
+    fn estimate_provisional_pages(&mut self, opening_pages: usize) {
+        let bytes_per_page = if opening_pages > 0 {
+            self.sources[0].text_len as f32 / opening_pages as f32
+        } else {
+            0.0
+        };
+        // Under a few hundred bytes per page the opening chunk is nearly empty
+        // (a cover, a single image): too little to scale a whole book from.
+        let bytes_per_page = if bytes_per_page >= 256.0 {
+            bytes_per_page
+        } else {
+            2048.0
+        };
+        for (index, entry) in self.entries.iter_mut().enumerate() {
+            if entry.layout.is_some() {
+                continue;
+            }
+            if self
+                .fixed_layouts
+                .get(index)
+                .and_then(|fixed| *fixed)
+                .is_some()
+            {
+                entry.provisional_pages = 1;
+                continue;
+            }
+            let pages = self.sources[index].text_len as f32 / bytes_per_page;
+            entry.provisional_pages = pages.round().max(1.0) as usize;
+        }
+    }
+
     /// Lays out every chunk, building the page list, TOC page numbers and page
     /// map. Cheap to call more than once.
     pub fn ensure_layout(&mut self) -> Result<()> {
@@ -2986,6 +3313,7 @@ impl Document {
             .map(|_| ChunkEntry {
                 layout: None,
                 stale: false,
+                provisional_pages: 0,
             })
             .collect();
         let count = self.sources.len();
@@ -3025,6 +3353,7 @@ impl Document {
         self.entries[probe_index] = ChunkEntry {
             layout: Some(probe_layout),
             stale: false,
+            provisional_pages: 0,
         };
         // When the probe is the opening chunk (a cover, usually the most
         // image-heavy chunk of all) its DOM is what the first page needs, so
@@ -3119,6 +3448,7 @@ impl Document {
                     self.entries[0] = ChunkEntry {
                         layout: Some(layout),
                         stale: false,
+                        provisional_pages: 0,
                     };
                     (doc, lines, page_starts)
                 }
@@ -3131,6 +3461,7 @@ impl Document {
                     self.entries[index] = ChunkEntry {
                         layout: Some(layout),
                         stale: false,
+                        provisional_pages: 0,
                     };
                 }
             }
@@ -3154,6 +3485,7 @@ impl Document {
             self.entries[chunk_index] = ChunkEntry {
                 layout: Some(layout),
                 stale: false,
+                provisional_pages: 0,
             };
             // The chunk's DOM and line boxes are only needed to derive page
             // metadata; release them now so the pass stays flat in RSS instead
@@ -3170,6 +3502,7 @@ impl Document {
                 self.entries[0] = ChunkEntry {
                     layout: Some(layout),
                     stale: false,
+                    provisional_pages: 0,
                 };
                 (doc, lines, page_starts)
             }
@@ -4902,6 +5235,16 @@ impl Document {
     ) -> Result<Vec<SearchHit>> {
         if query.is_empty() {
             bail!("search query must not be empty");
+        }
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.stale || entry.layout.is_none())
+        {
+            // A lazily opened book (or one whose background pass is still
+            // running) has no lines for its unlaid chunks, and skipping them
+            // would silently hide matches.
+            bail!("full-text search needs every chunk laid out; call ensure_layout_complete()");
         }
 
         let literal = !pattern_is_regex || (search_flags & SEARCH_FLAGS_LITERAL) != 0;
@@ -7887,6 +8230,35 @@ mod layout_plan_tests {
     }
 
     #[test]
+    fn spine_sections_are_read_from_the_markup() {
+        // The EPUB generator: slot and real index plus the resource path.
+        let epub = "<section class=\"calibre\" data-spine-index=\"7\" \
+                    data-spine-real-index=\"3\" data-spine-id=\"id7\" \
+                    data-spine-href=\"text/part0029.html\"><p>one</p></section>";
+        let sections = scan_spine_sections(epub);
+        assert_eq!(sections.len(), 1);
+        // XPointers number fragments from `data-spine-index + 1`.
+        assert_eq!(sections[0].slot, 8);
+        assert_eq!(sections[0].real, 3);
+        assert_eq!(sections[0].href.as_deref(), Some("text/part0029.html"));
+
+        // MOBI/KF8 emit the slot only, and put other attributes after it.
+        let mobi = "<section class=\"cre-spine\" data-spine-index=\"1\" id=\"cre-sec-1\">\
+                    <p>x</p></section>";
+        let sections = scan_spine_sections(mobi);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].slot, 2);
+        assert_eq!(sections[0].real, 2);
+        assert_eq!(sections[0].href, None);
+
+        // Several sections in one chunk, and no marker at all (FB2/TXT).
+        let many = "<section class=\"cre-spine\" data-spine-index=\"1\"></section>\
+                    <section class=\"cre-spine\" data-spine-index=\"2\"></section>";
+        assert_eq!(scan_spine_sections(many).len(), 2);
+        assert!(scan_spine_sections("<p>no sections</p>").is_empty());
+    }
+
+    #[test]
     fn large_book_is_split_to_fit_available_memory() {
         // 80 MB available: budget is min(available - 24 MB, available / 2)
         // = 40 MB of layout, i.e. 320 kB of HTML per layout (also the cap).
@@ -8074,31 +8446,6 @@ fn css_page_geometry(
     (css_height_u32, css_height, css_margin)
 }
 
-fn collect_spine_chunks(
-    node: &Node,
-    chunk_index: usize,
-    out: &mut HashMap<u32, usize>,
-    real: &mut HashMap<u32, u32>,
-) {
-    if let Some(index) =
-        node_attr(node, "data-spine-index").and_then(|value| value.parse::<u32>().ok())
-    {
-        // XPointers number sections with `data-spine-index + 1` (see
-        // `xpointer::spine_index_for_node`), so key the chunks the same way:
-        // mixing the two numbering schemes sent lookups for the last section
-        // of a chunk to the *next* chunk, where the section does not exist.
-        let slot = index + 1;
-        out.entry(slot).or_insert(chunk_index);
-        let real_index = node_attr(node, "data-spine-real-index")
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(slot);
-        real.entry(slot).or_insert(real_index);
-    }
-    for child in &node.children {
-        collect_spine_chunks(node.with(*child), chunk_index, out, real);
-    }
-}
-
 fn href_key(href: &str) -> (String, Option<String>) {
     let (path, fragment) = split_toc_href(href);
     let path = if path.contains("://") {
@@ -8156,6 +8503,14 @@ fn page_for_href(
         .or_else(|| href_pages.get(&(path, None)))
         .copied()
         .context("navigation target was not found in the rendered document")
+}
+
+/// Stand-in page for a navigation target whose chunk has not been laid out yet:
+/// the first page of the chunk that holds its resource. Exact as soon as the
+/// chunk is laid out (lazy open, before the background pass reaches it).
+fn provisional_page_for_href(first_pages: &HashMap<String, usize>, href: &str) -> Option<usize> {
+    let (path, _fragment) = href_key(href);
+    first_pages.get(&path).copied()
 }
 
 /// Page of a spine document target.

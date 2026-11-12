@@ -231,6 +231,78 @@ Measured in the x86 emulator (21.epub, font +8 px, background on):
 Without the plugin the footer stays on 2003/2007 for the rest of the session,
 and the TOC keeps the page numbers computed at layout time.
 
+## Opening a big book: first chunk now, the rest in the background
+
+The open-time pass lays out every chunk, because every page number is a prefix
+sum over them. That is where most of "opening a book" goes on a large file:
+1.7 MB of chunk HTML takes ~0.25 s on x86 and ~1.5 s on a PW2, 25 MB takes 6.1 s
+and 25-30 s. Above `LAZY_OPEN_MIN_BYTES` (3 MB of chunk HTML) `open` now lays out
+the **opening chunk only**, fills in a page estimate for the rest and hands them
+to the same worker a settings change uses. The first page is on screen in ~70 ms
+instead of 206 ms for 21.epub, and in ~400 ms instead of 5.6 s for a 24 MB book
+(x86; the device divides the layout part by 4-6).
+
+The reading position does not depend on that pass:
+
+- KOReader restores `last_xpointer`, and `go_to_xpointer` /
+  `ensure_xpointer_layout` lay out exactly the chunk that XPointer points into,
+  then position by XPointer. The content is right immediately; only the page
+  number is an estimate.
+- A TOC jump uses the entry's XPointer for the same reason. A **page-number**
+  jump (Go to page, the progress bar) uses the estimate and lands near the
+  target until the pass ends; after it, it is exact.
+- Bookmarks, highlights and annotation restore all go through XPointers, so
+  they land on the right text too.
+
+What holds this together (the invariants worth keeping):
+
+- `ChunkEntry.layout` is the page table for the current settings; while it is
+  missing the entry carries `provisional_pages`. `stale` means "the layout, if
+  any, is not for the current settings" and is what the worker selects on. No
+  other code branches on those states.
+- `ensure_page_layout` (one page's chunk) and `ensure_xpointer_layout` (one
+  XPointer's chunk) are the only places a chunk is laid out outside the open
+  pass and the worker. Every API that needs real geometry goes through them.
+- The chunk -> `DocFragment` map is read from the chunk markup
+  (`ChunkSource::spine`), not from a layout, because an XPointer has to find its
+  chunk before that chunk has ever been laid out. That replaced
+  `ChunkLayout::spine_slots`, so the map has one source instead of two.
+- Whole-book queries that cannot work from estimates call
+  `ensure_layout_complete()`. Full-text search does (from cre-lua): skipping
+  unlaid chunks would silently hide matches.
+
+The estimate itself comes from the opening chunk's bytes-per-page scaled by each
+chunk's HTML size (a pre-paginated chunk is one page). Measured: within 2% on
+21.epub, within 8% on the 24 MB book.
+
+Measured on x86_64 release, same fonts and settings:
+
+| Book | Open before | Open now | Converged |
+|---|---|---|---|
+| 21.epub (1.7 MB, 18 chunks) | 206 ms | 70 ms (forced) | 637 pages in 305 ms |
+| 24 MB text (25 MB, 268 chunks) | 5 627 ms | 396 ms | 16 719 pages in 5.6 s |
+
+The converged page count and the page hashes of the first, middle and last page
+are identical to a full open (checked on both books, and by the
+`lazy_open_converges_to_the_full_layout` test). By default 21.epub stays on the
+exact path; `CRE_LAZY_OPEN=1`/`0` forces either path for A/B runs, and
+`Document::with_options_lazy` / `with_options_exact` do it from the API.
+
+The costs, and why they stay contained:
+
+- Page numbers, the progress percentage and the library's page count are an
+  estimate for the length of the pass. This is the same degraded state
+  crengine's partial rerendering has, and the plugin sends one
+  `DocumentRerendered` when the pass ends, so the footer, the TOC and the saved
+  `doc_pages` become exact then.
+- A TOC entry in a chunk that is not laid out yet points at that chunk's first
+  page (a stand-in, better than a page number of 0); the jump still lands in the
+  right chunk, and after the pass the entry has its exact page and XPointer.
+- The worker competes with page turns for the two cores, exactly as a settings
+  change does today.
+- Memory does not grow: the open path holds one DOM at a time instead of one per
+  worker, and only page metadata is kept per chunk.
+
 
 Measured on x86_64 release (interleaved runs):
 

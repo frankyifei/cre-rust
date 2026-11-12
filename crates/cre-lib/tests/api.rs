@@ -1119,3 +1119,66 @@ fn goto_pos_returns_to_the_page_it_came_from() {
         );
     }
 }
+
+/// A lazily opened book must reach exactly the page numbers a full open
+/// produces, and stay usable (navigation, rendering) while the background pass
+/// is still running.
+#[test]
+fn lazy_open_converges_to_the_full_layout() {
+    require_resources();
+
+    let options = DocumentOptions {
+        width: 600,
+        height: 800,
+        font_size: 18.0,
+        page_margin: 32.0,
+        ..Default::default()
+    };
+    let mut lazy = Document::with_options_lazy(fixture("juliet.epub"), &options).unwrap();
+    assert!(
+        lazy.has_background_layout(),
+        "the lazy path must leave the rest to the background worker"
+    );
+
+    // The reader restores its position and opens the TOC before the pass ends:
+    // every entry already has a page, and a jump into a chunk that has not been
+    // laid out yet lays that one chunk out and draws.
+    assert!(
+        lazy.toc().iter().all(|item| item.page.is_some()),
+        "TOC entries must have a stand-in page until the pass ends"
+    );
+    let estimated_last = lazy.page_count();
+    let landed = lazy.go_to_page(estimated_last).unwrap();
+    assert!(
+        (1..=estimated_last).contains(&landed),
+        "a page-number jump before convergence lands inside the estimate"
+    );
+    assert!(
+        has_ink(&lazy.render_page(landed).unwrap()),
+        "a page in a chunk laid out on demand must render"
+    );
+
+    // Reading the page count installs whatever the worker has finished, so this
+    // loop also advances the pass; wait for it to end.
+    let mut rounds = 0;
+    while lazy.has_background_layout() && rounds < 100_000 {
+        if !lazy.drain_background_layouts() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        rounds += 1;
+    }
+
+    let full = Document::with_options_exact(fixture("juliet.epub"), &options).unwrap();
+    assert_eq!(
+        lazy.page_count(),
+        full.page_count(),
+        "the converged lazy open must match a full layout page for page"
+    );
+    for page in [1usize, full.page_count() / 2, full.page_count()] {
+        assert_eq!(
+            lazy.xpointer_from_page(page).unwrap(),
+            full.xpointer_from_page(page).unwrap(),
+            "page {page} starts at the same place in both layouts"
+        );
+    }
+}

@@ -2282,11 +2282,16 @@ unsafe extern "C-unwind" fn doc_page_xpointer(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
         let page = arg_int(l, 2).max(1) as usize;
-        let xpointer = doc_ref(l)
-            .and_then(|doc| doc.inner.as_ref())
-            .and_then(|inner| inner.xpointer_from_page(page).ok())
-            .unwrap_or_default();
-        push_str(l, &xpointer);
+        // A page in a chunk the background pass has not reached yet has no
+        // XPointer yet. Callers store what they get (bookmarks, the last read
+        // position), so lay that one chunk out instead of returning an empty
+        // string.
+        let xpointer = doc_ref_mut(l).and_then(|doc| {
+            let inner = doc.inner.as_mut()?;
+            let page = inner.ensure_page_layout(page).ok()?;
+            inner.xpointer_from_page(page).ok()
+        });
+        push_str(l, xpointer.as_deref().unwrap_or_default());
     }
     1
 }
@@ -2615,9 +2620,15 @@ unsafe extern "C-unwind" fn doc_find_text(l: *mut lua_State) -> c_int {
         let pattern_is_regex = arg_bool(l, 6);
         let requested = arg_int(l, 7);
         let search_flags = arg_int(l, 8) as i32;
-        let Some(inner) = doc_ref(l).and_then(|doc| doc.inner.as_ref()) else {
+        let Some(inner) = doc_mut_synced(l).and_then(|doc| doc.inner.as_mut()) else {
             return 0;
         };
+        // Full-text search walks every page, so a book that is still being laid
+        // out in the background (or was opened lazily) has to be completed
+        // first: chunks without lines would silently hide matches.
+        if inner.ensure_layout_complete().is_err() {
+            return 0;
+        }
         let Some(hits) = find_text_document_hits(
             inner,
             &query,
@@ -2753,9 +2764,12 @@ unsafe extern "C-unwind" fn doc_find_all_text(l: *mut lua_State) -> c_int {
         let requested = arg_int(l, 5);
         let get_matched_text = arg_bool(l, 6);
         let search_flags = arg_int(l, 8) as i32;
-        let Some(inner) = doc_ref(l).and_then(|doc| doc.inner.as_ref()) else {
+        let Some(inner) = doc_mut_synced(l).and_then(|doc| doc.inner.as_mut()) else {
             return 0;
         };
+        if inner.ensure_layout_complete().is_err() {
+            return 0;
+        }
         let Some(hits) = find_all_document_hits(
             inner,
             &query,
