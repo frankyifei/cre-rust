@@ -186,13 +186,14 @@ converge to exactly the page count and page hashes of a fresh open):
 
 | Book | Chunks | Partial (current chunk only) | Converged | Slowest install |
 |---|---|---|---|---|
-| 21.epub (1.7 MB HTML) | 18 | 637 -> 779 pages | 801 pages in 260 ms | 0.8 ms |
+| 1.7 MB-HTML EPUB | 18 | 637 -> 779 pages | 801 pages in 260 ms | 0.8 ms |
 | 24 MB text book | 268 | 16 719 -> 18 413 pages | 18 639 pages in 5.3 s | 5.3 ms |
 
 The install cost is one `rebuild_view` per draw (the page table and the TOC
 are rebuilt); it stays under 6 ms even for 18 000 pages. On a device the worker
-takes the same time a full layout would (15-30 s for a 17 MB book), spread over
-the reading session instead of blocking it.
+takes the same time a full layout would — the 13.6 MB book above spends 43.9 s
+in QEMU and 100 s on the PW2 on that pass — spread over the reading session
+instead of blocking it.
 
 ### Telling KOReader the pass is over
 
@@ -238,7 +239,8 @@ Two small pieces close this:
 adding the method to the `CreDocument` wrapper would mean editing
 `frontend/document/credocument.lua`, which is what the plugin avoids.
 
-Measured in the x86 emulator (21.epub, font +8 px, background on):
+Measured in the x86_64 KOReader emulator (a 1.7 MB-HTML EPUB, font +8 px,
+background on):
 
 | | Live total | Footer shows |
 |---|---|---|
@@ -254,19 +256,36 @@ and the TOC keeps the page numbers computed at layout time.
 
 The open-time pass lays out every chunk, because every page number is a prefix
 sum over them. That is where most of "opening a book" goes on a large file:
-1.7 MB of chunk HTML takes ~0.25 s on x86 and ~1.5 s on a PW2, 25 MB takes 6.1 s
-and 25-30 s. Above `LAZY_OPEN_MIN_BYTES` (3 MB of chunk HTML) `open` now lays out
-the **opening chunk only**, fills in a page estimate for the rest and hands them
-to the same worker a settings change uses. The first page is on screen in ~70 ms
-instead of 206 ms for 21.epub, and in ~400 ms instead of 5.6 s for a 24 MB book
-(x86; the device divides the layout part by 4-6).
+1.7 MB of chunk HTML takes ~0.3 s on x86 and 3.3 s in QEMU-on-ARM, 25 MB takes
+5.7 s and 63.5 s. Above `LAZY_OPEN_MIN_BYTES` (3 MB of chunk HTML) `open` now lays
+out the **opening chunk only**, fills in a page estimate for the rest and hands
+them to the same worker a settings change uses.
 
-Measured on the device that motivated this: a 13.6 MB, 320-chunk EPUB (27 MB of
-generated HTML) needed **1 min 40 s** to show its first page and now shows it in
-about **2 s**; the background pass then finishes while the reader reads, and the
-page count and TOC converge to exactly what the full pass produced. On x86 the
-same book opens in 425 ms instead of 4 766 ms, and in QEMU-on-ARM in 3.4 s
-instead of 50.2 s.
+Measured with one build, one machine per column, and only the lazy open switched
+(`CRE_LAZY_OPEN=0` / `=1`). x86_64 is a native build; ARMv7 is the e-ink build
+under `qemu-user` (`-cpu cortex-a9`):
+
+| Book | Full layout at open | First chunk now | Speed-up | Pages exactly settled |
+|---|---|---|---|---|
+| 1.7 MB-HTML EPUB (18 chunks), x86_64 | 293 ms | 72 ms | 4.1x | 637 in 0.30 s |
+| 13.6 MB / 320 chunks, x86_64 | 4 103 ms | 440 ms | 9.3x | 8 310 in 4.4 s |
+| 13.6 MB / 320 chunks, ARMv7 (QEMU) | 43.9 s | 3.7 s | 11.8x | 8 310 in 46 s |
+| 24 MB text book, x86_64 | 5 688 ms | 380 ms | 15x | 16 719 in 5.9 s |
+| 24 MB text book, ARMv7 (QEMU) | 63.5 s | 3.9 s | 16.4x | 16 719 in 77 s |
+
+The device that motivated this measured **1 min 40 s** to the first page of the
+13.6 MB book before the change; after it the same book opens in a few seconds
+(observed, not timed to the second). QEMU is not a slower stand-in for a PW2
+here: on that book the device took 100 s for the full pass where QEMU takes
+43.9 s, so the ARM column is a *lower bound* for the device, not an upper one.
+Do not extrapolate a device number from it.
+
+There is **no disk cache**: every open re-reads the container, converts the
+markup and re-chunks the book, and the table above is that path with the layout
+part deferred. crengine keeps a rendered copy on disk and reloads it, which would
+make a second open of the same book nearly instant (the 320-chunk conversion is
+the floor of the 3.7 s figure). That is a future option; the current goal is to
+make the open fast without one, so no number here assumes a cache.
 
 The decision is taken in `ensure_layout`, not in the constructor: the reader
 parses on `loadDocument` and lays out on `renderDocument` (`cre-lua` opens with
@@ -292,10 +311,10 @@ The reading position does not depend on that pass:
 Restoring a position in the *last* chunk does not make opening proportional to
 where the reader stopped: the open lays out the first chunk, and the restore
 lays out the one chunk the saved XPointer points into. Measured on x86_64
-release, that second chunk costs 7.8 ms on the 24 MB book and 21.7 ms on
-21.epub (the latter also rebuilds the page table and re-bases the reading
-position), i.e. 0.1-0.3 s on a PW2, on top of an open that is already a fraction
-of the old one. What *is* estimated when opening at the end is the page number
+release, that second chunk costs 7.8 ms on the 24 MB book and 21.7 ms on the
+1.7 MB-HTML book (the latter also rebuilds the page table and re-bases the
+reading position); on a PW2 it is that one chunk's layout, which we have not
+timed separately. What *is* estimated when opening at the end is the page number
 shown for that position, until the pass ends.
 
 What holds this together (the invariants worth keeping):
@@ -316,21 +335,15 @@ What holds this together (the invariants worth keeping):
   unlaid chunks would silently hide matches.
 
 The estimate itself comes from the opening chunk's bytes-per-page scaled by each
-chunk's HTML size (a pre-paginated chunk is one page). Measured: within 2% on
-21.epub, within 8% on the 24 MB book.
-
-Measured on x86_64 release, same fonts and settings:
-
-| Book | Open before | Open now | Converged |
-|---|---|---|---|
-| 21.epub (1.7 MB, 18 chunks) | 206 ms | 70 ms (forced) | 637 pages in 305 ms |
-| 24 MB text (25 MB, 268 chunks) | 5 627 ms | 396 ms | 16 719 pages in 5.6 s |
+chunk's HTML size (a pre-paginated chunk is one page). Measured: within 2% on the
+1.7 MB-HTML book, within 8% on the 24 MB book.
 
 The converged page count and the page hashes of the first, middle and last page
 are identical to a full open (checked on both books, and by the
-`lazy_open_converges_to_the_full_layout` test). By default 21.epub stays on the
-exact path; `CRE_LAZY_OPEN=1`/`0` forces either path for A/B runs, and
-`Document::with_options_lazy` / `with_options_exact` do it from the API.
+`lazy_open_converges_to_the_full_layout` test). By default a book below the 3 MB
+threshold stays on the exact path; `CRE_LAZY_OPEN=1`/`0` forces either path for
+A/B runs, and `Document::with_options_lazy` / `with_options_exact` do it from the
+API.
 
 The costs, and why they stay contained:
 
@@ -352,13 +365,14 @@ Measured on x86_64 release (interleaved runs):
 
 | Book | Open before | Open after | Peak before | Peak after |
 |---|---|---|---|---|
-| `jk.epub` (70 chunks) | 1500 ms | 645 ms | 54 MB | 95 MB |
-| `12.epub` (image pages) | 480 ms | 415 ms | 178 MB | 228 MB |
-| `juliet.epub` | 202 ms | 202 ms | 46 MB | 57 MB |
+| a 70-chunk book | 1500 ms | 645 ms | 54 MB | 95 MB |
+| an image-heavy book | 480 ms | 415 ms | 178 MB | 228 MB |
+| a 0.8 MB novel | 202 ms | 202 ms | 46 MB | 57 MB |
 
 Parallel layout raises the peak, which is the wrong trade on a small device:
-`CRE_AVAILABLE_MB=128` gives `jk.epub` two workers (1532 -> 948 ms) and keeps
-`12.epub` on one worker, and the memory gate can always fall back to one.
+`CRE_AVAILABLE_MB=128` gives the 70-chunk book two workers (1532 -> 948 ms) and
+keeps the image-heavy book on one worker, and the memory gate can always fall
+back to one.
 
 ## Trimming
 
@@ -372,8 +386,8 @@ those arenas, so the process RSS stays high even when the data is gone.
 - `CRE_NO_TRIM=1` disables it for A/B measurements.
 
 Measured on a 738 kB book split into three 256 kB chunks, jumping across
-chunks: peak 63.8 -> 46.4 MB. On `zyj.epub`: open RSS 42.5 -> 36.4 MB, peak
-73.5 -> 42.4 MB.
+chunks: peak 63.8 -> 46.4 MB. On a large text book: open RSS 42.5 -> 36.4 MB,
+peak 73.5 -> 42.4 MB.
 
 ## Refusing a book that cannot fit
 
@@ -426,22 +440,22 @@ reserve as the exact check (the compressed text counts here, because nothing is
 allocated yet).
 
 Measured on the 24 MB book with `CRE_AVAILABLE_MB=22`: refusal in **under
-10 ms** with 8.4 MB max RSS, instead of 6.0 s and 132 MB. A normal `15.epub`
+10 ms** with 8.4 MB max RSS, instead of 6.0 s and 132 MB. A normal 7.3 MB book
 open is unchanged at 123 ms.
 
 ## Measurements
 
 | Change | Before | After |
 |---|---|---|
-| `15.epub` engine RSS, open / peak | 105 / 127 MB | 33 / 45 MB |
-| `15.epub` reader process, open / peak | 153 / 169 MB | 102 / 119 MB |
+| 7.3 MB book engine RSS, open / peak | 105 / 127 MB | 33 / 45 MB |
+| 7.3 MB book reader process, open / peak | 153 / 169 MB | 102 / 119 MB |
 | 24 MB text book RSS (LZ4) | 66.1 MB | 41.5 MB |
 | 24 MB text book, 38 MB budget, open peak | 132 MB | 64 MB |
 | 24 MB text book RSS after open (one XPointer per page) | 63.8 MB | 62.0 MB |
 | 43 MB AZW3, 38 MB budget, open peak | 60.8 MB | 34.1 MB |
 | 43 MB AZW3, 38 MB budget, steady | 31.7 MB | 25.0 MB |
 | 23 MB AZW3, 38 MB budget, open peak | 43.0 MB | 37.0 MB |
-| `zyj.epub` open / peak (arena trim) | 42.5 / 73.5 MB | 36.4 / 42.4 MB |
+| large text book open / peak (arena trim) | 42.5 / 73.5 MB | 36.4 / 42.4 MB |
 | 8 full-page JPEGs, 64 MB budget, peak | 126 MB | 56 MB |
 | 60-image book, RSS after open (LRU) | 40.1 MB | 35.6 MB |
 | 24 MB book at 22 MB free, time to refuse | 6.0 s | < 10 ms |

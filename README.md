@@ -29,27 +29,45 @@ workspace has 36 test targets.
 ## Performance highlights
 
 Opening a book used to cost one layout per chunk, because every page number is a
-prefix sum over them. On a 13.6 MB, 320-chunk EPUB that was **1 min 40 s on a
-Kindle PW2** before the first page appeared. Now the reader lays out the opening
-chunk, draws the first page, and lays the rest out in reading order on a
-background worker: the same book is on screen in about **2 seconds**, and the
-page total and TOC page numbers settle while the reader is already reading.
+prefix sum over them. On the 13.6 MB, 320-chunk EPUB below that meant **1 min 40 s
+on a Kindle PW2** before the first page appeared. The reader now lays out the
+opening chunk, draws the first page, and lays the rest out in reading order on a
+background worker.
 
-| Case | Before | Now |
-|---|---|---|
-| First page, 13.6 MB EPUB / 320 chunks, Kindle PW2 | 1 min 40 s | ~2 s |
-| First page, same book, x86_64 | 4.8 s | 0.43 s |
-| First page, 24 MB text book, x86_64 | 5.6 s | 0.4 s |
-| First page, 24 MB text book, ARM (QEMU) | 64 s | 3.6 s |
-| Font change, 24 MB book | 5.6 s blocking | page is instant, 5.3 s in the background |
+Measured with the same build, the same books, and only the lazy open switched
+(`CRE_LAZY_OPEN=0` / `=1`). The x86_64 column is a native build; the ARM column
+is the ARMv7 e-ink build under `qemu-user` (`-cpu cortex-a9`):
+
+| Book | Full layout at open | First chunk now | Speed-up | Pages exactly settled |
+|---|---|---|---|---|
+| 1.7 MB-HTML EPUB (18 chunks), x86_64 | 293 ms | 72 ms | 4.1x | 637 in 0.30 s |
+| 13.6 MB / 320 chunks, x86_64 | 4 103 ms | 440 ms | 9.3x | 8 310 in 4.4 s |
+| 13.6 MB / 320 chunks, ARMv7 (QEMU) | 43.9 s | 3.7 s | 11.8x | 8 310 in 46 s |
+| 24 MB text book, x86_64 | 5 688 ms | 380 ms | 15x | 16 719 in 5.9 s |
+| 24 MB text book, ARMv7 (QEMU) | 63.5 s | 3.9 s | 16.4x | 16 719 in 77 s |
+
+The Kindle PW2 that motivated this timed **1 min 40 s** to the first page of the
+13.6 MB book before the change; afterwards the same book opens in a few seconds
+(observed, not timed to the second). Do not read the QEMU column as the device
+number: on this book the device was *slower* than QEMU — 100 s for the full pass
+where QEMU takes 44 s — so QEMU is a lower bound for a PW2, not a slower proxy.
 
 The result is not an approximation: the converged page count and the page hashes
-are identical to a full layout, on both a 1.7 MB book and a 24 MB one. The
+are identical to a full layout, on both the 1.7 MB and the 24 MB book. The
 reading position is restored by XPointer, so it is exact from the first draw; a
 TOC or bookmark jump into a chunk that has not been laid out yet costs one chunk,
 not the book. The same machinery makes a font, line-spacing or margin change a
 relayout for **every format** (the layout settings are kept out of the chunk
 HTML as `cre-css` tokens), instead of reopening and re-parsing the book.
+
+**There is no disk cache.** Every open re-reads the container, converts the
+markup and re-chunks the book; the numbers above are that path, made cheap by
+laying out only the first chunk. crengine instead keeps a rendered copy on disk
+and reloads it, which would make a *second* open of the same book nearly
+instant, including for the books that are still expensive here (a 320-chunk
+conversion is the floor of the 3.7 s above). Building that cache is a future
+option we are deliberately not spending time on yet: the current goal is to make
+the open fast without one. Any disk-cache numbers would be a different table.
 
 Details and measurements: [Chunked layout](#chunked-layout-with-partial-relayout),
 [Opening a big book](#opening-a-big-book), [docs/MEMORY.md](docs/MEMORY.md).
@@ -149,12 +167,12 @@ index, the page total and the TOC page numbers converge to the real layout
 without blocking the reader. This holds for every format: the chunk HTML never
 contains the layout settings (they are `cre-css` tokens filled in when a chunk is
 laid out), so a settings change re-lays out the chunks a book already has instead
-of reopening it. Measured in the QEMU harness:
+of reopening it. Measured on ARMv7 under `qemu-user` (the e-ink build):
 
 | Book | Full relayout | Partial relayout |
 |---|---|---|
-| `juliet.epub` | 4.1 s | 0.47 s |
-| `zyj.epub` | 7.3 s | 0.71 s |
+| a 0.8 MB novel (a few chunks) | 4.1 s | 0.47 s |
+| a large text book (many chunks) | 7.3 s | 0.71 s |
 
 On x86 a 24 MB text book converges in 5.3 s while the reader keeps turning
 pages (the install costs 5 ms per draw), and a 1.7 MB book in 260 ms; the page
@@ -170,21 +188,26 @@ right immediately; page numbers settle when the pass ends. Small books (below
 the threshold) keep the full pass, which costs about a second and gives exact
 numbers from the first draw; `CRE_LAZY_OPEN=1`/`0` forces either path.
 
-| Book | Full layout at open | First chunk now | Converged |
+| Book | Full layout at open | First chunk now | Pages exactly settled |
 |---|---|---|---|
-| 21.epub (1.7 MB HTML) | 206 ms | 70 ms | 637 pages in 0.3 s |
-| 13.6 MB / 27 MB HTML / 320 chunks, x86 | 4 766 ms | **425 ms** | 8 310 pages in 4.4 s |
-| the same book on ARM (QEMU) | 50.2 s | **3.4 s** | 4.4 s of background work |
-| 24 MB text book, x86 | 5 627 ms | **396 ms** | 16 719 pages in 5.6 s |
-| 24 MB text book, ARM (QEMU) | 63.9 s | **3.6 s** | 68 s of background work |
+| 1.7 MB-HTML EPUB (18 chunks), x86_64 native | 293 ms | 72 ms | 637 in 0.30 s |
+| 13.6 MB / 27 MB HTML / 320 chunks, x86_64 native | 4 103 ms | 440 ms | 8 310 in 4.4 s |
+| the same book, ARMv7 under qemu-user | 43.9 s | 3.7 s | 8 310 in 46 s |
+| 24 MB text book, x86_64 native | 5 688 ms | 380 ms | 16 719 in 5.9 s |
+| 24 MB text book, ARMv7 under qemu-user | 63.5 s | 3.9 s | 16 719 in 77 s |
+
+The 13.6 MB book was also measured on a Kindle PW2: 1 min 40 s to the first page
+before the change, a few seconds after it (observed, not timed to the second).
+The device is not faster than QEMU on this workload — it took 100 s for the full
+pass where QEMU takes 44 s — so the ARM column is a lower bound for the device.
 
 The converged page count and page hashes are identical to a full open (there are
 tests for that), and a TOC or bookmark jump into a chunk that has not been laid
 out yet costs one chunk, not the book. Restoring a position at the very end of a
 book does not cost more than restoring one at the start: the open lays out the
 first chunk and the restore lays out the single chunk the XPointer names (+8 to
-+22 ms on x86, ~0.1-0.3 s on a PW2). Page-number jumps land near the target
-until the pass ends; XPointer jumps are exact from the first draw.
++22 ms on x86, proportionally more on a PW2). Page-number jumps land near the
+target until the pass ends; XPointer jumps are exact from the first draw.
 
 Until it ends, page numbers, the progress percentage and the TOC page numbers
 are estimates — the same degraded state crengine's partial rerendering has.
