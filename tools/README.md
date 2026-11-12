@@ -8,6 +8,7 @@ This directory holds the development tools. They are not part of the
 | `qemu-kindle/` | Run the genuine Kindle KOReader build on a Linux desktop |
 | `qemu-kindle/plugin/` | KOReader input and script plugin for the harness |
 | `qemu-kindle/examples/` | Example `QK_SCRIPT` files |
+| `koreader-plugins/` | KOReader plugin that keeps page totals and the TOC in sync with the background layout |
 
 ## Quick start: run KOReader with QEMU
 
@@ -104,11 +105,27 @@ The examples:
 Use this hook to test a chapter jump, a font change, a page turn, or a timing
 problem.
 
+## Page-number plugin
+
+`koreader-plugins/crebackgroundlayout.koplugin` is for the reader, not the
+harness. A font, spacing or margin change is laid out in the background, so the
+page total and the TOC page numbers move while the pass runs; the plugin follows
+the total while it runs and tells KOReader when the numbers are final (see
+[`koreader-plugins/README.md`](koreader-plugins/README.md) and
+[`../docs/PAGE-NUMBERS.md`](../docs/PAGE-NUMBERS.md)).
+
+```sh
+cp -r tools/koreader-plugins/crebackgroundlayout.koplugin <koreader>/plugins/
+```
+
 ## Directory layout
 
 ```text
 tools/
   README.md
+  koreader-plugins/
+    README.md            What the plugin does and why
+    crebackgroundlayout.koplugin/
   qemu-kindle/
     README.md            Full harness documentation
     run.sh               Repository wrapper (build module + run)

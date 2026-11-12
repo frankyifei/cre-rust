@@ -191,6 +191,33 @@ are estimates — the same degraded state crengine's partial rerendering has.
 KOReader is told when it ends (see `docs/MEMORY.md`), which is what refreshes
 the footer total and the TOC.
 
+### Keeping page numbers in sync (`crebackgroundlayout.koplugin`)
+
+The engine cannot push an event into KOReader: the `cre` API is a set of
+questions the reader asks. The reader caches the answers — `ReaderFooter` keeps
+the page total until a `TocReset`, `ReaderToc` keeps the page numbers it read at
+layout time until a `DocumentRerendered` — so a background pass needs someone to
+tell the reader when the numbers moved and when they are final. crengine gets
+that from reloading the document after its background subprocess; this engine has
+nothing to reload, so the frontend half is a small plugin instead of a patch:
+KOReader can keep following upstream.
+
+```sh
+cp -r tools/koreader-plugins/crebackgroundlayout.koplugin <koreader>/plugins/
+```
+
+While a pass runs it re-reads the page total once a second (which also advances
+the pass, so an idle reader still converges) and refreshes the footer; when the
+pass ends it sends one `DocumentRerendered`, which drops the TOC cache so the TOC
+opens with the final page numbers. It is a plugin because that is the only way to
+do it without editing KOReader, and it only uses the public events
+(`TocReset`, `DocumentRerendered`) that KOReader already listens to.
+
+[docs/PAGE-NUMBERS.md](docs/PAGE-NUMBERS.md) walks through the mechanism, the two
+reliability rules (re-arm on every reader-ready, because a style change reloads
+the document; read the page count before trusting the pending flag) and the
+diagnostics (`CREBG_LOG=1`).
+
 ### Memory: one chunk, kept compressed
 
 A big text book keeps the generated HTML of every chunk so a settings change
