@@ -744,6 +744,8 @@ struct ChunkLayoutWork<'a> {
     count: usize,
     resources: &'a ResourceSource,
     margins: &'a [PageMargins],
+    /// Whether the book's own `@font-face` fonts may be used.
+    embedded_fonts: bool,
 }
 
 impl ChunkLayoutWork<'_> {
@@ -762,6 +764,7 @@ impl ChunkLayoutWork<'_> {
             self.margins[index],
             self.fixed_heights[index],
             self.resources,
+            self.embedded_fonts,
         )
     }
 
@@ -1351,6 +1354,20 @@ pub struct Document {
     font_context: Arc<FontContext>,
     /// Every chunk's own layout, parallel to `sources`.
     entries: Vec<ChunkEntry>,
+    /// Family names from the book's `@font-face` rules, in the order they are
+    /// declared. The fonts themselves are loaded by Blitz (see
+    /// `cre_epub::font_faces_in` / `font_faces_in_stylesheets`); this is the
+    /// list the reader shows.
+    embedded_fonts: Vec<String>,
+    /// Whether the book's own fonts may be used
+    /// (`crengine.doc.embedded.fonts` in cre.cpp).
+    ///
+    /// Off strips the `@font-face` rules: from a chunk's HTML before it is
+    /// parsed, and from the stylesheets `EpubNet`/`FileNet` serve (a chapter's
+    /// `<link rel="stylesheet">` is fetched through them, so the rules are not
+    /// in the chunk HTML at all). An atomic because the network provider holds
+    /// the same flag and a relayout copies it into the background worker.
+    embedded_fonts_flag: Arc<std::sync::atomic::AtomicBool>,
     chunks: Vec<ChunkMeta>,
     pages: Vec<PageMeta>,
     xpointer_pages: HashMap<String, usize>,
@@ -1584,6 +1601,7 @@ impl Document {
                 let mut sources: Vec<ChunkSource> = Vec::new();
                 let mut fixed_layouts: Vec<Option<FixedLayout>> = Vec::new();
                 let mut content_images: Vec<String> = Vec::new();
+                let mut embedded_fonts: Vec<String> = Vec::new();
                 let mut chunk_image_bytes = 0u64;
                 let compression_started = std::time::Instant::now();
                 book.to_html_chunks_budgeted_stream(
@@ -1594,6 +1612,14 @@ impl Document {
                     |html| {
                         fixed_layouts.push(parse_fixed_layout(&html));
                         content_images.extend(cre_epub::image_sources_in(&html));
+                        for name in cre_epub::font_faces_in(&html) {
+                            if !embedded_fonts
+                                .iter()
+                                .any(|existing: &String| existing.eq_ignore_ascii_case(&name))
+                            {
+                                embedded_fonts.push(name);
+                            }
+                        }
                         chunk_image_bytes =
                             chunk_image_bytes
                                 .max(cre_epub::chunk_image_bytes(&book.resource_provider, &html)
@@ -1613,8 +1639,21 @@ impl Document {
                 }
                 let cover_image = epub_cover_image(&book);
                 let has_non_linear_flows = book.spine.iter().any(|item| !item.linear);
+                // The chapter's `<link rel="stylesheet">` is fetched through
+                // `EpubNet`, so the stylesheet is where most books declare their
+                // fonts. Scan both places: this covers a stylesheet-only book
+                // and one that inlines the rules.
+                for name in cre_epub::font_faces_in_stylesheets(&book) {
+                    if !embedded_fonts
+                        .iter()
+                        .any(|existing| existing.eq_ignore_ascii_case(&name))
+                    {
+                        embedded_fonts.push(name);
+                    }
+                }
+                let embedded_fonts_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
                 let resource_provider = Arc::new(book.resource_provider);
-                Self::build_from_sources(
+                let mut document = Self::build_from_sources(
                     sources,
                     fixed_layouts,
                     content_images,
@@ -1622,6 +1661,7 @@ impl Document {
                     Arc::new(EpubNet {
                         svg: svg_raster.clone(),
                         resource_provider: resource_provider.clone(),
+                        embedded_fonts: embedded_fonts_flag.clone(),
                     }),
                     ResourceSource::Epub(resource_provider),
                     svg_raster.clone(),
@@ -1637,7 +1677,10 @@ impl Document {
                     lazy,
                     source_bytes,
                     chunk_image_bytes,
-                )
+                )?;
+                document.embedded_fonts = embedded_fonts;
+                document.embedded_fonts_flag = embedded_fonts_flag;
+                Ok(document)
             }
             DocumentFormat::Fb2 => {
                 let mut book = Fb2Book::open(path)?;
@@ -1899,12 +1942,15 @@ impl Document {
                     identifiers: None,
                     item_count: 1,
                 };
-                Self::build(
+                let embedded_fonts = cre_epub::font_faces_in(&html);
+                let embedded_fonts_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                let mut document = Self::build(
                     split_single_document(html, &ResourceSource::Empty),
                     &base_url,
                     Arc::new(FileNet {
                         root: root.clone(),
                         svg: svg_raster.clone(),
+                        embedded_fonts: embedded_fonts_flag.clone(),
                     }),
                     ResourceSource::Empty,
                     Arc::new(ImageRaster::new(options.width, options.height)),
@@ -1920,7 +1966,10 @@ impl Document {
                     lazy,
                     source_bytes,
                     0,
-                )
+                )?;
+                document.embedded_fonts = embedded_fonts;
+                document.embedded_fonts_flag = embedded_fonts_flag;
+                Ok(document)
             }
         }
     }
@@ -2073,6 +2122,8 @@ impl Document {
             page_map: Vec::new(),
             raw_toc,
             raw_page_map_items: page_map_items,
+            embedded_fonts: Vec::new(),
+            embedded_fonts_flag: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             layout_done: false,
             lazy_open: lazy,
             active: RefCell::new(None),
@@ -2315,6 +2366,8 @@ impl Document {
             self.margins,
             fixed_height,
             &self.resources,
+            self.embedded_fonts_flag
+                .load(std::sync::atomic::Ordering::Relaxed),
         )
     }
 }
@@ -2336,7 +2389,18 @@ fn layout_chunk_html(
     margins: PageMargins,
     fixed_height: Option<f32>,
     resources: &ResourceSource,
+    embedded_fonts: bool,
 ) -> Result<(ChunkLayout, HtmlDocument, Vec<LineBox>, Vec<PageStart>)> {
+    // A book's own `@font-face` fonts are fetched by Blitz while it parses the
+    // chunk; dropping the rules is therefore the way to ignore them, and a
+    // `font-family` that no longer resolves falls back to the next one in the
+    // list (the reader's font).
+    let html = if embedded_fonts {
+        std::borrow::Cow::Borrowed(html)
+    } else {
+        cre_epub::strip_font_faces(html)
+    };
+    let html = html.as_ref();
     // A caller that never configured page margins keeps the uniform
     // `page_margin` of the options in use for this chunk (a fixed-layout chunk
     // zeroes it), and a pre-paginated page gets no margin at all: it is scaled
@@ -2909,6 +2973,9 @@ impl Document {
         let font_context = Arc::clone(&self.font_context);
         let font_blobs = self.font_blobs.clone();
         let resources = self.resources.clone();
+        let embedded_fonts = self
+            .embedded_fonts_flag
+            .load(std::sync::atomic::Ordering::SeqCst);
         let options: Vec<DocumentOptions> = indices
             .iter()
             .map(|&index| self.layout_options_for_chunk(index))
@@ -2947,6 +3014,7 @@ impl Document {
                     margins[slot],
                     fixed_heights[slot],
                     &resources,
+                    embedded_fonts,
                 );
                 let Ok((layout, doc, lines, page_starts)) = laid_out else {
                     break;
@@ -3434,6 +3502,9 @@ impl Document {
                 count,
                 resources: &self.resources,
                 margins: &chunk_margins,
+                embedded_fonts: self
+                    .embedded_fonts_flag
+                    .load(std::sync::atomic::Ordering::SeqCst),
             };
             std::thread::scope(|scope| {
                 for _ in 1..workers {
@@ -3528,6 +3599,46 @@ impl Document {
 
     pub fn metadata(&self) -> &DocumentMetadata {
         &self.metadata
+    }
+
+    /// Family names the book declares with `@font-face`, in declaration order.
+    ///
+    /// The fonts are fetched and registered by Blitz while a chunk is parsed;
+    /// this is what the reader lists (and what decides whether its "embedded
+    /// fonts" setting is offered at all).
+    pub fn embedded_font_list(&self) -> &[String] {
+        &self.embedded_fonts
+    }
+
+    /// Whether the book's own fonts are used (`crengine.doc.embedded.fonts`).
+    ///
+    /// Turning them off drops the `@font-face` rules — from a chunk's HTML and
+    /// from the stylesheets the network provider serves — so a `font-family`
+    /// that no longer resolves falls back to the reader's font. Call
+    /// [`Self::relayout`] afterwards to apply it to chunks already laid out.
+    pub fn set_embedded_fonts(&mut self, enabled: bool) {
+        if enabled == self.embedded_fonts_enabled() {
+            return;
+        }
+        self.embedded_fonts_flag
+            .store(enabled, std::sync::atomic::Ordering::SeqCst);
+        // Dropping the rules keeps the *next* layout from fetching the fonts,
+        // but Blitz registers an `@font-face` font in the document's font
+        // context, and that registration outlives the chunk it came from. A
+        // fresh context makes the fonts already registered unavailable, which is
+        // what crengine's "do not use the document's fonts" does (a `font-family`
+        // that resolves to nothing falls back to the reader's font).
+        //
+        // TODO(upstream): `blitz-dom` has no way to disable or unregister the
+        // fonts of a document, so this relies on the context being rebuilt.
+        // Drop the rebuild once the font registry can be told to forget a
+        // document's faces.
+        self.rebuild_font_context();
+    }
+
+    pub fn embedded_fonts_enabled(&self) -> bool {
+        self.embedded_fonts_flag
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn page_count(&self) -> usize {
@@ -9334,6 +9445,9 @@ fn encode_png(rgba: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
 struct EpubNet {
     resource_provider: Arc<LazyResource>,
     svg: Arc<ImageRaster>,
+    /// Shared with the `Document`: a relayout must see the reader's current
+    /// "use the book's fonts" setting without rebuilding the provider.
+    embedded_fonts: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl NetProvider for EpubNet {
@@ -9351,8 +9465,22 @@ impl NetProvider for EpubNet {
         // A document's `<body class="…">` becomes a `<section class="…">` in
         // the chunk, so the stylesheet's `body.class` rules have to lose the
         // `body` part to keep matching (a cover's `body.cov2 { background }`).
+        //
+        // The book's `@font-face` rules usually live here rather than in the
+        // chunk HTML (a chapter links its stylesheet), so honouring
+        // `crengine.doc.embedded.fonts` means dropping them before Blitz parses
+        // the sheet: a family that no longer resolves falls back to the next
+        // one in the list, which is the reader's font.
         let bytes = if key.to_ascii_lowercase().ends_with(".css") {
-            cre_epub::body_selectors_to_class(&String::from_utf8_lossy(&bytes)).into_bytes()
+            let css = cre_epub::body_selectors_to_class(&String::from_utf8_lossy(&bytes));
+            if self
+                .embedded_fonts
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                css.into_bytes()
+            } else {
+                cre_epub::strip_font_faces(&css).into_owned().into_bytes()
+            }
         } else {
             bytes
         };
@@ -9400,6 +9528,7 @@ impl NetProvider for MapNet {
 struct FileNet {
     root: PathBuf,
     svg: Arc<ImageRaster>,
+    embedded_fonts: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl NetProvider for FileNet {
@@ -9413,6 +9542,17 @@ impl NetProvider for FileNet {
             && candidate.is_file()
         {
             bytes = std::fs::read(&candidate).unwrap_or_default();
+        }
+        // Same rule as `EpubNet`: a linked stylesheet carries the book's
+        // `@font-face` rules, so it is where the setting is applied.
+        if !self
+            .embedded_fonts
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && decoded.to_ascii_lowercase().ends_with(".css")
+        {
+            bytes = cre_epub::strip_font_faces(&String::from_utf8_lossy(&bytes))
+                .into_owned()
+                .into_bytes();
         }
         let bytes = self.svg.rasterize(&decoded, &bytes).unwrap_or(bytes);
         let bytes = self.svg.placeholder(&decoded, &bytes).unwrap_or(bytes);

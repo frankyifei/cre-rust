@@ -200,6 +200,15 @@ provider serves the bytes, so the declared family, weight and style are
 registered without a separate font list. TTF, OTF, WOFF and WOFF2 are decoded
 (the `woff` feature is enabled). `local()` sources are skipped upstream.
 
+The reader can turn those fonts off (`crengine.doc.embedded.fonts.enabled`).
+Most books keep the rules in a linked stylesheet rather than in the chapter
+HTML, so the setting is applied in two places: `cre_epub::strip_font_faces` on
+the chunk HTML, and the same strip on the `.css` bytes served by `EpubNet` and
+`FileNet`. Blitz registers a fetched face into the document's `FontContext` and
+that registration outlives the chunk, so the flag also rebuilds the context —
+otherwise the family would stay resolvable after the rules were dropped. See
+[`FONTS.md`](FONTS.md) for the measurements.
+
 ## Images
 
 The format crates rewrite image references to `epub://book/<path>` URLs. The

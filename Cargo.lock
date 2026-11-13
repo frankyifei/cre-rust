@@ -430,10 +430,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cre-css"
+version = "0.1.0"
+
+[[package]]
 name = "cre-epub"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cre-css",
  "percent-encoding",
  "roxmltree 0.21.1",
  "url",
@@ -446,6 +451,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "cre-css",
  "roxmltree 0.21.1",
 ]
 
@@ -454,6 +460,7 @@ name = "cre-kf8"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cre-css",
  "cre-pdb",
 ]
 
@@ -467,6 +474,7 @@ dependencies = [
  "blitz-html",
  "blitz-paint",
  "blitz-traits",
+ "cre-css",
  "cre-epub",
  "cre-fb2",
  "cre-kf8",
@@ -513,6 +521,7 @@ name = "cre-mobi"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cre-css",
  "cre-pdb",
 ]
 
@@ -552,6 +561,7 @@ name = "cre-text"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cre-css",
 ]
 
 [[package]]

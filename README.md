@@ -319,6 +319,11 @@ LTO and stripping keep the module around 19.7 MB. See
   Serif CJK JP/KR/SC/TC/HK and similar);
 - fonts embedded in the book (`@font-face`, TTF/OTF/WOFF/WOFF2) through the
   same resource provider, with the declared family, weight and style;
+- the reader's **Embedded Fonts** toggle and the book's font list
+  (`getEmbeddedFontList()`): the engine reports the families a book declares and
+  can drop them at layout time, without reopening the book — on a 13 MB book
+  with two embedded TTFs that is 80 MB → 34.6 MB of RSS and 707 → 679 pages.
+  See [`docs/FONTS.md`](docs/FONTS.md);
 - generic family lists, fallback chains, font bias, and the reader's
   `font-family: math` slot;
 - bold and italic synthesis;

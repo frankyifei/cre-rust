@@ -60,6 +60,10 @@ struct Doc {
     interline: i32,
     stylesheet: String,
     embedded_stylesheet_enabled: bool,
+    /// Whether the book's own `@font-face` fonts are used
+    /// (`crengine.doc.embedded.fonts.enabled`). Off means a relayout without
+    /// the rules, which falls back to the reader's font.
+    embedded_fonts_enabled: bool,
     background_color: String,
     background_color_value: u32,
     background_image: String,
@@ -125,6 +129,7 @@ impl Doc {
             interline: 100,
             stylesheet: String::new(),
             embedded_stylesheet_enabled: true,
+            embedded_fonts_enabled: true,
             background_color: String::new(),
             background_color_value: 0xFF_FFFF,
             background_image: String::new(),
@@ -319,7 +324,7 @@ impl Doc {
         // invalidate the layout: rebuilding the whole book for it was a
         // multi-second freeze that changed nothing on the page.
         format!(
-            "{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
+            "{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
             path,
             self.width,
             self.height,
@@ -334,6 +339,7 @@ impl Doc {
             self.interline,
             self.stylesheet,
             self.embedded_stylesheet_enabled,
+            self.embedded_fonts_enabled,
             self.render_dpi,
             self.scale_font_with_dpi,
             properties,
@@ -440,7 +446,14 @@ impl Doc {
                 self.scale_font_with_dpi = enabled;
                 true
             }
-            "crengine.doc.embedded.fonts.enabled" => false,
+            "crengine.doc.embedded.fonts.enabled" => {
+                let enabled = value != 0;
+                if enabled == self.embedded_fonts_enabled {
+                    return false;
+                }
+                self.embedded_fonts_enabled = enabled;
+                true
+            }
             // Typography sliders: they end up in the settings stylesheet.
             "crengine.style.space.width.scale.percent"
             | "crengine.style.space.condensing.percent"
@@ -508,6 +521,9 @@ impl Doc {
         opened.set_font_gamma(self.render_font_gamma());
         opened.set_background_color(self.background_color_value);
         opened.set_page_margins(self.page_margins());
+        // The setting survives a reopen (a page-size change reopens the book):
+        // `Document` always opens with the book's own fonts enabled.
+        opened.set_embedded_fonts(self.embedded_fonts_enabled);
         self.inner = Some(opened);
         self.path = Some(path);
         self.needs_layout = true;
@@ -623,6 +639,7 @@ impl Doc {
         let fonts_changed = self.refresh_font_data(&options).unwrap_or(false);
         if let Some(inner) = self.inner.as_mut() {
             inner.set_page_margins(margins);
+            inner.set_embedded_fonts(self.embedded_fonts_enabled);
         }
         if self
             .inner
@@ -3682,12 +3699,20 @@ unsafe extern "C-unwind" fn doc_set_embedded_stylesheet(l: *mut lua_State) -> c_
 unsafe extern "C-unwind" fn doc_set_embedded_fonts(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
     unsafe {
-        let enabled = arg_int(l, 2);
+        let enabled = arg_int(l, 2) != 0;
+        let value = if enabled {
+            "1".to_string()
+        } else {
+            "0".to_string()
+        };
         if let Some(doc) = doc_mut(l) {
-            doc.properties.insert(
-                "crengine.doc.embedded.fonts.enabled".to_string(),
-                enabled.to_string(),
-            );
+            let changed = doc.embedded_fonts_enabled != enabled;
+            doc.embedded_fonts_enabled = enabled;
+            doc.properties
+                .insert("crengine.doc.embedded.fonts.enabled".to_string(), value);
+            if changed {
+                doc.relayout();
+            }
         }
     }
     0
@@ -3899,7 +3924,35 @@ unsafe extern "C-unwind" fn doc_get_header_height(_l: *mut lua_State) -> c_int {
 
 unsafe extern "C-unwind" fn doc_get_embedded_font_list(l: *mut lua_State) -> c_int {
     // SAFETY: `l` is the active Lua state.
-    unsafe { lua::lua_newtable(l) };
+    unsafe {
+        // cre.cpp returns a `name -> in use` table (and the reader calls
+        // `next()` on it, so it must never be nil). The names exist once the
+        // book is parsed, which a lazy open defers until the first draw: go
+        // through `doc_ref` so a pending layout is done instead of answering
+        // "no embedded fonts".
+        let names: Vec<String> = match doc_ref(l) {
+            Some(doc) => doc
+                .inner
+                .as_ref()
+                .map(|inner| inner.embedded_font_list().to_vec())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        lua::lua_newtable(l);
+        for name in names {
+            let Ok(name) = std::ffi::CString::new(name) else {
+                // A name with an interior NUL cannot be a CSS font family.
+                continue;
+            };
+            // crengine reports whether the font was actually instantiated.
+            // Blitz registers a font under its family only when a rule uses it,
+            // but it does not expose that registry, so a listed name counts as
+            // used. TODO(upstream): report `false` for declared-but-unused
+            // fonts once Blitz exposes its font registry.
+            push_bool(l, true);
+            lua::lua_setfield(l, -2, name.as_ptr().cast());
+        }
+    }
     1
 }
 
@@ -4822,6 +4875,7 @@ unsafe extern "C-unwind" fn doc_render_hash(l: *mut lua_State) -> c_int {
             doc.margins.hash(&mut hasher);
             doc.view_mode.hash(&mut hasher);
             doc.embedded_stylesheet_enabled.hash(&mut hasher);
+            doc.embedded_fonts_enabled.hash(&mut hasher);
             doc.stylesheet.hash(&mut hasher);
             doc.path.hash(&mut hasher);
             doc.layout_height.hash(&mut hasher);

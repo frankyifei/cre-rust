@@ -78,10 +78,29 @@ fn main() {
     let pages = doc.page_count();
     let open_ms = started.elapsed().as_secs_f64() * 1000.0;
     println!(
-        "open_ms={open_ms:.1} pages={pages} rss_kb={} peak_kb={}",
+        "open_ms={open_ms:.1} pages={pages} rss_kb={} peak_kb={} fonts={:?}",
         rss_kb(),
-        peak_kb()
+        peak_kb(),
+        doc.embedded_font_list()
     );
+
+    // `EMBEDDED_FONTS=0` measures the same book with the `@font-face` rules
+    // dropped at layout time (a relayout, not a reopen).
+    if std::env::var("EMBEDDED_FONTS").ok().as_deref() == Some("0") {
+        let started = Instant::now();
+        doc.set_embedded_fonts(false);
+        let relaid = doc.relayout(&options).expect("relayout");
+        // A relayout lays out only the chunk being read straight away; the rest
+        // finishes in the background. Measure the whole book.
+        doc.ensure_layout_complete().expect("layout");
+        println!(
+            "embedded_fonts=off relayout_ok={relaid} relayout_ms={:.1} pages={} rss_kb={}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            doc.page_count(),
+            rss_kb()
+        );
+    }
+    let pages = doc.page_count();
 
     let mut total_render = 0.0f64;
     let mut rendered = 0usize;

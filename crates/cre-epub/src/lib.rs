@@ -2168,11 +2168,127 @@ pub fn chunk_image_bytes(provider: &LazyResource, chunk_html: &str) -> usize {
         .sum()
 }
 
-/// Root-relative resource paths of every `<img>` in a chunk body. Spine
-/// parsing rewrites `src` to `epub://book/...`, so both forms are accepted.
 /// Resource names referenced by the `<img>` tags of a fragment.
 pub fn image_sources_in(body: &str) -> Vec<String> {
     image_sources(body, "")
+}
+
+/// Family names declared by the `@font-face` rules in `html`.
+///
+/// The engine does not load these fonts itself: Blitz fetches each `src` through
+/// the document's `NetProvider`, decodes TTF/OTF/WOFF/WOFF2 and registers it
+/// under the declared family (see `blitz_dom::net::fetch_font_face`). The names
+/// are collected so the reader can list the book's fonts and decide whether to
+/// use them at all.
+///
+/// TODO(upstream): this is a scan of the CSS text because `blitz-dom` exposes no
+/// query for the `@font-face` families a document declares. Replace it once the
+/// font registry can be enumerated.
+pub fn font_faces_in(html: &str) -> Vec<String> {
+    // ASCII lowercasing keeps byte offsets (CSS names are case-sensitive).
+    let lower = html.to_ascii_lowercase();
+    let mut out: Vec<String> = Vec::new();
+    let mut from = 0usize;
+    while let Some(found) = lower[from..].find("@font-face") {
+        let start = from + found;
+        let Some(open) = lower[start..].find('{') else {
+            break;
+        };
+        let body_start = start + open + 1;
+        let Some(close) = lower[body_start..].find('}') else {
+            break;
+        };
+        if let Some(name) = font_family_of(&html[body_start..body_start + close])
+            && !out
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&name))
+        {
+            out.push(name);
+        }
+        from = body_start + close + 1;
+    }
+    out
+}
+
+/// Removes the `@font-face` rules from `html`, leaving everything else alone.
+///
+/// The rules are dropped rather than their `font-family` declarations: a name
+/// that resolves to nothing falls back to the next family in the list, which is
+/// what "do not use the book's fonts" means.
+pub fn strip_font_faces(html: &str) -> std::borrow::Cow<'_, str> {
+    let lower = html.to_ascii_lowercase();
+    if !lower.contains("@font-face") {
+        return std::borrow::Cow::Borrowed(html);
+    }
+    let mut out = String::with_capacity(html.len());
+    let mut from = 0usize;
+    while let Some(found) = lower[from..].find("@font-face") {
+        let start = from + found;
+        let Some(open) = lower[start..].find('{') else {
+            break;
+        };
+        let body_start = start + open + 1;
+        let Some(close) = lower[body_start..].find('}') else {
+            break;
+        };
+        out.push_str(&html[from..start]);
+        from = body_start + close + 1;
+    }
+    out.push_str(&html[from..]);
+    std::borrow::Cow::Owned(out)
+}
+
+/// Family names declared by the book's stylesheet resources.
+///
+/// A chapter usually keeps its CSS in `<link rel="stylesheet">` rather than an
+/// inline `<style>` (Calibre's output does), so the `@font-face` rules a chunk
+/// is laid out with are not in the chunk HTML at all: Blitz fetches them from
+/// the stylesheet through `cre_lib::EpubNet`. Reading them here keeps
+/// [`EpubBook::manifest`] the single source of truth for what the book brings.
+pub fn font_faces_in_stylesheets(book: &EpubBook) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in &book.manifest {
+        let is_css = item.media_type.eq_ignore_ascii_case("text/css")
+            || item.href.to_ascii_lowercase().ends_with(".css");
+        if !is_css {
+            continue;
+        }
+        // `ManifestItem::href` is already resolved against the OPF directory
+        // when the package is parsed.
+        let key = item.href.clone();
+        let Some(bytes) = book.resource_provider.get(&key) else {
+            continue;
+        };
+        for name in font_faces_in(&String::from_utf8_lossy(&bytes)) {
+            if !out
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&name))
+            {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+/// `font-family` value inside one `@font-face` block.
+fn font_family_of(block: &str) -> Option<String> {
+    let lower = block.to_ascii_lowercase();
+    let at = lower.find("font-family")?;
+    let rest = &block[at + "font-family".len()..];
+    let rest = &rest[rest.find(':')? + 1..];
+    let value = rest
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 fn image_sources(body: &str, doc_dir: &str) -> Vec<String> {
@@ -3998,6 +4114,50 @@ fn scope_selector_list(selectors: &str, scope: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn font_faces_are_collected_once_per_family() {
+        let css = "\
+@font-face { src: url(fonts/00001.ttf); font-family: \"FZBeiWeiKaiShu-S19_GB18030\"; }
+@font-face { src: local(\"STSong\"); font-family: 'Song'; }
+@font-face { src: url(fonts/00002.ttf); font-family: STXingkai; }
+@font-face { src: url(fonts/00003.ttf); font-family: \"Song\"; }";
+        assert_eq!(
+            super::font_faces_in(css),
+            vec![
+                "FZBeiWeiKaiShu-S19_GB18030".to_string(),
+                "Song".to_string(),
+                "STXingkai".to_string(),
+            ]
+        );
+        // HTML without any rule is the common case and must stay free of work.
+        assert!(super::font_faces_in("<p>plain</p>").is_empty());
+    }
+
+    #[test]
+    fn stripping_font_faces_leaves_the_rest_of_the_stylesheet() {
+        let css = "\
+@page { margin: 5pt; }
+@font-face { src: url(fonts/00001.ttf); font-family: One; }
+p { font-family: One, serif; }";
+        let stripped = super::strip_font_faces(css);
+        assert!(!stripped.contains("@font-face"), "{stripped}");
+        assert!(stripped.contains("@page { margin: 5pt; }"), "{stripped}");
+        assert!(stripped.contains("font-family: One, serif"), "{stripped}");
+        // The `font-family` declaration is kept on purpose: a family that no
+        // longer resolves falls back to the next one in the list.
+        assert_eq!(stripped.matches("font-family").count(), 1, "{stripped}");
+        // No rule, no copy.
+        assert!(matches!(
+            super::strip_font_faces("<p>plain</p>"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            super::strip_font_faces(css).as_ref(),
+            stripped.as_ref(),
+            "stripping must be idempotent"
+        );
+    }
+
     #[test]
     fn sections_are_packed_whole_into_chunks() {
         let html = "<html><head><title>t</title></head><body>\
