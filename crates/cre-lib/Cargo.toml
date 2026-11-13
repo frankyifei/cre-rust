@@ -26,6 +26,7 @@ blitz-dom = { version = "=0.3.0-beta.4", default-features = false, features = [
 blitz-html = "=0.3.0-beta.4"
 blitz-paint = { version = "=0.3.0-beta.4", default-features = false, features = ["svg"] }
 blitz-traits = "=0.3.0-beta.4"
+cre-book = { path = "../cre-book" }
 cre-epub = { path = "../cre-epub" }
 cre-css = { path = "../cre-css" }
 cre-fb2 = { path = "../cre-fb2" }

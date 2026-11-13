@@ -430,6 +430,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cre-book"
+version = "0.1.0"
+dependencies = [
+ "cre-pdb",
+ "image",
+ "percent-encoding",
+]
+
+[[package]]
 name = "cre-css"
 version = "0.1.0"
 
@@ -438,6 +447,7 @@ name = "cre-epub"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cre-book",
  "cre-css",
  "percent-encoding",
  "roxmltree 0.21.1",
@@ -475,6 +485,7 @@ dependencies = [
  "blitz-html",
  "blitz-paint",
  "blitz-traits",
+ "cre-book",
  "cre-css",
  "cre-epub",
  "cre-fb2",

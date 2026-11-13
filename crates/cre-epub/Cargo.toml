@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow = "1"
+cre-book = { path = "../cre-book" }
 cre-css = { path = "../cre-css" }
 percent-encoding = "2"
 roxmltree = "0.21"

@@ -115,6 +115,10 @@ fn resource_cache_bytes() -> usize {
         .unwrap_or(DEFAULT_RESOURCE_CACHE_BYTES)
 }
 
+/// Image header reading and cost estimates live in `cre-book` now; the names
+/// stay here for the generator and for `cre-lib`'s chunk budget.
+pub use cre_book::{estimated_image_bytes, is_image_bytes};
+
 pub struct LazyResource {
     pub epub_path: Option<PathBuf>,
     cache: Arc<Mutex<ResourceCache>>,
@@ -169,6 +173,26 @@ impl ResourceCache {
             self.order.remove(position);
         }
         self.order.push_back(key.to_string());
+    }
+}
+
+/// A zip archive is one kind of [`cre_book::ResourceProvider`]; the trait is all
+/// that cre-lib needs to know about it.
+impl cre_book::ResourceProvider for LazyResource {
+    fn get(&self, key: &str) -> Option<std::sync::Arc<Vec<u8>>> {
+        LazyResource::get(self, key)
+    }
+
+    fn estimated_decoded_bytes(&self, key: &str) -> Option<usize> {
+        LazyResource::estimated_decoded_bytes(self, key)
+    }
+
+    fn cache_stats(&self) -> (usize, usize) {
+        LazyResource::cache_stats(self)
+    }
+
+    fn pinned_bytes(&self) -> usize {
+        LazyResource::pinned_bytes(self)
     }
 }
 
@@ -307,7 +331,7 @@ impl LazyResource {
             return Some((width as usize * height as usize * 4).max(64 * 1024));
         }
         self.entry_size(&key)
-            .map(|size| estimated_decoded_image_bytes(&key, size))
+            .map(|size| cre_book::estimated_decoded_from_size(&key, size))
     }
 
     /// (entries, bytes) currently cached, for tests and diagnostics.
@@ -2490,33 +2514,6 @@ const DOM_BYTES_PER_HTML_BYTE: usize = 128;
 /// dimensions-based estimate the EPUB path uses applies. `name` supplies the
 /// format when the magic bytes are not recognised (`mobi-image-3` has no
 /// extension).
-pub fn estimated_image_bytes(name: &str, bytes: &[u8]) -> usize {
-    if let Some((width, height)) = image_dimensions(bytes) {
-        return (width as usize * height as usize * 4).max(64 * 1024);
-    }
-    estimated_decoded_image_bytes(name, bytes.len())
-}
-
-/// True when `name` ends in a picture extension the estimator understands.
-pub fn is_image_bytes(bytes: &[u8]) -> bool {
-    image_dimensions(bytes).is_some() || bytes.starts_with(b"<svg")
-}
-
-fn estimated_decoded_image_bytes(name: &str, file_bytes: usize) -> usize {
-    let factor = if name.ends_with(".jpg") || name.ends_with(".jpeg") {
-        32
-    } else if name.ends_with(".png") || name.ends_with(".gif") {
-        4
-    } else if name.ends_with(".webp") {
-        12
-    } else if name.ends_with(".svg") {
-        return 2 * 1024 * 1024;
-    } else {
-        8
-    };
-    file_bytes.saturating_mul(factor)
-}
-
 fn tag_name(raw: &str) -> String {
     let rest = raw.trim_start_matches('<').trim_start_matches('/');
     rest.chars()

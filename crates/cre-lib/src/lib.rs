@@ -9,6 +9,7 @@ use blitz_dom::{DocumentConfig, Node, NodeId, Point, StyleThreading};
 use blitz_html::HtmlDocument;
 use blitz_traits::net::{Bytes, NetHandler, NetProvider, Request};
 use blitz_traits::shell::{ColorScheme, Viewport};
+use cre_book::{GeneratedResources, MapResources, ResourceSource, generated_resource};
 use cre_epub::{
     EpubBook, HtmlOptions, LazyResource, PageMapItem as RawPageMapItem, TocItem as RawTocItem,
     normalize_path,
@@ -1232,191 +1233,6 @@ fn join_text_boxes<'a>(items: impl Iterator<Item = (&'a str, PageTextLine)>) -> 
     text
 }
 
-/// Resources of a format read from one file (FB2 binaries, MOBI/KF8 images).
-///
-/// FB2 decodes its pictures from base64 into memory; MOBI/KF8 keep them in the
-/// PalmDB and are indexed by range, so a picture is sliced out of the mapped
-/// file when a page paints it instead of being copied at open time.
-#[derive(Clone)]
-pub enum MapResources {
-    Owned(Arc<HashMap<String, Vec<u8>>>),
-    Mapped(Arc<cre_pdb::BookResources>),
-}
-
-impl MapResources {
-    pub fn get(&self, key: &str) -> Option<&[u8]> {
-        match self {
-            Self::Owned(map) => map.get(key).map(Vec::as_slice),
-            Self::Mapped(index) => index.get(key),
-        }
-    }
-
-    pub fn contains_key(&self, key: &str) -> bool {
-        match self {
-            Self::Owned(map) => map.contains_key(key),
-            Self::Mapped(index) => index.contains_key(key),
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        match self {
-            Self::Owned(map) => map.len(),
-            Self::Mapped(index) => index.len(),
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Bytes of the resources the index can reach. For a mapped PalmDB these
-    /// are file pages, not anonymous memory.
-    pub fn bytes(&self) -> usize {
-        match self {
-            Self::Owned(map) => map.values().map(Vec::len).sum(),
-            Self::Mapped(index) => index.bytes(),
-        }
-    }
-
-    /// Drops the mapped pages the open pass faulted in; a page that paints a
-    /// picture faults it back in from the page cache.
-    pub fn drop_pages(&self) {
-        if let Self::Mapped(index) = self {
-            index.drop_pages();
-        }
-    }
-}
-
-/// Resources the engine generates while preparing a book (page-fit wrappers,
-/// decoded `data:` pictures). Shared by the document, the net providers and the
-/// painter, so a generated key behaves like any resource.
-type GeneratedResources = Arc<std::sync::Mutex<HashMap<String, Arc<Vec<u8>>>>>;
-
-/// One generated resource, if the key names one.
-fn generated_resource(generated: &GeneratedResources, key: &str) -> Option<Arc<Vec<u8>>> {
-    generated.lock().ok()?.get(key).cloned()
-}
-
-/// Where a document's resources come from, plus the ones the engine makes up.
-///
-/// A standalone HTML document has no archive to index: its pictures and
-/// stylesheets sit next to it on disk, and some of them are inlined in the
-/// markup as `data:` URIs. Rather than special-casing that per caller, every
-/// source answers the same `get(key)`, and [`Self::generated`] holds what the
-/// engine synthesises while preparing the book (page-fit wrappers, decoded
-/// `data:` pictures) so the net providers and the painter see one namespace.
-#[derive(Clone)]
-pub struct ResourceSource {
-    base: ResourceBase,
-    generated: Arc<std::sync::Mutex<HashMap<String, Arc<Vec<u8>>>>>,
-}
-
-#[derive(Clone)]
-enum ResourceBase {
-    Empty,
-    /// Resources carried in memory or indexed in the book file.
-    Map(MapResources),
-    Epub(Arc<LazyResource>),
-    /// A standalone document: resources are files next to it.
-    Files(PathBuf),
-}
-
-impl ResourceSource {
-    fn new(base: ResourceBase) -> Self {
-        Self {
-            base,
-            generated: Arc::new(std::sync::Mutex::new(HashMap::new())),
-        }
-    }
-
-    fn empty() -> Self {
-        Self::new(ResourceBase::Empty)
-    }
-
-    fn map(map: MapResources) -> Self {
-        Self::new(ResourceBase::Map(map))
-    }
-
-    fn epub(provider: Arc<LazyResource>) -> Self {
-        Self::new(ResourceBase::Epub(provider))
-    }
-
-    fn files(root: PathBuf) -> Self {
-        Self::new(ResourceBase::Files(root))
-    }
-
-    /// Resource bytes for `key`: generated resources first, then the book.
-    fn get(&self, key: &str) -> Option<Arc<Vec<u8>>> {
-        let key = normalize_path(key);
-        if let Ok(generated) = self.generated.lock()
-            && let Some(bytes) = generated.get(&key)
-        {
-            return Some(Arc::clone(bytes));
-        }
-        match &self.base {
-            ResourceBase::Empty => None,
-            ResourceBase::Map(map) => map.get(&key).map(|bytes| Arc::new(bytes.to_vec())),
-            ResourceBase::Epub(provider) => provider.get(&key),
-            ResourceBase::Files(root) => read_file_resource(root, &key),
-        }
-    }
-
-    /// Registers a resource the engine generated for this document.
-    fn insert(&self, key: impl Into<String>, bytes: impl Into<Arc<Vec<u8>>>) {
-        if let Ok(mut generated) = self.generated.lock() {
-            generated.insert(key.into(), bytes.into());
-        }
-    }
-
-    /// The generated-resource table, shared with the net providers.
-    pub fn generated(&self) -> Arc<std::sync::Mutex<HashMap<String, Arc<Vec<u8>>>>> {
-        Arc::clone(&self.generated)
-    }
-
-    /// Estimated decoded size of an image, for the chunk memory budget.
-    fn estimated_decoded_bytes(&self, key: &str) -> Option<usize> {
-        match &self.base {
-            ResourceBase::Empty => None,
-            ResourceBase::Epub(provider) => provider.estimated_decoded_bytes(key),
-            ResourceBase::Map(map) => {
-                let key = normalize_path(key);
-                map.get(&key)
-                    .map(|bytes| cre_epub::estimated_image_bytes(&key, bytes))
-            }
-            ResourceBase::Files(root) => {
-                let bytes = read_file_resource(root, key)?;
-                Some(cre_epub::estimated_image_bytes(key, &bytes))
-            }
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        matches!(self.base, ResourceBase::Empty)
-    }
-
-    fn is_epub(&self) -> bool {
-        matches!(self.base, ResourceBase::Epub(_))
-    }
-
-    /// Drops the book file's pages after the open pass; see
-    /// [`MapResources::drop_pages`].
-    fn drop_pages(&self) {
-        if let ResourceBase::Map(map) = &self.base {
-            map.drop_pages();
-        }
-    }
-}
-
-/// Reads one resource of a standalone document, refusing to leave its directory.
-fn read_file_resource(root: &Path, key: &str) -> Option<Arc<Vec<u8>>> {
-    let relative = percent_decode_str(key).decode_utf8_lossy();
-    let candidate = std::fs::canonicalize(root.join(relative.as_ref())).ok()?;
-    if !candidate.starts_with(root) || !candidate.is_file() {
-        return None;
-    }
-    std::fs::read(&candidate).ok().map(Arc::new)
-}
-
 pub struct Document {
     metadata: DocumentMetadata,
     width: u32,
@@ -1752,7 +1568,8 @@ impl Document {
                 }
                 let embedded_fonts_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
                 let resource_provider = Arc::new(book.resource_provider);
-                let resources = ResourceSource::epub(resource_provider.clone());
+                let provider: Arc<dyn cre_book::ResourceProvider> = resource_provider.clone();
+                let resources = ResourceSource::provider(provider);
                 let mut document = Self::build_from_sources(
                     sources,
                     fixed_layouts,
@@ -2598,7 +2415,7 @@ fn layout_chunk_html(
         // base64-copies the picture into the chunk HTML — fine for one cover,
         // wasteful for a book of plates. Run before the inliner so the
         // `<image>` this generates is inlined too.
-        let fitted = (!resources.is_epub()).then(|| {
+        let fitted = (!resources.is_archive()).then(|| {
             let width = options.width as f32 - margins.left - margins.right;
             let height = options.height as f32 - margins.top - margins.bottom;
             fit_cover_images(html, width, height)
@@ -3838,16 +3655,8 @@ impl Document {
         breakdown.placeheld_images = self.images.placeheld_count();
         breakdown.svg_cache_bytes = self.images.cached_bytes();
         breakdown.page_map_source_bytes = self.page_map_source.len();
-        match &self.resources.base {
-            ResourceBase::Epub(provider) => {
-                breakdown.resource_cache_bytes = provider.cache_stats().1;
-                breakdown.pinned_bytes = provider.pinned_bytes();
-            }
-            ResourceBase::Map(map) => {
-                breakdown.resource_cache_bytes = map.bytes();
-            }
-            ResourceBase::Empty | ResourceBase::Files(_) => {}
-        }
+        breakdown.resource_cache_bytes = self.resources.cache_bytes();
+        breakdown.pinned_bytes = self.resources.pinned_bytes();
         if let Some(active) = self.active.borrow().as_ref() {
             breakdown.active_line_boxes = active.lines.len();
             breakdown.active_text_nodes = active.rendered_text_nodes.len();
