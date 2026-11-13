@@ -30,7 +30,12 @@ Nothing in this repository has to rewrite the CSS for that to work.
    rules are usually *not* in the chunk HTML at all. Both places are scanned:
    `cre_epub::font_faces_in_stylesheets` walks the OPF manifest's CSS items, and
    the chunk callback runs `cre_epub::font_faces_in` for rules inlined in a
-   `<style>` element. The result is `Document::embedded_font_list()`.
+   `<style>` element (which is where a KF8 book keeps its CSS). The result is
+   `Document::embedded_font_list()`.
+   For KF8 the scan goes through `cre_epub::loadable_font_faces`: its URLs are
+   already flat resource names (`mobi-image-N`), so a rule whose file the book
+   no longer carries — which is what a converter that strips fonts leaves
+   behind — is not offered to the reader.
 2. **Honour the toggle at layout time.** Turning the setting off must not cost a
    reopen. The rules are dropped in three complementary places:
    - `cre_epub::strip_font_faces` on a chunk's HTML before it is parsed;
@@ -89,17 +94,29 @@ numbers include.
 |---|---|---|
 | EPUB 2/3 | yes — OPF manifest CSS plus any inline `<style>` | yes |
 | Standalone HTML/XHTML | yes — the document plus the stylesheets it `<link>`s | yes |
-| AZW3 / KF8 | not yet | strips, but there are no rules to strip *and* no font records to load |
+| AZW3 / KF8 | yes — the rules are in the flow, filtered to faces the book really carries | yes |
 | MOBI 6, FB2, TXT | no `@font-face` in practice | — |
 
-KF8 is the one worth adding. Its CSS lives in the flow and is already inlined
-into the chunk HTML (so `font_faces_in`/`strip_font_faces` apply unchanged), and
-`rewrite_kindle_urls` already turns `url(kindle:embed:N?mime=…)` into the
-resource name `mobi-image-N`. What is missing is the other end:
-`cre_kf8::build_resources` registers only records that look like images, so a
-font record is never exposed and Blitz fetches nothing. Registering the TTF/OTF
-records (magic `0x00010000`, `OTTO`, `ttcf`) plus collecting the names in the
-KF8 branch would make the table say "yes" for KF8 too.
+KF8 needed two things beyond the shared code. Its CSS lives in the flow and is
+already inlined into the chunk HTML, so `font_faces_in`/`strip_font_faces` apply
+unchanged, and `rewrite_kindle_urls` already turned
+`url(kindle:embed:N?mime=…)` into the resource name `mobi-image-N`. What was
+missing was the other end: `cre_kf8::build_resources` registered only records
+that look like images, so a font record was never exposed and Blitz fetched
+nothing. `cre_pdb::is_font_record` now recognises TTF/OTF/TTC by magic and those
+records are published under the same name.
+
+A limitation shared with EPUB: a `@font-face` that only lists `local(...)`
+families is still reported, because Blitz does not implement `local()` upstream
+(see the `TODO(upstream)` in `font_faces_in`). Such a family is never
+instantiated, so it appears in the list but cannot be used.
+
+One caveat on the KF8 row: it is covered by unit tests on both the record
+classifier and the rule filter, but no AZW3 with actual font records was
+available to try it end to end — the AZW3s at hand were produced by a converter
+that removed the font bytes and left `url(XXXXXXXXXXXXXXXX)` placeholders, which
+is exactly the case the filter drops. Their font list is empty and their layout
+hash is unchanged, which is at least the "nothing regressed" half of the test.
 
 ## Verified in the real reader
 

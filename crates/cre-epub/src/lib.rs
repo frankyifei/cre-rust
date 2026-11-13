@@ -2185,9 +2185,34 @@ pub fn image_sources_in(body: &str) -> Vec<String> {
 /// query for the `@font-face` families a document declares. Replace it once the
 /// font registry can be enumerated.
 pub fn font_faces_in(html: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for family in font_face_declarations(html).into_iter().map(|d| d.family) {
+        if !out
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&family))
+        {
+            out.push(family);
+        }
+    }
+    out
+}
+
+/// One `@font-face` rule: the family it registers and the `url()` sources it
+/// offers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FontFaceDeclaration {
+    pub family: String,
+    pub urls: Vec<String>,
+}
+
+/// Every `@font-face` rule in `html` (or a stylesheet), in document order.
+///
+/// TODO(upstream): a scan of the CSS text, because `blitz-dom` exposes no query
+/// for the `@font-face` rules a document declares.
+pub fn font_face_declarations(html: &str) -> Vec<FontFaceDeclaration> {
     // ASCII lowercasing keeps byte offsets (CSS names are case-sensitive).
     let lower = html.to_ascii_lowercase();
-    let mut out: Vec<String> = Vec::new();
+    let mut out = Vec::new();
     let mut from = 0usize;
     while let Some(found) = lower[from..].find("@font-face") {
         let start = from + found;
@@ -2198,14 +2223,59 @@ pub fn font_faces_in(html: &str) -> Vec<String> {
         let Some(close) = lower[body_start..].find('}') else {
             break;
         };
-        if let Some(name) = font_family_of(&html[body_start..body_start + close])
-            && !out
-                .iter()
-                .any(|existing| existing.eq_ignore_ascii_case(&name))
-        {
-            out.push(name);
+        let block = &html[body_start..body_start + close];
+        if let Some(family) = font_family_of(block) {
+            out.push(FontFaceDeclaration {
+                family,
+                urls: font_urls_of(block),
+            });
         }
         from = body_start + close + 1;
+    }
+    out
+}
+
+/// The families whose rules can actually be loaded.
+///
+/// `has_resource` answers for one `url()` value. A book whose converter dropped
+/// the font bytes still leaves the rule in the stylesheet, and listing such a
+/// family would offer the reader a font that can never resolve; KF8 is where
+/// this shows up because the URLs there are flat resource names
+/// (`mobi-image-N`), so the answer is a lookup.
+pub fn loadable_font_faces(html: &str, has_resource: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for declaration in font_face_declarations(html) {
+        if !declaration.urls.iter().any(|url| has_resource(url)) {
+            continue;
+        }
+        if !out
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&declaration.family))
+        {
+            out.push(declaration.family);
+        }
+    }
+    out
+}
+
+/// `url(...)` values inside one `@font-face` block.
+fn font_urls_of(block: &str) -> Vec<String> {
+    let lower = block.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(found) = lower[from..].find("url(") {
+        let start = from + found + 4;
+        let Some(close) = block[start..].find(')') else {
+            break;
+        };
+        let value = block[start..start + close]
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .trim();
+        if !value.is_empty() {
+            out.push(value.to_string());
+        }
+        from = start + close + 1;
     }
     out
 }
@@ -4144,6 +4214,34 @@ fn scope_selector_list(selectors: &str, scope: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_font_face_reports_its_family_and_urls() {
+        let css = "\
+@font-face { src: url(fonts/00001.ttf); font-family: \"One\"; }
+@font-face { font-family: Two; src: local(\"Songti\"), url( 'two.otf' ); }
+@font-face { font-family: Local Only; src: local(\"STSong\"); }";
+        let declarations = super::font_face_declarations(css);
+        assert_eq!(declarations.len(), 3, "{declarations:?}");
+        assert_eq!(declarations[0].family, "One");
+        assert_eq!(declarations[0].urls, ["fonts/00001.ttf"]);
+        assert_eq!(declarations[1].urls, ["two.otf"]);
+        assert!(declarations[2].urls.is_empty(), "{declarations:?}");
+    }
+
+    #[test]
+    fn only_faces_with_a_loadable_source_are_reported() {
+        // The shape a stripped AZW3 leaves behind: the rules survive, the font
+        // records do not, so the URL is a placeholder that resolves to nothing.
+        let css = "\
+@font-face { font-family: \"zw\"; src: local(\"Songti\"), url(XXXXXXXXXXXXXXXX); }
+@font-face { font-family: \"kt\"; src: url(mobi-image-5); }
+@font-face { font-family: \"local-only\"; src: local(\"STSong\"); }";
+        let families = super::loadable_font_faces(css, |url| url == "mobi-image-5");
+        assert_eq!(families, ["kt"], "{families:?}");
+        // With nothing available, nothing is offered.
+        assert!(super::loadable_font_faces(css, |_| false).is_empty());
+    }
+
     #[test]
     fn font_faces_are_collected_once_per_family() {
         let css = "\

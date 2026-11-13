@@ -20,7 +20,7 @@ use anyhow::{Context, Result, bail};
 use cre_pdb::html::{self, AnchorTarget, Tag};
 use cre_pdb::{
     BookResources, Index, MobiHeader, NULL_INDEX, Pdb, ResourceRange, extract_text,
-    image_extension, is_known_non_image_record, read_index,
+    image_extension, is_font_record, is_known_non_image_record, read_index,
 };
 
 /// One table of contents entry; `href` is a fragment in the generated document.
@@ -55,8 +55,11 @@ pub struct Kf8Book {
     pub description: Option<String>,
     pub keywords: Option<String>,
     pub identifiers: Option<String>,
-    /// Resource name (`mobi-image-N`) to image bytes.
     /// Resource name (`mobi-image-N`) to its range in the PalmDB file.
+    ///
+    /// Images and embedded fonts share the naming: the index is the one a
+    /// `kindle:embed:N` URL uses, so the name is kept even for a face the
+    /// stylesheet references.
     ///
     /// The bytes are sliced from the mapped file when a page paints them, so a
     /// 25 MB comic costs no anonymous memory for its pictures.
@@ -844,7 +847,10 @@ fn build_resources(pdb: &Pdb, header: &MobiHeader) -> (Vec<ResourceRange>, Optio
             break;
         };
         index += 1;
-        if is_known_non_image_record(data) || image_extension(data).is_none() {
+        // Index numbering follows the Kindle's own: `kindle:embed:N` counts
+        // every record from the first image one, including those the reader
+        // cannot use.
+        if resource_name(index, data).is_none() {
             continue;
         }
         let Some(range) = pdb.record_range(record_index) else {
@@ -857,6 +863,21 @@ fn build_resources(pdb: &Pdb, header: &MobiHeader) -> (Vec<ResourceRange>, Optio
         resources.push((format!("mobi-image-{index}"), range));
     }
     (resources, cover)
+}
+
+/// Resource name for the record at `index`, when the reader may fetch it.
+///
+/// Fonts count: a KF8 stylesheet addresses an embedded face with
+/// `url(kindle:embed:N?mime=application/x-font-ttf)`, and `rewrite_kindle_urls`
+/// maps that to the same `mobi-image-N` name an image gets.
+fn resource_name(index: usize, data: &[u8]) -> Option<String> {
+    if is_known_non_image_record(data) {
+        return None;
+    }
+    if image_extension(data).is_none() && !is_font_record(data) {
+        return None;
+    }
+    Some(format!("mobi-image-{index}"))
 }
 
 /// Returns the inside of the document's `<body>`, when the part has one.
@@ -991,6 +1012,34 @@ mod tests {
         assert!(out.contains("url(../Images/bg.png)"), "{out}");
         assert!(out.contains(".cover { background-image:"), "{out}");
         assert_eq!(rewrite_kindle_urls("p { margin: 0 }"), "p { margin: 0 }");
+    }
+
+    #[test]
+    fn a_font_face_url_points_at_the_same_resource_name() {
+        // The stylesheet side and the resource index have to agree: the font
+        // record is published under the name the rewritten URL asks for.
+        let css = "@font-face { src: url(kindle:embed:0005?mime=application/x-font-ttf); \
+                   font-family: \"Book\"; }";
+        let out = rewrite_kindle_urls(css);
+        assert!(out.contains("url(mobi-image-5)"), "{out}");
+        assert!(resource_name(5, b"OTTO\x00\x0a\x00\x80").is_some());
+    }
+
+    #[test]
+    fn resource_names_cover_images_and_fonts() {
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        assert_eq!(resource_name(3, &jpeg).as_deref(), Some("mobi-image-3"));
+        // Fonts are ordinary resource records in KF8; the reader has to be able
+        // to fetch them or `@font-face` cannot resolve.
+        let ttf = [0x00, 0x01, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x80];
+        assert_eq!(resource_name(4, &ttf).as_deref(), Some("mobi-image-4"));
+        assert_eq!(
+            resource_name(5, b"ttcf\x00\x01\x00\x00").as_deref(),
+            Some("mobi-image-5")
+        );
+        // Record types that live in the same area and are not fetchable.
+        assert_eq!(resource_name(6, b"FLIS\x00\x00\x00\x08"), None);
+        assert_eq!(resource_name(7, b"<html>\n<body>"), None);
     }
 
     #[test]

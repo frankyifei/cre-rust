@@ -1830,11 +1830,28 @@ impl Document {
                 let resources = MapResources::Mapped(Arc::new(std::mem::take(&mut book.resources)));
                 let resource_source = ResourceSource::Map(resources.clone());
                 let mut sink = ChunkSink::new();
+                // KF8 keeps its CSS in the flow, so the book's `@font-face`
+                // rules land in the generated HTML (unlike an EPUB chapter,
+                // which links its stylesheet).
+                let mut embedded_fonts: Vec<String> = Vec::new();
                 stream_single_document_chunks(&head, book.body_html(), &resource_source, |html| {
+                    // Only families whose rule points at a record the book
+                    // really has: a converter that drops the font bytes leaves
+                    // the rule behind with a placeholder URL.
+                    for name in
+                        cre_epub::loadable_font_faces(&html, |url| resources.contains_key(url))
+                    {
+                        if !embedded_fonts
+                            .iter()
+                            .any(|existing| existing.eq_ignore_ascii_case(&name))
+                        {
+                            embedded_fonts.push(name);
+                        }
+                    }
                     sink.push(html)
                 })?;
                 drop(book);
-                Self::build_from_sources(
+                let mut document = Self::build_from_sources(
                     sink.sources,
                     sink.fixed_layouts,
                     sink.content_images,
@@ -1857,7 +1874,9 @@ impl Document {
                     lazy,
                     source_bytes,
                     MAP_CHUNK_IMAGE_BYTES,
-                )
+                )?;
+                document.embedded_fonts = embedded_fonts;
+                Ok(document)
             }
             DocumentFormat::Txt => {
                 let book = TextBook::open(path)?;

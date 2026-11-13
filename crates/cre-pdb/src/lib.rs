@@ -967,6 +967,20 @@ pub fn image_extension(data: &[u8]) -> Option<&'static str> {
     None
 }
 
+/// True when the record looks like an embedded font (TTF, OTF, TTC).
+///
+/// KF8 books store their fonts as ordinary resource records next to the
+/// images, and the stylesheet addresses them with
+/// `url(kindle:embed:N?mime=application/x-font-ttf)`, so the same index that
+/// names an image names a font.
+pub fn is_font_record(data: &[u8]) -> bool {
+    data.starts_with(&[0x00, 0x01, 0x00, 0x00])
+        || data.starts_with(b"OTTO")
+        || data.starts_with(b"ttcf")
+        || data.starts_with(b"true")
+        || data.starts_with(b"typ1")
+}
+
 /// Record types that live in the resource area but are not images.
 pub fn is_known_non_image_record(data: &[u8]) -> bool {
     data.starts_with(b"FLIS")
@@ -1011,6 +1025,21 @@ mod tests {
     #[test]
     fn cp1252_maps_smart_quotes() {
         assert_eq!(cp1252(&[0x93, b'a', 0x94]), "\u{201C}a\u{201D}");
+    }
+
+    #[test]
+    fn font_records_are_recognised_by_their_magic() {
+        // A TrueType face starts with the version tag; CFF-based faces and
+        // collections have their own.
+        assert!(is_font_record(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x10]));
+        assert!(is_font_record(b"OTTO\x00\x0a\x00\x80"));
+        assert!(is_font_record(b"ttcf\x00\x01\x00\x00"));
+        assert!(is_font_record(b"true\x00\x05\x00\x00"));
+        // Images and record types that only look like resources are not fonts.
+        assert!(!is_font_record(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10]));
+        assert!(!is_font_record(b"FLIS\x00\x00\x00\x08"));
+        assert!(!is_font_record(b"\x89PNG\r\n\x1a\n"));
+        assert!(!is_font_record(b""));
     }
 
     #[test]
