@@ -2,7 +2,7 @@
 
 use crate::html::{find_matching_close_tag, find_tag_end, next_tag_start, tag_name};
 
-/// Points the `<image>` hrefs of inline SVG blocks at `epub://book/...`.
+/// Points the `<image>` hrefs of inline SVG blocks at `cre://book/...`.
 ///
 /// The parse-time inliner then needs no document directory: chunks can hold
 /// documents from several directories.

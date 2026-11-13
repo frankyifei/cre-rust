@@ -433,9 +433,13 @@ dependencies = [
 name = "cre-book"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "base64 0.22.1",
  "cre-pdb",
  "image",
+ "libc",
  "percent-encoding",
+ "regex",
 ]
 
 [[package]]

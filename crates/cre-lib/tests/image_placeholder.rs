@@ -159,7 +159,7 @@ fn relative_source_is_painted() {
 fn absolute_source_is_painted() {
     assert_image_visible(
         "absolute",
-        "epub://book/OEBPS/Images/absolute.jpg",
+        "cre://book/OEBPS/Images/absolute.jpg",
         "absolute.jpg",
     );
 }
@@ -237,7 +237,7 @@ fn background_image_is_still_painted() {
     let dir = std::env::temp_dir().join("cre-image-placeholder");
     // The stylesheet lives in the chapter so the URL is absolute: a CSS
     // `url(../...)` is not rewritten by the spine rewrite pass.
-    let body = "<style>body { background-image: url(epub://book/OEBPS/Images/background.jpg); \
+    let body = "<style>body { background-image: url(cre://book/OEBPS/Images/background.jpg); \
                 background-size: 100% 100%; }</style><p>before</p>";
     let jpeg = black_jpeg(1200, 1600);
     let path = write_epub(&dir, "background.epub", body, &[("background.jpg", &jpeg)]);

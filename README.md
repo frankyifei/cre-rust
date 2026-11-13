@@ -407,11 +407,19 @@ The format is detected from the file content, not from the extension.
 - There is no on-disk cache. Opening a book again makes the pages again.
 - Some cre.cpp APIs return fixed values. See [TODO.md](TODO.md).
 
+`cre-book` is the format-independent layer below the readers: the resource table
+(one namespace for zip entries, PalmDB records, files and generated resources),
+chunking and its memory budgets, the HTML/CSS/image/font helpers every generator
+needs. A new format implements its container plus a `ResourceProvider` and gets
+the rest from there. See [`CRATES.md`](CRATES.md) for the layering and what a
+format has to provide.
+
 ## Repository layout
 
 | Path | Content |
 |---|---|
 | `crates/cre-lib` | Engine core: open, layout, pagination, page lookup, positions, images, fonts |
+| `crates/cre-book` | Format-independent book layer: resource table, chunking, HTML helpers, page-fit plates, fonts, ruby |
 | `crates/cre-epub` | EPUB container, OPF, spine, TOC, HTML chunks |
 | `crates/cre-fb2` | FB2 reader |
 | `crates/cre-text` | TXT and standalone HTML reader |

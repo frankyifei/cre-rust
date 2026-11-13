@@ -349,9 +349,9 @@ fn node_to_html(
         "image" => {
             let href = node.attribute("href").unwrap_or("");
             if binary.contains_key(href) {
-                format!("<img src=\"fb2://binary/{href}\" alt=\"\">")
+                format!("<img src=\"cre://binary/{href}\" alt=\"\">")
             } else {
-                format!("<img src=\"fb2://binary/{href}\" alt=\"[missing image: {href}]\">")
+                format!("<img src=\"cre://binary/{href}\" alt=\"[missing image: {href}]\">")
             }
         }
         "epigraph" => format!(
@@ -439,7 +439,7 @@ mod tests {
         let b = Fb2Book::from_xml(xml).unwrap();
         assert!(b.binary.contains_key("img1.png"));
         let html = b.to_html(&Fb2HtmlOptions::default()).unwrap();
-        assert!(html.contains("fb2://binary/img1.png"));
+        assert!(html.contains("cre://binary/img1.png"));
     }
 
     #[test]
@@ -456,7 +456,7 @@ mod tests {
 
         let html = book.to_html(&Fb2HtmlOptions::default()).unwrap();
         assert!(html.len() > 1000);
-        assert!(html.contains("fb2://binary/pixel.png"));
+        assert!(html.contains("cre://binary/pixel.png"));
         assert!(html.contains("Chapter One"));
     }
 }

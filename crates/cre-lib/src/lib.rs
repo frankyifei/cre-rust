@@ -1355,7 +1355,7 @@ impl Document {
                     sources,
                     fixed_layouts,
                     content_images,
-                    "epub://book/",
+                    "cre://book/",
                     Arc::new(EpubNet {
                         svg: svg_raster.clone(),
                         resource_provider: resource_provider.clone(),
@@ -1423,7 +1423,7 @@ impl Document {
                     sink.sources,
                     sink.fixed_layouts,
                     sink.content_images,
-                    "fb2://book/",
+                    "cre://book/",
                     Arc::new(MapNet {
                         resources: resources.clone(),
                         svg: svg_raster.clone(),
@@ -1487,7 +1487,7 @@ impl Document {
                     sink.sources,
                     sink.fixed_layouts,
                     sink.content_images,
-                    "mobi://book/",
+                    "cre://book/",
                     Arc::new(MapNet {
                         resources: resources.clone(),
                         svg: svg_raster.clone(),
@@ -1568,7 +1568,7 @@ impl Document {
                     sink.sources,
                     sink.fixed_layouts,
                     sink.content_images,
-                    "azw3://book/",
+                    "cre://book/",
                     Arc::new(MapNet {
                         resources: resources.clone(),
                         svg: svg_raster.clone(),
@@ -1609,7 +1609,7 @@ impl Document {
                 let html = book.to_html(&html_options);
                 Self::build(
                     split_single_document(html, &ResourceSource::empty()),
-                    "text://book/",
+                    "cre://book/",
                     Arc::new(EmptyNet),
                     ResourceSource::empty(),
                     Arc::new(ImageRaster::new(options.width, options.height)),
@@ -8785,9 +8785,9 @@ fn document_css_for_svg(html: &str, resources: &ResourceSource) -> String {
             continue;
         };
         let href_value = href_value.as_str().trim();
-        // EPUB chunks point at `epub://book/...`; a standalone document keeps
+        // EPUB chunks point at `cre://book/...`; a standalone document keeps
         // the link relative to its own directory.
-        let key = if let Some(path) = href_value.strip_prefix("epub://book/") {
+        let key = if let Some(path) = href_value.strip_prefix("cre://book/") {
             normalize_path(&percent_decode_str(path).decode_utf8_lossy())
         } else if href_value.contains("://") {
             continue;

@@ -93,7 +93,7 @@ pub fn image_sources(body: &str, doc_dir: &str) -> Vec<String> {
                 // Percent-encoded names must be decoded: that is the key the
                 // provider is asked for when the picture is fetched.
                 let decoded = percent_decode_str(value).decode_utf8_lossy();
-                if let Some(relative) = decoded.strip_prefix("epub://book/") {
+                if let Some(relative) = decoded.strip_prefix("cre://book/") {
                     out.push(normalize_path(relative));
                 } else if !decoded.is_empty()
                     && !decoded.starts_with("data:")
@@ -190,11 +190,11 @@ pub fn svg_block_inline_images(
         let attrs = parse_attrs(tag);
         if let Some(href) = attrs.get("xlink:href").or_else(|| attrs.get("href")) {
             let href = href.trim();
-            let book_url = href.starts_with("epub://book/");
+            let book_url = href.starts_with("cre://book/");
             if !href.is_empty() && !href.starts_with("data:") && (book_url || !is_external(href)) {
                 let without_fragment = href.split('#').next().unwrap_or(href);
                 let relative = without_fragment
-                    .strip_prefix("epub://book/")
+                    .strip_prefix("cre://book/")
                     .unwrap_or(without_fragment);
                 let key = normalize_path(&percent_decode_str(relative).decode_utf8_lossy());
                 if let Some(bytes) = fetch(&key) {

@@ -574,7 +574,7 @@ impl EpubBook {
     }
 
     pub fn resource_url(&self, path: &str) -> String {
-        format!("epub://book/{}", encode_path(&normalize_path(path)))
+        format!("cre://book/{}", encode_path(&normalize_path(path)))
     }
 
     pub fn normalize_inline_svg_images(&mut self) -> usize {
@@ -1371,7 +1371,7 @@ fn svg_hrefs_to_book_paths(html: &str, doc_dir: &str) -> String {
                 let href = href.trim();
                 if !href.is_empty() && !href.starts_with("data:") && !is_external(href) {
                     let resolved = resolve_href(doc_dir, &value_without_fragment(href));
-                    let url = format!("epub://book/{}", encode_path(&resolved));
+                    let url = format!("cre://book/{}", encode_path(&resolved));
                     replaced = replace_attribute_value(tag, "xlink:href", &url)
                         .or_else(|| replace_attribute_value(tag, "href", &url))
                         .unwrap_or(replaced);
@@ -1393,7 +1393,7 @@ fn svg_hrefs_to_book_paths(html: &str, doc_dir: &str) -> String {
 
 /// Estimated decoded (RGBA) bytes of the images a generated chunk refers to.
 ///
-/// Chunk HTML points at resources through `epub://book/`, so no document
+/// Chunk HTML points at resources through `cre://book/`, so no document
 /// directory is needed. `cre-lib` uses this to include the decoded-image cost
 /// of a chunk in its low-memory estimate.
 fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
@@ -1721,7 +1721,7 @@ fn extract_styles(html: &str, opf_dir: &str, doc_path: &str) -> (Vec<String>, Ve
         {
             let path = resolve_href(doc_dir, href);
             css_urls.push(format!(
-                "epub://book/{}",
+                "cre://book/{}",
                 encode_path(&normalize_path(&path))
             ));
         }
@@ -1751,7 +1751,7 @@ fn extract_styles(html: &str, opf_dir: &str, doc_path: &str) -> (Vec<String>, Ve
 }
 
 /// Rewrites `url(...)` references inside a stylesheet so they point at the book
-/// (`epub://book/...`). Background images declared in a document's CSS are
+/// (`cre://book/...`). Background images declared in a document's CSS are
 /// relative to that document otherwise, and the chunk's HTML lives at the book
 /// root, so they silently failed to load.
 fn rewrite_css_urls(css: &str, doc_dir: &str) -> String {
@@ -1800,7 +1800,7 @@ fn rewrite_css_urls(css: &str, doc_dir: &str) -> String {
         } else {
             let path = resolve_href(doc_dir, &value_without_fragment(arg));
             out.push_str(&format!(
-                "url(\"epub://book/{}\")",
+                "url(\"cre://book/{}\")",
                 encode_path(&normalize_path(&path))
             ));
         }
@@ -1922,7 +1922,7 @@ fn rewrite_tag(tag: &str, doc_dir: &str, opf_dir: &str) -> String {
                             } else {
                                 let path = resolve_href(doc_dir, &value_without_fragment(value));
                                 let mut url =
-                                    format!("epub://book/{}", encode_path(&normalize_path(&path)));
+                                    format!("cre://book/{}", encode_path(&normalize_path(&path)));
                                 if let Some(fragment) = value.split_once('#').map(|(_, f)| f) {
                                     url.push('#');
                                     url.push_str(fragment);
@@ -1954,7 +1954,7 @@ fn rewrite_tag(tag: &str, doc_dir: &str, opf_dir: &str) -> String {
                             } else {
                                 let path = resolve_href(doc_dir, &value_without_fragment(value));
                                 let mut url =
-                                    format!("epub://book/{}", encode_path(&normalize_path(&path)));
+                                    format!("cre://book/{}", encode_path(&normalize_path(&path)));
                                 if let Some(fragment) = value.split_once('#').map(|(_, f)| f) {
                                     url.push('#');
                                     url.push_str(fragment);
@@ -2155,7 +2155,7 @@ fn svg_image_tag(
     svg_attrs: &HashMap<String, String>,
     image_attrs: &HashMap<String, String>,
 ) -> String {
-    let src = format!("epub://book/{}", encode_path(image_key));
+    let src = format!("cre://book/{}", encode_path(image_key));
     let mut tag = format!("<img src=\"{}\"", escape_attr(&src));
     if let Some(id) = svg_attrs.get("id").or_else(|| image_attrs.get("id")) {
         tag.push_str(&format!(" id=\"{}\"", escape_attr(id)));
@@ -2280,10 +2280,10 @@ fn full_page_image_replacement(
     }
 
     // `normalize_inline_svg_images` rewrites an SVG-backed image to
-    // `epub://book/<key>`. Treat our own scheme like a relative source;
+    // `cre://book/<key>`. Treat our own scheme like a relative source;
     // rejecting every `://` here skipped the fit style for exactly those
     // full-page images, so a tall image got its own page after a blank one.
-    let image_key = if let Some(relative) = src.strip_prefix("epub://book/") {
+    let image_key = if let Some(relative) = src.strip_prefix("cre://book/") {
         let relative = percent_decode_str(relative).decode_utf8_lossy();
         normalize_path(&relative)
     } else {
@@ -2389,7 +2389,7 @@ fn image_fit_tag(
     image_key: &str,
     available_height: f32,
 ) -> String {
-    let src = format!("epub://book/{}", encode_path(image_key));
+    let src = format!("cre://book/{}", encode_path(image_key));
     let mut tag = format!("<img src=\"{}\"", escape_attr(&src));
     if let Some(id) = image_attrs.get("id") {
         tag.push_str(&format!(" id=\"{}\"", escape_attr(id)));
@@ -2413,7 +2413,7 @@ fn image_fit_tag(
 }
 
 fn full_page_image_tag(generated_key: &str, image_attrs: &HashMap<String, String>) -> String {
-    let src = format!("epub://book/{}", encode_path(generated_key));
+    let src = format!("cre://book/{}", encode_path(generated_key));
     let mut tag = format!("<img src=\"{}\"", escape_attr(&src));
     if let Some(id) = image_attrs.get("id") {
         tag.push_str(&format!(" id=\"{}\"", escape_attr(id)));
@@ -3044,7 +3044,7 @@ p { font-family: One, serif; }";
     #[test]
     fn inline_svg_images_resolve_any_resource_name() {
         // KF8 names its images `mobi-image-N`; the EPUB path passes
-        // `epub://book/…` hrefs. Both have to reach the fetch closure, or
+        // `cre://book/…` hrefs. Both have to reach the fetch closure, or
         // usvg drops the picture.
         let mut resources = std::collections::HashMap::new();
         resources.insert("mobi-image-2", b"\x89PNG\r\n\x1a\nrest".to_vec());
@@ -3059,7 +3059,7 @@ p { font-family: One, serif; }";
         let out = inline_svg_images_to_data_uris(html, &fetch).expect("a KF8 image should inline");
         assert!(out.contains("data:image/png;base64,"), "{out}");
 
-        let html = r#"<svg viewBox="0 0 10 10"><image href="epub://book/images/one.jpg"/></svg>"#;
+        let html = r#"<svg viewBox="0 0 10 10"><image href="cre://book/images/one.jpg"/></svg>"#;
         let out =
             inline_svg_images_to_data_uris(html, &fetch).expect("an EPUB image should inline");
         assert!(out.contains("data:image/jpeg;base64,"), "{out}");
@@ -3260,8 +3260,8 @@ p { font-family: One, serif; }";
     fn builds_combined_html_with_rewritten_resources() {
         let book = juliet();
         let html = book.to_html(&HtmlOptions::default()).unwrap();
-        assert!(html.contains("epub://book/OPS/css/main.css"));
-        assert!(html.contains("epub://book/OPS/images/logo-feedbooks-tiny.png"));
+        assert!(html.contains("cre://book/OPS/css/main.css"));
+        assert!(html.contains("cre://book/OPS/images/logo-feedbooks-tiny.png"));
         assert!(html.contains("data-spine-index=\"1\""));
         assert!(html.contains("data-spine-href=\"OPS/cover.xml\""));
         assert!(html.contains("Romeo and Juliet"));
@@ -3337,7 +3337,7 @@ p { font-family: One, serif; }";
         assert!(book.resource("cre-inline-svg-1.svg").is_none());
 
         let html = book.to_html(&HtmlOptions::default()).unwrap();
-        assert!(html.contains("epub://book/images/one.jpg"));
+        assert!(html.contains("cre://book/images/one.jpg"));
         assert!(html.contains("max-width:100%;height:auto"));
         assert!(!html.contains("data:image/jpeg;base64,"));
     }
@@ -3372,7 +3372,7 @@ p { font-family: One, serif; }";
         assert_eq!((fit.width, fit.height), (520, 736));
 
         let html = book.to_html(&HtmlOptions::default()).unwrap();
-        assert!(html.contains(&format!("epub://book/{generated_key}")));
+        assert!(html.contains(&format!("cre://book/{generated_key}")));
         assert!(html.contains("style=\"max-width:100%;height:auto\""));
         assert!(!html.contains("height: 100%; max-width: 100%"));
     }
@@ -3655,7 +3655,7 @@ p { font-family: One, serif; }";
             docs[1].body_html
         );
         let html = book.to_html(&HtmlOptions::default()).unwrap();
-        assert!(html.contains("epub://book/images/one.jpg"));
+        assert!(html.contains("cre://book/images/one.jpg"));
     }
 
     /// A tall image is not only used as a cover: a chapter can hold one inline.
@@ -3667,7 +3667,7 @@ p { font-family: One, serif; }";
         let mut book = EpubBook::from_bytes(synthetic_tall_image_with_text_epub()).unwrap();
         assert_eq!(book.normalize_full_page_images(600.0, 800.0, 40.0, 32.0), 1);
         let html = book.to_html(&HtmlOptions::default()).unwrap();
-        assert!(html.contains("epub://book/images/one.jpg"));
+        assert!(html.contains("cre://book/images/one.jpg"));
         assert!(html.contains("max-height:736px"));
         assert!(
             html.contains("border: 1px solid red;max-width:100%;max-height:736px"),
@@ -3677,7 +3677,7 @@ p { font-family: One, serif; }";
     }
 
     /// `normalize_inline_svg_images` turns a lone full-page SVG image into
-    /// `<img src="epub://book/...">`. The full-page pass must accept that
+    /// `<img src="cre://book/...">`. The full-page pass must accept that
     /// scheme too, or a tall cover stays unclipped, gets its own page, and
     /// leaves the preceding page blank (14.epub/15.epub at a 1080x1440 view).
     #[test]
@@ -3687,7 +3687,7 @@ p { font-family: One, serif; }";
         // An image-only page is scaled to the page through a generated SVG.
         assert!(book.resource("cre-page-fit-1.svg").is_some());
         let html = book.to_html(&HtmlOptions::default()).unwrap();
-        assert!(html.contains("epub://book/cre-page-fit-1.svg"));
+        assert!(html.contains("cre://book/cre-page-fit-1.svg"));
         assert!(!html.contains("height: 100%"));
     }
 
@@ -3833,7 +3833,7 @@ p { font-family: One, serif; }";
 <html xmlns="http://www.w3.org/1999/xhtml">
   <head><title>Cover</title></head>
   <body>
-    <img src="epub://book/images/one.jpg" alt="Cover" style="max-width:100%;height:auto" />
+    <img src="cre://book/images/one.jpg" alt="Cover" style="max-width:100%;height:auto" />
   </body>
 </html>"#;
         synthetic_epub_fixture(container, opf, doc, &tall_png_bytes(100, 1000))
