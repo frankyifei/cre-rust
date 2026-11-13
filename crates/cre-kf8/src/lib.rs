@@ -202,8 +202,12 @@ impl Kf8Book {
                 .map(|viewport| format!(" data-cre-fixed-layout=\"{viewport}\""))
                 .unwrap_or_default();
             body.push_str(&format!(
-                "<section class=\"cre-spine\" data-spine-index=\"{section_count}\" \
-                 id=\"cre-sec-{section_count}\"{fixed}>"
+                "<section class=\"cre-spine\" data-spine-index=\"{}\" \
+                 id=\"cre-sec-{section_count}\"{fixed}>",
+                // Zero-based, like the EPUB generator: cre-lib adds one to get
+                // the 1-based `DocFragment[n]` crengine uses, so the first part
+                // must be `DocFragment[1]`.
+                section_count - 1
             ));
             body.push_str(trimmed);
             body.push_str("</section>\n");

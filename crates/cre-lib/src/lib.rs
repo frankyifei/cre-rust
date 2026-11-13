@@ -8722,7 +8722,7 @@ fn page_for_spine_node(
     Some(page_containing_top(target, page_starts))
 }
 
-fn page_containing_top(top: f32, page_starts: &[PageStart]) -> usize {
+pub(crate) fn page_containing_top(top: f32, page_starts: &[PageStart]) -> usize {
     let mut page = 1usize;
     for (index, start) in page_starts.iter().enumerate() {
         if top + 1.0 >= start.clip_top {

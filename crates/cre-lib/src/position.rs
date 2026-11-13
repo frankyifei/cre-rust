@@ -16,6 +16,12 @@ pub struct TextPosition {
     /// paragraph.
     pub text_index: Option<u32>,
     pub codepoint_offset: u32,
+    /// The path names an element rather than a character inside its text.
+    ///
+    /// A page that holds only a picture has no text to anchor to, so crengine
+    /// points at the element instead (`/body/DocFragment[2]/body/div/img`).
+    /// `text_index` and `codepoint_offset` are unused then.
+    pub element: bool,
 }
 
 impl TextPosition {
@@ -27,6 +33,10 @@ impl TextPosition {
             path.push('[');
             path.push_str(&segment.index.to_string());
             path.push(']');
+        }
+
+        if self.element {
+            return format!("/body/DocFragment[{}]/body{}", self.spine_index, path);
         }
 
         let text = match self.text_index {
@@ -115,17 +125,26 @@ pub fn parse_text_position(input: &str) -> Result<TextPosition> {
     }
 
     let Some(terminal) = parts.last() else {
-        return Err(anyhow!("unsupported XPointer: path must end with text().0"));
+        return Err(anyhow!("unsupported XPointer: path is empty"));
     };
-    let (text_index, codepoint_offset) = parse_terminal(terminal)?;
+    // A terminal `text()[k].N` is a character; anything else is an element
+    // (crengine uses that form for a position with no text, such as a picture).
+    let (text_index, codepoint_offset, element) = match parse_terminal(terminal) {
+        Ok((text_index, codepoint_offset)) => (text_index, codepoint_offset, false),
+        Err(_) => (None, 0, true),
+    };
 
+    let end = if element {
+        parts.len()
+    } else {
+        parts.len() - 1
+    };
     let mut segments = Vec::new();
-    for part in parts
-        .iter()
-        .take(parts.len().saturating_sub(1))
-        .skip(cursor)
-    {
+    for part in parts.iter().take(end).skip(cursor) {
         segments.push(parse_path_segment(part)?);
+    }
+    if element && segments.is_empty() {
+        return Err(anyhow!("unsupported XPointer: element path is empty"));
     }
 
     Ok(TextPosition {
@@ -133,6 +152,7 @@ pub fn parse_text_position(input: &str) -> Result<TextPosition> {
         path: segments,
         text_index,
         codepoint_offset,
+        element,
     })
 }
 
@@ -189,6 +209,14 @@ fn parse_path_segment(segment: &str) -> Result<PathSegment> {
     if segment.is_empty() || segment == "text()" {
         return Err(anyhow!("unsupported XPointer: malformed path segment"));
     }
+    // A segment is a tag name, optionally with a 1-based index. Anything else
+    // (a function call, an offset) is not part of a path.
+    let tag_is_name = |tag: &str| {
+        !tag.is_empty()
+            && tag
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':'))
+    };
 
     if let Some(open) = segment.find('[') {
         if !segment.ends_with(']') {
@@ -201,7 +229,7 @@ fn parse_path_segment(segment: &str) -> Result<PathSegment> {
         let index = index
             .parse::<u32>()
             .map_err(|_| anyhow!("unsupported XPointer: malformed path segment index"))?;
-        if tag.is_empty() || index == 0 {
+        if !tag_is_name(tag) || index == 0 {
             return Err(anyhow!(
                 "unsupported XPointer: malformed path segment index"
             ));
@@ -211,6 +239,9 @@ fn parse_path_segment(segment: &str) -> Result<PathSegment> {
             index,
         })
     } else {
+        if !tag_is_name(segment) {
+            return Err(anyhow!("unsupported XPointer: malformed path segment"));
+        }
         Ok(PathSegment {
             tag: segment.to_string(),
             index: 1,

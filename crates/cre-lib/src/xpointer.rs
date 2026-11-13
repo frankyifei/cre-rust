@@ -6,7 +6,7 @@ use blitz_dom::{Node, NodeId};
 use blitz_html::HtmlDocument;
 
 use crate::position::{PathSegment, TextPosition, parse_text_position};
-use crate::{LineBox, PageStart};
+use crate::{LineBox, PageStart, page_containing_top};
 
 pub(crate) fn xpointer_from_page(
     doc: &HtmlDocument,
@@ -17,7 +17,16 @@ pub(crate) fn xpointer_from_page(
     page_margin: f32,
 ) -> Result<String> {
     let root = doc.root_element();
-    let position = position_for_page(root, lines, page_starts, page, height, page_margin)?;
+    // A page whose only content is a picture has no line to anchor to; point at
+    // the element instead, which is what crengine does for those pages and what
+    // makes bookmarks and the last-read position work on a comic.
+    let position = match position_for_page(root, lines, page_starts, page, height, page_margin) {
+        Ok(position) => position,
+        Err(text_error) => {
+            element_position_for_page(doc, root, page_starts, page, height, page_margin)
+                .map_err(|element_error| element_error.context(text_error.to_string()))?
+        }
+    };
     Ok(position.to_xpointer())
 }
 
@@ -28,6 +37,10 @@ pub(crate) fn page_from_xpointer(
 ) -> Result<usize> {
     let position = parse_text_position(xpointer)?;
     let root = doc.root_element();
+    if position.element {
+        let element_id = resolve_element_position(root, &position)?;
+        return page_for_element(doc, root, element_id, page_starts);
+    }
     let text_id = resolve_text_position(root, &position)?;
     page_for_text_node(doc, root, text_id, page_starts)
 }
@@ -471,6 +484,19 @@ pub(crate) fn position_for_text_node(
         spine_index_for_node(root.with(spine_root_id)).unwrap_or(1)
     };
 
+    let path = path_to_node(root, target_id, spine_root_id)?;
+    let text_index = text_index_for_node(root, target_id);
+    Ok(TextPosition {
+        spine_index,
+        path,
+        text_index,
+        codepoint_offset,
+        element: false,
+    })
+}
+
+/// XPointer path of `target_id` below `spine_root_id`.
+fn path_to_node(root: &Node, target_id: NodeId, spine_root_id: NodeId) -> Result<Vec<PathSegment>> {
     let mut path = Vec::new();
     let mut current_id = target_id;
     while current_id != spine_root_id {
@@ -487,15 +513,89 @@ pub(crate) fn position_for_text_node(
         }
         current_id = parent_id;
     }
-
     path.reverse();
-    let text_index = text_index_for_node(root, target_id);
+    Ok(path)
+}
+
+/// A position for a page that carries no text: the element that starts it.
+///
+/// Crengine points at the element in that case (`…/body/div[3]/img`), which is
+/// what makes `getXPointer`, bookmarks and the last-read position work on a
+/// picture page.
+fn element_position_for_page(
+    doc: &HtmlDocument,
+    root: &Node,
+    page_starts: &[PageStart],
+    page: usize,
+    height: u32,
+    page_margin: f32,
+) -> Result<TextPosition> {
+    let index = page.checked_sub(1).context("page numbers are 1-based")?;
+    let start = *page_starts
+        .get(index)
+        .with_context(|| format!("page {page} is outside 1..={}", page_starts.len()))?;
+    let upper = page_starts
+        .get(index + 1)
+        .map_or(start.top + height as f32 - page_margin, |next| {
+            next.clip_top
+        });
+
+    // The deepest element whose box starts on this page (an `<img>` rather than
+    // the `<html>` that also starts there), else the last one overlapping it.
+    let mut on_page: Option<(f32, NodeId)> = None;
+    let mut overlapping: Option<NodeId> = None;
+    collect_element_boxes(doc, root, &mut |id, top, bottom| {
+        if bottom <= start.clip_top || top >= upper {
+            return;
+        }
+        if top + 1.0 >= start.clip_top {
+            // Later elements win ties: document order puts a child after its
+            // parent, so the innermost box that starts here is kept.
+            match on_page {
+                Some((best_top, _)) if top < best_top - 0.5 => {}
+                _ => on_page = Some((top, id)),
+            }
+        } else {
+            overlapping = Some(id);
+        }
+    });
+    let element_id = on_page
+        .map(|(_, id)| id)
+        .or(overlapping)
+        .context("page has no element that can produce an XPointer")?;
+
+    let body_id = find_body_id(root).context("document has no body element")?;
+    let spine_root_id = find_spine_ancestor_id(root, element_id, body_id).unwrap_or(body_id);
+    let spine_index = if spine_root_id == body_id {
+        1
+    } else {
+        spine_index_for_node(root.with(spine_root_id)).unwrap_or(1)
+    };
     Ok(TextPosition {
         spine_index,
-        path,
-        text_index,
-        codepoint_offset,
+        path: path_to_node(root, element_id, spine_root_id)?,
+        text_index: None,
+        codepoint_offset: 0,
+        element: true,
     })
+}
+
+/// Calls `visit` with every laid-out element box, in document order.
+fn collect_element_boxes(
+    doc: &HtmlDocument,
+    node: &Node,
+    visit: &mut impl FnMut(NodeId, f32, f32),
+) {
+    if node.element_data().is_some()
+        && !node.is_anonymous()
+        && let Some(rect) = doc.get_client_bounding_rect(node.id)
+    {
+        let top = rect.y as f32;
+        visit(node.id, top, top + rect.height as f32);
+    }
+    for child in &node.children {
+        collect_element_boxes(doc, node.with(*child), visit);
+    }
 }
 
 /// 1-based index of a text node among its parent's text children, when the
@@ -534,12 +634,23 @@ pub(crate) fn compare_text_positions(
     right: &TextPosition,
 ) -> Option<std::cmp::Ordering> {
     use std::cmp::Ordering;
-    let left_id = resolve_text_position(root, left).ok()?;
-    let right_id = resolve_text_position(root, right).ok()?;
+    let left_id = resolve_any_position(root, left).ok()?;
+    let right_id = resolve_any_position(root, right).ok()?;
     Some(match left_id.cmp(&right_id) {
+        // An element position has no character offset to break a tie with.
+        Ordering::Equal if left.element || right.element => Ordering::Equal,
         Ordering::Equal => left.codepoint_offset.cmp(&right.codepoint_offset),
         order => order,
     })
+}
+
+/// The node a position names: the element itself, or its text node.
+fn resolve_any_position(root: &Node, position: &TextPosition) -> Result<NodeId> {
+    if position.element {
+        resolve_element_position(root, position)
+    } else {
+        resolve_text_position(root, position)
+    }
 }
 
 pub(crate) fn resolve_text_position(root: &Node, position: &TextPosition) -> Result<NodeId> {
@@ -717,6 +828,45 @@ fn node_attr<'a>(node: &'a Node, name: &str) -> Option<&'a str> {
         .iter()
         .find(|attr| attr.name.local.to_string() == name)
         .map(|attr| attr.value.as_str())
+}
+
+fn page_for_element(
+    doc: &HtmlDocument,
+    root: &Node,
+    element_id: NodeId,
+    page_starts: &[PageStart],
+) -> Result<usize> {
+    // An empty anchor (`<a id="…"></a>`) has no box; the page it means is the
+    // one that holds the content following it.
+    let top = match doc.get_client_bounding_rect(element_id) {
+        Some(rect) => rect.y as f32,
+        None => {
+            first_rect_after(doc, root, element_id).context("XPointer target has no layout rect")?
+        }
+    };
+    Ok(page_containing_top(top, page_starts))
+}
+
+/// Y of the first laid-out element after `target` in document order.
+fn first_rect_after(doc: &HtmlDocument, root: &Node, target: NodeId) -> Option<f32> {
+    fn walk(doc: &HtmlDocument, node: &Node, target: NodeId, seen: &mut bool) -> Option<f32> {
+        if node.id == target {
+            *seen = true;
+        } else if *seen
+            && node.element_data().is_some()
+            && let Some(rect) = doc.get_client_bounding_rect(node.id)
+        {
+            return Some(rect.y as f32);
+        }
+        for child in &node.children {
+            if let Some(top) = walk(doc, node.with(*child), target, seen) {
+                return Some(top);
+            }
+        }
+        None
+    }
+    let mut seen = false;
+    walk(doc, root, target, &mut seen)
 }
 
 fn page_for_text_node(

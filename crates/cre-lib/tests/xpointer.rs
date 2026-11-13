@@ -47,6 +47,78 @@ fn xpointer_parse_accepts_xpointer_scheme() {
 }
 
 #[test]
+fn every_page_produces_a_round_tripping_xpointer() {
+    require_resources();
+    let doc = Document::open(fixture("juliet.epub")).expect("open fixture");
+    for page in 1..=doc.page_count() {
+        let xpointer = doc
+            .xpointer_from_page(page)
+            .unwrap_or_else(|error| panic!("page {page} has no XPointer: {error}"));
+        assert_eq!(
+            doc.page_from_xpointer(&xpointer).unwrap(),
+            page,
+            "page {page} round-trips to the wrong page: {xpointer}"
+        );
+    }
+}
+
+#[test]
+fn a_block_picture_page_produces_an_element_xpointer() {
+    require_resources();
+    let dir = std::env::temp_dir().join("cre-element-xpointer");
+    std::fs::create_dir_all(&dir).expect("create dir");
+    // A real picture so the element has a box.
+    let image = image::RgbImage::from_pixel(300, 400, image::Rgb([8, 8, 8]));
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 80)
+        .encode(image.as_raw(), 300, 400, image::ExtendedColorType::Rgb8)
+        .expect("encode jpeg");
+    std::fs::write(dir.join("page.jpg"), &jpeg).expect("write jpeg");
+    // A block-level picture leaves no line box behind, which is the shape a
+    // comic page has (and the one that used to have no XPointer at all).
+    let html = "<html><body>\
+                <section class=\"cre-spine\" data-spine-index=\"0\" id=\"s1\">\
+                <img src=\"page.jpg\" style=\"display:block;width:100%\"/></section>\
+                <section class=\"cre-spine\" data-spine-index=\"1\" id=\"s2\">\
+                <p>a page with text</p></section></body></html>";
+    let path = dir.join("pages.html");
+    std::fs::write(&path, html).expect("write html");
+
+    let doc = Document::open(&path).expect("open document");
+    let first = doc
+        .xpointer_from_page(1)
+        .expect("a picture page must still produce an XPointer");
+    assert!(
+        !first.contains("text()"),
+        "expected the element form, got {first}"
+    );
+    assert_eq!(doc.page_from_xpointer(&first).unwrap(), 1);
+    // The text page keeps the character-level form.
+    let second = doc.xpointer_from_page(doc.page_count()).unwrap();
+    assert!(second.contains("text()"), "{second}");
+}
+
+#[test]
+fn xpointer_parse_accepts_an_element_form() {
+    // A page with no text (a picture) is addressed by its element, the way
+    // crengine does; the path round-trips untouched.
+    for input in [
+        "/body/DocFragment[2]/body/img[1]",
+        "/body/DocFragment[3]/body/div[1]/img[1]",
+        "/body/DocFragment[1]/body/section[2]",
+    ] {
+        let position = parse_text_position(input).unwrap_or_else(|error| {
+            panic!("rejected {input}: {error}");
+        });
+        assert!(position.element, "{input} should be an element position");
+        assert_eq!(position.to_xpointer(), input);
+    }
+    // The text form still parses as text.
+    let text = parse_text_position("/body/DocFragment[2]/body/p[1]/text()[2].5").unwrap();
+    assert!(!text.element);
+}
+
+#[test]
 fn xpointer_parse_rejects_invalid_paths() {
     for input in [
         "not-an-xpointer",

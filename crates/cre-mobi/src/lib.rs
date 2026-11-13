@@ -403,8 +403,11 @@ fn wrap_sections(body: &[u8]) -> (String, usize) {
             continue;
         }
         count += 1;
+        // Zero-based, like the EPUB generator: cre-lib adds one to get the
+        // 1-based `DocFragment[n]` crengine uses.
         html.push_str(&format!(
-            "<section class=\"cre-spine\" data-spine-index=\"{count}\" id=\"cre-sec-{count}\">"
+            "<section class=\"cre-spine\" data-spine-index=\"{}\" id=\"cre-sec-{count}\">",
+            count - 1
         ));
         html.push_str(trimmed);
         html.push_str("</section>\n");
@@ -413,7 +416,7 @@ fn wrap_sections(body: &[u8]) -> (String, usize) {
         // No page breaks at all: still give the document one section so
         // XPointers have a DocFragment to name.
         let text = String::from_utf8_lossy(body).trim().to_string();
-        html.push_str("<section class=\"cre-spine\" data-spine-index=\"1\" id=\"cre-sec-1\">");
+        html.push_str("<section class=\"cre-spine\" data-spine-index=\"0\" id=\"cre-sec-1\">");
         html.push_str(&text);
         html.push_str("</section>\n");
         count = 1;
@@ -794,8 +797,9 @@ mod tests {
         let body = b"<p>one</p><div class=\"cre-pagebreak\"></div><p>two</p>";
         let (html, sections) = wrap_sections(body);
         assert_eq!(sections, 2);
+        // Zero-based: cre-lib adds one for `DocFragment[n]`.
+        assert!(html.contains("data-spine-index=\"0\""));
         assert!(html.contains("data-spine-index=\"1\""));
-        assert!(html.contains("data-spine-index=\"2\""));
         assert!(html.contains("<p>two</p>"));
     }
 

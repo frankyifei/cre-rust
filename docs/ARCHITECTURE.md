@@ -85,6 +85,20 @@ For a line that holds several text nodes, a position is compared in block byte
 space, not with `TextPosition` ordering. This is necessary for headings such as
 `<h1><span>Chapter</span> One</h1>`.
 
+A page with no text — a picture page, which is every page of a comic — has no
+line to anchor to, so the position names the element instead:
+
+```text
+/body/DocFragment[3]/body/img[1]
+```
+
+That form round-trips like the text one (`page_from_xpointer` resolves it to the
+page the element sits on). Without it, `getXPointer()` had nothing to return for
+those pages, and the reader lost the last-read position, bookmarks and the
+"go to page" dialog; KOReader also picks the XPointer branch over the page when
+both are available, so a TOC entry with a page but no XPointer was a menu that
+jumped nowhere.
+
 ## Layout and pagination
 
 `cre-lib` builds one Blitz document for one chunk. It then collects:
