@@ -246,12 +246,22 @@ The format crates rewrite image references to `epub://book/<path>` URLs. The
 net provider serves the bytes. SVG files are rasterized at page size with
 resvg.
 
-A MOBI/KF8 part that holds nothing but a picture is turned into a
+A MOBI/KF8/HTML part that holds nothing but a picture is turned into a
 `cre-page-fit-N` plate before the document is chunked, so layout sees a
-page-sized box and painting reads the picture from the resource map instead of
+page-sized box and painting reads the picture from the resource table instead of
 a base64 copy inside the HTML (a 48 MB comic: 612 -> 68 MB peak, 3.1 -> 0.03 s
 to open). The part's own `<div>` is kept, because that is where a KF8 book puts
 its TOC anchors.
+
+## Resources
+
+`ResourceSource` is the one place that answers "give me the bytes for this key":
+a zip entry, a PalmDB record range, an in-memory map, or a file next to a
+standalone document. It also carries a *generated* table, consulted first, for
+what the engine makes up while preparing the book — page-fit wrappers and
+decoded `data:` pictures. That is what lets a standalone HTML document (which
+has no archive to write into) use the same plate path as an EPUB, and it keeps
+the painter, the net provider and `getImageDataAt` on one namespace.
 
 An image-only SVG block is rewritten to a plain `<img>`. It is an image, not a
 drawing.

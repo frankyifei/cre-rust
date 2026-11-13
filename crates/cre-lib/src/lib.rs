@@ -437,7 +437,7 @@ fn split_single_document(html: String, resources: &ResourceSource) -> Vec<String
     let cost = |section: &str| -> (usize, usize) {
         let images = cre_epub::image_sources_in(section)
             .into_iter()
-            .filter_map(|key| resource_image_bytes(resources, &key))
+            .filter_map(|key| resources.estimated_decoded_bytes(&key))
             .sum();
         (section.len(), images)
     };
@@ -491,7 +491,7 @@ where
     let cost = |section: &str| -> (usize, usize) {
         let images = cre_epub::image_sources_in(section)
             .into_iter()
-            .filter_map(|key| resource_image_bytes(resources, &key))
+            .filter_map(|key| resources.estimated_decoded_bytes(&key))
             .sum();
         (section.len(), images)
     };
@@ -566,19 +566,6 @@ impl ChunkSink {
             .extend(cre_epub::image_sources_in(&html));
         self.sources.push(ChunkSource::new(html));
         Ok(())
-    }
-}
-
-/// Estimated decoded size of one resource, for the chunk image budget.
-fn resource_image_bytes(resources: &ResourceSource, key: &str) -> Option<usize> {
-    match resources {
-        ResourceSource::Epub(provider) => provider.estimated_decoded_bytes(key),
-        ResourceSource::Map(map) => {
-            let key = normalize_path(key);
-            map.get(&key)
-                .map(|bytes| cre_epub::estimated_image_bytes(&key, bytes))
-        }
-        ResourceSource::Empty => None,
     }
 }
 
@@ -1300,22 +1287,134 @@ impl MapResources {
     }
 }
 
+/// Resources the engine generates while preparing a book (page-fit wrappers,
+/// decoded `data:` pictures). Shared by the document, the net providers and the
+/// painter, so a generated key behaves like any resource.
+type GeneratedResources = Arc<std::sync::Mutex<HashMap<String, Arc<Vec<u8>>>>>;
+
+/// One generated resource, if the key names one.
+fn generated_resource(generated: &GeneratedResources, key: &str) -> Option<Arc<Vec<u8>>> {
+    generated.lock().ok()?.get(key).cloned()
+}
+
+/// Where a document's resources come from, plus the ones the engine makes up.
+///
+/// A standalone HTML document has no archive to index: its pictures and
+/// stylesheets sit next to it on disk, and some of them are inlined in the
+/// markup as `data:` URIs. Rather than special-casing that per caller, every
+/// source answers the same `get(key)`, and [`Self::generated`] holds what the
+/// engine synthesises while preparing the book (page-fit wrappers, decoded
+/// `data:` pictures) so the net providers and the painter see one namespace.
 #[derive(Clone)]
-pub enum ResourceSource {
+pub struct ResourceSource {
+    base: ResourceBase,
+    generated: Arc<std::sync::Mutex<HashMap<String, Arc<Vec<u8>>>>>,
+}
+
+#[derive(Clone)]
+enum ResourceBase {
     Empty,
     /// Resources carried in memory or indexed in the book file.
     Map(MapResources),
     Epub(Arc<LazyResource>),
+    /// A standalone document: resources are files next to it.
+    Files(PathBuf),
 }
 
 impl ResourceSource {
+    fn new(base: ResourceBase) -> Self {
+        Self {
+            base,
+            generated: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn empty() -> Self {
+        Self::new(ResourceBase::Empty)
+    }
+
+    fn map(map: MapResources) -> Self {
+        Self::new(ResourceBase::Map(map))
+    }
+
+    fn epub(provider: Arc<LazyResource>) -> Self {
+        Self::new(ResourceBase::Epub(provider))
+    }
+
+    fn files(root: PathBuf) -> Self {
+        Self::new(ResourceBase::Files(root))
+    }
+
+    /// Resource bytes for `key`: generated resources first, then the book.
+    fn get(&self, key: &str) -> Option<Arc<Vec<u8>>> {
+        let key = normalize_path(key);
+        if let Ok(generated) = self.generated.lock()
+            && let Some(bytes) = generated.get(&key)
+        {
+            return Some(Arc::clone(bytes));
+        }
+        match &self.base {
+            ResourceBase::Empty => None,
+            ResourceBase::Map(map) => map.get(&key).map(|bytes| Arc::new(bytes.to_vec())),
+            ResourceBase::Epub(provider) => provider.get(&key),
+            ResourceBase::Files(root) => read_file_resource(root, &key),
+        }
+    }
+
+    /// Registers a resource the engine generated for this document.
+    fn insert(&self, key: impl Into<String>, bytes: impl Into<Arc<Vec<u8>>>) {
+        if let Ok(mut generated) = self.generated.lock() {
+            generated.insert(key.into(), bytes.into());
+        }
+    }
+
+    /// The generated-resource table, shared with the net providers.
+    pub fn generated(&self) -> Arc<std::sync::Mutex<HashMap<String, Arc<Vec<u8>>>>> {
+        Arc::clone(&self.generated)
+    }
+
+    /// Estimated decoded size of an image, for the chunk memory budget.
+    fn estimated_decoded_bytes(&self, key: &str) -> Option<usize> {
+        match &self.base {
+            ResourceBase::Empty => None,
+            ResourceBase::Epub(provider) => provider.estimated_decoded_bytes(key),
+            ResourceBase::Map(map) => {
+                let key = normalize_path(key);
+                map.get(&key)
+                    .map(|bytes| cre_epub::estimated_image_bytes(&key, bytes))
+            }
+            ResourceBase::Files(root) => {
+                let bytes = read_file_resource(root, key)?;
+                Some(cre_epub::estimated_image_bytes(key, &bytes))
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        matches!(self.base, ResourceBase::Empty)
+    }
+
+    fn is_epub(&self) -> bool {
+        matches!(self.base, ResourceBase::Epub(_))
+    }
+
     /// Drops the book file's pages after the open pass; see
     /// [`MapResources::drop_pages`].
     fn drop_pages(&self) {
-        if let Self::Map(map) = self {
+        if let ResourceBase::Map(map) = &self.base {
             map.drop_pages();
         }
     }
+}
+
+/// Reads one resource of a standalone document, refusing to leave its directory.
+fn read_file_resource(root: &Path, key: &str) -> Option<Arc<Vec<u8>>> {
+    let relative = percent_decode_str(key).decode_utf8_lossy();
+    let candidate = std::fs::canonicalize(root.join(relative.as_ref())).ok()?;
+    if !candidate.starts_with(root) || !candidate.is_file() {
+        return None;
+    }
+    std::fs::read(&candidate).ok().map(Arc::new)
 }
 
 pub struct Document {
@@ -1499,7 +1598,7 @@ impl Document {
             vec![html.to_string()],
             "",
             Arc::new(EmptyNet),
-            ResourceSource::Empty,
+            ResourceSource::empty(),
             Arc::new(ImageRaster::new(options.width, options.height)),
             None,
             false,
@@ -1653,6 +1752,7 @@ impl Document {
                 }
                 let embedded_fonts_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
                 let resource_provider = Arc::new(book.resource_provider);
+                let resources = ResourceSource::epub(resource_provider.clone());
                 let mut document = Self::build_from_sources(
                     sources,
                     fixed_layouts,
@@ -1662,8 +1762,9 @@ impl Document {
                         svg: svg_raster.clone(),
                         resource_provider: resource_provider.clone(),
                         embedded_fonts: embedded_fonts_flag.clone(),
+                        generated: resources.generated(),
                     }),
-                    ResourceSource::Epub(resource_provider),
+                    resources,
                     svg_raster.clone(),
                     cover_image,
                     has_non_linear_flows,
@@ -1711,7 +1812,7 @@ impl Document {
                 let cover_image = book.binary.values().next().cloned();
                 let binary = Arc::new(std::mem::take(&mut book.binary));
                 let resources = MapResources::Owned(binary);
-                let resource_source = ResourceSource::Map(resources.clone());
+                let resource_source = ResourceSource::map(resources.clone());
                 let mut sink = ChunkSink::new();
                 stream_single_document_chunks(&head, &body, &resource_source, |html| {
                     sink.push(html)
@@ -1728,6 +1829,7 @@ impl Document {
                     Arc::new(MapNet {
                         resources: resources.clone(),
                         svg: svg_raster.clone(),
+                        generated: resource_source.generated(),
                     }),
                     resource_source,
                     svg_raster.clone(),
@@ -1771,10 +1873,10 @@ impl Document {
                 let head = book.html_head(&html_options);
                 let cover_image = book.cover_image.take();
                 let resources = MapResources::Mapped(Arc::new(std::mem::take(&mut book.resources)));
-                let resource_source = ResourceSource::Map(resources.clone());
-                let body = prepare_map_page_images(
+                let resource_source = ResourceSource::map(resources.clone());
+                let body = prepare_page_images(
                     book.body_html().to_string(),
-                    &resources,
+                    &resource_source,
                     options,
                     &svg_raster,
                 );
@@ -1791,6 +1893,7 @@ impl Document {
                     Arc::new(MapNet {
                         resources: resources.clone(),
                         svg: svg_raster.clone(),
+                        generated: resource_source.generated(),
                     }),
                     resource_source,
                     svg_raster.clone(),
@@ -1834,10 +1937,10 @@ impl Document {
                 let head = book.html_head(&html_options);
                 let cover_image = book.cover_image.take();
                 let resources = MapResources::Mapped(Arc::new(std::mem::take(&mut book.resources)));
-                let resource_source = ResourceSource::Map(resources.clone());
-                let body = prepare_map_page_images(
+                let resource_source = ResourceSource::map(resources.clone());
+                let body = prepare_page_images(
                     book.body_html().to_string(),
-                    &resources,
+                    &resource_source,
                     options,
                     &svg_raster,
                 );
@@ -1871,6 +1974,7 @@ impl Document {
                     Arc::new(MapNet {
                         resources: resources.clone(),
                         svg: svg_raster.clone(),
+                        generated: resource_source.generated(),
                     }),
                     resource_source,
                     svg_raster.clone(),
@@ -1906,10 +2010,10 @@ impl Document {
                 let html_options = TextHtmlOptions::default();
                 let html = book.to_html(&html_options);
                 Self::build(
-                    split_single_document(html, &ResourceSource::Empty),
+                    split_single_document(html, &ResourceSource::empty()),
                     "text://book/",
                     Arc::new(EmptyNet),
-                    ResourceSource::Empty,
+                    ResourceSource::empty(),
                     Arc::new(ImageRaster::new(options.width, options.height)),
                     None,
                     false,
@@ -1996,16 +2100,25 @@ impl Document {
                     }
                 }
                 let embedded_fonts_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                // A standalone document has no archive to index: its pictures
+                // and stylesheets are files next to it, and some are inlined as
+                // `data:` URIs. The resource source answers both, so the plate
+                // pass and the painter use the same namespace as every other
+                // format.
+                let resources = ResourceSource::files(root.clone());
+                let images = Arc::new(ImageRaster::new(options.width, options.height));
+                let html = prepare_page_images(html, &resources, options, &images);
                 let mut document = Self::build(
-                    split_single_document(html, &ResourceSource::Empty),
+                    split_single_document(html, &resources),
                     &base_url,
                     Arc::new(FileNet {
                         root: root.clone(),
-                        svg: svg_raster.clone(),
+                        svg: images.clone(),
                         embedded_fonts: embedded_fonts_flag.clone(),
+                        generated: resources.generated(),
                     }),
-                    ResourceSource::Empty,
-                    Arc::new(ImageRaster::new(options.width, options.height)),
+                    resources,
+                    images,
                     None,
                     false,
                     metadata,
@@ -2051,7 +2164,7 @@ impl Document {
         // Only images an `<img>` element references may become a size
         // placeholder: a CSS background image has no other painter, and a
         // fixed-layout page draws its images through its own transform.
-        let content_images: Vec<String> = if matches!(resources, ResourceSource::Empty) {
+        let content_images: Vec<String> = if resources.is_empty() {
             Vec::new()
         } else {
             htmls
@@ -2473,13 +2586,7 @@ fn layout_chunk_html(
         // (and only for the parse: the stored chunk HTML keeps the short href).
         // Every format goes through here, so a KF8 cover wrapped in `<svg>`
         // keeps its picture too.
-        let inlined = |key: &str| -> Option<Arc<Vec<u8>>> {
-            match resources {
-                ResourceSource::Epub(provider) => provider.get(key),
-                ResourceSource::Map(map) => map.get(key).map(|data| Arc::new(data.to_vec())),
-                ResourceSource::Empty => None,
-            }
-        };
+        let inlined = |key: &str| -> Option<Arc<Vec<u8>>> { resources.get(key) };
         // A section that holds nothing but a picture is a plate page: scale it
         // to the page. MOBI/KF8 are one document with `<section
         // class="cre-spine">` parts, so it has to be done here, per section.
@@ -2491,11 +2598,10 @@ fn layout_chunk_html(
         // base64-copies the picture into the chunk HTML — fine for one cover,
         // wasteful for a book of plates. Run before the inliner so the
         // `<image>` this generates is inlined too.
-        let fitted = (!matches!(resources, ResourceSource::Epub(_))).then(|| {
+        let fitted = (!resources.is_epub()).then(|| {
             let width = options.width as f32 - margins.left - margins.right;
             let height = options.height as f32 - margins.top - margins.bottom;
-            let html = fit_cover_images(html, width, height);
-            fit_picture_sections(&html, width, height)
+            fit_cover_images(html, width, height)
         });
         let html = fitted.as_deref().unwrap_or(html);
         let inlined = cre_epub::inline_svg_images_to_data_uris(html, &inlined);
@@ -2503,11 +2609,7 @@ fn layout_chunk_html(
         // Inline SVG needs the document's CSS and a pattern-capable rasterizer;
         // see `prepare_inline_svgs`. Text-only chunks skip the work entirely.
         let prepared_svg = contains_ignore_ascii_case(html, "<svg").then(|| {
-            let epub_provider = match resources {
-                ResourceSource::Epub(provider) => Some(provider.as_ref()),
-                _ => None,
-            };
-            let css = document_css_for_svg(html, epub_provider);
+            let css = document_css_for_svg(html, resources);
             prepare_inline_svgs(html, &css, options.width)
         });
         let html = prepared_svg.as_deref().unwrap_or(html);
@@ -3736,15 +3838,15 @@ impl Document {
         breakdown.placeheld_images = self.images.placeheld_count();
         breakdown.svg_cache_bytes = self.images.cached_bytes();
         breakdown.page_map_source_bytes = self.page_map_source.len();
-        match &self.resources {
-            ResourceSource::Epub(provider) => {
+        match &self.resources.base {
+            ResourceBase::Epub(provider) => {
                 breakdown.resource_cache_bytes = provider.cache_stats().1;
                 breakdown.pinned_bytes = provider.pinned_bytes();
             }
-            ResourceSource::Map(map) => {
+            ResourceBase::Map(map) => {
                 breakdown.resource_cache_bytes = map.bytes();
             }
-            ResourceSource::Empty => {}
+            ResourceBase::Empty | ResourceBase::Files(_) => {}
         }
         if let Some(active) = self.active.borrow().as_ref() {
             breakdown.active_line_boxes = active.lines.len();
@@ -3854,7 +3956,7 @@ impl Document {
     pub fn resource(&self, path: &str) -> Option<Vec<u8>> {
         let (key, _) = href_key(path);
         let key = key.strip_prefix("binary/").unwrap_or(&key);
-        lookup_resource(&self.resources, key).map(|data| (*data).clone())
+        self.resources.get(key).map(|data| (*data).clone())
     }
 
     pub fn image_data_at(&self, position: PagePosition) -> Result<Option<Vec<u8>>> {
@@ -6998,16 +7100,6 @@ fn common_ancestor(root: &Node, left: NodeId, right: NodeId) -> Option<NodeId> {
     None
 }
 
-fn lookup_resource(resources: &ResourceSource, key: &str) -> Option<Arc<Vec<u8>>> {
-    match resources {
-        ResourceSource::Empty => None,
-        ResourceSource::Map(map) => map.get(key).map(|bytes| Arc::new(bytes.to_vec())),
-        // The provider already hands out `Arc`s; copying the bytes here made
-        // every page render clone the whole (compressed) picture.
-        ResourceSource::Epub(provider) => provider.get(key),
-    }
-}
-
 fn find_image_data_at(
     doc: &HtmlDocument,
     node: &Node,
@@ -7046,7 +7138,7 @@ fn find_image_data_at(
             };
             let (key, _) = href_key(&resolved);
             let key = key.strip_prefix("binary/").unwrap_or(&key);
-            if let Some(data) = lookup_resource(resources, key) {
+            if let Some(data) = resources.get(key) {
                 return Some((*data).clone());
             }
         }
@@ -7126,12 +7218,20 @@ fn collect_placed_images(
         let placed = images
             .placeheld_size(key)
             .and_then(|(width, height)| {
-                lookup_resource(resources, key)
+                resources
+                    .get(key)
                     .map(|bytes| (bytes, width, height, cre_paint::ImageFit::Fill))
             })
             .or_else(|| {
-                let fit = images.page_fit_image(key)?;
-                let bytes = lookup_resource(resources, &fit.source)?;
+                // A generated key is flat (`cre-page-fit-N`), while a standalone
+                // document resolves its `src` against the document's directory,
+                // so the key arrives as a full file path there.
+                let fit = images.page_fit_image(key).or_else(|| {
+                    key.rsplit('/')
+                        .next()
+                        .and_then(|name| images.page_fit_image(name))
+                })?;
+                let bytes = resources.get(&fit.source)?;
                 Some((
                     bytes,
                     fit.width,
@@ -8928,19 +9028,18 @@ fn page_fit_svg(width: f32, height: f32) -> String {
 /// Turns a book's picture-only parts into page-sized plates that point at the
 /// image instead of inlining it.
 ///
-/// This is the MOBI/KF8 counterpart of `cre_epub::normalize_full_page_images`:
-/// EPUB rewrites each spine document and writes a generated resource into the
-/// archive view, while these formats keep the whole book in one document whose
-/// parts are `<section class="cre-spine">`. A part that is one picture gets a
-/// `cre-page-fit-N` wrapper in `page_fit`/`page_svgs`, and its content becomes a
-/// single `<img src="cre-page-fit-N">`, so layout sees a page-sized box and
-/// painting reads the original bytes from the resource map.
-fn normalize_map_page_images(
+/// This is the counterpart of `cre_epub::normalize_full_page_images` and works
+/// for any source that can answer `get(key)` — a PalmDB resource map, a
+/// standalone document's directory, or a `data:` picture already in the markup.
+/// A part that is one picture gets a `cre-page-fit-N` wrapper (written into the
+/// source's generated table), and its content becomes a single
+/// `<img src="cre-page-fit-N">`, so layout sees a page-sized box and painting
+/// reads the original bytes through the same table.
+fn normalize_page_images(
     body: String,
-    resources: &MapResources,
+    resources: &ResourceSource,
     available: (f32, f32),
     page_fit: &mut HashMap<String, cre_epub::PageFitImage>,
-    page_svgs: &mut HashMap<String, Arc<Vec<u8>>>,
 ) -> String {
     static SRC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let src = SRC.get_or_init(|| {
@@ -8974,9 +9073,23 @@ fn normalize_map_page_images(
         if picture.starts_with("cre-page-fit-") {
             continue;
         }
-        let key = normalize_path(&picture);
-        let Some((image_width, image_height)) = resources.get(&key).and_then(image_dimensions)
-        else {
+        // A `data:` picture is already in the markup; decode it so the painter
+        // can read it back from the generated table like any other resource.
+        let (key, bytes) = match data_uri_bytes(&picture) {
+            Some(bytes) => {
+                let key = format!("cre-data-image-{counter}");
+                resources.insert(key.clone(), bytes.clone());
+                (key, bytes)
+            }
+            None => {
+                let key = normalize_path(&picture);
+                let Some(bytes) = resources.get(&key) else {
+                    continue;
+                };
+                (key, bytes)
+            }
+        };
+        let Some((image_width, image_height)) = image_dimensions(&bytes) else {
             continue;
         };
         // Replace the part's content, but keep the anchors it carried: a KF8
@@ -8997,7 +9110,7 @@ fn normalize_map_page_images(
                 contain: true,
             },
         );
-        page_svgs.insert(
+        resources.insert(
             name.clone(),
             Arc::new(page_fit_svg(width, height).into_bytes()),
         );
@@ -9040,15 +9153,14 @@ fn section_anchor_ids(section: &str) -> Vec<String> {
     out
 }
 
-/// Wraps the picture-only parts of a MOBI/KF8 document into page-fit plates and
-/// registers them on the raster.
+/// Wraps the picture-only parts of a document into page-fit plates.
 ///
 /// Called before the document is split into chunks, so the generated
 /// `cre-page-fit-N` keys are in place for every chunk and the chunk budgets see
 /// the small wrapper instead of the picture.
-fn prepare_map_page_images(
+fn prepare_page_images(
     body: String,
-    resources: &MapResources,
+    resources: &ResourceSource,
     options: &DocumentOptions,
     svg: &Arc<ImageRaster>,
 ) -> String {
@@ -9057,80 +9169,31 @@ fn prepare_map_page_images(
         options.height as f32 - options.page_margin * 2.0,
     );
     let mut page_fit = HashMap::new();
-    let mut page_svgs = HashMap::new();
-    let body = normalize_map_page_images(body, resources, available, &mut page_fit, &mut page_svgs);
+    let body = normalize_page_images(body, resources, available, &mut page_fit);
     svg.set_page_fit_images(page_fit);
-    svg.set_page_fit_resources(page_svgs);
     body
 }
 
-/// Scales a picture-only section to the page.
+/// Bytes of a `data:` URI, when `value` is one.
 ///
-/// MOBI and KF8 keep the whole book in one document and mark each part with
-/// `<section class="cre-spine">`. A part whose only content is an image (a
-/// cover, a plate) should fill the page the way an EPUB spine document that is
-/// one picture does; a plain `<img>` is capped to its own size by
-/// `max-width: 100%`, so it sat small in the middle of the page. The picture is
-/// wrapped in a page-sized SVG with `preserveAspectRatio="… meet"`, so it is
-/// enlarged and never cropped.
-fn fit_picture_sections(html: &str, width: f32, height: f32) -> String {
-    if !contains_ignore_ascii_case(html, "<img") || !contains_ignore_ascii_case(html, "cre-spine") {
-        return html.to_string();
+/// A document can inline its pictures instead of shipping files; the painter
+/// still needs bytes under a key, so the plate pass decodes them once and puts
+/// them in the generated table.
+fn data_uri_bytes(value: &str) -> Option<Arc<Vec<u8>>> {
+    use base64::Engine;
+    let rest = value.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    if meta
+        .split(';')
+        .any(|part| part.eq_ignore_ascii_case("base64"))
+    {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(payload.trim())
+            .ok()?;
+        return Some(Arc::new(bytes));
     }
-    static SRC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let src = SRC.get_or_init(|| {
-        regex::Regex::new(r#"(?is)\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)')"#)
-            .expect("img src regex is valid")
-    });
-    let (width, height) = (width.max(1.0).round(), height.max(1.0).round());
-    let closing = "</section>";
-    let mut out = String::with_capacity(html.len() + 256);
-    // `cursor` is how far the output has been written, `scan` how far the
-    // search has got; a section that is left alone only moves `scan`, so its
-    // content is copied with the surrounding text.
-    let mut cursor = 0usize;
-    let mut scan = 0usize;
-    let mut changed = false;
-    let lower = html.to_ascii_lowercase();
-    while let Some(pos) = lower[scan..].find("<section") {
-        let start = scan + pos;
-        let Some(open_end) = html[start..].find('>').map(|end| start + end + 1) else {
-            break;
-        };
-        if !html[start..open_end]
-            .to_ascii_lowercase()
-            .contains("cre-spine")
-        {
-            scan = open_end;
-            continue;
-        }
-        let Some(close) = lower[open_end..].find(closing).map(|end| open_end + end) else {
-            break;
-        };
-        let end = close + closing.len();
-        let Some(picture) = picture_only_body(&html[open_end..close], src) else {
-            scan = end;
-            continue;
-        };
-        // A plate generated by `normalize_map_page_images` already fills the
-        // page and must not be wrapped again (that would inline the picture).
-        if picture.starts_with("cre-page-fit-") {
-            scan = end;
-            continue;
-        }
-        out.push_str(&html[cursor..open_end]);
-        out.push_str(&page_picture_svg(&picture, width, height, true));
-        // Keep the section's own closing tag.
-        out.push_str(&html[close..end]);
-        cursor = end;
-        scan = end;
-        changed = true;
-    }
-    if !changed {
-        return html.to_string();
-    }
-    out.push_str(&html[cursor..]);
-    out
+    let decoded = percent_decode_str(payload).decode_utf8_lossy().into_owned();
+    Some(Arc::new(decoded.into_bytes()))
 }
 
 /// The `src` of the single image `body` holds, when that is all it holds.
@@ -9392,8 +9455,8 @@ fn svg_view_box(open_tag: &str) -> Option<(f32, f32, f32, f32)> {
 }
 
 /// The document's CSS, from its `<style>` blocks and linked stylesheets.
-fn document_css_for_svg(html: &str, provider: Option<&LazyResource>) -> String {
-    if !contains_ignore_ascii_case(html, "<style") && provider.is_none() {
+fn document_css_for_svg(html: &str, resources: &ResourceSource) -> String {
+    if !contains_ignore_ascii_case(html, "<style") && resources.is_empty() {
         return String::new();
     }
     let lower = html.to_ascii_lowercase();
@@ -9416,9 +9479,6 @@ fn document_css_for_svg(html: &str, provider: Option<&LazyResource>) -> String {
         cursor = text_start + close + "</style".len();
     }
 
-    let Some(provider) = provider else {
-        return css;
-    };
     static LINK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static HREF: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static REL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -9454,11 +9514,16 @@ fn document_css_for_svg(html: &str, provider: Option<&LazyResource>) -> String {
             continue;
         };
         let href_value = href_value.as_str().trim();
-        let Some(path) = href_value.strip_prefix("epub://book/") else {
+        // EPUB chunks point at `epub://book/...`; a standalone document keeps
+        // the link relative to its own directory.
+        let key = if let Some(path) = href_value.strip_prefix("epub://book/") {
+            normalize_path(&percent_decode_str(path).decode_utf8_lossy())
+        } else if href_value.contains("://") {
             continue;
+        } else {
+            normalize_path(&percent_decode_str(href_value).decode_utf8_lossy())
         };
-        let key = normalize_path(&percent_decode_str(path).decode_utf8_lossy());
-        if let Some(bytes) = provider.get(&key) {
+        if let Some(bytes) = resources.get(&key) {
             css.push_str(&String::from_utf8_lossy(&bytes));
             css.push('\n');
         }
@@ -9486,11 +9551,6 @@ struct ImageRaster {
     placeholders: std::sync::Mutex<PlaceholderCache>,
     /// Generated page-fit wrappers and the original image each stands for.
     page_fit: std::sync::Mutex<HashMap<String, cre_epub::PageFitImage>>,
-    /// The SVG bytes served for a generated page-fit key. EPUB keeps these in
-    /// the book's resource provider (it writes them into the archive view); a
-    /// MOBI/KF8 book has no writable provider, so the wrapper lives here and the
-    /// net providers hand it out.
-    page_resources: std::sync::Mutex<HashMap<String, Arc<Vec<u8>>>>,
 }
 
 #[derive(Default)]
@@ -9514,21 +9574,7 @@ impl ImageRaster {
             placeheld: std::sync::Mutex::new(HashMap::new()),
             placeholders: std::sync::Mutex::new(HashMap::new()),
             page_fit: std::sync::Mutex::new(HashMap::new()),
-            page_resources: std::sync::Mutex::new(HashMap::new()),
         }
-    }
-
-    /// Registers the SVG bytes of the page-fit wrappers built for a book whose
-    /// resources cannot be extended (MOBI/KF8).
-    fn set_page_fit_resources(&self, resources: HashMap<String, Arc<Vec<u8>>>) {
-        if let Ok(mut page_resources) = self.page_resources.lock() {
-            page_resources.extend(resources);
-        }
-    }
-
-    /// SVG bytes of a generated page-fit wrapper, if the key names one.
-    fn page_fit_resource(&self, key: &str) -> Option<Arc<Vec<u8>>> {
-        self.page_resources.lock().ok()?.get(key).cloned()
     }
 
     /// Notes which resources `<img>` elements reference.
@@ -9686,6 +9732,9 @@ struct EpubNet {
     /// Shared with the `Document`: a relayout must see the reader's current
     /// "use the book's fonts" setting without rebuilding the provider.
     embedded_fonts: Arc<std::sync::atomic::AtomicBool>,
+    /// Resources the engine generated (page-fit wrappers, decoded `data:`
+    /// pictures); consulted before the book itself.
+    generated: GeneratedResources,
 }
 
 impl NetProvider for EpubNet {
@@ -9695,6 +9744,10 @@ impl NetProvider for EpubNet {
             .trim_start_matches('/')
             .to_string();
         let key = normalize_path(&path);
+        if let Some(bytes) = generated_resource(&self.generated, &key) {
+            handler.bytes(request.url.to_string(), Bytes::from((*bytes).clone()));
+            return;
+        }
         let bytes = self
             .resource_provider
             .get(&key)
@@ -9733,6 +9786,7 @@ impl NetProvider for EpubNet {
 struct MapNet {
     resources: MapResources,
     svg: Arc<ImageRaster>,
+    generated: GeneratedResources,
 }
 
 impl NetProvider for MapNet {
@@ -9742,9 +9796,10 @@ impl NetProvider for MapNet {
             .trim_start_matches('/')
             .to_string();
         let name = path.strip_prefix("binary/").unwrap_or(&path).to_string();
-        // A page-fit wrapper is generated for the layout, not stored in the
-        // book: the picture itself is painted from the resource it names.
-        if let Some(bytes) = self.svg.page_fit_resource(&name) {
+        // A page-fit wrapper (or a decoded `data:` picture) is generated for the
+        // layout, not stored in the book: the plate itself is painted from the
+        // resource it names.
+        if let Some(bytes) = generated_resource(&self.generated, &normalize_path(&name)) {
             handler.bytes(request.url.to_string(), Bytes::from((*bytes).clone()));
             return;
         }
@@ -9773,6 +9828,7 @@ struct FileNet {
     root: PathBuf,
     svg: Arc<ImageRaster>,
     embedded_fonts: Arc<std::sync::atomic::AtomicBool>,
+    generated: GeneratedResources,
 }
 
 impl NetProvider for FileNet {
@@ -9780,6 +9836,16 @@ impl NetProvider for FileNet {
         let decoded = percent_decode_str(request.url.path())
             .decode_utf8_lossy()
             .to_string();
+        // Generated resources are keyed relative to the document's directory.
+        let relative = decoded
+            .strip_prefix(self.root.to_string_lossy().as_ref())
+            .map(|rest| rest.trim_start_matches('/'))
+            .unwrap_or(&decoded)
+            .to_string();
+        if let Some(bytes) = generated_resource(&self.generated, &normalize_path(&relative)) {
+            handler.bytes(request.url.to_string(), Bytes::from((*bytes).clone()));
+            return;
+        }
         let mut bytes = Vec::new();
         if let Ok(candidate) = std::fs::canonicalize(&decoded)
             && candidate.starts_with(&self.root)
@@ -9857,78 +9923,90 @@ mod map_page_image_tests {
         out
     }
 
-    fn book_body() -> String {
-        "<section class=\"cre-spine\" data-spine-index=\"1\" id=\"cre-sec-1\">\
-         <div class=\"fs\" id=\"k8-0-326\"><div><img src=\"mobi-image-2\" width=\"600\" \
-         height=\"800\"/></div></div>\
-         </section>\
-         <section class=\"cre-spine\" data-spine-index=\"2\" id=\"cre-sec-2\">\
-         <p>text</p></section>"
-            .to_string()
+    fn book_body(src: &str) -> String {
+        format!(
+            "<section class=\"cre-spine\" data-spine-index=\"0\" id=\"cre-sec-1\">\
+             <div class=\"fs\" id=\"k8-0-326\"><div><img src=\"{src}\" width=\"600\" \
+             height=\"800\"/></div></div>\
+             </section>\
+             <section class=\"cre-spine\" data-spine-index=\"1\" id=\"cre-sec-2\">\
+             <p>text</p></section>"
+        )
     }
 
-    fn resources() -> MapResources {
+    fn source_with(image: Vec<u8>) -> ResourceSource {
         let mut map = HashMap::new();
-        map.insert("mobi-image-2".to_string(), jpeg(600, 800));
-        MapResources::Owned(Arc::new(map))
+        map.insert("page.jpg".to_string(), image);
+        ResourceSource::map(MapResources::Owned(Arc::new(map)))
     }
 
     #[test]
     fn a_picture_part_becomes_a_page_fit_plate() {
+        let resources = source_with(jpeg(600, 800));
         let mut page_fit = HashMap::new();
-        let mut svgs = HashMap::new();
-        let out = normalize_map_page_images(
-            book_body(),
-            &resources(),
+        let out = normalize_page_images(
+            book_body("page.jpg"),
+            &resources,
             (600.0, 800.0),
             &mut page_fit,
-            &mut svgs,
         );
         assert!(out.contains("src=\"cre-page-fit-0\""), "{out}");
         // The picture itself is not copied into the document any more.
-        assert!(!out.contains("mobi-image-2"), "{out}");
+        assert!(!out.contains("page.jpg"), "{out}");
         // The part's TOC anchor stays: navigation entries point at `#k8-0-326`,
         // so dropping the element would lose the page. It is re-emitted as an
         // empty anchor, because the `<div class="fs">` around it also carries
         // the book's page-box CSS.
         assert!(out.contains("<a id=\"k8-0-326\"></a>"), "{out}");
         assert!(!out.contains("class=\"fs\""), "{out}");
-        // The plate itself declares how it fills the reader's page.
-        assert!(
-            out.contains("style=\"display:block;max-width:100%;height:auto\""),
-            "{out}"
-        );
         // A part with text is left alone.
         assert!(out.contains("<p>text</p>"), "{out}");
 
         let plate = page_fit.get("cre-page-fit-0").expect("plate");
-        assert_eq!(plate.source, "mobi-image-2");
+        assert_eq!(plate.source, "page.jpg");
         assert_eq!((plate.width, plate.height), (600, 800));
         assert!(
             plate.contain,
             "a plate keeps its aspect inside the page box"
         );
-        assert!(svgs.contains_key("cre-page-fit-0"));
-        // The wrapper declares the page box, not the picture's own size.
-        let svg = String::from_utf8(svgs["cre-page-fit-0"].as_ref().clone()).unwrap();
+        // The wrapper is a generated resource, like every other resource kind:
+        // the painter and the net provider read it back through `get`.
+        let svg = String::from_utf8(resources.get("cre-page-fit-0").unwrap().to_vec()).unwrap();
         assert!(svg.contains("viewBox=\"0 0 600 800\""), "{svg}");
         assert!(!svg.contains("<image"), "{svg}");
     }
 
     #[test]
+    fn an_inlined_data_uri_becomes_a_plate() {
+        // A standalone HTML document can inline its pictures; the painter still
+        // needs bytes under a key, so the pass decodes them once.
+        let encoded = cre_epub::base64_encode(&jpeg(300, 400));
+        let src = format!("data:image/jpeg;base64,{encoded}");
+        let resources = ResourceSource::empty();
+        let mut page_fit = HashMap::new();
+        let out = normalize_page_images(book_body(&src), &resources, (600.0, 800.0), &mut page_fit);
+        assert!(out.contains("src=\"cre-page-fit-0\""), "{out}");
+        assert!(!out.contains("base64"), "{out}");
+        let plate = page_fit.get("cre-page-fit-0").expect("plate");
+        assert_eq!((plate.width, plate.height), (300, 400));
+        // The decoded picture is readable through the same table.
+        let bytes = resources.get(&plate.source).expect("decoded picture");
+        assert_eq!(image_dimensions(&bytes), Some((300, 400)));
+    }
+
+    #[test]
     fn plate_rewriting_is_idempotent() {
-        let once = normalize_map_page_images(
-            book_body(),
-            &resources(),
+        let resources = source_with(jpeg(600, 800));
+        let once = normalize_page_images(
+            book_body("page.jpg"),
+            &resources,
             (600.0, 800.0),
-            &mut HashMap::new(),
             &mut HashMap::new(),
         );
-        let twice = normalize_map_page_images(
+        let twice = normalize_page_images(
             once.clone(),
-            &resources(),
+            &resources,
             (600.0, 800.0),
-            &mut HashMap::new(),
             &mut HashMap::new(),
         );
         assert_eq!(twice, once, "a generated plate must not be wrapped again");
@@ -9936,14 +10014,14 @@ mod map_page_image_tests {
 
     #[test]
     fn a_picture_with_unknown_size_is_left_as_it_is() {
-        let out = normalize_map_page_images(
-            book_body(),
-            &MapResources::Owned(Arc::new(HashMap::new())),
+        let resources = ResourceSource::empty();
+        let out = normalize_page_images(
+            book_body("page.jpg"),
+            &resources,
             (600.0, 800.0),
             &mut HashMap::new(),
-            &mut HashMap::new(),
         );
-        assert_eq!(out, book_body());
+        assert_eq!(out, book_body("page.jpg"));
     }
 }
 
@@ -9985,29 +10063,6 @@ mod font_size_tests {
         );
         assert!(styled.contains("font-size:10px"), "{styled}");
         assert!(!styled.contains("font-size:36px"), "{styled}");
-    }
-}
-
-#[cfg(test)]
-mod picture_section_tests {
-    use super::*;
-
-    #[test]
-    fn documents_without_a_picture_section_are_untouched() {
-        let html = r#"<html><body><section class="cre-spine"><p>text</p><p><img src="mobi-image-1"/></p></section><section class="cre-spine"><p>more</p></section></body></html>"#;
-        assert_eq!(fit_picture_sections(html, 600.0, 800.0), html);
-    }
-
-    #[test]
-    fn a_picture_only_section_is_wrapped_in_a_page_svg() {
-        let html = r#"<html><body><p>intro</p><section class="cre-spine"><p><img src="mobi-image-1"/></p></section><section class="cre-spine"><p>after</p></section></body></html>"#;
-        let out = fit_picture_sections(html, 600.0, 800.0);
-        assert!(out.contains("<p>intro</p>"), "{out}");
-        assert!(out.contains("viewBox=\"0 0 600 800\""), "{out}");
-        assert!(out.contains("href=\"mobi-image-1\""), "{out}");
-        assert!(out.contains("<p>after</p>"), "{out}");
-        // The section keeps its tags and the document keeps its tail.
-        assert!(out.ends_with("</section></body></html>"), "{out}");
     }
 }
 

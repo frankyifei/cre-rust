@@ -58,14 +58,21 @@ picture is not cropped, no base64 copy is pinned, and no decoded pixels are
 held during layout. This removed 10 MB of pinned base64 copies and a 4.6 MB
 page-sized PNG cache on `12.epub` (RSS 77.2 -> 39.5 MB).
 
-MOBI and KF8 get the same wrapper through a different door. Their parts are
-`<section class="cre-spine">` blocks inside one document, so
-`normalize_map_page_images` rewrites a picture-only part at open time — before
-the document is split into chunks — and the wrapper SVG is served from
-`ImageRaster` (`page_fit_resources`) because a PalmDB has no writable resource
-view. Only the `<img>` tag is replaced: the wrapper `<div>` carries the book's
-TOC anchors (`id="k8-42-1337"`), and losing it made every navigation entry fall
-back to "no page".
+Every format gets this wrapper: EPUB rewrites each spine document, and the
+single-document formats (MOBI, KF8, standalone HTML) have their
+`<section class="cre-spine">` parts rewritten by `prepare_page_images` at open
+time, before the document is split into chunks. The wrapper is a *generated
+resource*: it lives in the document's writable resource table
+([`ResourceSource::generated`](../docs/ARCHITECTURE.md)), which the net provider
+and the painter both read, so it behaves like any other resource no matter
+whether the book is a zip, a PalmDB, a directory or an inline `data:` URI. Only
+the `<img>` tag is replaced: the wrapper `<div>` carries the book's TOC anchors
+(`id="k8-42-1337"`), and losing it made every navigation entry fall back to "no
+page".
+
+A `data:` picture is decoded once into that same table, so an HTML document that
+inlines its images gets the same page-sized plate without a second base64 copy
+inside an SVG.
 
 A 48 MB fixed-size comic (184 plates) measured on the native x86_64 release
 build with `perf_probe`:
@@ -92,6 +99,23 @@ found the hard way:
   fixed page. The rewrite replaces the part's content with the wrapper, and
   re-emits its `id`/`name` anchors as empty `<a>` elements so navigation still
   lands on the page without the book's box.
+
+## Resource bytes
+
+A document's resources come from one place, `ResourceSource`:
+
+| Kind | Where the bytes are |
+|---|---|
+| EPUB | the zip, memory-mapped and cached by `LazyResource` |
+| MOBI / KF8 | record ranges in the memory-mapped PalmDB |
+| FB2 | the in-memory binary map |
+| standalone HTML | files next to the document (percent-decoded, inside its directory) |
+
+On top of that sits the *generated* table: page-fit wrappers and decoded
+`data:` pictures. It is consulted before the base, so every consumer — layout
+through the net provider, painting through `resources.get`, `getImageDataAt`
+and long-press — sees one flat namespace, and a generated key can be addressed
+exactly like a file.
 
 ## Decoding at the painted size
 
@@ -134,16 +158,17 @@ the peak drops: `15.epub` 70.2 -> 51.0 MB, `12.epub` 69.2 -> 59.3 MB.
 Measured on x86_64 release: the box filter drops from 6.3-7.8 ms to
 2.5-3.5 ms, and `12.epub` image pages from 18.1 ms to 11.5 ms (-36%).
 
-## Resource bytes
+## Resource caching
 
 - `lookup_resource` returns `Arc<Vec<u8>>`, so a resource shared by several
   consumers is not copied.
 - The decompressed-resource cache is a byte-bounded LRU (4 MB by default,
   `CRE_RESOURCE_CACHE_KB` overrides). Evicted images are re-read from the zip
   when they are painted again.
-- Resources the engine generated (rewritten XHTML, page-fit wrappers) are
-  **pinned**: they have no zip entry to read again, and evicting them would
-  make the pages that use them blank.
+- Resources the engine generated for a book (rewritten XHTML) are **pinned**:
+  they have no zip entry to read again, and evicting them would make the pages
+  that use them blank. The document's own generated table (page-fit wrappers,
+  decoded `data:` pictures) is separate and never evicted.
 - Image keys are resolved the way the provider serves them: percent-decoded,
   and with any query string dropped from `src`/`href`.
 

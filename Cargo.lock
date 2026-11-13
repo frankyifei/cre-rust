@@ -470,6 +470,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "anyrender",
+ "base64 0.22.1",
  "blitz-dom",
  "blitz-html",
  "blitz-paint",
