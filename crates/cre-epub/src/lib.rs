@@ -117,7 +117,16 @@ fn resource_cache_bytes() -> usize {
 
 /// Image header reading and cost estimates live in `cre-book` now; the names
 /// stay here for the generator and for `cre-lib`'s chunk budget.
-pub use cre_book::{estimated_image_bytes, is_image_bytes};
+// The shared book layer owns these; the names stay reachable here because the
+// generator and cre-lib call them through this crate. (S6 moves the callers.)
+pub use cre_book::css::*;
+pub use cre_book::fonts::*;
+pub use cre_book::html::*;
+pub use cre_book::images::{
+    estimated_image_bytes, image_mime, image_sources, image_sources_in,
+    inline_svg_images_to_data_uris, is_image_bytes, svg_block_inline_images,
+};
+pub use cre_book::ruby::*;
 
 pub struct LazyResource {
     pub epub_path: Option<PathBuf>,
@@ -1845,198 +1854,6 @@ fn floor_char_boundary(text: &str, index: usize) -> usize {
     index
 }
 
-/// Points the `<image>` hrefs of inline SVG blocks at `epub://book/...`.
-///
-/// The parse-time inliner then needs no document directory: chunks can hold
-/// documents from several directories.
-/// Turns `<ruby>base<rt>ann</rt></ruby>` into two stacked, centred inline
-/// blocks.
-///
-/// Blitz has no ruby layout: it lays the annotation out as ordinary inline text
-/// after the base character, so the note sits to the right of its character and
-/// the line keeps the annotation's own advance. A ruby cell is a small vertical
-/// stack instead - annotation above the base, both centred, the cell as wide as
-/// the wider of the two - which is how crengine and browsers draw it.
-/// Turns `<ruby>` markup into the stacked cell Blitz can lay out.
-///
-/// Blitz has no ruby box, so each base + annotation pair becomes an
-/// inline-block with the note absolutely positioned above the base (see
-/// [`ruby_cell_markup`]). Exposed so every format that can carry ruby (EPUB,
-/// KF8, MOBI, TXT) shares the same conversion.
-pub fn rewrite_ruby(html: &str) -> String {
-    if !html
-        .as_bytes()
-        .windows(5)
-        .any(|window| window.eq_ignore_ascii_case(b"<ruby"))
-    {
-        return html.to_string();
-    }
-    let mut out = String::with_capacity(html.len() + html.len() / 16);
-    let mut cursor = 0usize;
-    while let Some(open_start) = next_tag_start(html, cursor, "<ruby") {
-        let Some((close_start, close_end)) =
-            find_matching_close_tag(html, open_start, "<ruby", "</ruby")
-        else {
-            break;
-        };
-        out.push_str(&html[cursor..open_start]);
-        let inner = &html[find_tag_end(html, open_start).unwrap_or(close_start)..close_start];
-        match ruby_cell(inner) {
-            Some(cell) => out.push_str(&cell),
-            None => out.push_str(&html[open_start..close_end]),
-        }
-        cursor = close_end;
-    }
-    out.push_str(&html[cursor..]);
-    out
-}
-
-/// The two stacked blocks of one ruby cell, or `None` when the markup is not a
-/// plain base + annotation pair.
-fn ruby_cell(inner: &str) -> Option<String> {
-    let lower = inner.to_ascii_lowercase();
-    let rt_start = next_tag_start(&lower, 0, "<rt")?;
-    let rt_body_start = find_tag_end(inner, rt_start)?;
-    let rt_end = next_tag_start(&lower, rt_body_start, "</rt")?;
-    // Only the first pair is handled; anything else (multiple annotations,
-    // nested markup we do not understand) is left to the normal inline path.
-    if next_tag_start(&lower, rt_end + "</rt".len(), "<rt").is_some() {
-        return None;
-    }
-    let base = strip_ruby_wrappers(&inner[..rt_start]);
-    let annotation = strip_ruby_wrappers(&inner[rt_body_start..rt_end]);
-    if base.trim().is_empty() || annotation.trim().is_empty() {
-        return None;
-    }
-    // The cell keeps the width of the annotated characters, the note is centred
-    // above them and squeezed to that width whatever its length, and a zhuyin
-    // tone mark sits on a row of its own above the letters, flush right over its
-    // character. That is how Chrome typesets ruby, and it is also the only way
-    // the characters keep their normal rhythm: sizing the cell to the note
-    // instead pushes every character on the line apart.
-    Some(ruby_cell_markup(&base, &annotation))
-}
-
-/// One ruby cell: the base in flow, the note absolutely positioned above it.
-///
-/// The base comes first so the inline-block reports its baseline (a block that
-/// follows the note would make the character drop below the surrounding text),
-/// and the note lives in a box exactly as wide as the base, which is what makes
-/// the centring and the flush-right tone mark line up with the character rather
-/// than with the cell (the cell also holds the book's letter-spacing).
-fn ruby_cell_markup(base: &str, annotation: &str) -> String {
-    let (tones, letters) = if is_zhuyin(annotation) {
-        split_tone_marks(annotation)
-    } else {
-        (String::new(), annotation.trim().to_string())
-    };
-    let has_tones = !tones.trim().is_empty();
-    let has_letters = !letters.trim().is_empty();
-    let base_em = ruby_em(base).max(0.5);
-    // The note is drawn at half size; squeeze it onto the character when it is
-    // wider, so a three- or four-letter note still fits over one ideograph.
-    let letters_em = ruby_em(&letters) * 0.5;
-    let scale = if letters_em > base_em * 1.02 {
-        (base_em / letters_em).clamp(0.35, 1.0)
-    } else {
-        1.0
-    };
-    // The mark is top-anchored and the letters bottom-anchored, so the note band
-    // is only a little taller than one half-size row: a full extra row left a
-    // visible gap between the mark and the letters under it.
-    let pad = if has_tones { "0.82em" } else { "0.5em" };
-    let mut note = String::new();
-    if has_tones {
-        note.push_str(&format!(
-            r#"<span style="position:absolute;right:0;top:0;white-space:nowrap;font-size:50%;line-height:1;letter-spacing:normal;">{tones}</span>"#
-        ));
-    }
-    if has_letters {
-        let letters = if scale < 0.995 {
-            format!(
-                r#"<span style="display:inline-block;transform:scaleX({scale:.3});transform-origin:center;">{letters}</span>"#
-            )
-        } else {
-            letters
-        };
-        note.push_str(&format!(
-            r#"<span style="position:absolute;left:50%;bottom:0;transform:translateX(-50%);white-space:nowrap;font-size:50%;line-height:1;letter-spacing:normal;">{letters}</span>"#
-        ));
-    }
-    // Reserve the rows the note occupies, so the line box grows like it did when
-    // the note was laid out in flow.
-    format!(
-        r#"<span style="display:inline-block;position:relative;vertical-align:baseline;padding-top:{pad};"><span style="display:block;white-space:nowrap;line-height:1.15;">{base}</span><span style="position:absolute;left:0;top:0;width:{base_em:.3}em;height:{pad};">{note}</span></span>"#
-    )
-}
-
-/// True when the annotation uses bopomofo (zhuyin) letters.
-fn is_zhuyin(text: &str) -> bool {
-    text.chars()
-        .any(|ch| matches!(ch as u32, 0x3100..=0x312F | 0x31A0..=0x31BF))
-}
-
-/// Splits the tone marks of a zhuyin annotation from its letters.
-///
-/// The tone letters are the spacing modifier letters `ˉ ˊ ˇ ˋ ˙`; a book that
-/// stores the tone as a combining mark gets that mark moved up as well.
-fn split_tone_marks(annotation: &str) -> (String, String) {
-    let mut tones = String::new();
-    let mut letters = String::new();
-    for ch in annotation.chars() {
-        let code = ch as u32;
-        let is_tone = matches!(
-            code,
-            0x02C7 | 0x02C9 | 0x02CA..=0x02CB | 0x02D9 | 0x0300..=0x036F | 0xFE20..=0xFE2F
-        );
-        if is_tone {
-            tones.push(ch);
-        } else if !ch.is_whitespace() {
-            letters.push(ch);
-        }
-    }
-    (tones, letters)
-}
-
-/// Approximate advance of `text` in em, for squeezing a ruby note onto its base.
-///
-/// Full-width characters count one em, Latin and other narrow ones half; the
-/// result only has to be close enough to fit the note into the character.
-fn ruby_em(text: &str) -> f32 {
-    text.chars()
-        .filter(|ch| !ch.is_whitespace() && *ch != '<' && *ch != '>')
-        .map(|ch| {
-            let code = ch as u32;
-            match code {
-                0x0300..=0x036F | 0x02C7 | 0x02C9 | 0x02CA..=0x02CB | 0x02D9 | 0xFE20..=0xFE2F => {
-                    0.0
-                }
-                0x2E80..=0xF9FF | 0xFF00..=0xFF60 => 1.0,
-                _ => 0.5,
-            }
-        })
-        .sum()
-}
-
-/// Drops `<rb>`/`<rp>` wrappers and their closing tags, keeping the text.
-fn strip_ruby_wrappers(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut cursor = 0usize;
-    while let Some(open) = text[cursor..].find('<').map(|offset| cursor + offset) {
-        out.push_str(&text[cursor..open]);
-        let Some(end) = find_tag_end(text, open) else {
-            return out;
-        };
-        let name = tag_name(&text[open..end]);
-        if !matches!(name.as_str(), "rb" | "rp" | "rt") {
-            out.push_str(&text[open..end]);
-        }
-        cursor = end;
-    }
-    out.push_str(&text[cursor..]);
-    out
-}
-
 fn svg_hrefs_to_book_paths(html: &str, doc_dir: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut cursor = 0usize;
@@ -2082,376 +1899,11 @@ fn svg_hrefs_to_book_paths(html: &str, doc_dir: &str) -> String {
     out
 }
 
-/// Rewrites the images inside inline SVG blocks to `data:` URIs.
-///
-/// Blitz parses an inline `<svg>` with usvg's default href resolver, which only
-/// understands `data:` URIs; a relative `xlink:href` makes the image node
-/// unreadable and the whole SVG is dropped (fixed-layout pages render blank,
-/// including any text the SVG draws). Passing the bytes inline lets usvg build
-/// the tree, so the image, the text and the link hotspots all survive.
-///
-/// The rewrite is for the HTML handed to the parser only: storing it would
-/// keep a base64 copy of every page image for the whole session.
-pub fn inline_svg_images_to_data_uris(
-    html: &str,
-    fetch: &dyn Fn(&str) -> Option<std::sync::Arc<Vec<u8>>>,
-) -> Option<String> {
-    let mut out = String::with_capacity(html.len());
-    let mut cursor = 0usize;
-    let mut changed = false;
-    while let Some(open_start) = next_tag_start(html, cursor, "<svg") {
-        let Some((_close_start, close_end)) =
-            find_matching_close_tag(html, open_start, "<svg", "</svg")
-        else {
-            break;
-        };
-        out.push_str(&html[cursor..open_start]);
-        let block = &html[open_start..close_end];
-        let (rewritten, block_changed) = svg_block_inline_images(block, fetch);
-        changed |= block_changed;
-        out.push_str(&rewritten);
-        cursor = close_end;
-    }
-    if !changed {
-        return None;
-    }
-    out.push_str(&html[cursor..]);
-    Some(out)
-}
-
-/// Replaces the href of every `<image>` in one SVG block with a data URI.
-fn svg_block_inline_images(
-    block: &str,
-    fetch: &dyn Fn(&str) -> Option<std::sync::Arc<Vec<u8>>>,
-) -> (String, bool) {
-    let mut out = String::with_capacity(block.len());
-    let mut cursor = 0usize;
-    let mut changed = false;
-    while let Some(start) = next_tag_start(block, cursor, "<image") {
-        let Some(end) = find_tag_end(block, start) else {
-            break;
-        };
-        out.push_str(&block[cursor..start]);
-        let tag = &block[start..end];
-        let mut replaced = tag.to_string();
-        let attrs = parse_attrs(tag);
-        if let Some(href) = attrs.get("xlink:href").or_else(|| attrs.get("href")) {
-            let href = href.trim();
-            let book_url = href.starts_with("epub://book/");
-            if !href.is_empty() && !href.starts_with("data:") && (book_url || !is_external(href)) {
-                let without_fragment = href.split('#').next().unwrap_or(href);
-                let relative = without_fragment
-                    .strip_prefix("epub://book/")
-                    .unwrap_or(without_fragment);
-                let key = normalize_path(&percent_decode_str(relative).decode_utf8_lossy());
-                if let Some(bytes) = fetch(&key) {
-                    let mime = image_mime(&bytes, &key);
-                    let encoded = base64_encode(&bytes);
-                    let data_uri = format!("data:{mime};base64,{encoded}");
-                    replaced = replace_attribute_value(tag, "xlink:href", &data_uri)
-                        .or_else(|| replace_attribute_value(tag, "href", &data_uri))
-                        .unwrap_or(replaced);
-                    changed = true;
-                }
-            }
-        }
-        out.push_str(&replaced);
-        cursor = end;
-    }
-    out.push_str(&block[cursor..]);
-    (out, changed)
-}
-
-/// Rewrites `name="value"` (or single quotes) inside one tag.
-fn replace_attribute_value(tag: &str, name: &str, value: &str) -> Option<String> {
-    let lower = tag.to_ascii_lowercase();
-    let at = lower.find(&format!("{name}="))?;
-    let rest = &tag[at + name.len() + 1..];
-    let quote = rest.chars().next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
-    }
-    let close = rest[1..].find(quote)? + 1;
-    let mut out = String::with_capacity(tag.len() + value.len());
-    out.push_str(&tag[..at + name.len() + 1]);
-    out.push(quote);
-    out.push_str(value);
-    out.push_str(&rest[close..]);
-    Some(out)
-}
-
 /// Estimated decoded (RGBA) bytes of the images a generated chunk refers to.
 ///
 /// Chunk HTML points at resources through `epub://book/`, so no document
 /// directory is needed. `cre-lib` uses this to include the decoded-image cost
 /// of a chunk in its low-memory estimate.
-pub fn chunk_image_bytes(provider: &LazyResource, chunk_html: &str) -> usize {
-    image_sources(chunk_html, "")
-        .iter()
-        .filter_map(|key| provider.estimated_decoded_bytes(key))
-        .sum()
-}
-
-/// Resource names referenced by the `<img>` tags of a fragment.
-pub fn image_sources_in(body: &str) -> Vec<String> {
-    image_sources(body, "")
-}
-
-/// Family names declared by the `@font-face` rules in `html`.
-///
-/// The engine does not load these fonts itself: Blitz fetches each `src` through
-/// the document's `NetProvider`, decodes TTF/OTF/WOFF/WOFF2 and registers it
-/// under the declared family (see `blitz_dom::net::fetch_font_face`). The names
-/// are collected so the reader can list the book's fonts and decide whether to
-/// use them at all.
-///
-/// TODO(upstream): this is a scan of the CSS text because `blitz-dom` exposes no
-/// query for the `@font-face` families a document declares. Replace it once the
-/// font registry can be enumerated.
-pub fn font_faces_in(html: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for family in font_face_declarations(html).into_iter().map(|d| d.family) {
-        if !out
-            .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(&family))
-        {
-            out.push(family);
-        }
-    }
-    out
-}
-
-/// One `@font-face` rule: the family it registers and the `url()` sources it
-/// offers.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FontFaceDeclaration {
-    pub family: String,
-    pub urls: Vec<String>,
-}
-
-/// Every `@font-face` rule in `html` (or a stylesheet), in document order.
-///
-/// TODO(upstream): a scan of the CSS text, because `blitz-dom` exposes no query
-/// for the `@font-face` rules a document declares.
-pub fn font_face_declarations(html: &str) -> Vec<FontFaceDeclaration> {
-    // ASCII lowercasing keeps byte offsets (CSS names are case-sensitive).
-    let lower = html.to_ascii_lowercase();
-    let mut out = Vec::new();
-    let mut from = 0usize;
-    while let Some(found) = lower[from..].find("@font-face") {
-        let start = from + found;
-        let Some(open) = lower[start..].find('{') else {
-            break;
-        };
-        let body_start = start + open + 1;
-        let Some(close) = lower[body_start..].find('}') else {
-            break;
-        };
-        let block = &html[body_start..body_start + close];
-        if let Some(family) = font_family_of(block) {
-            out.push(FontFaceDeclaration {
-                family,
-                urls: font_urls_of(block),
-            });
-        }
-        from = body_start + close + 1;
-    }
-    out
-}
-
-/// The families whose rules can actually be loaded.
-///
-/// `has_resource` answers for one `url()` value. A book whose converter dropped
-/// the font bytes still leaves the rule in the stylesheet, and listing such a
-/// family would offer the reader a font that can never resolve; KF8 is where
-/// this shows up because the URLs there are flat resource names
-/// (`mobi-image-N`), so the answer is a lookup.
-pub fn loadable_font_faces(html: &str, has_resource: impl Fn(&str) -> bool) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for declaration in font_face_declarations(html) {
-        if !declaration.urls.iter().any(|url| has_resource(url)) {
-            continue;
-        }
-        if !out
-            .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(&declaration.family))
-        {
-            out.push(declaration.family);
-        }
-    }
-    out
-}
-
-/// `url(...)` values inside one `@font-face` block.
-fn font_urls_of(block: &str) -> Vec<String> {
-    let lower = block.to_ascii_lowercase();
-    let mut out = Vec::new();
-    let mut from = 0usize;
-    while let Some(found) = lower[from..].find("url(") {
-        let start = from + found + 4;
-        let Some(close) = block[start..].find(')') else {
-            break;
-        };
-        let value = block[start..start + close]
-            .trim()
-            .trim_matches(|c| c == '"' || c == '\'')
-            .trim();
-        if !value.is_empty() {
-            out.push(value.to_string());
-        }
-        from = start + close + 1;
-    }
-    out
-}
-
-/// Removes the `@font-face` rules from `html`, leaving everything else alone.
-///
-/// The rules are dropped rather than their `font-family` declarations: a name
-/// that resolves to nothing falls back to the next family in the list, which is
-/// what "do not use the book's fonts" means.
-pub fn strip_font_faces(html: &str) -> std::borrow::Cow<'_, str> {
-    let lower = html.to_ascii_lowercase();
-    if !lower.contains("@font-face") {
-        return std::borrow::Cow::Borrowed(html);
-    }
-    let mut out = String::with_capacity(html.len());
-    let mut from = 0usize;
-    while let Some(found) = lower[from..].find("@font-face") {
-        let start = from + found;
-        let Some(open) = lower[start..].find('{') else {
-            break;
-        };
-        let body_start = start + open + 1;
-        let Some(close) = lower[body_start..].find('}') else {
-            break;
-        };
-        out.push_str(&html[from..start]);
-        from = body_start + close + 1;
-    }
-    out.push_str(&html[from..]);
-    std::borrow::Cow::Owned(out)
-}
-
-/// Family names declared by the book's stylesheet resources.
-///
-/// A chapter usually keeps its CSS in `<link rel="stylesheet">` rather than an
-/// inline `<style>` (Calibre's output does), so the `@font-face` rules a chunk
-/// is laid out with are not in the chunk HTML at all: Blitz fetches them from
-/// the stylesheet through `cre_lib::EpubNet`. Reading them here keeps
-/// [`EpubBook::manifest`] the single source of truth for what the book brings.
-pub fn font_faces_in_stylesheets(book: &EpubBook) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for item in &book.manifest {
-        let is_css = item.media_type.eq_ignore_ascii_case("text/css")
-            || item.href.to_ascii_lowercase().ends_with(".css");
-        if !is_css {
-            continue;
-        }
-        // `ManifestItem::href` is already resolved against the OPF directory
-        // when the package is parsed.
-        let key = item.href.clone();
-        let Some(bytes) = book.resource_provider.get(&key) else {
-            continue;
-        };
-        for name in font_faces_in(&String::from_utf8_lossy(&bytes)) {
-            if !out
-                .iter()
-                .any(|existing| existing.eq_ignore_ascii_case(&name))
-            {
-                out.push(name);
-            }
-        }
-    }
-    out
-}
-
-/// `href`s of the stylesheets a document links, in document order.
-///
-/// Only `<link rel="stylesheet">` is considered. EPUB chapters are covered by
-/// [`font_faces_in_stylesheets`] (which reads the OPF manifest), so this exists
-/// for a standalone HTML document, whose linked CSS is served from disk.
-pub fn stylesheet_hrefs(html: &str) -> Vec<String> {
-    let lower = html.to_ascii_lowercase();
-    let mut out = Vec::new();
-    let mut cursor = 0;
-    while let Some(pos) = lower[cursor..].find("<link") {
-        let start = cursor + pos;
-        let end = lower[start..]
-            .find('>')
-            .map(|p| p + start + 1)
-            .unwrap_or(html.len());
-        let attrs = parse_attrs(&html[start..end]);
-        let rel = attrs
-            .get("rel")
-            .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_default();
-        if rel.split_ascii_whitespace().any(|r| r == "stylesheet")
-            && let Some(href) = attrs.get("href")
-        {
-            out.push(href.clone());
-        }
-        cursor = end;
-    }
-    out
-}
-
-/// `font-family` value inside one `@font-face` block.
-fn font_family_of(block: &str) -> Option<String> {
-    let lower = block.to_ascii_lowercase();
-    let at = lower.find("font-family")?;
-    let rest = &block[at + "font-family".len()..];
-    let rest = &rest[rest.find(':')? + 1..];
-    let value = rest
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .trim_matches(|c| c == '"' || c == '\'')
-        .trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
-}
-
-fn image_sources(body: &str, doc_dir: &str) -> Vec<String> {
-    // ASCII lowercasing keeps byte offsets, so positions found in `lower` can
-    // be used to slice the original text (zip names are case-sensitive).
-    let lower = body.to_ascii_lowercase();
-    let mut out = Vec::new();
-    let mut index = 0usize;
-    while let Some(found) = lower[index..].find("<img") {
-        let start = index + found;
-        let Some(end) = lower[start..].find('>').map(|offset| start + offset) else {
-            break;
-        };
-        if let Some(src_at) = lower[start..end].find("src=") {
-            let rest = &body[start + src_at + 4..end];
-            let rest = rest.trim_start();
-            if let Some(quote @ ('"' | '\'')) = rest.chars().next()
-                && let Some(close) = rest[1..].find(quote)
-            {
-                let value = rest[1..1 + close].split(['#', '?']).next().unwrap_or("");
-                // Percent-encoded names must be decoded: that is the key the
-                // provider is asked for when the picture is fetched.
-                let decoded = percent_decode_str(value).decode_utf8_lossy();
-                if let Some(relative) = decoded.strip_prefix("epub://book/") {
-                    out.push(normalize_path(relative));
-                } else if !decoded.is_empty()
-                    && !decoded.starts_with("data:")
-                    && !decoded.contains("://")
-                {
-                    out.push(normalize_path(&format!("{doc_dir}{decoded}")));
-                }
-            }
-        }
-        index = end + 1;
-    }
-    out
-}
-
-/// Width and height from an image header, without decoding the pixels.
 fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     if bytes.len() > 24 && bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
@@ -2502,25 +1954,49 @@ fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     None
 }
 
+pub fn chunk_image_bytes(provider: &LazyResource, chunk_html: &str) -> usize {
+    image_sources(chunk_html, "")
+        .iter()
+        .filter_map(|key| provider.estimated_decoded_bytes(key))
+        .sum()
+}
+
+/// Family names declared by the book's stylesheet resources.
+///
+/// A chapter usually keeps its CSS in `<link rel="stylesheet">` rather than an
+/// inline `<style>` (Calibre's output does), so the `@font-face` rules a chunk
+/// is laid out with are not in the chunk HTML at all: Blitz fetches them from
+/// the stylesheet through `cre_lib::EpubNet`. Reading them here keeps
+/// [`EpubBook::manifest`] the single source of truth for what the book brings.
+pub fn font_faces_in_stylesheets(book: &EpubBook) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in &book.manifest {
+        let is_css = item.media_type.eq_ignore_ascii_case("text/css")
+            || item.href.to_ascii_lowercase().ends_with(".css");
+        if !is_css {
+            continue;
+        }
+        // `ManifestItem::href` is already resolved against the OPF directory
+        // when the package is parsed.
+        let key = item.href.clone();
+        let Some(bytes) = book.resource_provider.get(&key) else {
+            continue;
+        };
+        for name in font_faces_in(&String::from_utf8_lossy(&bytes)) {
+            if !out
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&name))
+            {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
 /// Memory a chunk's text costs per byte of generated HTML (DOM nodes,
 /// computed styles and line boxes). Matches `cre-lib`'s chunk planner.
 const DOM_BYTES_PER_HTML_BYTE: usize = 128;
-
-/// Rough decoded size of an image resource, from its file size and format.
-/// Estimated decoded size of one image, for the chunk memory budgets.
-///
-/// Used by the formats whose resources are a plain in-memory map (MOBI/KF8):
-/// there is no provider to ask, but the bytes are at hand, so the same
-/// dimensions-based estimate the EPUB path uses applies. `name` supplies the
-/// format when the magic bytes are not recognised (`mobi-image-3` has no
-/// extension).
-fn tag_name(raw: &str) -> String {
-    let rest = raw.trim_start_matches('<').trim_start_matches('/');
-    rest.chars()
-        .take_while(|ch| !ch.is_whitespace() && *ch != '>' && *ch != '/')
-        .collect::<String>()
-        .to_ascii_lowercase()
-}
 
 fn find_closing_tag(body: &str, from: usize, name: &str) -> Option<usize> {
     let needle = format!("</{name}");
@@ -2788,61 +2264,6 @@ fn extract_styles(html: &str, opf_dir: &str, doc_path: &str) -> (Vec<String>, Ve
     (css_urls, styles)
 }
 
-/// Rewrites `body.class`, `body#id` and `body[...]` selectors to the bare
-/// selector.
-///
-/// A spine document's `<body class="cov2">` is rebuilt as a
-/// `<section class="cov2">` inside the chunk, because a chunk holds several
-/// documents and only one `<body>` can exist. Rules like
-/// `body.cov2 { background-image: … }` — the usual way a cover page styles its
-/// own background — therefore never matched, and the background was lost.
-/// Linked stylesheets are shared by every document and are not scoped, so the
-/// one thing that can be done there is to drop the `body` part of the selector;
-/// the class still only appears on the document that declared it.
-pub fn body_selectors_to_class(css: &str) -> String {
-    if !contains_ignore_ascii_case(css, "body") {
-        return css.to_string();
-    }
-    let bytes = css.as_bytes();
-    let mut out = String::with_capacity(css.len());
-    let mut copied = 0usize;
-    let mut index = 0usize;
-    while index + 4 <= bytes.len() {
-        if bytes[index..index + 4].eq_ignore_ascii_case(b"body") {
-            // Not part of a longer name (`tbody`, `.body`, `my-body`).
-            let previous_ok = index == 0
-                || !matches!(
-                    bytes[index - 1],
-                    b'-' | b'_' | b'.' | b'#' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z'
-                );
-            let follows_ok = matches!(
-                bytes.get(index + 4),
-                Some(b'.') | Some(b'#') | Some(b'[') | Some(b':')
-            );
-            if previous_ok && follows_ok {
-                out.push_str(&css[copied..index]);
-                copied = index + 4;
-                index += 4;
-                continue;
-            }
-        }
-        index += 1;
-    }
-    out.push_str(&css[copied..]);
-    out
-}
-
-fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
-    let needle = needle.as_bytes();
-    if needle.is_empty() {
-        return true;
-    }
-    haystack
-        .as_bytes()
-        .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle))
-}
-
 /// Rewrites `url(...)` references inside a stylesheet so they point at the book
 /// (`epub://book/...`). Background images declared in a document's CSS are
 /// relative to that document otherwise, and the chunk's HTML lives at the book
@@ -3068,59 +2489,6 @@ fn rewrite_tag(tag: &str, doc_dir: &str, opf_dir: &str) -> String {
     out
 }
 
-fn parse_attrs(tag: &str) -> HashMap<String, String> {
-    let mut attrs = HashMap::new();
-    let mut i = 0;
-    while i < tag.len() {
-        let Some(c) = tag[i..].chars().next() else {
-            break;
-        };
-        if c.is_ascii_alphabetic() || c == '_' {
-            let start = i;
-            i += c.len_utf8();
-            while i < tag.len() {
-                let ch = tag[i..].chars().next().unwrap();
-                if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':') {
-                    i += ch.len_utf8();
-                } else {
-                    break;
-                }
-            }
-            let name = tag[start..i].to_ascii_lowercase();
-            while i < tag.len() && tag[i..].chars().next().is_some_and(|c| c.is_whitespace()) {
-                i += 1;
-            }
-            if i < tag.len() && tag[i..].starts_with('=') {
-                i += 1;
-                while i < tag.len() && tag[i..].chars().next().is_some_and(|c| c.is_whitespace()) {
-                    i += 1;
-                }
-                if i < tag.len() {
-                    let quote = tag[i..].chars().next().unwrap();
-                    if quote == '"' || quote == '\'' {
-                        i += 1;
-                        let value_start = i;
-                        while i < tag.len() {
-                            let ch = tag[i..].chars().next().unwrap();
-                            if ch == quote {
-                                break;
-                            }
-                            i += ch.len_utf8();
-                        }
-                        attrs.insert(name, tag[value_start..i].to_string());
-                        if i < tag.len() {
-                            i += 1;
-                        }
-                    }
-                }
-            }
-        } else {
-            i += c.len_utf8();
-        }
-    }
-    attrs
-}
-
 fn is_html_resource(media_type: &str, href: &str) -> bool {
     if media_type.to_ascii_lowercase().contains("html") {
         return true;
@@ -3158,13 +2526,6 @@ fn spine_layout(properties: &str, global: SpineLayout) -> SpineLayout {
         }
     }
     global
-}
-
-fn file_extension(path: &str) -> String {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    name.rsplit_once('.')
-        .map(|(_, extension)| extension.to_ascii_lowercase())
-        .unwrap_or_default()
 }
 
 fn rewrite_inline_svg_image_blocks(html: &str, doc_dir: &str, provider: &LazyResource) -> String {
@@ -3321,99 +2682,6 @@ fn svg_image_tag(
     }
     tag.push_str(" style=\"max-width:100%;height:auto\">");
     tag
-}
-
-fn next_tag_start(text: &str, from: usize, tag_lower: &str) -> Option<usize> {
-    if from > text.len() {
-        return None;
-    }
-    let mut from = from;
-    while let Some(rel) = text[from..].find(tag_lower) {
-        let pos = from + rel;
-        if is_tag_boundary(text, pos + tag_lower.len()) {
-            return Some(pos);
-        }
-        from = pos + tag_lower.len();
-    }
-    None
-}
-
-fn is_tag_boundary(text: &str, pos: usize) -> bool {
-    if pos >= text.len() {
-        return true;
-    }
-    match text[pos..].chars().next() {
-        Some(c) => c.is_whitespace() || c == '>' || c == '/',
-        None => true,
-    }
-}
-
-fn find_matching_close_tag(
-    text: &str,
-    open_start: usize,
-    open_tag: &str,
-    close_tag: &str,
-) -> Option<(usize, usize)> {
-    let mut depth = 1usize;
-    let mut scan = open_start + open_tag.len();
-
-    while scan < text.len() {
-        let next_open = next_tag_start(text, scan, open_tag);
-        let next_close = next_tag_start(text, scan, close_tag);
-        match (next_open, next_close) {
-            (None, None) => return None,
-            (Some(open_pos), None) => {
-                depth += 1;
-                scan = find_tag_end(text, open_pos)?;
-            }
-            (None, Some(close_pos)) => {
-                depth -= 1;
-                let close_end = find_tag_end(text, close_pos)?;
-                if depth == 0 {
-                    return Some((close_pos, close_end));
-                }
-                scan = close_end;
-            }
-            (Some(open_pos), Some(close_pos)) => {
-                if close_pos < open_pos {
-                    depth -= 1;
-                    let close_end = find_tag_end(text, close_pos)?;
-                    if depth == 0 {
-                        return Some((close_pos, close_end));
-                    }
-                    scan = close_end;
-                } else {
-                    depth += 1;
-                    scan = find_tag_end(text, open_pos)?;
-                }
-            }
-        }
-    }
-
-    None
-}
-
-fn find_tag_end(text: &str, start: usize) -> Option<usize> {
-    let bytes = text.as_bytes();
-    if start >= bytes.len() || bytes[start] != b'<' {
-        return None;
-    }
-    let mut i = start + 1;
-    let mut quote: Option<u8> = None;
-    while i < bytes.len() {
-        let byte = bytes[i];
-        if let Some(quote_byte) = quote {
-            if byte == quote_byte {
-                quote = None;
-            }
-        } else if byte == b'"' || byte == b'\'' {
-            quote = Some(byte);
-        } else if byte == b'>' {
-            return Some(i + 1);
-        }
-        i += 1;
-    }
-    None
 }
 
 fn has_element_tag(text: &str, start: usize, end: usize) -> bool {
@@ -3688,100 +2956,6 @@ fn style_has_full_height(style: &str) -> bool {
         }
     }
     false
-}
-
-fn image_mime(data: &[u8], path: &str) -> &'static str {
-    if data.starts_with(&[0x89, 0x50, 0x4e, 0x47]) {
-        return "image/png";
-    }
-    if data.starts_with(&[0xff, 0xd8, 0xff]) {
-        return "image/jpeg";
-    }
-    if data.starts_with(b"GIF8") {
-        return "image/gif";
-    }
-    if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
-        return "image/webp";
-    }
-    if data.starts_with(b"BM") {
-        return "image/bmp";
-    }
-    match file_extension(path).as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "bmp" => "image/bmp",
-        "svg" | "svgz" => "image/svg+xml",
-        _ => "application/octet-stream",
-    }
-}
-
-/// Encodes raw bytes as standard base64 (used to build `data:` URIs).
-pub fn base64_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
-        let value = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[((value >> 18) & 0x3f) as usize] as char);
-        out.push(ALPHABET[((value >> 12) & 0x3f) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(ALPHABET[((value >> 6) & 0x3f) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(ALPHABET[(value & 0x3f) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
-}
-
-fn is_external(value: &str) -> bool {
-    let value = value.trim();
-    value.is_empty()
-        || value.starts_with('#')
-        || value.starts_with('/')
-        || value.starts_with("data:")
-        || value.starts_with("mailto:")
-        || value.contains("://")
-        || value.starts_with("javascript:")
-}
-
-fn value_without_fragment(value: &str) -> String {
-    // A fragment and a query are both metadata: the zip entry is the path.
-    value.split(['#', '?']).next().unwrap_or(value).to_string()
-}
-
-pub fn resolve_href(base_dir: &str, href: &str) -> String {
-    let href = percent_decode_str(href).decode_utf8_lossy();
-    let href = href.replace('\\', "/");
-    let path = if href.starts_with('/') {
-        href.trim_start_matches('/').to_string()
-    } else {
-        format!("{base_dir}/{href}")
-    };
-    normalize_path(&path)
-}
-
-pub fn normalize_path(path: &str) -> String {
-    let path = path.replace('\\', "/");
-    let mut parts: Vec<&str> = Vec::new();
-    for part in path.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            other => parts.push(other),
-        }
-    }
-    parts.join("/")
 }
 
 fn parse_toc(
@@ -4110,13 +3284,6 @@ fn resolve_toc_href(base_dir: &str, href: &str) -> String {
 
 fn parent_dir(path: &str) -> &str {
     path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("")
-}
-
-fn encode_path(path: &str) -> String {
-    path.replace('%', "%25")
-        .replace(' ', "%20")
-        .replace('#', "%23")
-        .replace('?', "%3F")
 }
 
 fn decode_text(bytes: &[u8]) -> String {
