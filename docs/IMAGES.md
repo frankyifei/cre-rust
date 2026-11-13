@@ -79,6 +79,20 @@ The ink difference is anti-aliasing at the page edge; the page content is the
 same. Without the rewrite each plate was a base64 copy inside the chunk, and
 `usvg` decoded every one of them during the layout parse.
 
+Two things are needed for the plate to look right in the reader, and both were
+found the hard way:
+
+- the wrapper SVG must declare `width`/`height` (not just a `viewBox`). It is
+  referenced from an `<img>`, so only its intrinsic size is used: a `viewBox`
+  alone leaves the element at the CSS default box and the picture appears small
+  in a corner.
+- the part's own page-box CSS has to go. Kindle comics size the page with
+  `div.fs { width:1072px; height:1448px; position:relative }` and
+  `img.singlePage { position:absolute; height:100% }`, i.e. the book's own
+  fixed page. The rewrite replaces the part's content with the wrapper, and
+  re-emits its `id`/`name` anchors as empty `<a>` elements so navigation still
+  lands on the page without the book's box.
+
 ## Decoding at the painted size
 
 A photo on a 758x1024 page is painted at roughly a quarter of its pixels.

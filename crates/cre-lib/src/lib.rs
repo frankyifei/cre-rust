@@ -8914,10 +8914,14 @@ fn page_picture_svg(picture: &str, width: f32, height: f32, block: bool) -> Stri
 /// painted by [`collect_placed_images`] from the resource the wrapper names, so
 /// the picture is never copied into the chunk HTML (an inlined plate is a
 /// base64 copy per page, and a comic pays for it in peak memory).
+///
+/// The `width`/`height` attributes matter: the wrapper is referenced from an
+/// `<img>`, so the document's layout needs an intrinsic size. Without them the
+/// element collapses to the CSS default box and the picture sits in a corner.
 fn page_fit_svg(width: f32, height: f32) -> String {
     format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {width:.0} {height:.0}\" \
-         preserveAspectRatio=\"xMidYMid meet\" style=\"display:block;width:100%;height:auto\"></svg>"
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width:.0}\" height=\"{height:.0}\" \
+         viewBox=\"0 0 {width:.0} {height:.0}\"></svg>"
     )
 }
 
@@ -8975,20 +8979,13 @@ fn normalize_map_page_images(
         else {
             continue;
         };
-        // Replace the `<img>` tag itself, not the whole part: the parts carry the
-        // TOC anchors on their wrapping `<div>` (`id="k8-42-1337"`), and those
-        // must survive or every navigation entry loses its page.
+        // Replace the part's content, but keep the anchors it carried: a KF8
+        // part keeps its TOC anchor on the wrapping `<div>` (`id="k8-42-1337"`),
+        // and that same element carries the book's own page-box CSS
+        // (`div.fs { width:1072px; height:1448px; position:relative }`), which
+        // sized the plate to the book's page instead of the reader's. Empty
+        // `<a>` elements keep the navigation target without the box.
         let section = &body[open_end..close];
-        let section_lower = section.to_ascii_lowercase();
-        let Some(image_start) = section_lower.find("<img") else {
-            continue;
-        };
-        let Some(image_end) = section[image_start..]
-            .find('>')
-            .map(|at| image_start + at + 1)
-        else {
-            continue;
-        };
         let name = format!("cre-page-fit-{counter}");
         counter += 1;
         page_fit.insert(
@@ -9004,13 +9001,42 @@ fn normalize_map_page_images(
             name.clone(),
             Arc::new(page_fit_svg(width, height).into_bytes()),
         );
-        out.push_str(&body[cursor..open_end + image_start]);
+        out.push_str(&body[cursor..open_end]);
+        for anchor in section_anchor_ids(section) {
+            out.push_str(&format!("<a id=\"{anchor}\"></a>"));
+        }
         out.push_str(&format!(
-            "<img class=\"cre-plate\" src=\"{name}\" alt=\"\"/>"
+            "<img class=\"cre-plate\" src=\"{name}\" \
+             style=\"display:block;max-width:100%;height:auto\" alt=\"\"/>"
         ));
-        cursor = open_end + image_end;
+        cursor = close;
     }
     out.push_str(&body[cursor..]);
+    out
+}
+
+/// `id`/`name` values carried by the tags inside one part.
+///
+/// They are the book's navigation targets; the plate rewrite replaces the markup
+/// around them, so they are re-emitted as empty anchors (an empty `<a>` has no
+/// box, and `page_for_node` falls through to the content that follows it).
+fn section_anchor_ids(section: &str) -> Vec<String> {
+    static ATTRS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let attrs = ATTRS.get_or_init(|| {
+        regex::Regex::new(r#"(?is)\b(?:id|name)\s*=\s*(?:"([^"]*)"|'([^']*)')"#)
+            .expect("anchor attribute regex is valid")
+    });
+    let mut out: Vec<String> = Vec::new();
+    for captures in attrs.captures_iter(section) {
+        let Some(value) = captures.get(1).or_else(|| captures.get(2)) else {
+            continue;
+        };
+        let value = value.as_str().trim();
+        if value.is_empty() || out.iter().any(|existing| existing == value) {
+            continue;
+        }
+        out.push(value.to_string());
+    }
     out
 }
 
@@ -9861,9 +9887,17 @@ mod map_page_image_tests {
         assert!(out.contains("src=\"cre-page-fit-0\""), "{out}");
         // The picture itself is not copied into the document any more.
         assert!(!out.contains("mobi-image-2"), "{out}");
-        // The part's wrapper and its TOC anchor stay: navigation entries point
-        // at `#k8-0-326`, so dropping the element would lose the page.
-        assert!(out.contains("id=\"k8-0-326\""), "{out}");
+        // The part's TOC anchor stays: navigation entries point at `#k8-0-326`,
+        // so dropping the element would lose the page. It is re-emitted as an
+        // empty anchor, because the `<div class="fs">` around it also carries
+        // the book's page-box CSS.
+        assert!(out.contains("<a id=\"k8-0-326\"></a>"), "{out}");
+        assert!(!out.contains("class=\"fs\""), "{out}");
+        // The plate itself declares how it fills the reader's page.
+        assert!(
+            out.contains("style=\"display:block;max-width:100%;height:auto\""),
+            "{out}"
+        );
         // A part with text is left alone.
         assert!(out.contains("<p>text</p>"), "{out}");
 
