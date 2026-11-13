@@ -1,6 +1,9 @@
 //! Splitting a generated document into reader chunks.
 
+use anyhow::Result;
+
 use crate::html::{find_tag_end, tag_name};
+use crate::resources::ResourceSource;
 
 /// Splits a complete HTML document into parts of at most `limit` bytes,
 /// repeating the document's head and closing tags in every part. Used for
@@ -500,4 +503,239 @@ pub fn find_closing_tag(body: &str, from: usize, name: &str) -> Option<usize> {
     let needle = format!("</{name}");
     let haystack = body.get(from..)?;
     haystack.find(&needle).map(|offset| from + offset)
+}
+
+/// Memory left untouched for KOReader's own post-open work (widgets, caches,
+/// thumbnails) and for the page bitmap handed back to it.
+///
+/// This is the ceiling for [`layout_reserve`]; the chunk planner uses it as
+/// is, because a smaller chunk only ever costs a relayout.
+pub const LAYOUT_MEMORY_RESERVE: usize = 24 * 1024 * 1024;
+
+pub const MAX_CHUNK_BYTES: usize = 128 * 1024;
+
+/// Free memory and where the figure came from, for the diagnostics page.
+pub fn memory_available_detail() -> Option<(u64, &'static str)> {
+    // Testing knob: pretend the device only has this much memory, so the
+    // chunk planner can be exercised on a desktop.
+    if let Ok(value) = std::env::var("CRE_AVAILABLE_MB")
+        && let Ok(mb) = value.trim().parse::<u64>()
+        && mb > 0
+    {
+        return Some((mb.saturating_mul(1024 * 1024), "CRE_AVAILABLE_MB"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let field = |key: &str| -> Option<u64> {
+            info.lines()
+                .find(|line| line.starts_with(key))
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|value| value.parse::<u64>().ok())
+        };
+        // MemAvailable exists since Linux 3.14; the Kindle PW2 runs 3.0, so
+        // fall back to the classic free+buffers+cached estimate there.
+        if let Some(available) = field("MemAvailable:") {
+            return Some((available.saturating_mul(1024), "MemAvailable"));
+        }
+        let free = field("MemFree:")?;
+        let buffers = field("Buffers:").unwrap_or(0);
+        let cached = field("Cached:").unwrap_or(0);
+        return Some((
+            (free + buffers + cached).saturating_mul(1024),
+            "MemFree+Buffers+Cached",
+        ));
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+// ---- chunk budgets -------------------------------------------------------
+// How large a chunk may be, from the memory the kernel can still hand out.
+// Every format uses the same numbers: this estimate is what keeps a large book
+// from being killed on a Kindle.
+
+/// Bounds for a layout chunk: below a page's worth of text chunking only adds
+/// relayouts; above this a single layout is both slow (blitz's layout cost
+/// grows faster than the text: 9.7 s for a 251 kB book as one document, versus
+/// ~4.4 s in four chunks) and expensive in memory. Pagination is unaffected as
+/// long as chunks end at spine-item boundaries, because every spine item
+/// starts a page anyway.
+pub const MIN_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Resident cost of keeping a book laid out, per byte of generated HTML
+/// (DOM nodes, computed styles and parley line boxes). Measured whole-book
+/// layouts: 251 kB of XHTML cost 28 MB, 579 kB cost 44 MB. 128 B/B is the
+/// safe upper bound, and chunk *sizing* keeps using it so it errs towards
+/// smaller chunks.
+pub const LAYOUT_BYTES_PER_HTML_BYTE: usize = 128;
+
+/// Bytes the kernel says it can still hand out, if the platform reports it.
+pub fn available_memory_bytes() -> Option<usize> {
+    memory_available_detail().map(|(bytes, _)| bytes as usize)
+}
+
+/// Text and image budget for one layout chunk, from the memory the kernel can
+/// still hand out.
+///
+/// The text budget uses [`LAYOUT_BYTES_PER_HTML_BYTE`]; the image budget is in
+/// estimated decoded bytes, because blitz decodes a chunk's images while
+/// parsing it (a dense illustrated book costs far more than its text).
+pub fn chunk_budgets(available: Option<usize>) -> (usize, Option<usize>, usize) {
+    let Some(available) = available else {
+        return (usize::MAX, None, usize::MAX);
+    };
+    let budget = available
+        .saturating_sub(LAYOUT_MEMORY_RESERVE)
+        .min(available / 2)
+        .max(MIN_CHUNK_BYTES * LAYOUT_BYTES_PER_HTML_BYTE);
+    let text = (budget / LAYOUT_BYTES_PER_HTML_BYTE).clamp(MIN_CHUNK_BYTES, MAX_CHUNK_BYTES);
+    // Images get 60% of the layout budget when there is plenty of memory, but
+    // only a third on a small device: a chunk activation (e.g. jumping to
+    // another part of the book) has to fit next to the reader UI and the page
+    // cache, not just next to the text layout.
+    let image_share = if available < 128 * 1024 * 1024 {
+        budget / 3
+    } else {
+        (budget * 3) / 5
+    };
+    let images = image_share;
+    (text, Some(images), budget)
+}
+
+/// Chooses the layout chunk size for `total_html` bytes of generated content.
+///
+/// `usize::MAX` means "lay the whole book out at once", like crengine: page
+/// breaks, page numbers and TOC targets then match the original engine and
+/// reading never re-lays out a chunk mid-book. When the book is too large for
+/// the memory actually available, the layout is split so that one chunk's DOM
+/// fits in roughly half of what the kernel can hand out.
+pub fn plan_chunk_bytes(total_html: usize, available: Option<usize>) -> usize {
+    let Some(available) = available else {
+        // No memory information: trust the device rather than degrading the
+        // layout for everyone.
+        return usize::MAX;
+    };
+    // Never plan to use more than half of what is available, and always leave
+    // the reserve free: the layout spike happens while KOReader is also
+    // allocating for the reader UI, and the kernel needs cache headroom.
+    let budget = available
+        .saturating_sub(LAYOUT_MEMORY_RESERVE)
+        .min(available / 2)
+        .max(MIN_CHUNK_BYTES * LAYOUT_BYTES_PER_HTML_BYTE);
+    let max_html = budget / LAYOUT_BYTES_PER_HTML_BYTE;
+    if total_html <= max_html {
+        return usize::MAX;
+    }
+    max_html.clamp(MIN_CHUNK_BYTES, MAX_CHUNK_BYTES)
+}
+
+/// Splits a format that is produced as one HTML document (FB2, TXT, a
+/// standalone HTML file) into layout chunks when it would not fit in one,
+/// using the same memory budget as EPUB chunking.
+pub fn split_single_document(html: String, resources: &ResourceSource) -> Vec<String> {
+    let available = available_memory_bytes();
+    let target = plan_chunk_bytes(html.len(), available);
+    if target == usize::MAX || html.len() <= target {
+        return vec![html];
+    }
+    // The same budgets the EPUB chunker uses: decoded images dominate a
+    // chunk's footprint, and they cannot be seen in the HTML size. A KF8
+    // photo page can be 100 kB of JPEG and 20 MB decoded.
+    let (text_budget, image_budget, layout_budget) = chunk_budgets(available);
+    let text_limit = target.min(text_budget).max(MIN_CHUNK_BYTES);
+    let image_budget = image_budget.unwrap_or(usize::MAX);
+    let cost = |section: &str| -> (usize, usize) {
+        let images = crate::images::image_sources_in(section)
+            .into_iter()
+            .filter_map(|key| resources.estimated_decoded_bytes(&key))
+            .sum();
+        (section.len(), images)
+    };
+    // MOBI/KF8 bodies are a run of `<section class="cre-spine">` parts; cutting
+    // between them keeps each chunk a whole number of parts. A book whose part
+    // is bigger than the budget falls back to the generic splitter, which can
+    // only respect the text budget.
+    if let Some(parts) = split_html_document_at_sections_with(
+        &html,
+        text_limit,
+        image_budget,
+        layout_budget,
+        LAYOUT_BYTES_PER_HTML_BYTE,
+        cost,
+    ) {
+        return parts;
+    }
+    split_html_document(&html, text_limit)
+}
+
+/// Streams the chunks of a format generated as one document body (MOBI,
+/// AZW3/KF8, FB2).
+///
+/// The generators keep their body separately, so this takes the document head
+/// and body and hands one finished chunk at a time to `emit`; the full
+/// generated document never exists. Chunk boundaries are the same as
+/// [`split_single_document`] would produce.
+pub fn stream_single_document_chunks<F>(
+    head: &str,
+    body: &str,
+    resources: &ResourceSource,
+    mut emit: F,
+) -> Result<()>
+where
+    F: FnMut(String) -> Result<()>,
+{
+    const TAIL: &str = "</body></html>";
+    let available = available_memory_bytes();
+    let html_len = head.len() + body.len() + TAIL.len();
+    let target = plan_chunk_bytes(html_len, available);
+    if target == usize::MAX || html_len <= target {
+        emit(format!("{head}{body}{TAIL}"))?;
+        return Ok(());
+    }
+    // The same budgets the EPUB chunker uses: decoded images dominate a
+    // chunk's footprint, and they cannot be seen in the HTML size. A KF8
+    // photo page can be 100 kB of JPEG and 20 MB decoded.
+    let (text_budget, image_budget, layout_budget) = chunk_budgets(available);
+    let text_limit = target.min(text_budget).max(MIN_CHUNK_BYTES);
+    let image_budget = image_budget.unwrap_or(usize::MAX);
+    let cost = |section: &str| -> (usize, usize) {
+        let images = crate::images::image_sources_in(section)
+            .into_iter()
+            .filter_map(|key| resources.estimated_decoded_bytes(&key))
+            .sum();
+        (section.len(), images)
+    };
+    // MOBI/KF8 bodies are a run of `<section class="cre-spine">` parts; cutting
+    // between them keeps each chunk a whole number of parts. A book whose part
+    // is bigger than the budget falls back to the generic splitter, which can
+    // only respect the text budget.
+    let mut failure: Option<anyhow::Error> = None;
+    let handled = stream_html_document_at_sections_with(
+        head,
+        body,
+        TAIL,
+        text_limit,
+        image_budget,
+        layout_budget,
+        LAYOUT_BYTES_PER_HTML_BYTE,
+        cost,
+        |chunk| {
+            if failure.is_none()
+                && let Err(error) = emit(chunk)
+            {
+                failure = Some(error);
+            }
+        },
+    );
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if handled {
+        return Ok(());
+    }
+    for part in split_html_body_parts(body, text_limit) {
+        emit(format!("{head}{part}{TAIL}"))?;
+    }
+    Ok(())
 }

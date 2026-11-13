@@ -9,9 +9,10 @@
 
 use std::fmt;
 
+use cre_book::chunk::{LAYOUT_MEMORY_RESERVE, memory_available_detail};
+
 use crate::{
-    CHUNK_DOM_BYTES_PER_HTML_BYTE, ChunkSource, LAYOUT_MEMORY_RESERVE, layout_reserve,
-    memory_available_detail, memory_total_bytes, resident_bytes,
+    CHUNK_DOM_BYTES_PER_HTML_BYTE, ChunkSource, layout_reserve, memory_total_bytes, resident_bytes,
 };
 
 /// Bytes a page needs in the page index (line entries, page metadata and the
