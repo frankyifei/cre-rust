@@ -55,6 +55,8 @@ pub struct MobiBook {
     pub description: Option<String>,
     pub keywords: Option<String>,
     pub identifiers: Option<String>,
+    /// EXTH 498: the series the book belongs to, when the publisher set it.
+    pub series: Option<String>,
     /// Resource name (`mobi-image-N`) to its range in the PalmDB file.
     ///
     /// The bytes are sliced from the mapped file when a page paints them, so a
@@ -163,6 +165,7 @@ impl MobiBook {
             .string(104, encoding)
             .map(|isbn| format!("ISBN: {isbn}"))
             .or_else(|| header.exth.string(113, encoding));
+        let series = header.exth.string(498, encoding);
 
         // 7. Table of contents: the NCX index when the file has one, otherwise
         //    one entry per chapter section with its heading text.
@@ -189,6 +192,7 @@ impl MobiBook {
             description,
             keywords,
             identifiers,
+            series,
             resources,
             toc,
             cover_image,

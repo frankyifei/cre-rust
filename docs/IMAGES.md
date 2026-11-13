@@ -58,6 +58,27 @@ picture is not cropped, no base64 copy is pinned, and no decoded pixels are
 held during layout. This removed 10 MB of pinned base64 copies and a 4.6 MB
 page-sized PNG cache on `12.epub` (RSS 77.2 -> 39.5 MB).
 
+MOBI and KF8 get the same wrapper through a different door. Their parts are
+`<section class="cre-spine">` blocks inside one document, so
+`normalize_map_page_images` rewrites a picture-only part at open time — before
+the document is split into chunks — and the wrapper SVG is served from
+`ImageRaster` (`page_fit_resources`) because a PalmDB has no writable resource
+view. Only the `<img>` tag is replaced: the wrapper `<div>` carries the book's
+TOC anchors (`id="k8-42-1337"`), and losing it made every navigation entry fall
+back to "no page".
+
+A 48 MB fixed-size comic (184 plates) measured on the native x86_64 release
+build with `perf_probe`:
+
+| | Open | Peak RSS | First page |
+|---|---|---|---|
+| Inlined `<svg><image href="data:…">` | 3 099 ms | 612 MB | 61052 ink |
+| `cre-page-fit-N` resource | 26 ms | 68 MB | 61048 ink |
+
+The ink difference is anti-aliasing at the page edge; the page content is the
+same. Without the rewrite each plate was a base64 copy inside the chunk, and
+`usvg` decoded every one of them during the layout parse.
+
 ## Decoding at the painted size
 
 A photo on a 758x1024 page is painted at roughly a quarter of its pixels.

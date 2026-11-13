@@ -337,7 +337,7 @@ LTO and stripping keep the module around 19.7 MB. See
 | FB2 | Base64 binaries, inline images |
 | TXT and HTML | Plain text, standalone HTML with local resources |
 | MOBI 6 (`.mobi`, `.prc`, `.azw`) | PalmDOC decompression, EXTH, `filepos` links, images |
-| KF8 / AZW3 | Separate crate, shared PalmDB container |
+| KF8 / AZW3 | Separate crate, shared PalmDB container; fixed pages, embedded fonts, series |
 
 The format is detected from the file content, not from the extension.
 
@@ -399,7 +399,9 @@ The format is detected from the file content, not from the extension.
 - MathML is a presentation subset. A matrix (`mtable`) is kept on one page
   rather than split between rows; huge formulas are clipped, as an inline
   table would be in crengine.
-- MOBI and KF8: no DRM, no embedded fonts, and limited CSS.
+- MOBI and KF8: no DRM, and the CSS support is whatever the flow carries (both
+  formats are laid out by the same engine, so a KF8 book gets the same
+  typography, images, fixed pages and embedded fonts as an EPUB).
 - EPUB CFI output is simplified.
 - Two-page view, scroll view, and some page-flow APIs are partial.
 - There is no on-disk cache. Opening a book again makes the pages again.

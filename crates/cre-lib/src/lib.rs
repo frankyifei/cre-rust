@@ -1752,7 +1752,7 @@ impl Document {
                     title: book.title.clone(),
                     creator: book.creator.clone(),
                     language: book.language.clone(),
-                    series: None,
+                    series: book.series.clone(),
                     description: book.description.clone(),
                     keywords: book.keywords.clone(),
                     identifiers: book.identifiers.clone(),
@@ -1772,8 +1772,14 @@ impl Document {
                 let cover_image = book.cover_image.take();
                 let resources = MapResources::Mapped(Arc::new(std::mem::take(&mut book.resources)));
                 let resource_source = ResourceSource::Map(resources.clone());
+                let body = prepare_map_page_images(
+                    book.body_html().to_string(),
+                    &resources,
+                    options,
+                    &svg_raster,
+                );
                 let mut sink = ChunkSink::new();
-                stream_single_document_chunks(&head, book.body_html(), &resource_source, |html| {
+                stream_single_document_chunks(&head, &body, &resource_source, |html| {
                     sink.push(html)
                 })?;
                 drop(book);
@@ -1809,7 +1815,7 @@ impl Document {
                     title: book.title.clone(),
                     creator: book.creator.clone(),
                     language: book.language.clone(),
-                    series: None,
+                    series: book.series.clone(),
                     description: book.description.clone(),
                     keywords: book.keywords.clone(),
                     identifiers: book.identifiers.clone(),
@@ -1829,12 +1835,18 @@ impl Document {
                 let cover_image = book.cover_image.take();
                 let resources = MapResources::Mapped(Arc::new(std::mem::take(&mut book.resources)));
                 let resource_source = ResourceSource::Map(resources.clone());
+                let body = prepare_map_page_images(
+                    book.body_html().to_string(),
+                    &resources,
+                    options,
+                    &svg_raster,
+                );
                 let mut sink = ChunkSink::new();
                 // KF8 keeps its CSS in the flow, so the book's `@font-face`
                 // rules land in the generated HTML (unlike an EPUB chapter,
                 // which links its stylesheet).
                 let mut embedded_fonts: Vec<String> = Vec::new();
-                stream_single_document_chunks(&head, book.body_html(), &resource_source, |html| {
+                stream_single_document_chunks(&head, &body, &resource_source, |html| {
                     // Only families whose rule points at a record the book
                     // really has: a converter that drops the font bytes leaves
                     // the rule behind with a placeholder URL.
@@ -8827,6 +8839,11 @@ fn fit_cover_images(html: &str, width: f32, height: f32) -> String {
     let Some(src) = attr_value(tag, "src") else {
         return html.to_string();
     };
+    // A picture this module already turned into a page-sized plate must keep
+    // its wrapper (wrapping it again inlines the picture).
+    if src.starts_with("cre-page-fit-") {
+        return html.to_string();
+    }
     let Some(declared_height) = attr_value(tag, "height").and_then(parse_pixels) else {
         return html.to_string();
     };
@@ -8891,6 +8908,136 @@ fn page_picture_svg(picture: &str, width: f32, height: f32, block: bool) -> Stri
     )
 }
 
+/// The page-sized transparent SVG served for a `cre-page-fit-N` key.
+///
+/// The same box `page_picture_svg` declares, minus the picture: the pixels are
+/// painted by [`collect_placed_images`] from the resource the wrapper names, so
+/// the picture is never copied into the chunk HTML (an inlined plate is a
+/// base64 copy per page, and a comic pays for it in peak memory).
+fn page_fit_svg(width: f32, height: f32) -> String {
+    format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {width:.0} {height:.0}\" \
+         preserveAspectRatio=\"xMidYMid meet\" style=\"display:block;width:100%;height:auto\"></svg>"
+    )
+}
+
+/// Turns a book's picture-only parts into page-sized plates that point at the
+/// image instead of inlining it.
+///
+/// This is the MOBI/KF8 counterpart of `cre_epub::normalize_full_page_images`:
+/// EPUB rewrites each spine document and writes a generated resource into the
+/// archive view, while these formats keep the whole book in one document whose
+/// parts are `<section class="cre-spine">`. A part that is one picture gets a
+/// `cre-page-fit-N` wrapper in `page_fit`/`page_svgs`, and its content becomes a
+/// single `<img src="cre-page-fit-N">`, so layout sees a page-sized box and
+/// painting reads the original bytes from the resource map.
+fn normalize_map_page_images(
+    body: String,
+    resources: &MapResources,
+    available: (f32, f32),
+    page_fit: &mut HashMap<String, cre_epub::PageFitImage>,
+    page_svgs: &mut HashMap<String, Arc<Vec<u8>>>,
+) -> String {
+    static SRC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let src = SRC.get_or_init(|| {
+        regex::Regex::new(r#"(?is)\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)')"#)
+            .expect("img src regex is valid")
+    });
+    let (width, height) = (available.0.max(1.0).round(), available.1.max(1.0).round());
+    let closing = "</section>";
+    let lower = body.to_ascii_lowercase();
+    let mut out = String::with_capacity(body.len());
+    let mut cursor = 0usize;
+    let mut scan = 0usize;
+    let mut counter = 0usize;
+    while let Some(pos) = lower[scan..].find("<section") {
+        let start = scan + pos;
+        let Some(open_end) = body[start..].find('>').map(|end| start + end + 1) else {
+            break;
+        };
+        if !lower[start..open_end].contains("cre-spine") {
+            scan = open_end;
+            continue;
+        }
+        let Some(close) = lower[open_end..].find(closing).map(|end| open_end + end) else {
+            break;
+        };
+        let end = close + closing.len();
+        scan = end;
+        let Some(picture) = picture_only_body(&body[open_end..close], src) else {
+            continue;
+        };
+        if picture.starts_with("cre-page-fit-") {
+            continue;
+        }
+        let key = normalize_path(&picture);
+        let Some((image_width, image_height)) = resources.get(&key).and_then(image_dimensions)
+        else {
+            continue;
+        };
+        // Replace the `<img>` tag itself, not the whole part: the parts carry the
+        // TOC anchors on their wrapping `<div>` (`id="k8-42-1337"`), and those
+        // must survive or every navigation entry loses its page.
+        let section = &body[open_end..close];
+        let section_lower = section.to_ascii_lowercase();
+        let Some(image_start) = section_lower.find("<img") else {
+            continue;
+        };
+        let Some(image_end) = section[image_start..]
+            .find('>')
+            .map(|at| image_start + at + 1)
+        else {
+            continue;
+        };
+        let name = format!("cre-page-fit-{counter}");
+        counter += 1;
+        page_fit.insert(
+            name.clone(),
+            cre_epub::PageFitImage {
+                source: key,
+                width: image_width,
+                height: image_height,
+                contain: true,
+            },
+        );
+        page_svgs.insert(
+            name.clone(),
+            Arc::new(page_fit_svg(width, height).into_bytes()),
+        );
+        out.push_str(&body[cursor..open_end + image_start]);
+        out.push_str(&format!(
+            "<img class=\"cre-plate\" src=\"{name}\" alt=\"\"/>"
+        ));
+        cursor = open_end + image_end;
+    }
+    out.push_str(&body[cursor..]);
+    out
+}
+
+/// Wraps the picture-only parts of a MOBI/KF8 document into page-fit plates and
+/// registers them on the raster.
+///
+/// Called before the document is split into chunks, so the generated
+/// `cre-page-fit-N` keys are in place for every chunk and the chunk budgets see
+/// the small wrapper instead of the picture.
+fn prepare_map_page_images(
+    body: String,
+    resources: &MapResources,
+    options: &DocumentOptions,
+    svg: &Arc<ImageRaster>,
+) -> String {
+    let available = (
+        options.width as f32 - options.page_margin * 2.0,
+        options.height as f32 - options.page_margin * 2.0,
+    );
+    let mut page_fit = HashMap::new();
+    let mut page_svgs = HashMap::new();
+    let body = normalize_map_page_images(body, resources, available, &mut page_fit, &mut page_svgs);
+    svg.set_page_fit_images(page_fit);
+    svg.set_page_fit_resources(page_svgs);
+    body
+}
+
 /// Scales a picture-only section to the page.
 ///
 /// MOBI and KF8 keep the whole book in one document and mark each part with
@@ -8939,6 +9086,12 @@ fn fit_picture_sections(html: &str, width: f32, height: f32) -> String {
             scan = end;
             continue;
         };
+        // A plate generated by `normalize_map_page_images` already fills the
+        // page and must not be wrapped again (that would inline the picture).
+        if picture.starts_with("cre-page-fit-") {
+            scan = end;
+            continue;
+        }
         out.push_str(&html[cursor..open_end]);
         out.push_str(&page_picture_svg(&picture, width, height, true));
         // Keep the section's own closing tag.
@@ -9307,6 +9460,11 @@ struct ImageRaster {
     placeholders: std::sync::Mutex<PlaceholderCache>,
     /// Generated page-fit wrappers and the original image each stands for.
     page_fit: std::sync::Mutex<HashMap<String, cre_epub::PageFitImage>>,
+    /// The SVG bytes served for a generated page-fit key. EPUB keeps these in
+    /// the book's resource provider (it writes them into the archive view); a
+    /// MOBI/KF8 book has no writable provider, so the wrapper lives here and the
+    /// net providers hand it out.
+    page_resources: std::sync::Mutex<HashMap<String, Arc<Vec<u8>>>>,
 }
 
 #[derive(Default)]
@@ -9330,7 +9488,21 @@ impl ImageRaster {
             placeheld: std::sync::Mutex::new(HashMap::new()),
             placeholders: std::sync::Mutex::new(HashMap::new()),
             page_fit: std::sync::Mutex::new(HashMap::new()),
+            page_resources: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Registers the SVG bytes of the page-fit wrappers built for a book whose
+    /// resources cannot be extended (MOBI/KF8).
+    fn set_page_fit_resources(&self, resources: HashMap<String, Arc<Vec<u8>>>) {
+        if let Ok(mut page_resources) = self.page_resources.lock() {
+            page_resources.extend(resources);
+        }
+    }
+
+    /// SVG bytes of a generated page-fit wrapper, if the key names one.
+    fn page_fit_resource(&self, key: &str) -> Option<Arc<Vec<u8>>> {
+        self.page_resources.lock().ok()?.get(key).cloned()
     }
 
     /// Notes which resources `<img>` elements reference.
@@ -9544,6 +9716,12 @@ impl NetProvider for MapNet {
             .trim_start_matches('/')
             .to_string();
         let name = path.strip_prefix("binary/").unwrap_or(&path).to_string();
+        // A page-fit wrapper is generated for the layout, not stored in the
+        // book: the picture itself is painted from the resource it names.
+        if let Some(bytes) = self.svg.page_fit_resource(&name) {
+            handler.bytes(request.url.to_string(), Bytes::from((*bytes).clone()));
+            return;
+        }
         // Slice the resource instead of copying it: the placeholder only needs
         // the header to learn the intrinsic size, and copying the whole record
         // here would fault every picture's pages in during the layout pass.
@@ -9632,6 +9810,107 @@ body { font-size: 20px; }
     assert!(find_case_insensitive(bytes, b"cre-render-base", 0).is_some());
     assert!(find_case_insensitive(bytes, b"font-size: 20px", 0).is_some());
     assert!(find_case_insensitive(bytes, b"visible", 0).is_some());
+}
+
+#[cfg(test)]
+mod map_page_image_tests {
+    use super::*;
+
+    fn jpeg(width: u32, height: u32) -> Vec<u8> {
+        let image = image::RgbImage::from_pixel(width, height, image::Rgb([16, 16, 16]));
+        let mut out = Vec::new();
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 80);
+        encoder
+            .encode(
+                image.as_raw(),
+                width,
+                height,
+                image::ExtendedColorType::Rgb8,
+            )
+            .expect("encode jpeg");
+        out
+    }
+
+    fn book_body() -> String {
+        "<section class=\"cre-spine\" data-spine-index=\"1\" id=\"cre-sec-1\">\
+         <div class=\"fs\" id=\"k8-0-326\"><div><img src=\"mobi-image-2\" width=\"600\" \
+         height=\"800\"/></div></div>\
+         </section>\
+         <section class=\"cre-spine\" data-spine-index=\"2\" id=\"cre-sec-2\">\
+         <p>text</p></section>"
+            .to_string()
+    }
+
+    fn resources() -> MapResources {
+        let mut map = HashMap::new();
+        map.insert("mobi-image-2".to_string(), jpeg(600, 800));
+        MapResources::Owned(Arc::new(map))
+    }
+
+    #[test]
+    fn a_picture_part_becomes_a_page_fit_plate() {
+        let mut page_fit = HashMap::new();
+        let mut svgs = HashMap::new();
+        let out = normalize_map_page_images(
+            book_body(),
+            &resources(),
+            (600.0, 800.0),
+            &mut page_fit,
+            &mut svgs,
+        );
+        assert!(out.contains("src=\"cre-page-fit-0\""), "{out}");
+        // The picture itself is not copied into the document any more.
+        assert!(!out.contains("mobi-image-2"), "{out}");
+        // The part's wrapper and its TOC anchor stay: navigation entries point
+        // at `#k8-0-326`, so dropping the element would lose the page.
+        assert!(out.contains("id=\"k8-0-326\""), "{out}");
+        // A part with text is left alone.
+        assert!(out.contains("<p>text</p>"), "{out}");
+
+        let plate = page_fit.get("cre-page-fit-0").expect("plate");
+        assert_eq!(plate.source, "mobi-image-2");
+        assert_eq!((plate.width, plate.height), (600, 800));
+        assert!(
+            plate.contain,
+            "a plate keeps its aspect inside the page box"
+        );
+        assert!(svgs.contains_key("cre-page-fit-0"));
+        // The wrapper declares the page box, not the picture's own size.
+        let svg = String::from_utf8(svgs["cre-page-fit-0"].as_ref().clone()).unwrap();
+        assert!(svg.contains("viewBox=\"0 0 600 800\""), "{svg}");
+        assert!(!svg.contains("<image"), "{svg}");
+    }
+
+    #[test]
+    fn plate_rewriting_is_idempotent() {
+        let once = normalize_map_page_images(
+            book_body(),
+            &resources(),
+            (600.0, 800.0),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
+        let twice = normalize_map_page_images(
+            once.clone(),
+            &resources(),
+            (600.0, 800.0),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
+        assert_eq!(twice, once, "a generated plate must not be wrapped again");
+    }
+
+    #[test]
+    fn a_picture_with_unknown_size_is_left_as_it_is() {
+        let out = normalize_map_page_images(
+            book_body(),
+            &MapResources::Owned(Arc::new(HashMap::new())),
+            (600.0, 800.0),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
+        assert_eq!(out, book_body());
+    }
 }
 
 #[cfg(test)]

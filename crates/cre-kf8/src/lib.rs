@@ -55,6 +55,8 @@ pub struct Kf8Book {
     pub description: Option<String>,
     pub keywords: Option<String>,
     pub identifiers: Option<String>,
+    /// EXTH 498: the series the book belongs to, when the publisher set it.
+    pub series: Option<String>,
     /// Resource name (`mobi-image-N`) to its range in the PalmDB file.
     ///
     /// Images and embedded fonts share the naming: the index is the one a
@@ -69,6 +71,8 @@ pub struct Kf8Book {
     /// Number of XHTML parts (spine sections) in the book.
     pub section_count: usize,
     body: String,
+    /// Attributes of the book's own `<body>` tag, with the leading space.
+    body_attrs: String,
 }
 
 impl Kf8Book {
@@ -176,6 +180,10 @@ impl Kf8Book {
         //    `DocFragment` indices match the book's own files.
         let mut body = String::new();
         let mut section_count = 0usize;
+        // The book's `<body>` attributes (`class="calibre"` and friends) are
+        // kept on the generated body so the stylesheet's `body.class` rules
+        // keep matching; the parts themselves are flattened into sections.
+        let mut body_attrs = String::new();
         for part in &parts {
             let inner = extract_body(&part.bytes).unwrap_or_else(|| part.bytes.clone());
             let text = String::from_utf8_lossy(&inner);
@@ -183,9 +191,19 @@ impl Kf8Book {
             if trimmed.is_empty() {
                 continue;
             }
+            if body_attrs.is_empty() {
+                body_attrs = body_tag_attrs(&part.bytes);
+            }
             section_count += 1;
+            // A pre-paginated part declares its initial containing block with
+            // `<meta name="viewport">`. cre-lib reads the marker and treats the
+            // section as one fixed page instead of reflowing its text.
+            let fixed = part_viewport(&part.bytes)
+                .map(|viewport| format!(" data-cre-fixed-layout=\"{viewport}\""))
+                .unwrap_or_default();
             body.push_str(&format!(
-                "<section class=\"cre-spine\" data-spine-index=\"{section_count}\" id=\"cre-sec-{section_count}\">"
+                "<section class=\"cre-spine\" data-spine-index=\"{section_count}\" \
+                 id=\"cre-sec-{section_count}\"{fixed}>"
             ));
             body.push_str(trimmed);
             body.push_str("</section>\n");
@@ -219,6 +237,7 @@ impl Kf8Book {
             .string(104, encoding)
             .map(|isbn| format!("ISBN: {isbn}"))
             .or_else(|| header.exth.string(113, encoding));
+        let series = header.exth.string(498, encoding);
 
         // 8. Table of contents from the NCX, else from the part headings.
         let mut toc = kf8_toc(&pdb, &header, &target_ids, &parts);
@@ -244,11 +263,13 @@ impl Kf8Book {
             description,
             keywords,
             identifiers,
+            series,
             resources,
             toc,
             cover_image,
             section_count,
             body: rewrite_kindle_urls(&with_styles(&body, &styles)),
+            body_attrs,
         })
     }
 
@@ -276,7 +297,8 @@ impl Kf8Book {
         let language = escape_html(self.language.as_deref().unwrap_or("und"));
         format!(
             "<!DOCTYPE html><html lang=\"{language}\"><head><meta charset=\"utf-8\">\
-             <title>{title}</title><style>{css}</style></head><body>"
+             <title>{title}</title><style>{css}</style></head><body{}>",
+            self.body_attrs
         )
     }
 }
@@ -880,6 +902,78 @@ fn resource_name(index: usize, data: &[u8]) -> Option<String> {
     Some(format!("mobi-image-{index}"))
 }
 
+/// The `<body>` tag's attributes of one part, with a leading space.
+///
+/// The generated document has a body of its own, so the book's `body class="…"`
+/// would otherwise be lost and every `body.class` rule in its stylesheet would
+/// stop matching.
+fn body_tag_attrs(part: &[u8]) -> String {
+    let lower = part.to_ascii_lowercase();
+    let Some(at) = lower.windows(5).position(|window| window == b"<body") else {
+        return String::new();
+    };
+    let Some(end) = lower[at..].iter().position(|byte| *byte == b'>') else {
+        return String::new();
+    };
+    // `<body` itself is 5 bytes; keep everything up to the closing `>`.
+    String::from_utf8_lossy(&part[at + 5..at + end]).into_owned()
+}
+
+/// The fixed page size a part declares, in the marker cre-lib reads.
+///
+/// A pre-paginated part carries `<meta name="viewport" content="width=600,
+/// height=800">` (or `width=device-width`). Returns `"600x800"` / `"device"` /
+/// `None`, i.e. the value of `data-cre-fixed-layout`.
+fn part_viewport(part: &[u8]) -> Option<String> {
+    let lower = part.to_ascii_lowercase();
+    let mut at = 0usize;
+    while let Some(found) = find_bytes(&lower[at..], b"<meta") {
+        let start = at + found;
+        let offset = lower[start..].iter().position(|byte| *byte == b'>')?;
+        let end = start + offset;
+        if let Some(tag) = html::Tag::parse(&part[start..=end])
+            && tag
+                .attribute("name")
+                .is_some_and(|name| name.eq_ignore_ascii_case("viewport"))
+            && let Some(content) = tag.attribute("content")
+        {
+            return viewport_marker(content);
+        }
+        at = end + 1;
+    }
+    None
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// `width=600, height=800` -> `600x800`; `width=device-width` -> `device`.
+fn viewport_marker(content: &str) -> Option<String> {
+    let mut width = None;
+    let mut height = None;
+    for part in content.split(',') {
+        let Some((name, value)) = part.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        match name.trim().to_ascii_lowercase().as_str() {
+            "width" if value.eq_ignore_ascii_case("device-width") => return Some("device".into()),
+            "width" => width = value.parse::<f32>().ok(),
+            "height" => height = value.parse::<f32>().ok(),
+            _ => {}
+        }
+    }
+    match (width, height) {
+        (Some(width), Some(height)) if width > 0.0 && height > 0.0 => {
+            Some(format!("{width:.0}x{height:.0}"))
+        }
+        _ => None,
+    }
+}
+
 /// Returns the inside of the document's `<body>`, when the part has one.
 fn extract_body(data: &[u8]) -> Option<Vec<u8>> {
     let lower = data.to_ascii_lowercase();
@@ -1040,6 +1134,37 @@ mod tests {
         // Record types that live in the same area and are not fetchable.
         assert_eq!(resource_name(6, b"FLIS\x00\x00\x00\x08"), None);
         assert_eq!(resource_name(7, b"<html>\n<body>"), None);
+    }
+
+    #[test]
+    fn a_viewport_meta_becomes_the_fixed_layout_marker() {
+        assert_eq!(
+            viewport_marker("width=600, height=800").as_deref(),
+            Some("600x800")
+        );
+        assert_eq!(
+            viewport_marker("width=device-width, initial-scale=1").as_deref(),
+            Some("device")
+        );
+        // Half a viewport is not a page size.
+        assert_eq!(viewport_marker("width=600"), None);
+        assert_eq!(viewport_marker("initial-scale=1"), None);
+
+        let fixed = br#"<html><head><meta name="viewport" content="width=1024, height=768"/>
+                       </head><body><p>x</p></body></html>"#;
+        assert_eq!(part_viewport(fixed).as_deref(), Some("1024x768"));
+        // A reflowable part has no viewport; the body is laid out as text.
+        let reflowable = br#"<html><head><title>t</title></head><body><p>x</p></body></html>"#;
+        assert_eq!(part_viewport(reflowable), None);
+    }
+
+    #[test]
+    fn the_body_attributes_survive_the_head_rewrite() {
+        // `body.class` rules in the book's stylesheet have to keep matching.
+        let part = br#"<html><head><title>t</title></head>
+                       <body class="calibre" aid="0"><p>x</p></body></html>"#;
+        assert_eq!(body_tag_attrs(part), " class=\"calibre\" aid=\"0\"");
+        assert_eq!(body_tag_attrs(b"<p>no body here</p>"), "");
     }
 
     #[test]

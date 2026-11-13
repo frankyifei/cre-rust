@@ -209,11 +209,35 @@ that registration outlives the chunk, so the flag also rebuilds the context —
 otherwise the family would stay resolvable after the rules were dropped. See
 [`FONTS.md`](FONTS.md) for the measurements.
 
+## MOBI and KF8
+
+A Kindle file is a PalmDB: the text flow is split into parts by the skeleton and
+fragment indices, and `cre-kf8` reassembles each part into one XHTML document.
+The whole book becomes one rendered document, with one `<section
+class="cre-spine" data-spine-index="N">` per part, so page breaks and
+`DocFragment` indices still follow the book's own files.
+
+Resource references are rewritten on the way in: `kindle:embed:N` becomes
+`mobi-image-N`, and the picture is sliced out of the memory-mapped file when it
+is painted. A pre-paginated part declares its size with `<meta
+name="viewport">`; the value is copied onto the section as
+`data-cre-fixed-layout`, which is the same marker an EPUB fixed page uses, so
+`parse_fixed_layout` handles both. The book's own `<body>` attributes are kept on
+the generated body, otherwise every `body.class` rule in its stylesheet would
+stop matching, and EXTH 498 provides the series name.
+
 ## Images
 
 The format crates rewrite image references to `epub://book/<path>` URLs. The
 net provider serves the bytes. SVG files are rasterized at page size with
 resvg.
+
+A MOBI/KF8 part that holds nothing but a picture is turned into a
+`cre-page-fit-N` plate before the document is chunked, so layout sees a
+page-sized box and painting reads the picture from the resource map instead of
+a base64 copy inside the HTML (a 48 MB comic: 612 -> 68 MB peak, 3.1 -> 0.03 s
+to open). The part's own `<div>` is kept, because that is where a KF8 book puts
+its TOC anchors.
 
 An image-only SVG block is rewritten to a plain `<img>`. It is an image, not a
 drawing.

@@ -45,7 +45,9 @@ fn check_book(path: &Path, expected: DocumentFormat) {
         assert!(page >= 1 && page <= doc.page_count(), "{entry:?}");
     }
 
-    // Reading through a couple of TOC targets works and produces ink.
+    // Reading through a couple of TOC targets works and produces ink. A comic
+    // book's targets are picture pages and carry no text at all, so the ink is
+    // the only thing that can prove the page is not blank.
     for entry in toc.iter().skip(1).take(3) {
         let page = doc.go_to_href(&entry.href).unwrap();
         assert_eq!(doc.current_page(), page);
@@ -55,7 +57,6 @@ fn check_book(path: &Path, expected: DocumentFormat) {
             "page {page} of {} rendered blank",
             path.display()
         );
-        assert!(!doc.page_text(page).unwrap_or_default().trim().is_empty());
     }
 }
 
