@@ -1942,7 +1942,28 @@ impl Document {
                     identifiers: None,
                     item_count: 1,
                 };
-                let embedded_fonts = cre_epub::font_faces_in(&html);
+                let mut embedded_fonts = cre_epub::font_faces_in(&html);
+                // A standalone document keeps its rules in the linked
+                // stylesheets, not in the document text; `FileNet` serves them
+                // from this directory, so read the same files for the list.
+                for href in cre_epub::stylesheet_hrefs(&html) {
+                    let href = href.split(['#', '?']).next().unwrap_or("");
+                    if href.is_empty() || href.contains("://") {
+                        continue;
+                    }
+                    let decoded = percent_decode_str(href).decode_utf8_lossy();
+                    let Ok(css) = std::fs::read_to_string(root.join(decoded.as_ref())) else {
+                        continue;
+                    };
+                    for name in cre_epub::font_faces_in(&css) {
+                        if !embedded_fonts
+                            .iter()
+                            .any(|existing| existing.eq_ignore_ascii_case(&name))
+                        {
+                            embedded_fonts.push(name);
+                        }
+                    }
+                }
                 let embedded_fonts_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
                 let mut document = Self::build(
                     split_single_document(html, &ResourceSource::Empty),

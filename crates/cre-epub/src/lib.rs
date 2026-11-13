@@ -2271,6 +2271,36 @@ pub fn font_faces_in_stylesheets(book: &EpubBook) -> Vec<String> {
     out
 }
 
+/// `href`s of the stylesheets a document links, in document order.
+///
+/// Only `<link rel="stylesheet">` is considered. EPUB chapters are covered by
+/// [`font_faces_in_stylesheets`] (which reads the OPF manifest), so this exists
+/// for a standalone HTML document, whose linked CSS is served from disk.
+pub fn stylesheet_hrefs(html: &str) -> Vec<String> {
+    let lower = html.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    while let Some(pos) = lower[cursor..].find("<link") {
+        let start = cursor + pos;
+        let end = lower[start..]
+            .find('>')
+            .map(|p| p + start + 1)
+            .unwrap_or(html.len());
+        let attrs = parse_attrs(&html[start..end]);
+        let rel = attrs
+            .get("rel")
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        if rel.split_ascii_whitespace().any(|r| r == "stylesheet")
+            && let Some(href) = attrs.get("href")
+        {
+            out.push(href.clone());
+        }
+        cursor = end;
+    }
+    out
+}
+
 /// `font-family` value inside one `@font-face` block.
 fn font_family_of(block: &str) -> Option<String> {
     let lower = block.to_ascii_lowercase();

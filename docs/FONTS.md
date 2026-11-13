@@ -83,6 +83,24 @@ There is **no disk cache** for layout or fonts. Every open re-parses, re-fetches
 and re-registers; a cache is a possible future optimisation, not something these
 numbers include.
 
+## Which formats
+
+| Format | Font list | Toggle |
+|---|---|---|
+| EPUB 2/3 | yes — OPF manifest CSS plus any inline `<style>` | yes |
+| Standalone HTML/XHTML | yes — the document plus the stylesheets it `<link>`s | yes |
+| AZW3 / KF8 | not yet | strips, but there are no rules to strip *and* no font records to load |
+| MOBI 6, FB2, TXT | no `@font-face` in practice | — |
+
+KF8 is the one worth adding. Its CSS lives in the flow and is already inlined
+into the chunk HTML (so `font_faces_in`/`strip_font_faces` apply unchanged), and
+`rewrite_kindle_urls` already turns `url(kindle:embed:N?mime=…)` into the
+resource name `mobi-image-N`. What is missing is the other end:
+`cre_kf8::build_resources` registers only records that look like images, so a
+font record is never exposed and Blitz fetches nothing. Registering the TTF/OTF
+records (magic `0x00010000`, `OTTO`, `ttcf`) plus collecting the names in the
+KF8 branch would make the table say "yes" for KF8 too.
+
 ## Verified in the real reader
 
 The numbers above come from `perf_probe` (native x86_64). The same book was run

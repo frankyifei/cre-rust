@@ -73,11 +73,11 @@ fn package_xml() -> &'static str {
 </package>"#
 }
 
-/// The `@font-face` and the `font-family` that uses it. The font URL is
-/// relative to the stylesheet, like a real book's.
-fn book_css() -> String {
+/// The `@font-face` and the `font-family` that uses it. `font_url` is resolved
+/// against the stylesheet, like a real book's.
+fn book_css(font_url: &str) -> String {
     format!(
-        r#"@font-face {{ src: url(../Fonts/mono.ttf); font-family: "{FAMILY}"; }}
+        r#"@font-face {{ src: url({font_url}); font-family: "{FAMILY}"; }}
 p {{ font-family: "{FAMILY}", serif; }}"#
     )
 }
@@ -92,7 +92,10 @@ fn paragraphs() -> String {
 /// same rules in a `<style>` element.
 fn chapter_xml(inline_css: bool) -> String {
     let (head, style) = if inline_css {
-        (String::new(), format!("<style>{}</style>", book_css()))
+        (
+            String::new(),
+            format!("<style>{}</style>", book_css("../Fonts/mono.ttf")),
+        )
     } else {
         (
             r#"<link rel="stylesheet" type="text/css" href="../Styles/book.css"/>"#.to_string(),
@@ -128,7 +131,8 @@ fn write_epub(dir: &Path, name: &str, inline_css: bool) -> PathBuf {
     zip.start_file("OEBPS/Text/ch1.xhtml", deflated).unwrap();
     zip.write_all(chapter_xml(inline_css).as_bytes()).unwrap();
     zip.start_file("OEBPS/Styles/book.css", deflated).unwrap();
-    zip.write_all(book_css().as_bytes()).unwrap();
+    zip.write_all(book_css("../Fonts/mono.ttf").as_bytes())
+        .unwrap();
     zip.start_file("OEBPS/Fonts/mono.ttf", stored).unwrap();
     zip.write_all(&std::fs::read(EMBEDDED_FONT).expect("read font"))
         .unwrap();
@@ -217,4 +221,59 @@ fn a_book_without_font_face_reports_no_fonts() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.html");
     let document = Document::with_options(&path, &options()).expect("open document");
     assert!(document.embedded_font_list().is_empty());
+}
+
+/// A standalone HTML document goes through `FileNet` instead of `EpubNet`, but
+/// the reader expects the same behaviour: the linked stylesheet is where the
+/// rules live, so the toggle has to reach that provider too.
+///
+/// The fallback face the HTML pipeline picks for `serif` happens to have nearly
+/// the same advance widths as the embedded monospace one, so the page count does
+/// not move here. What has to hold is that "turned off" lays out exactly like a
+/// document that never declared the font — that is the observable promise.
+#[test]
+fn a_standalone_html_document_is_handled_the_same_way() {
+    require_fonts();
+    let dir = std::env::temp_dir().join("cre-embedded-fonts-html");
+    std::fs::create_dir_all(&dir).expect("create dir");
+    std::fs::copy(EMBEDDED_FONT, dir.join("mono.ttf")).expect("copy font");
+    // Served from the document's own directory, so the font URL is a plain
+    // relative path.
+    std::fs::write(dir.join("book.css"), book_css("mono.ttf")).expect("write css");
+    std::fs::write(
+        dir.join("plain.css"),
+        format!("p {{ font-family: \"{FAMILY}\", serif; }}"),
+    )
+    .expect("write plain css");
+    let page = |css: &str| {
+        format!(
+            "<html><head><link rel=\"stylesheet\" href=\"{css}\"/></head>\
+             <body>{}</body></html>",
+            paragraphs()
+        )
+    };
+    let path = dir.join("book.html");
+    std::fs::write(&path, page("book.css")).expect("write html");
+    let plain = dir.join("plain.html");
+    std::fs::write(&plain, page("plain.css")).expect("write html");
+
+    let mut document = Document::with_options(&path, &options()).expect("open document");
+    assert_eq!(document.embedded_font_list(), [FAMILY.to_string()]);
+    let chars_with_book_font = characters_on_page(&mut document, 1);
+
+    document.set_embedded_fonts(false);
+    assert!(document.relayout(&options()).expect("relayout"));
+    let chars_toggled_off = characters_on_page(&mut document, 1);
+    assert_ne!(chars_toggled_off, chars_with_book_font);
+
+    let mut reference = Document::with_options(&plain, &options()).expect("open plain");
+    assert!(
+        reference.embedded_font_list().is_empty(),
+        "the reference document declares no font"
+    );
+    assert_eq!(
+        chars_toggled_off,
+        characters_on_page(&mut reference, 1),
+        "turning the fonts off must lay out like a book without the rules"
+    );
 }
