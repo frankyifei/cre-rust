@@ -119,15 +119,14 @@ fn resource_cache_bytes() -> usize {
 /// stay here for the generator and for `cre-lib`'s chunk budget.
 // The shared book layer owns these; the names stay reachable here because the
 // generator and cre-lib call them through this crate. (S6 moves the callers.)
-pub use cre_book::chunk::*;
-pub use cre_book::css::*;
-pub use cre_book::fonts::*;
-pub use cre_book::html::*;
-pub use cre_book::images::{
-    PageFitImage, estimated_image_bytes, image_mime, image_sources, image_sources_in,
-    inline_svg_images_to_data_uris, is_image_bytes, svg_block_inline_images,
-};
-pub use cre_book::ruby::*;
+use cre_book::chunk::*;
+use cre_book::fonts::*;
+use cre_book::html::*;
+#[cfg(test)]
+use cre_book::images::inline_svg_images_to_data_uris;
+use cre_book::images::{PageFitImage, image_mime, image_sources};
+#[cfg(test)]
+use cre_book::ruby::ruby_cell;
 
 pub struct LazyResource {
     pub epub_path: Option<PathBuf>,

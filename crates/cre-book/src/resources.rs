@@ -158,6 +158,24 @@ impl ResourceSource {
         }
     }
 
+    /// The key a URL resolves to inside this document.
+    ///
+    /// A standalone document's `src` resolves to a file path, while every other
+    /// source keys resources relative to the book; callers that hold a URL (the
+    /// painter, long-press) use this so the same table answers for both.
+    pub fn key_for(&self, path: &str) -> String {
+        let path = normalize_key(path);
+        match &self.base {
+            ResourceBase::Files(root) => {
+                let root = normalize_key(&root.to_string_lossy());
+                path.strip_prefix(&root)
+                    .map(|rest| rest.trim_start_matches('/').to_string())
+                    .unwrap_or(path)
+            }
+            _ => path,
+        }
+    }
+
     /// Registers a resource the engine generated for this document.
     pub fn insert(&self, key: impl Into<String>, bytes: impl Into<Arc<Vec<u8>>>) {
         if let Ok(mut generated) = self.generated.lock() {

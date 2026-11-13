@@ -19,10 +19,10 @@ use cre_book::chunk::{
 };
 use cre_book::html::attr_value;
 use cre_book::images::{fit_cover_images, normalize_page_images};
+use cre_book::normalize_path;
 use cre_book::{GeneratedResources, MapResources, ResourceSource, generated_resource};
 use cre_epub::{
     EpubBook, HtmlOptions, LazyResource, PageMapItem as RawPageMapItem, TocItem as RawTocItem,
-    normalize_path,
 };
 use cre_fb2::{Fb2Book, Fb2HtmlOptions};
 use cre_kf8::{Kf8Book, Kf8HtmlOptions};
@@ -400,7 +400,7 @@ impl ChunkSink {
     fn push(&mut self, html: String) -> Result<()> {
         self.fixed_layouts.push(parse_fixed_layout(&html));
         self.content_images
-            .extend(cre_epub::image_sources_in(&html));
+            .extend(cre_book::image_sources_in(&html));
         self.sources.push(ChunkSource::new(html));
         Ok(())
     }
@@ -1052,7 +1052,7 @@ pub struct Document {
     entries: Vec<ChunkEntry>,
     /// Family names from the book's `@font-face` rules, in the order they are
     /// declared. The fonts themselves are loaded by Blitz (see
-    /// `cre_epub::font_faces_in` / `font_faces_in_stylesheets`); this is the
+    /// `cre_book::font_faces_in` / `font_faces_in_stylesheets`); this is the
     /// list the reader shows.
     embedded_fonts: Vec<String>,
     /// Whether the book's own fonts may be used
@@ -1307,8 +1307,8 @@ impl Document {
                     layout_budget,
                     |html| {
                         fixed_layouts.push(parse_fixed_layout(&html));
-                        content_images.extend(cre_epub::image_sources_in(&html));
-                        for name in cre_epub::font_faces_in(&html) {
+                        content_images.extend(cre_book::image_sources_in(&html));
+                        for name in cre_book::font_faces_in(&html) {
                             if !embedded_fonts
                                 .iter()
                                 .any(|existing: &String| existing.eq_ignore_ascii_case(&name))
@@ -1552,7 +1552,7 @@ impl Document {
                     // really has: a converter that drops the font bytes leaves
                     // the rule behind with a placeholder URL.
                     for name in
-                        cre_epub::loadable_font_faces(&html, |url| resources.contains_key(url))
+                        cre_book::loadable_font_faces(&html, |url| resources.contains_key(url))
                     {
                         if !embedded_fonts
                             .iter()
@@ -1675,11 +1675,11 @@ impl Document {
                     identifiers: None,
                     item_count: 1,
                 };
-                let mut embedded_fonts = cre_epub::font_faces_in(&html);
+                let mut embedded_fonts = cre_book::font_faces_in(&html);
                 // A standalone document keeps its rules in the linked
                 // stylesheets, not in the document text; `FileNet` serves them
                 // from this directory, so read the same files for the list.
-                for href in cre_epub::stylesheet_hrefs(&html) {
+                for href in cre_book::fonts::stylesheet_hrefs(&html) {
                     let href = href.split(['#', '?']).next().unwrap_or("");
                     if href.is_empty() || href.contains("://") {
                         continue;
@@ -1688,7 +1688,7 @@ impl Document {
                     let Ok(css) = std::fs::read_to_string(root.join(decoded.as_ref())) else {
                         continue;
                     };
-                    for name in cre_epub::font_faces_in(&css) {
+                    for name in cre_book::font_faces_in(&css) {
                         if !embedded_fonts
                             .iter()
                             .any(|existing| existing.eq_ignore_ascii_case(&name))
@@ -1767,7 +1767,7 @@ impl Document {
         } else {
             htmls
                 .iter()
-                .flat_map(|html| cre_epub::image_sources_in(html))
+                .flat_map(|html| cre_book::image_sources_in(html))
                 .collect()
         };
         // The chunks are compressed before the memory check so it can count the
@@ -2161,7 +2161,7 @@ fn layout_chunk_html(
     let html = if embedded_fonts {
         std::borrow::Cow::Borrowed(html)
     } else {
-        cre_epub::strip_font_faces(html)
+        cre_book::strip_font_faces(html)
     };
     let html = html.as_ref();
     // A caller that never configured page margins keeps the uniform
@@ -2202,7 +2202,7 @@ fn layout_chunk_html(
             fit_cover_images(html, width, height)
         });
         let html = fitted.as_deref().unwrap_or(html);
-        let inlined = cre_epub::inline_svg_images_to_data_uris(html, &inlined);
+        let inlined = cre_book::images::inline_svg_images_to_data_uris(html, &inlined);
         let html = inlined.as_deref().unwrap_or(html);
         // Inline SVG needs the document's CSS and a pattern-capable rasterizer;
         // see `prepare_inline_svgs`. Text-only chunks skip the work entirely.
@@ -6802,21 +6802,22 @@ fn collect_placed_images(
         };
         let (key, _) = href_key(&resolved);
         let key = key.strip_prefix("binary/").unwrap_or(&key);
+        let key = resources.key_for(key);
         // A plain oversized image is a size placeholder (painted with `fill`);
         // a generated page-fit wrapper is a transparent page-sized SVG whose
         // real picture is painted inside it with `contain`.
         let placed = images
-            .placeheld_size(key)
+            .placeheld_size(&key)
             .and_then(|(width, height)| {
                 resources
-                    .get(key)
+                    .get(&key)
                     .map(|bytes| (bytes, width, height, cre_paint::ImageFit::Fill))
             })
             .or_else(|| {
                 // A generated key is flat (`cre-page-fit-N`), while a standalone
                 // document resolves its `src` against the document's directory,
                 // so the key arrives as a full file path there.
-                let fit = images.page_fit_image(key).or_else(|| {
+                let fit = images.page_fit_image(&key).or_else(|| {
                     key.rsplit('/')
                         .next()
                         .and_then(|name| images.page_fit_image(name))
@@ -7613,7 +7614,7 @@ fn create_document(
     // markup, and Blitz has no ruby box. Stack the note over its base here, in
     // the one place every format passes through, rather than in the EPUB
     // generator as well.
-    html_source = cre_epub::rewrite_ruby(&html_source);
+    html_source = cre_book::rewrite_ruby(&html_source);
     html_source = font_size_attributes_become_styles(&html_source, options.font_size);
     html_source = absolute_font_size_keywords_become_px(&html_source, options.font_size);
     let stripped_at = started.elapsed().as_secs_f64() * 1000.0;
@@ -8675,7 +8676,7 @@ fn rasterize_pattern_svgs(html: &str, width_hint: u32) -> String {
         let Some(png) = encode_png(&rgba, raster_width, raster_height) else {
             continue;
         };
-        let encoded = cre_epub::base64_encode(&png);
+        let encoded = cre_book::base64_encode(&png);
         out.push_str(&html[cursor..open_end]);
         out.push_str(&format!(
             "<image x=\"{x}\" y=\"{y}\" width=\"{width}\" height=\"{height}\" \
@@ -8821,7 +8822,7 @@ struct ImageRaster {
     /// Transparent SVG of a given intrinsic size, used as a layout placeholder.
     placeholders: std::sync::Mutex<PlaceholderCache>,
     /// Generated page-fit wrappers and the original image each stands for.
-    page_fit: std::sync::Mutex<HashMap<String, cre_epub::PageFitImage>>,
+    page_fit: std::sync::Mutex<HashMap<String, cre_book::images::PageFitImage>>,
 }
 
 #[derive(Default)]
@@ -8867,14 +8868,14 @@ impl ImageRaster {
     }
 
     /// Records the transparent page-fit wrappers generated at open.
-    fn set_page_fit_images(&self, images: HashMap<String, cre_epub::PageFitImage>) {
+    fn set_page_fit_images(&self, images: HashMap<String, cre_book::images::PageFitImage>) {
         if let Ok(mut page_fit) = self.page_fit.lock() {
             page_fit.extend(images);
         }
     }
 
     /// The original image a page-fit wrapper paints, with its real size.
-    fn page_fit_image(&self, key: &str) -> Option<cre_epub::PageFitImage> {
+    fn page_fit_image(&self, key: &str) -> Option<cre_book::images::PageFitImage> {
         self.page_fit.lock().ok()?.get(key).cloned()
     }
 
@@ -9034,14 +9035,14 @@ impl NetProvider for EpubNet {
         // the sheet: a family that no longer resolves falls back to the next
         // one in the list, which is the reader's font.
         let bytes = if key.to_ascii_lowercase().ends_with(".css") {
-            let css = cre_epub::body_selectors_to_class(&String::from_utf8_lossy(&bytes));
+            let css = cre_book::css::body_selectors_to_class(&String::from_utf8_lossy(&bytes));
             if self
                 .embedded_fonts
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
                 css.into_bytes()
             } else {
-                cre_epub::strip_font_faces(&css).into_owned().into_bytes()
+                cre_book::strip_font_faces(&css).into_owned().into_bytes()
             }
         } else {
             bytes
@@ -9131,12 +9132,12 @@ impl NetProvider for FileNet {
             .load(std::sync::atomic::Ordering::Relaxed)
             && decoded.to_ascii_lowercase().ends_with(".css")
         {
-            bytes = cre_epub::strip_font_faces(&String::from_utf8_lossy(&bytes))
+            bytes = cre_book::strip_font_faces(&String::from_utf8_lossy(&bytes))
                 .into_owned()
                 .into_bytes();
         }
-        let bytes = self.svg.rasterize(&decoded, &bytes).unwrap_or(bytes);
-        let bytes = self.svg.placeholder(&decoded, &bytes).unwrap_or(bytes);
+        let bytes = self.svg.rasterize(&relative, &bytes).unwrap_or(bytes);
+        let bytes = self.svg.placeholder(&relative, &bytes).unwrap_or(bytes);
         handler.bytes(request.url.to_string(), Bytes::from(bytes));
     }
 }
@@ -9251,7 +9252,7 @@ mod map_page_image_tests {
     fn an_inlined_data_uri_becomes_a_plate() {
         // A standalone HTML document can inline its pictures; the painter still
         // needs bytes under a key, so the pass decodes them once.
-        let encoded = cre_epub::base64_encode(&jpeg(300, 400));
+        let encoded = cre_book::base64_encode(&jpeg(300, 400));
         let src = format!("data:image/jpeg;base64,{encoded}");
         let resources = ResourceSource::empty();
         let mut page_fit = HashMap::new();
