@@ -7,6 +7,8 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
+regex = "1"
 percent-encoding = "2"
 libc = "0.2"
 image = { version = "0.25", default-features = false, features = [

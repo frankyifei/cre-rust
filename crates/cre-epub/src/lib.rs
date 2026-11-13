@@ -124,7 +124,7 @@ pub use cre_book::css::*;
 pub use cre_book::fonts::*;
 pub use cre_book::html::*;
 pub use cre_book::images::{
-    estimated_image_bytes, image_mime, image_sources, image_sources_in,
+    PageFitImage, estimated_image_bytes, image_mime, image_sources, image_sources_in,
     inline_svg_images_to_data_uris, is_image_bytes, svg_block_inline_images,
 };
 pub use cre_book::ruby::*;
@@ -434,24 +434,6 @@ pub struct EpubBook {
     pub global_layout: SpineLayout,
     /// Generated page-fit wrappers and the original image each stands for.
     pub page_fit_images: HashMap<String, PageFitImage>,
-}
-
-/// A generated page-fit wrapper: a transparent SVG with the page's size whose
-/// pixels are painted from `source` by the renderer.
-///
-/// The wrapper used to inline the whole image as a base64 data URI, which kept
-/// a second copy of every picture-only page's payload in memory (12.epub:
-/// 10 MB). The layout only needs the wrapper's size, and painting goes through
-/// the same placeholder path as any other image.
-#[derive(Clone, Debug)]
-pub struct PageFitImage {
-    /// Original image resource, painted at draw time.
-    pub source: String,
-    pub width: u32,
-    pub height: u32,
-    /// False when the header could not be read: the picture then fills the
-    /// page box instead of being contained.
-    pub contain: bool,
 }
 
 impl EpubBook {

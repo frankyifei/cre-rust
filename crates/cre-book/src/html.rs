@@ -275,3 +275,42 @@ pub fn encode_path(path: &str) -> String {
         .replace('#', "%23")
         .replace('?', "%3F")
 }
+
+/// The value of `name` in one tag, without the quotes.
+pub fn attr_value(tag: &str, name: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let at = lower.find(name)?;
+    let rest = tag[at + name.len()..].trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    let quote = rest.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let end = rest[1..].find(quote)? + 1;
+    Some(rest[1..end].to_string())
+}
+
+/// A length attribute as pixels, ignoring its unit (`987`, `987px`).
+pub fn parse_pixels(value: String) -> Option<f32> {
+    let digits: String = value
+        .trim()
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
+        .collect();
+    digits.parse::<f32>().ok()
+}
+
+/// The text of an HTML fragment with its tags removed.
+pub fn text_without_tags(html: &str) -> String {
+    let mut text = String::new();
+    let mut depth = 0usize;
+    for ch in html.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => text.push(ch),
+            _ => {}
+        }
+    }
+    text
+}
