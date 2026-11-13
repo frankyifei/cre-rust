@@ -2537,7 +2537,17 @@ unsafe extern "C-unwind" fn doc_toc(l: *mut lua_State) -> c_int {
             push_int(l, item.page.unwrap_or(0) as i64);
             lua::lua_rawset(l, -3);
             push_str(l, "xpointer");
-            push_str(l, item.xpointer.as_deref().unwrap_or_default());
+            // crengine always has an xpointer here; a picture-only page cannot
+            // (there is no text to anchor to). Push `nil`, not `""`: KOReader
+            // prefers the xpointer when it is truthy, and an empty string would
+            // send it to `gotoXPointer("")`, which does nothing while the TOC
+            // still shows the right page number.
+            match item.xpointer.as_deref() {
+                Some(xpointer) if !xpointer.is_empty() => push_str(l, xpointer),
+                _ => {
+                    lua::lua_pushnil(l);
+                }
+            }
             lua::lua_rawset(l, -3);
             push_str(l, "depth");
             push_int(l, item.depth as i64);
