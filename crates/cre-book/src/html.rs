@@ -49,8 +49,13 @@ pub fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
         .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
-pub fn parse_attrs(tag: &str) -> HashMap<String, String> {
-    let mut attrs = HashMap::new();
+/// The attributes of a tag, in the order they are written.
+///
+/// `parse_attrs` is this collected into a map; a caller that has to reproduce
+/// the markup (the plate rewrite re-emits the anchors a part carried) needs the
+/// order, so the parser itself yields it.
+pub fn attrs_in_order(tag: &str) -> Vec<(String, String)> {
+    let mut attrs = Vec::new();
     let mut i = 0;
     while i < tag.len() {
         let Some(c) = tag[i..].chars().next() else {
@@ -88,7 +93,7 @@ pub fn parse_attrs(tag: &str) -> HashMap<String, String> {
                             }
                             i += ch.len_utf8();
                         }
-                        attrs.insert(name, tag[value_start..i].to_string());
+                        attrs.push((name, tag[value_start..i].to_string()));
                         if i < tag.len() {
                             i += 1;
                         }
@@ -100,6 +105,10 @@ pub fn parse_attrs(tag: &str) -> HashMap<String, String> {
         }
     }
     attrs
+}
+
+pub fn parse_attrs(tag: &str) -> HashMap<String, String> {
+    attrs_in_order(tag).into_iter().collect()
 }
 
 pub fn file_extension(path: &str) -> String {

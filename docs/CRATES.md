@@ -34,9 +34,10 @@ What every format shares, and what the layout engine consumes:
 | `ruby` | the stacked ruby cell rewriting (Blitz has no ruby box) |
 | `css` | the layout tokens (`__CRE_FONT_SIZE_PX__`, `__CRE_PAGE_MARGIN_PX__`) and `substitute`, plus `body_selectors_to_class` |
 
-It depends only on `cre-resource`, `image`, `regex`, `base64`,
-`percent-encoding`, `anyhow` and `libc` - never on blitz and never on a
-container crate - so a format can be tested on its own.
+It depends only on `cre-resource`, `image`, `base64`, `percent-encoding`,
+`anyhow` and `libc` - never on blitz, never on a container crate, and (since the
+plate rewrite reads attributes with `html::attrs_in_order` instead of a regex)
+never on the regex crate - so a format can be tested on its own.
 
 ## `cre-resource`
 
@@ -82,6 +83,21 @@ Two things deliberately stay per-format, and are not merged:
   it; MOBI/KF8/FB2/text fit the plate at layout time (`fit_cover_images`). That
   is what `ResourceSource::is_archive()` selects - it is a statement about who
   fits the plate, not about the container.
+
+## Regex
+
+`cre-lib` and `cre-lua` are the only crates that use it, through one workspace
+pin (`[workspace.dependencies] regex`), so the version cannot drift between
+them. The Unicode features are kept even though the engine's own patterns are
+ASCII: `cre-lua` compiles patterns typed by the reader (`doc_check_regex` and
+the regex search mode), so `\p{Han}` has to work and `\w` has to match CJK.
+Trimming the Unicode tables would shrink the Kindle (armv7) library by 352 KiB
+(1.8%: 20.2 MB -> 19.9 MB, measured), and it is not worth silently changing what
+a reader's search pattern means.
+
+`cre-book` does its markup scanning by hand (`attr_value`, `attrs_in_order`,
+`next_tag_start`, `find_tag_end`): attributes in a tag are a small, well-defined
+grammar, and every format pays for it on every chunk.
 
 ## What a new format implements
 

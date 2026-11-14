@@ -14,6 +14,14 @@ members = [
     "crates/cre-render", "crates/cre-text",
 ]
 
+[workspace.dependencies]
+# One version for every crate that names it, so it cannot drift between them.
+# The Unicode tables stay on: `cre-lua` compiles search patterns typed by the
+# reader, so `\p{Han}` has to work and `\w` has to match CJK. Turning them off
+# would save 352 KiB on the Kindle build (1.8%) and silently change what those
+# patterns match.
+regex = "1.13.1"
+
 [workspace.package]
 edition = "2024"
 license = "AGPL-3.0-or-later"

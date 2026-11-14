@@ -379,23 +379,23 @@ pub fn page_picture_svg(picture: &str, width: f32, height: f32, block: bool) -> 
 }
 
 /// The `src` of the single image `body` holds, when that is all it holds.
-pub fn picture_only_body(body: &str, src: &regex::Regex) -> Option<String> {
+/// The single picture a part consists of, if it is one.
+///
+/// The `src` comes from the tag's own attributes (`parse_attrs`), which is both
+/// cheaper and less surprising than matching `\bsrc=` anywhere in the markup: a
+/// `data-src` is not a picture the reader can show.
+pub fn picture_only_body(body: &str) -> Option<String> {
     let lower = body.to_ascii_lowercase();
     if lower.matches("<img").count() != 1 {
         return None;
     }
     let start = lower.find("<img")?;
     let end = body[start..].find('>').map(|offset| start + offset + 1)?;
-    let captures = src.captures(&body[start..end])?;
-    let picture = captures
-        .get(1)
-        .or_else(|| captures.get(2))?
-        .as_str()
-        .trim()
-        .to_string();
-    if picture.is_empty() {
-        return None;
-    }
+    let picture = crate::html::attrs_in_order(&body[start..end])
+        .into_iter()
+        .find(|(name, _)| name == "src")
+        .map(|(_, value)| value.trim().to_string())
+        .filter(|value| !value.is_empty())?;
     // Anything left after removing the image (tags excluded) is text, so the
     // section is a normal page with a picture in it.
     let rest = format!("{}{}", &body[..start], &body[end..]);
@@ -405,27 +405,30 @@ pub fn picture_only_body(body: &str, src: &regex::Regex) -> Option<String> {
         .then_some(picture)
 }
 
-/// `id`/`name` values carried by the tags inside one part.
+/// `id`/`name` values carried by the tags inside one part, in document order.
 ///
 /// They are the book's navigation targets; the plate rewrite replaces the markup
 /// around them, so they are re-emitted as empty anchors (an empty `<a>` has no
 /// box, and `page_for_node` falls through to the content that follows it).
 pub fn section_anchor_ids(section: &str) -> Vec<String> {
-    static ATTRS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let attrs = ATTRS.get_or_init(|| {
-        regex::Regex::new(r#"(?is)\b(?:id|name)\s*=\s*(?:"([^"]*)"|'([^']*)')"#)
-            .expect("anchor attribute regex is valid")
-    });
     let mut out: Vec<String> = Vec::new();
-    for captures in attrs.captures_iter(section) {
-        let Some(value) = captures.get(1).or_else(|| captures.get(2)) else {
-            continue;
+    let mut at = 0usize;
+    while let Some(offset) = section[at..].find('<') {
+        let start = at + offset;
+        let Some(end) = crate::html::find_tag_end(section, start) else {
+            break;
         };
-        let value = value.as_str().trim();
-        if value.is_empty() || out.iter().any(|existing| existing == value) {
-            continue;
+        for (name, value) in crate::html::attrs_in_order(&section[start..end]) {
+            if name != "id" && name != "name" {
+                continue;
+            }
+            let value = value.trim();
+            if value.is_empty() || out.iter().any(|existing| existing == value) {
+                continue;
+            }
+            out.push(value.to_string());
         }
-        out.push(value.to_string());
+        at = end;
     }
     out
 }
@@ -543,11 +546,6 @@ pub fn normalize_page_images(
     available: (f32, f32),
     page_fit: &mut HashMap<String, PageFitImage>,
 ) -> String {
-    static SRC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let src = SRC.get_or_init(|| {
-        regex::Regex::new(r#"(?is)\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)')"#)
-            .expect("img src regex is valid")
-    });
     let (width, height) = (available.0.max(1.0).round(), available.1.max(1.0).round());
     let closing = "</section>";
     let lower = body.to_ascii_lowercase();
@@ -569,7 +567,7 @@ pub fn normalize_page_images(
         };
         let end = close + closing.len();
         scan = end;
-        let Some(picture) = picture_only_body(&body[open_end..close], src) else {
+        let Some(picture) = picture_only_body(&body[open_end..close]) else {
             continue;
         };
         if picture.starts_with("cre-page-fit-") {

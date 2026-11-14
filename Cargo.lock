@@ -439,7 +439,6 @@ dependencies = [
  "image",
  "libc",
  "percent-encoding",
- "regex",
 ]
 
 [[package]]
