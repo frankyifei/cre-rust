@@ -108,7 +108,7 @@ pub struct DocumentOptions {
     /// Kept for the API (and for the reader's cache key): it used to be the
     /// layout viewport's height, which made viewport units resolve against the
     /// whole chunk. The layout viewport is the page now, see
-    /// [`create_document`].
+    /// `create_document`.
     pub layout_height: u32,
     pub page_margin: f32,
     pub font_size: f32,
@@ -550,38 +550,34 @@ pub struct MemoryBreakdown {
     pub page_map_source_bytes: usize,
 }
 
-/// One chunk's layout, in the chunk's own coordinates.
+/// The DOM node a stored line belongs to.
 ///
-/// Keeping this per chunk (instead of only the flattened page list) is what
-/// makes a settings change cheap: the chunks that are not being read keep their
-/// pages as a provisional page list and are laid out again only when they are
-/// needed, like crengine's `ldomDocument::partialRender` for a `DocFragment`.
+/// This is Blitz's id, and the only upstream type that survives a chunk being
+/// laid out: the search and XPointer paths look a line up by node, and a chunk's
+/// DOM is dropped once its pages exist, so there is nothing else to point with.
+/// It is named here rather than spelled `NodeId` so an upgrade has one place to
+/// change - see §2.5 of `docs/blitz-dom-adoption-plan.md` for the rest of the
+/// surface, which is deliberately small.
+type BlockId = NodeId;
+
 /// One line's place in the book: the text node holding its first character, the
 /// offset in it and the 0-based local page. Kept XPointer-free on purpose: a
 /// path is only built for the first line of each page.
 #[derive(Clone)]
 struct LineEntry {
-    block: NodeId,
+    block: BlockId,
     /// Byte offset of the line's first character in the block's layout text.
     offset: u32,
     page: usize,
 }
 
-/// One chunk's generated HTML, kept compressed.
-///
-/// A large text book keeps the generated HTML of every chunk so a settings
-/// change can re-lay the book out without re-reading and re-splitting it. That
-/// copy is about the size of the book's text, which is tens of megabytes for a
-/// big novel, so each chunk is stored as an LZ4 block and decompressed only
-/// when that chunk is laid out (including a TOC jump straight to it). The
-/// compressor is fast enough that a layout does not notice it.
 /// A spine section carried by a chunk's HTML, read from the markup rather than
 /// from a layout.
 ///
 /// It is the chunk → `DocFragment` map an XPointer needs, and it is available
 /// before the chunk has ever been laid out. That matters when a book is opened
 /// lazily: the reader restores its position (an XPointer) before the chunk that
-/// holds it has been laid out, and the jump would otherwise have no the map.
+/// holds it has been laid out, and the jump would otherwise have no map.
 #[derive(Clone, Debug)]
 struct SpineSection {
     /// XPointer section number (`data-spine-index + 1`, see
@@ -594,6 +590,14 @@ struct SpineSection {
     href: Option<String>,
 }
 
+/// One chunk's generated HTML, kept compressed.
+///
+/// A large text book keeps the generated HTML of every chunk so a settings
+/// change can re-lay the book out without re-reading and re-splitting it. That
+/// copy is about the size of the book's text, which is tens of megabytes for a
+/// big novel, so each chunk is stored as an LZ4 block and decompressed only
+/// when that chunk is laid out (including a TOC jump straight to it). The
+/// compressor is fast enough that a layout does not notice it.
 struct ChunkSource {
     compressed: Vec<u8>,
     /// Uncompressed length, which the layout uses for its estimates.
@@ -676,6 +680,12 @@ fn scan_spine_sections(html: &str) -> Vec<SpineSection> {
     sections
 }
 
+/// One chunk's layout, in the chunk's own coordinates.
+///
+/// Keeping this per chunk (instead of only the flattened page list) is what
+/// makes a settings change cheap: the chunks that are not being read keep their
+/// pages as a provisional page list and are laid out again only when they are
+/// needed, like crengine's `ldomDocument::partialRender` for a `DocFragment`.
 struct ChunkLayout {
     pages: Vec<LocalPage>,
     /// Every line of the chunk, sorted in document order (by text node id, then
