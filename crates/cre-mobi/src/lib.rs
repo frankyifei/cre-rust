@@ -481,7 +481,12 @@ fn ncx_toc(
     let Ok(index) = read_index(pdb, header.ncx_index as usize, header.encoding) else {
         return Vec::new();
     };
-    let mut toc = Vec::new();
+    // A Kindle NCX is written level by level - every chapter, then every
+    // section - not in reading order, so the entries are sorted by their byte
+    // position in the text. The reader rebuilds the tree from `depth` plus this
+    // order, and a stable sort keeps a chapter before a section that shares its
+    // position.
+    let mut entries: Vec<(u32, MobiTocItem)> = Vec::new();
     for entry in &index.entries {
         let Some(filepos) = entry.tag(1) else {
             continue;
@@ -500,19 +505,23 @@ fn ncx_toc(
             .get(&filepos)
             .cloned()
             .unwrap_or_else(|| format!("filepos{filepos}"));
-        toc.push(MobiTocItem {
-            title: title.to_string(),
-            href: format!("#{id}"),
-            depth: entry.tag(4).unwrap_or(0) as usize,
-        });
+        entries.push((
+            filepos,
+            MobiTocItem {
+                title: title.to_string(),
+                href: format!("#{id}"),
+                depth: entry.tag(4).unwrap_or(0) as usize,
+            },
+        ));
     }
-    toc
+    entries.sort_by_key(|(position, _)| *position);
+    entries.into_iter().map(|(_, item)| item).collect()
 }
 
 /// Fallback table of contents: one entry per chapter section, titled with the
 /// section's first heading (or its first line of text).
 fn section_toc(body: &str) -> Vec<MobiTocItem> {
-    let mut toc = Vec::new();
+    let mut entries: Vec<(String, usize, usize)> = Vec::new();
     for (index, section) in body.split("<section ").skip(1).enumerate() {
         // `split` leaves the section's own start tag in front; drop it so its
         // attributes are not mistaken for text.
@@ -520,21 +529,31 @@ fn section_toc(body: &str) -> Vec<MobiTocItem> {
             Some(end) => &section[end + 1..],
             None => section,
         };
-        let title = section_heading(content).unwrap_or_else(|| {
-            let text = strip_tags(content);
-            let text = text.trim();
-            text.chars().take(48).collect()
+        let (title, level) = cre_book::html::first_heading(content).unwrap_or_else(|| {
+            let text = section_heading(content).unwrap_or_else(|| {
+                let raw = strip_tags(content);
+                raw.trim().chars().take(48).collect()
+            });
+            (text, 1)
         });
         if title.trim().is_empty() {
             continue;
         }
-        toc.push(MobiTocItem {
-            title: title.trim().to_string(),
-            href: format!("#cre-sec-{}", index + 1),
-            depth: 0,
-        });
+        entries.push((title.trim().to_string(), level, index + 1));
     }
-    toc
+    let min_level = entries
+        .iter()
+        .map(|(_, level, _)| *level)
+        .min()
+        .unwrap_or(1);
+    entries
+        .into_iter()
+        .map(|(title, level, number)| MobiTocItem {
+            title,
+            href: format!("#cre-sec-{number}"),
+            depth: level.saturating_sub(min_level),
+        })
+        .collect()
 }
 
 /// The best available title for a chapter section.

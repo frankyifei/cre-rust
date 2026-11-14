@@ -364,6 +364,14 @@ pub fn extract_body(data: &[u8]) -> Option<Vec<u8>> {
 /// Generators use it for a table of contents built from the document itself,
 /// which is what a book without an NCX has.
 pub fn heading_of(section: &str) -> Option<String> {
+    first_heading(section).map(|(text, _)| text)
+}
+
+/// The text of a section's first heading and its level (`1`..`6`).
+///
+/// A book without a table of contents falls back to its sections' headings, and
+/// the level is what gives that list its nesting.
+pub fn first_heading(section: &str) -> Option<(String, usize)> {
     let lower = section.to_ascii_lowercase();
     for level in 1..=6 {
         let open = format!("<h{level}");
@@ -375,8 +383,32 @@ pub fn heading_of(section: &str) -> Option<String> {
         let end = lower[content_start..].find(&close)? + content_start;
         let text = strip_tags(&section[content_start..end]);
         if !text.trim().is_empty() {
-            return Some(text.trim().to_string());
+            return Some((text.trim().to_string(), level));
         }
     }
     None
+}
+
+#[cfg(test)]
+mod heading_tests {
+    use super::*;
+
+    #[test]
+    fn a_heading_reports_its_level() {
+        assert_eq!(
+            first_heading("<h2>Chapter</h2><p>x</p>"),
+            Some(("Chapter".to_string(), 2))
+        );
+        assert_eq!(
+            first_heading("<div><h1 id=\"a\">One</h1></div>"),
+            Some(("One".to_string(), 1))
+        );
+        // An empty heading is skipped, not returned as the section's title.
+        assert_eq!(
+            first_heading("<h1></h1><h3>Three</h3>"),
+            Some(("Three".to_string(), 3))
+        );
+        assert_eq!(first_heading("<p>no heading</p>"), None);
+        assert_eq!(heading_of("<h4>T</h4>"), Some("T".to_string()));
+    }
 }

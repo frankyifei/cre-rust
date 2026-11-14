@@ -13,7 +13,7 @@
 //! `id` at the byte offset each link points at, then rewrite the link to a
 //! fragment. All numbers in `kindle:` URLs are base 32.
 
-use cre_book::html::{escape_html, extract_body, heading_of, strip_tags};
+use cre_book::html::{escape_html, extract_body, strip_tags};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -855,12 +855,16 @@ fn kf8_toc(
     target_ids: &HashMap<(u32, u32), String>,
     parts: &[Part],
 ) -> Vec<Kf8TocItem> {
-    let mut toc = Vec::new();
+    // The NCX a Kindle book carries is written level by level - every chapter,
+    // then every section - not in reading order. Sorting by the target's
+    // position inside the book puts each section back under its chapter; the
+    // reader builds the tree from `depth` plus this order.
+    let mut entries: Vec<((usize, usize), Kf8TocItem)> = Vec::new();
     for entry in ncx_entries(pdb, header) {
         let Some(title) = entry.text else {
             continue;
         };
-        let id = match entry.pos_fid {
+        let target = match entry.pos_fid {
             Some(key) => target_ids.get(&key).cloned(),
             // Some NCX entries carry a plain byte position instead of a
             // fragment reference: use the closest anchor in that part.
@@ -872,16 +876,43 @@ fn kf8_toc(
                 })
             }),
         };
-        let Some(id) = id else {
+        let Some(id) = target else {
             continue;
         };
-        toc.push(Kf8TocItem {
-            title,
-            href: format!("#{id}"),
-            depth: entry.level,
-        });
+        let position = toc_position(&id, parts).unwrap_or((usize::MAX, usize::MAX));
+        entries.push((
+            position,
+            Kf8TocItem {
+                title,
+                href: format!("#{id}"),
+                depth: entry.level,
+            },
+        ));
     }
-    toc
+    // Stable, so an entry and its first child that share a target keep the
+    // parent first - the NCX lists the parent level before the child level.
+    entries.sort_by_key(|(position, _)| *position);
+    entries.into_iter().map(|(_, item)| item).collect()
+}
+
+/// Where a TOC target sits in the book, for ordering.
+///
+/// The generator names a target after its part and byte offset
+/// (`k8-<part>-<pos>`); a target that kept the book's own `id` is located by
+/// looking for it in the parts.
+fn toc_position(id: &str, parts: &[Part]) -> Option<(usize, usize)> {
+    if let Some(rest) = id.strip_prefix("k8-")
+        && let Some((part, pos)) = rest.split_once('-')
+        && let (Ok(part), Ok(pos)) = (part.parse::<usize>(), pos.parse::<usize>())
+    {
+        return Some((part, pos));
+    }
+    parts.iter().enumerate().find_map(|(index, part)| {
+        part.bytes
+            .windows(id.len())
+            .position(|window| window == id.as_bytes())
+            .map(|offset| (index, offset))
+    })
 }
 
 fn build_resources(pdb: &Pdb, header: &MobiHeader) -> (Vec<ResourceRange>, Option<String>) {
@@ -1024,27 +1055,37 @@ fn viewport_marker(content: &str) -> Option<String> {
 }
 
 fn section_toc(body: &str) -> Vec<Kf8TocItem> {
-    let mut toc = Vec::new();
+    let mut entries: Vec<(String, usize, usize)> = Vec::new();
     for (index, section) in body.split("<section ").skip(1).enumerate() {
         let content = match section.find('>') {
             Some(end) => &section[end + 1..],
             None => section,
         };
-        let title = heading_of(content).unwrap_or_else(|| {
+        let (title, level) = cre_book::html::first_heading(content).unwrap_or_else(|| {
             let text = strip_tags(content);
-            let text = text.trim();
-            text.chars().take(40).collect()
+            let text: String = text.trim().chars().take(40).collect();
+            (text, 1)
         });
         if title.trim().is_empty() {
             continue;
         }
-        toc.push(Kf8TocItem {
-            title: title.trim().to_string(),
-            href: format!("#cre-sec-{}", index + 1),
-            depth: 0,
-        });
+        entries.push((title.trim().to_string(), level, index + 1));
     }
-    toc
+    // The shallowest heading is the list's root, so a book that starts every
+    // section with `<h2>` still starts at depth 0.
+    let min_level = entries
+        .iter()
+        .map(|(_, level, _)| *level)
+        .min()
+        .unwrap_or(1);
+    entries
+        .into_iter()
+        .map(|(title, level, number)| Kf8TocItem {
+            title,
+            href: format!("#cre-sec-{number}"),
+            depth: level.saturating_sub(min_level),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1173,6 +1214,18 @@ mod tests {
                        <body class="calibre" aid="0"><p>x</p></body></html>"#;
         assert_eq!(body_tag_attrs(part), " class=\"calibre\" aid=\"0\"");
         assert_eq!(body_tag_attrs(b"<p>no body here</p>"), "");
+    }
+
+    #[test]
+    fn a_generated_toc_target_says_where_it_is() {
+        // The NCX is written level by level, so the TOC is ordered by the part
+        // and byte offset a target encodes.
+        let parts: Vec<Part> = Vec::new();
+        assert_eq!(toc_position("k8-4-12232", &parts), Some((4, 12232)));
+        assert_eq!(toc_position("k8-39-418371", &parts), Some((39, 418371)));
+        // A target that kept the book's own id cannot be parsed: the caller
+        // falls back to the end of the list rather than dropping it.
+        assert_eq!(toc_position("p42-sigil_toc_id_3", &parts), None);
     }
 
     #[test]
