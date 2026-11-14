@@ -56,5 +56,7 @@ resvg = { version = "0.48.1", default-features = false, features = [
 url = "2"
 
 [dev-dependencies]
+# The integration tests build a synthetic EPUB; nothing in the engine
+# reads or writes a zip (that is `cre-epub`'s container).
+zip = { version = "4", default-features = false, features = ["deflate"] }
 # Building small EPUBs on the fly for the image-placeholder tests.
-zip = "4"

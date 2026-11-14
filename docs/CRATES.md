@@ -18,7 +18,10 @@ cre-lua                                    the KOReader module
 
 `cre-book` and `cre-pdb` do not know each other: `cre-book` holds a
 `ResourceIndex` and `cre-pdb` implements it, so the format-independent layer
-never learns that a PalmDB exists.
+never learns that a PalmDB exists. `cre-lib` names no container either: it
+reaches a book's bytes through the format crate that opened it, and the one zip
+implementation in `cre-lib` is a dev-dependency of the two integration tests
+that build a synthetic EPUB.
 
 ## `cre-book`
 
