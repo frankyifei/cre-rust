@@ -1423,6 +1423,7 @@ impl Document {
                         resources: resources.clone(),
                         svg: svg_raster.clone(),
                         generated: resource_source.generated(),
+                        fonts_enabled: resource_source.fonts_enabled(),
                     }),
                     resource_source,
                     svg_raster.clone(),
@@ -1487,6 +1488,7 @@ impl Document {
                         resources: resources.clone(),
                         svg: svg_raster.clone(),
                         generated: resource_source.generated(),
+                        fonts_enabled: resource_source.fonts_enabled(),
                     }),
                     resource_source,
                     svg_raster.clone(),
@@ -1537,11 +1539,20 @@ impl Document {
                     options,
                     &svg_raster,
                 );
+                for (name, bytes) in &book.stylesheets {
+                    resource_source.insert(name.clone(), Arc::new(bytes.clone()));
+                }
+                let style_texts: Vec<String> = book
+                    .stylesheets
+                    .iter()
+                    .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
+                    .collect();
                 let mut sink = ChunkSink::new();
-                // KF8 keeps its CSS in the flow, so the book's `@font-face`
-                // rules land in the generated HTML (unlike an EPUB chapter,
-                // which links its stylesheet).
-                let mut embedded_fonts: Vec<String> = Vec::new();
+                // The book's `@font-face` rules live in its stylesheet flows,
+                // which are served resources now.
+                let check = |url: &str| resources.contains_key(url);
+                let mut embedded_fonts: Vec<String> =
+                    cre_book::fonts::collect(style_texts.iter().map(String::as_str), Some(&check));
                 stream_single_document_chunks(&head, &body, &resource_source, |html| {
                     // Only families whose rule points at a record the book
                     // really has: a converter that drops the font bytes leaves
@@ -1568,6 +1579,7 @@ impl Document {
                         resources: resources.clone(),
                         svg: svg_raster.clone(),
                         generated: resource_source.generated(),
+                        fonts_enabled: resource_source.fonts_enabled(),
                     }),
                     resource_source,
                     svg_raster.clone(),
@@ -1870,6 +1882,9 @@ impl Document {
         ) {
             return Err(anyhow::Error::new(LowMemory { page }));
         }
+        // The document and its net providers share one font setting; take the
+        // handle before `resources` is moved into the struct.
+        let embedded_fonts_flag = resources.fonts_enabled();
         let mut document = Self {
             metadata,
             width: options.width,
@@ -1906,7 +1921,7 @@ impl Document {
             raw_toc,
             raw_page_map_items: page_map_items,
             embedded_fonts: Vec::new(),
-            embedded_fonts_flag: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            embedded_fonts_flag,
             layout_done: false,
             lazy_open: lazy,
             active: RefCell::new(None),
@@ -9079,6 +9094,9 @@ struct MapNet {
     resources: MapResources,
     svg: Arc<ImageRaster>,
     generated: GeneratedResources,
+    /// A KF8 stylesheet is a served resource, so the "use the book's fonts"
+    /// setting is applied when it is read.
+    fonts_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl NetProvider for MapNet {
@@ -9088,10 +9106,29 @@ impl NetProvider for MapNet {
             .trim_start_matches('/')
             .to_string();
         let name = path.strip_prefix("binary/").unwrap_or(&path).to_string();
+        let key = normalize_path(&name);
+        // A served stylesheet carries the book's `@font-face` rules, so the font
+        // setting is applied here, before any cache or the generated table.
+        if key.to_ascii_lowercase().ends_with(".css")
+            && !self
+                .fonts_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let raw = generated_resource(&self.generated, &key)
+                .map(|bytes| (*bytes).clone())
+                .or_else(|| self.resources.get(&key).map(|bytes| bytes.to_vec()))
+                .unwrap_or_default();
+            let text = String::from_utf8_lossy(&raw).into_owned();
+            let css = cre_book::fonts::strip_font_faces(&text)
+                .into_owned()
+                .into_bytes();
+            handler.bytes(request.url.to_string(), Bytes::from(css));
+            return;
+        }
         // A page-fit wrapper (or a decoded `data:` picture) is generated for the
         // layout, not stored in the book: the plate itself is painted from the
         // resource it names.
-        if let Some(bytes) = generated_resource(&self.generated, &normalize_path(&name)) {
+        if let Some(bytes) = generated_resource(&self.generated, &key) {
             handler.bytes(request.url.to_string(), Bytes::from((*bytes).clone()));
             return;
         }

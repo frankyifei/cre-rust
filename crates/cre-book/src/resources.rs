@@ -107,6 +107,10 @@ pub fn generated_resource(generated: &GeneratedResources, key: &str) -> Option<A
 pub struct ResourceSource {
     base: ResourceBase,
     generated: GeneratedResources,
+    /// Whether the book's own `@font-face` fonts may be used. It lives here so
+    /// the net providers - which hold the source, not the document - apply the
+    /// setting when they serve a stylesheet.
+    fonts_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -125,6 +129,7 @@ impl ResourceSource {
         Self {
             base,
             generated: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            fonts_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
@@ -181,6 +186,12 @@ impl ResourceSource {
         if let Ok(mut generated) = self.generated.lock() {
             generated.insert(key.into(), bytes.into());
         }
+    }
+
+    /// The document's "use the book's fonts" flag, shared with the net
+    /// providers and with the document itself.
+    pub fn fonts_enabled(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.fonts_enabled)
     }
 
     /// The generated-resource table, shared with the net providers.

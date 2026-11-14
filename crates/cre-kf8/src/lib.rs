@@ -66,6 +66,9 @@ pub struct Kf8Book {
     /// The bytes are sliced from the mapped file when a page paints them, so a
     /// 25 MB comic costs no anonymous memory for its pictures.
     pub resources: BookResources,
+    /// The book's stylesheets, one per non-primary flow, under the name the
+    /// generated head links them by.
+    pub stylesheets: Vec<(String, Vec<u8>)>,
     pub toc: Vec<Kf8TocItem>,
     pub cover_image: Option<Vec<u8>>,
     /// Number of XHTML parts (spine sections) in the book.
@@ -167,8 +170,10 @@ impl Kf8Book {
         }
         let target_ids = resolve_targets(&mut parts, &fragments, &link_targets);
 
-        // 4. Rewrite the `kindle:` URLs and anchor links in each part.
-        let styles = flow_styles(&flows);
+        // 4. Rewrite the `kindle:` URLs and anchor links in each part. The
+        //    stylesheet flows stay separate resources: a part's own `<head>`
+        //    is dropped, so the rebuilt head links them instead.
+        let stylesheets = flow_stylesheets(&flows);
         for part in parts.iter_mut() {
             let bytes = std::mem::take(&mut part.bytes);
             let rewritten = html::rewrite_tags(&bytes, |tag| rewrite_tag(tag, &target_ids));
@@ -269,10 +274,11 @@ impl Kf8Book {
             identifiers,
             series,
             resources,
+            stylesheets,
             toc,
             cover_image,
             section_count,
-            body: rewrite_kindle_urls(&with_styles(&body, &styles)),
+            body: rewrite_kindle_urls(&body),
             body_attrs,
         })
     }
@@ -299,9 +305,16 @@ impl Kf8Book {
         let css = base_css(options);
         let title = escape_html(self.title.as_deref().unwrap_or(""));
         let language = escape_html(self.language.as_deref().unwrap_or("und"));
+        // The book's own sheets come after the base CSS so its rules win, the
+        // same order an EPUB keeps.
+        let links: String = self
+            .stylesheets
+            .iter()
+            .map(|(name, _)| format!("<link rel=\"stylesheet\" href=\"{name}\">"))
+            .collect();
         format!(
             "<!DOCTYPE html><html lang=\"{language}\"><head><meta charset=\"utf-8\">\
-             <title>{title}</title><style>{css}</style></head><body{}>",
+             <title>{title}</title><style>{css}</style>{links}</head><body{}>",
             self.body_attrs
         )
     }
@@ -689,27 +702,24 @@ fn drop_flow_links(data: &[u8]) -> Vec<u8> {
     })
 }
 
-/// Returns the CSS carried by the non-primary flows.
-fn flow_styles(flows: &[Vec<u8>]) -> String {
-    let mut styles = String::new();
-    for flow in flows.iter().skip(1) {
-        let text = String::from_utf8_lossy(flow);
-        let cleaned = text
+/// The book's stylesheets: one resource per non-primary flow, named by its
+/// flow index (the index a `kindle:flow:N` link uses).
+fn flow_stylesheets(flows: &[Vec<u8>]) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    for (index, flow) in flows.iter().enumerate().skip(1) {
+        let text = String::from_utf8_lossy(flow)
             .replace("<![CDATA[", "")
-            .replace("]]>", "")
-            .trim()
-            .to_string();
-        if cleaned.is_empty() {
+            .replace("]]>", "");
+        let trimmed = text.trim();
+        if trimmed.is_empty() || trimmed.to_ascii_lowercase().contains("<svg") {
             continue;
         }
-        // Style sheets and inline <style> snippets both end up in the head.
-        if cleaned.to_ascii_lowercase().contains("<svg") {
-            continue;
-        }
-        styles.push_str(&cleaned);
-        styles.push('\n');
+        out.push((
+            format!("cre-flow-{index}.css"),
+            rewrite_kindle_urls(trimmed).into_bytes(),
+        ));
     }
-    styles
+    out
 }
 
 /// Rewrites `url(kindle:embed:N…),` inside the book's CSS.
@@ -767,13 +777,6 @@ fn contains_kindle_url(html: &str) -> bool {
     html.as_bytes()
         .windows("kindle:embed:".len())
         .any(|window| window.eq_ignore_ascii_case(b"kindle:embed:"))
-}
-
-fn with_styles(body: &str, styles: &str) -> String {
-    if styles.trim().is_empty() {
-        return body.to_string();
-    }
-    format!("<style>{styles}</style>\n{body}")
 }
 
 // ---------------------------------------------------------------------------
@@ -1063,6 +1066,23 @@ pub fn escape_html(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn css_flows_become_named_resources() {
+        let flows = vec![
+            b"main text".to_vec(),
+            b"p { color: red }".to_vec(),
+            b"<svg></svg>".to_vec(),
+            b"<![CDATA[ body { margin: 0 } ]]>".to_vec(),
+        ];
+        let sheets = flow_stylesheets(&flows);
+        assert_eq!(sheets.len(), 2, "{sheets:?}");
+        assert_eq!(sheets[0].0, "cre-flow-1.css");
+        assert!(String::from_utf8_lossy(&sheets[0].1).contains("color: red"));
+        // CDATA wrappers are stripped and the flow keeps its own index.
+        assert_eq!(sheets[1].0, "cre-flow-3.css");
+        assert!(String::from_utf8_lossy(&sheets[1].1).contains("margin: 0"));
+    }
 
     #[test]
     fn base32_matches_kindle_urls() {
