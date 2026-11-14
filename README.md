@@ -58,7 +58,7 @@ reading position is restored by XPointer, so it is exact from the first draw; a
 TOC or bookmark jump into a chunk that has not been laid out yet costs one chunk,
 not the book. The same machinery makes a font, line-spacing or margin change a
 relayout for **every format** (the layout settings are kept out of the chunk
-HTML as `cre-css` tokens), instead of reopening and re-parsing the book.
+HTML as layout tokens), instead of reopening and re-parsing the book.
 
 **There is no disk cache.** Every open re-reads the container, converts the
 markup and re-chunks the book; the numbers above are that path, made cheap by
@@ -165,7 +165,7 @@ Changing a font, margin or font-family lays out the current chunk immediately,
 then finishes the rest on a background worker in reading order, so the page
 index, the page total and the TOC page numbers converge to the real layout
 without blocking the reader. This holds for every format: the chunk HTML never
-contains the layout settings (they are `cre-css` tokens filled in when a chunk is
+contains the layout settings (they are layout tokens filled in when a chunk is
 laid out), so a settings change re-lays out the chunks a book already has instead
 of reopening it. Measured on ARMv7 under `qemu-user` (the e-ink build):
 

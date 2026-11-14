@@ -165,7 +165,7 @@ page)`, and rebuilds the page table, so the page index, the TOC page numbers
 and the total converge to the real layout.
 
 **Every format qualifies**, not only EPUB. The layout settings a chunk needs are
-never written into it: the generators emit `cre-css` tokens (`FONT_SIZE`, and
+never written into it: the generators emit layout tokens (`cre_book::css::FONT_SIZE`, and
 `PAGE_MARGIN` for the standalone-HTML path) and `layout_chunk_html` fills them in
 with the settings in use. A new format gets the relayout path by following that
 one rule, and `can_relayout_with` no longer looks at the format at all. Only a
