@@ -1339,14 +1339,10 @@ impl Document {
                 // `EpubNet`, so the stylesheet is where most books declare their
                 // fonts. Scan both places: this covers a stylesheet-only book
                 // and one that inlines the rules.
-                for name in cre_epub::font_faces_in_stylesheets(&book) {
-                    if !embedded_fonts
-                        .iter()
-                        .any(|existing| existing.eq_ignore_ascii_case(&name))
-                    {
-                        embedded_fonts.push(name);
-                    }
-                }
+                cre_book::fonts::extend_unique(
+                    &mut embedded_fonts,
+                    cre_epub::font_faces_in_stylesheets(&book),
+                );
                 let embedded_fonts_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
                 let resource_provider = Arc::new(book.resource_provider);
                 let provider: Arc<dyn cre_book::ResourceProvider> = resource_provider.clone();
@@ -1675,7 +1671,8 @@ impl Document {
                     identifiers: None,
                     item_count: 1,
                 };
-                let mut embedded_fonts = cre_book::font_faces_in(&html);
+                let mut embedded_fonts: Vec<String> = Vec::new();
+                let mut font_sources: Vec<String> = vec![html.clone()];
                 // A standalone document keeps its rules in the linked
                 // stylesheets, not in the document text; `FileNet` serves them
                 // from this directory, so read the same files for the list.
@@ -1688,15 +1685,12 @@ impl Document {
                     let Ok(css) = std::fs::read_to_string(root.join(decoded.as_ref())) else {
                         continue;
                     };
-                    for name in cre_book::font_faces_in(&css) {
-                        if !embedded_fonts
-                            .iter()
-                            .any(|existing| existing.eq_ignore_ascii_case(&name))
-                        {
-                            embedded_fonts.push(name);
-                        }
-                    }
+                    font_sources.push(css);
                 }
+                cre_book::fonts::extend_unique(
+                    &mut embedded_fonts,
+                    cre_book::fonts::collect(font_sources.iter().map(String::as_str), None),
+                );
                 let embedded_fonts_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
                 // A standalone document has no archive to index: its pictures
                 // and stylesheets are files next to it, and some are inlined as

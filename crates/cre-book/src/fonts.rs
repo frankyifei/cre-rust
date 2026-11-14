@@ -186,3 +186,34 @@ pub fn font_family_of(block: &str) -> Option<String> {
         Some(value.to_string())
     }
 }
+
+/// The families declared by a set of stylesheets or chunks, in order.
+///
+/// `has_resource` filters out a family whose `url()` the book cannot serve
+/// (KF8 leaves the rule behind when a converter stripped the font file).
+pub fn collect<'a>(
+    sources: impl IntoIterator<Item = &'a str>,
+    has_resource: Option<&dyn Fn(&str) -> bool>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for source in sources {
+        let names = match has_resource {
+            Some(check) => loadable_font_faces(source, check),
+            None => font_faces_in(source),
+        };
+        extend_unique(&mut out, names);
+    }
+    out
+}
+
+/// Appends families that are not already listed, case-insensitively.
+pub fn extend_unique(target: &mut Vec<String>, names: impl IntoIterator<Item = String>) {
+    for name in names {
+        if !target
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&name))
+        {
+            target.push(name);
+        }
+    }
+}
