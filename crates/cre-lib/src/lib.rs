@@ -1043,7 +1043,7 @@ pub struct Document {
     /// Page-size SVGs and the raster images replaced by a size placeholder.
     /// Painting reads the original pixels through `resources`.
     images: Arc<ImageRaster>,
-    cover_image: Option<Vec<u8>>,
+    cover_image: Option<String>,
     has_non_linear_flows: bool,
     net: Arc<dyn NetProvider>,
     font_context: Arc<FontContext>,
@@ -1402,7 +1402,7 @@ impl Document {
                 let head = book.html_head(&html_options);
                 // Move the pictures and the cover out instead of cloning a
                 // second copy of every base64-decoded image.
-                let cover_image = book.binary.values().next().cloned();
+                let cover_image = book.binary.keys().next().cloned();
                 let binary = Arc::new(std::mem::take(&mut book.binary));
                 let resources = MapResources::Owned(binary);
                 let resource_source = ResourceSource::map(resources.clone());
@@ -1776,7 +1776,7 @@ impl Document {
         net: Arc<dyn NetProvider>,
         resources: ResourceSource,
         images: Arc<ImageRaster>,
-        cover_image: Option<Vec<u8>>,
+        cover_image: Option<String>,
         has_non_linear_flows: bool,
         metadata: DocumentMetadata,
         raw_toc: Vec<RawTocItem>,
@@ -1851,7 +1851,7 @@ impl Document {
         net: Arc<dyn NetProvider>,
         resources: ResourceSource,
         images: Arc<ImageRaster>,
-        cover_image: Option<Vec<u8>>,
+        cover_image: Option<String>,
         has_non_linear_flows: bool,
         metadata: DocumentMetadata,
         raw_toc: Vec<RawTocItem>,
@@ -3560,8 +3560,13 @@ impl Document {
         &self.toc
     }
 
-    pub fn cover_image(&self) -> Option<&[u8]> {
-        self.cover_image.as_deref()
+    /// The book's cover, read through the resource table on demand.
+    ///
+    /// Only the key is kept: a cover is a few megabytes, and every format used
+    /// to copy it at open time just to hand it to the reader once.
+    pub fn cover_image(&self) -> Option<Vec<u8>> {
+        let key = self.cover_image.as_deref()?;
+        self.resources.get(key).map(|bytes| (*bytes).to_vec())
     }
 
     pub fn has_non_linear_flows(&self) -> bool {
@@ -6905,7 +6910,7 @@ fn collect_placed_images(
     }
 }
 
-fn epub_cover_image(book: &EpubBook) -> Option<Vec<u8>> {
+fn epub_cover_image(book: &EpubBook) -> Option<String> {
     let item = book
         .manifest
         .iter()
@@ -6924,8 +6929,7 @@ fn epub_cover_image(book: &EpubBook) -> Option<Vec<u8>> {
                         .is_some_and(|name| name.to_ascii_lowercase().starts_with("cover"))
             })
         })?;
-    let key = normalize_path(&item.href);
-    book.resource(&key)
+    Some(normalize_path(&item.href))
 }
 
 /// Rasterizes an SVG document into premultiplied RGBA bytes on a white background.

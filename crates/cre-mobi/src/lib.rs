@@ -63,7 +63,7 @@ pub struct MobiBook {
     /// 25 MB comic costs no anonymous memory for its pictures.
     pub resources: BookResources,
     pub toc: Vec<MobiTocItem>,
-    pub cover_image: Option<Vec<u8>>,
+    pub cover_image: Option<String>,
     /// Number of spine sections (chapter breaks) in the assembled document.
     pub section_count: usize,
     body: String,
@@ -447,7 +447,7 @@ fn split_on<'a>(data: &'a [u8], separator: &[u8]) -> Vec<&'a [u8]> {
 
 /// Builds the resource map: `mobi-image-N` for record N-1 after the first image
 /// record, which is how `recindex` numbers them.
-fn build_resources(pdb: &Pdb, header: &MobiHeader) -> (Vec<ResourceRange>, Option<Vec<u8>>) {
+fn build_resources(pdb: &Pdb, header: &MobiHeader) -> (Vec<ResourceRange>, Option<String>) {
     let mut resources = Vec::new();
     let mut cover = None;
     let first = header.first_image_index;
@@ -471,8 +471,8 @@ fn build_resources(pdb: &Pdb, header: &MobiHeader) -> (Vec<ResourceRange>, Optio
         let index = (record_index - first as usize) + 1;
         let name = format!("mobi-image-{index}");
         if cover_index == Some((index - 1) as u32) {
-            // The reader UI asks for the cover as bytes; copy just this one.
-            cover = Some(data.to_vec());
+            // Only the name: the reader asks the resource table for the bytes.
+            cover = Some(name.clone());
         }
         resources.push((name, range));
     }
@@ -766,10 +766,8 @@ mod tests {
         assert_eq!(book.creator.as_deref(), Some("An Author"));
         assert_eq!(book.section_count, 2);
         assert!(book.resources.contains_key("mobi-image-1"));
-        assert_eq!(
-            book.cover_image.as_ref().map(|image| image.len()),
-            Some(PIXEL_GIF.len())
-        );
+        // The cover is a resource name now, not a copy of the bytes.
+        assert_eq!(book.cover_image.as_deref(), Some("mobi-image-1"));
 
         // The link became a fragment link and the target got an anchor.
         let html = book.to_html(&MobiHtmlOptions::default());

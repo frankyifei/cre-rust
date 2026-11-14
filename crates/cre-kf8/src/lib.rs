@@ -70,7 +70,7 @@ pub struct Kf8Book {
     /// generated head links them by.
     pub stylesheets: Vec<(String, Vec<u8>)>,
     pub toc: Vec<Kf8TocItem>,
-    pub cover_image: Option<Vec<u8>>,
+    pub cover_image: Option<String>,
     /// Number of XHTML parts (spine sections) in the book.
     pub section_count: usize,
     body: String,
@@ -858,7 +858,7 @@ fn kf8_toc(
     toc
 }
 
-fn build_resources(pdb: &Pdb, header: &MobiHeader) -> (Vec<ResourceRange>, Option<Vec<u8>>) {
+fn build_resources(pdb: &Pdb, header: &MobiHeader) -> (Vec<ResourceRange>, Option<String>) {
     let mut resources = Vec::new();
     let mut cover = None;
     let start = if header.first_image_index == NULL_INDEX || header.first_image_index == 0 {
@@ -886,8 +886,8 @@ fn build_resources(pdb: &Pdb, header: &MobiHeader) -> (Vec<ResourceRange>, Optio
             break;
         };
         if cover_offset == Some((index - 1) as u32) {
-            // The reader UI asks for the cover as bytes; copy just this one.
-            cover = Some(data.to_vec());
+            // Only the name: the reader asks the resource table for the bytes.
+            cover = Some(format!("mobi-image-{index}"));
         }
         resources.push((format!("mobi-image-{index}"), range));
     }

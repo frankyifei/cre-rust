@@ -4184,8 +4184,7 @@ unsafe extern "C-unwind" fn doc_get_cover_image_data(l: *mut lua_State) -> c_int
     unsafe {
         let data = doc_ref(l)
             .and_then(|doc| doc.inner.as_ref())
-            .and_then(|inner| inner.cover_image())
-            .map(<[u8]>::to_vec);
+            .and_then(|inner| inner.cover_image());
         let Some(data) = data else {
             return 0;
         };
