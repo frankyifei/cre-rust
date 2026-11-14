@@ -56,6 +56,33 @@ Two traits, one per direction the bytes are read from:
 Keeping the traits in their own crate is what lets `cre-book` stay
 format-independent while `cre-pdb` gains no dependency on the book layer.
 
+### Which source each format uses
+
+Every format hands its bytes to the same two traits, so reading a resource has
+no per-format branch anywhere: the layout inliner, the painter, long-press and
+`@font-face` only ever ask the table for a key.
+
+| Format | Source | Trait / shape | Why that one |
+|---|---|---|---|
+| EPUB | the zip archive (`LazyResource`) | `ResourceProvider` | a deflate entry has to be decompressed, so the bytes are owned anyway; it also overrides `header()` so the intrinsic-size probe reads a prefix instead of the whole picture |
+| MOBI / AZW | PalmDB record ranges | `ResourceIndex` | the records are already in the mapping; **borrowing** keeps the open pass from faulting every picture in |
+| KF8 / AZW3 | PalmDB record ranges | `ResourceIndex` | same container as MOBI |
+| FB2 | the `<binary>` map decoded from the XML | `ResourceIndex` (in-memory) | the base64 is already decoded into memory, so there is nothing to map and nothing to copy |
+| TXT / standalone HTML | a directory next to the document | `ResourceSource::files` | there is no container to implement: the "container" is a path, and `cre-book` reads it with the same key namespace |
+
+Two things deliberately stay per-format, and are not merged:
+
+- **resource naming.** MOBI numbers only the images the reader can use
+  (`mobi-image-N`), while KF8 numbers *every* record from the first image one,
+  because `kindle:embed:N` in a KF8 book counts skipped records too. Merging the
+  two `build_resources` would need a flag for that, which is how the duplicated
+  logic becomes a duplicated bug.
+- **whole-page pictures.** EPUB rewrites a plate before chunking
+  (`cre_epub::normalize_full_page_images`), so the chunk budgets already count
+  it; MOBI/KF8/FB2/text fit the plate at layout time (`fit_cover_images`). That
+  is what `ResourceSource::is_archive()` selects - it is a statement about who
+  fits the plate, not about the container.
+
 ## What a new format implements
 
 1. Container parsing and text extraction.
