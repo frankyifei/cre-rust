@@ -14,8 +14,7 @@ use cre_book::chunk::{
     LAYOUT_BYTES_PER_HTML_BYTE, MAX_CHUNK_BYTES, MIN_CHUNK_BYTES, plan_chunk_bytes,
 };
 use cre_book::chunk::{
-    LAYOUT_MEMORY_RESERVE, available_memory_bytes, chunk_budgets, split_single_document,
-    stream_single_document_chunks,
+    LAYOUT_MEMORY_RESERVE, available_memory_bytes, chunk_budgets, stream_single_document_chunks,
 };
 use cre_book::html::attr_value;
 use cre_book::images::{fit_cover_images, normalize_page_images};
@@ -1603,8 +1602,20 @@ impl Document {
                 };
                 let html_options = TextHtmlOptions::default();
                 let html = book.to_html(&html_options);
-                Self::build(
-                    split_single_document(html, &ResourceSource::empty()),
+                let mut sink = ChunkSink::new();
+                match cre_book::chunk::html_body_parts(&html) {
+                    Some((head, body, _tail)) => cre_book::chunk::stream_single_document_chunks(
+                        head,
+                        body,
+                        &ResourceSource::empty(),
+                        |chunk| sink.push(chunk),
+                    )?,
+                    None => sink.push(html.clone())?,
+                }
+                Self::build_from_sources(
+                    sink.sources,
+                    sink.fixed_layouts,
+                    sink.content_images,
                     "cre://book/",
                     Arc::new(EmptyNet),
                     ResourceSource::empty(),
@@ -1700,8 +1711,23 @@ impl Document {
                 let resources = ResourceSource::files(root.clone());
                 let images = Arc::new(ImageRaster::new(options.width, options.height));
                 let html = prepare_page_images(html, &resources, options, &images);
-                let mut document = Self::build(
-                    split_single_document(html, &resources),
+                // Stream the chunks through the compressor instead of holding
+                // every chunk's HTML at once; a standalone document chunks the
+                // same way a book body does.
+                let mut sink = ChunkSink::new();
+                match cre_book::chunk::html_body_parts(&html) {
+                    Some((head, body, _tail)) => cre_book::chunk::stream_single_document_chunks(
+                        head,
+                        body,
+                        &resources,
+                        |chunk| sink.push(chunk),
+                    )?,
+                    None => sink.push(html.clone())?,
+                }
+                let mut document = Self::build_from_sources(
+                    sink.sources,
+                    sink.fixed_layouts,
+                    sink.content_images,
                     &base_url,
                     Arc::new(FileNet {
                         root: root.clone(),
