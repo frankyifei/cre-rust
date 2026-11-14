@@ -283,3 +283,28 @@ fn long_press_on_a_picture_page_returns_the_picture() {
         String::from_utf8_lossy(&data[..data.len().min(80)])
     );
 }
+
+/// A viewport unit is the reader's page, not the chunk.
+///
+/// The layout viewport used to be the chunk's height (`layout_height`, 100 000
+/// by default), so `50vh` was 50 000px: a page styled with it filled several
+/// screens and a `min-height: 100vh` section made `background-size: cover` zoom
+/// a picture about 125 times. Half a page of black must be half a page.
+#[test]
+fn viewport_units_are_page_relative() {
+    let path = write_page(
+        "viewport-units.html",
+        "<div style=\"height: 50vh; background-color: #000;\">x</div>",
+    );
+    let mut doc = Document::with_options(&path, &options()).unwrap();
+    let bitmap = doc.render_page(1).unwrap();
+    // `options()` is 600x800 with a 20px page margin.
+    let dark = bitmap.data.iter().filter(|value| **value < 64).count();
+    let content_width = 600 - 40;
+    let half_page = content_width * (800 / 2 - 20);
+    let ratio = dark as f32 / half_page as f32;
+    assert!(
+        (0.75..=1.3).contains(&ratio),
+        "50vh should paint about half a page: {dark} dark pixels, expected ~{half_page}"
+    );
+}

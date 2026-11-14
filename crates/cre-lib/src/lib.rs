@@ -96,6 +96,10 @@ pub struct DocumentMetadata {
 pub struct DocumentOptions {
     pub width: u32,
     pub height: u32,
+    /// Kept for the API (and for the reader's cache key): it used to be the
+    /// layout viewport's height, which made viewport units resolve against the
+    /// whole chunk. The layout viewport is the page now, see
+    /// [`create_document`].
     pub layout_height: u32,
     pub page_margin: f32,
     pub font_size: f32,
@@ -7710,17 +7714,18 @@ fn create_document(
     let profile = std::env::var_os("CRE_LAYOUT_PROFILE").is_some();
     let started = std::time::Instant::now();
     let config = DocumentConfig {
-        // The Blitz viewport is the *document's* layout box, not a page: its
-        // height is `layout_height` (the whole chunk), so `vh` and `vmin`
-        // resolve against that and not against the reader's page. Nothing in
-        // our own CSS may use a viewport unit for a page-sized rule - a
-        // `min-height: 100vh` on a page-level section made it as tall as the
-        // chunk, and `background-size: cover` then zoomed a picture 100x, so a
-        // corrected page showed one corner of its background. Use the page
-        // geometry in pixels (see `.cre-page-body` below) instead.
+        // The Blitz viewport is the reader's page, not the chunk. Its height
+        // decides what `vh`/`vmin`/`vmax` mean and what `height: 100%` resolves
+        // against, so it has to be the page: with the chunk's height here, a
+        // page-level section styled `min-height: 100vh` became as tall as the
+        // whole chunk and `background-size: cover` zoomed its picture ~125x,
+        // leaving one corner of it on the page. The document is not clipped to
+        // the viewport - pagination scrolls through it - so a page-sized
+        // viewport only fixes the units. `layout_height` used to be passed here
+        // and did exactly that damage.
         viewport: Some(Viewport::new(
             options.width,
-            options.layout_height,
+            options.height,
             options.viewport_scale,
             ColorScheme::Light,
         )),
