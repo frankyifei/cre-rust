@@ -620,8 +620,15 @@ pub fn normalize_page_images(
         for anchor in section_anchor_ids(section) {
             out.push_str(&format!("<a id=\"{anchor}\"></a>"));
         }
+        // A picture-only part can hold a small logo; only a picture that
+        // covers the part should be scaled to the page.
+        let class = if (image_width as f32 * image_height as f32) >= 0.5 * width * height {
+            "cre-plate cre-page-picture"
+        } else {
+            "cre-plate"
+        };
         out.push_str(&format!(
-            "<img class=\"cre-plate\" src=\"{name}\" \
+            "<img class=\"{class}\" src=\"{name}\" \
              style=\"display:block;max-width:100%;height:auto\" alt=\"\"/>"
         ));
         cursor = close;

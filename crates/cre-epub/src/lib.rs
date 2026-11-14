@@ -2316,7 +2316,12 @@ fn full_page_image_replacement(
         },
     );
 
-    Some(full_page_image_tag(&generated_key, &attrs))
+    // A picture-only page can hold a small logo just as well as a cover; only
+    // a picture that covers the page should be scaled to it.
+    let page_picture = dimensions.is_some_and(|(width, height)| {
+        width as f32 * height as f32 >= 0.5 * available_width * available_height
+    });
+    Some(full_page_image_tag(&generated_key, &attrs, page_picture))
 }
 
 /// True when the document's body holds exactly one image and no text: the
@@ -2393,14 +2398,25 @@ fn image_fit_tag(
     tag
 }
 
-fn full_page_image_tag(generated_key: &str, image_attrs: &HashMap<String, String>) -> String {
+fn full_page_image_tag(
+    generated_key: &str,
+    image_attrs: &HashMap<String, String>,
+    page_picture: bool,
+) -> String {
     let src = format!("cre://book/{}", encode_path(generated_key));
     let mut tag = format!("<img src=\"{}\"", escape_attr(&src));
     if let Some(id) = image_attrs.get("id") {
         tag.push_str(&format!(" id=\"{}\"", escape_attr(id)));
     }
-    if let Some(class) = image_attrs.get("class") {
-        tag.push_str(&format!(" class=\"{}\"", escape_attr(class)));
+    let mut class = image_attrs.get("class").cloned().unwrap_or_default();
+    if page_picture {
+        if !class.is_empty() {
+            class.push(' ');
+        }
+        class.push_str("cre-page-picture");
+    }
+    if !class.is_empty() {
+        tag.push_str(&format!(" class=\"{}\"", escape_attr(&class)));
     }
     if let Some(alt) = image_attrs.get("alt") {
         tag.push_str(&format!(" alt=\"{}\"", escape_attr(alt)));

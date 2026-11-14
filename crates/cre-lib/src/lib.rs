@@ -7800,7 +7800,7 @@ fn create_document(
     // already places the text inside the top and bottom margins.
     if margins.is_explicit() {
         html_source.push_str(&format!(
-            "<style>/* cre-page-margins */ html, body {{ padding: 0 {margin_right_css:.3}px 0 \
+            "<style>/* cre-page-margins */ body {{ padding: 0 {margin_right_css:.3}px 0 \
              {margin_left_css:.3}px; }}</style>"
         ));
     }
@@ -7836,11 +7836,13 @@ fn create_document(
     if margins.is_explicit() {
         let margin_top_css = (margins.top / scale).max(0.0);
         let picture_height = (page_height_css - margin_top_css - margin_bottom_css).max(1.0);
-        html_source.push_str(&format!(
-            "<style>img[src*=\"cre-page-fit\"] {{ display: block; width: 100%; \
-             height: {picture_height:.0}px; margin: {margin_top_css:.0}px 0 0 0; \
-             max-width: none; max-height: none; }}</style>"
-        ));
+        let rule = format!(
+            "<style>img.cre-page-picture {{ display: block !important; \
+             width: 100% !important; height: {picture_height:.0}px !important; \
+             margin: {margin_top_css:.0}px 0 0 0 !important; \
+             max-width: none !important; max-height: none !important; }}</style>"
+        );
+        html_source.push_str(&rule);
     }
     html_source.push_str(&format!(
         "<style>img, svg, video, canvas, object, embed {{ max-width: 100%; \
