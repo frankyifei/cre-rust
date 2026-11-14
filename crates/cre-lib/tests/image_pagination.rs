@@ -244,3 +244,42 @@ fn image_hit_test_uses_the_queried_page_origin() {
         "page 1 image missed after page 2 changed the viewport scroll"
     );
 }
+
+/// Long-press on a picture page must open the picture.
+///
+/// A page whose only content is an image is laid out through a generated
+/// transparent SVG that stands in for the picture (the "plate"), and the hit
+/// test used to hand that wrapper to the viewer: the reader got a blank page.
+/// The wrapper is an implementation detail, so the hit test has to resolve it
+/// back to the picture the renderer paints.
+#[test]
+fn long_press_on_a_picture_page_returns_the_picture() {
+    // A 1x1 PNG, inlined: the plate pass turns it into a generated resource.
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    let path = write_page(
+        "plate-hit-test.html",
+        &format!(
+            "<section class=\"cre-spine\" data-spine-index=\"1\">\
+             <p><img alt=\"plate\" src=\"data:image/png;base64,{png}\"/></p>\
+             </section>\
+             <section class=\"cre-spine\" data-spine-index=\"2\"><p>SECOND</p></section>"
+        ),
+    );
+    let mut doc = Document::with_options(&path, &options()).unwrap();
+    doc.render_page(1).unwrap();
+
+    let data = doc
+        .image_data_at(cre_lib::PagePosition {
+            page: 1,
+            x: 300.0,
+            y: 400.0,
+        })
+        .unwrap()
+        .expect("a picture page must answer a long-press");
+    assert!(data.starts_with(b"\x89PNG"), "expected the picture's bytes");
+    assert!(
+        !data.starts_with(b"<svg"),
+        "the plate wrapper is not the picture: {}",
+        String::from_utf8_lossy(&data[..data.len().min(80)])
+    );
+}

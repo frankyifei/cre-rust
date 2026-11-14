@@ -3685,15 +3685,25 @@ impl Document {
             } else {
                 (position.x / scale, position.y / scale)
             };
-            Ok(find_image_data_at(
+            let keys = find_image_keys_at(
                 &active.doc,
                 root,
                 page_bottom,
                 position_x,
                 position_y,
                 &self.base_url,
-                &self.resources,
-            ))
+            );
+            // A page-fit plate is a generated transparent SVG that stands in
+            // for a picture the renderer paints itself, so long-press has to
+            // open the picture: handing the wrapper over opened a blank page.
+            Ok(keys.into_iter().find_map(|key| {
+                let source = self
+                    .images
+                    .page_fit_image(&key)
+                    .map(|fit| fit.source)
+                    .unwrap_or(key);
+                self.resources.get(&source).map(|data| (*data).to_vec())
+            }))
         })
     }
 
@@ -6761,15 +6771,14 @@ fn common_ancestor(root: &Node, left: NodeId, right: NodeId) -> Option<NodeId> {
     None
 }
 
-fn find_image_data_at(
+fn find_image_keys_at(
     doc: &HtmlDocument,
     node: &Node,
     page_bottom: f32,
     x: f32,
     y: f32,
     base_url: &str,
-    resources: &ResourceSource,
-) -> Option<Vec<u8>> {
+) -> Vec<String> {
     if node
         .element_data()
         .is_some_and(|element| element.name.local.to_string() == "img")
@@ -6788,37 +6797,54 @@ fn find_image_data_at(
                 && y >= visible_top
                 && y <= visible_bottom
         });
-        if hit {
-            let src = node_attr(node, "src")?;
-            let resolved = if src.contains("://") {
-                src.to_string()
-            } else if src.starts_with('/') {
-                format!("{}{}", base_url.trim_end_matches('/'), src)
-            } else {
-                format!("{}{}", base_url, src)
-            };
-            let (key, _) = href_key(&resolved);
-            let key = key.strip_prefix("binary/").unwrap_or(&key);
-            if let Some(data) = resources.get(key) {
-                return Some((*data).clone());
-            }
+        if hit && let Some(src) = node_attr(node, "src") {
+            return image_key_candidates(src, base_url);
         }
     }
 
     for child in node.children.iter() {
-        if let Some(data) = find_image_data_at(
-            doc,
-            node.with(*child),
-            page_bottom,
-            x,
-            y,
-            base_url,
-            resources,
-        ) {
-            return Some(data);
+        let keys = find_image_keys_at(doc, node.with(*child), page_bottom, x, y, base_url);
+        if !keys.is_empty() {
+            return keys;
         }
     }
-    None
+    Vec::new()
+}
+
+/// Every key a `<img src>` may name, most specific first.
+///
+/// A resource key is what the net provider answers to, and it is not always the
+/// URL a document wrote: an EPUB serves `cre://book/<key>`, a standalone
+/// document serves a path relative to its own directory, and a generated plate
+/// (`cre-page-fit-N`, no scheme at all) is a bare key. The caller tries them in
+/// order and takes the first that holds bytes.
+fn image_key_candidates(src: &str, base_url: &str) -> Vec<String> {
+    let src = src.trim();
+    let mut keys = Vec::new();
+    if let Some(relative) = src.strip_prefix("cre://book/") {
+        keys.push(normalize_path(
+            &percent_decode_str(relative).decode_utf8_lossy(),
+        ));
+    } else if src.contains("://") {
+        let (key, _) = href_key(src);
+        keys.push(key.strip_prefix("binary/").unwrap_or(&key).to_string());
+    } else {
+        // The bare name, as the generated table and `MapNet` address it.
+        keys.push(normalize_path(src));
+        // And the same name resolved against the document, for a real relative
+        // path (`../Images/cover.jpg`).
+        let resolved = if src.starts_with('/') {
+            format!("{}{}", base_url.trim_end_matches('/'), src)
+        } else {
+            format!("{base_url}{src}")
+        };
+        let (key, _) = href_key(&resolved);
+        let key = key.strip_prefix("binary/").unwrap_or(&key).to_string();
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys
 }
 
 /// Visible device-pixel area of the images the renderer paints itself.
