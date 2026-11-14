@@ -46,11 +46,16 @@ image = { version = "0.25", default-features = false, features = [
 percent-encoding = "2"
 regex.workspace = true
 png = "0.18"
+# The only pure-Rust SVG rasteriser. `usvg` (the parser) and `tiny-skia` (the
+# backend) are in the graph anyway - `anyrender_svg` and `cre-paint` need them -
+# so this adds the renderer itself, plus the raster decoders `raster-images`
+# turns on. Measured on the armv7 library: 424 KiB in total, of which 172 KiB is
+# the renderer and 252 KiB the gif/webp decoders. Dropping `raster-images` is
+# not an option: EPUB covers are commonly an SVG wrapper around an embedded
+# JPEG, and without it they render blank.
 resvg = { version = "0.48.1", default-features = false, features = [
     "text",
     "system-fonts",
-    # EPUB covers are commonly an SVG wrapper around an embedded JPEG; without
-    # this resvg renders such SVGs blank (getImageData / page-fit covers).
     "raster-images",
 ] }
 url = "2"
