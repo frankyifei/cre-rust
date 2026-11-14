@@ -328,7 +328,7 @@ fn base_css(options: &Kf8HtmlOptions) -> String {
          body {{ font-family: serif; font-size: 1em; line-height: {}; padding: {}px {}px; }}\n\
          h1, h2, h3, h4, h5, h6 {{ font-family: sans-serif; }}\n\
          .cre-spine {{ display: block; page-break-before: always; }}",
-        cre_css::FONT_SIZE,
+        cre_book::css::FONT_SIZE,
         options.line_height,
         options.margin_y,
         options.margin_x
@@ -1142,7 +1142,10 @@ mod tests {
         // when the chunk is laid out, so a font change is a relayout.
         let css = base_css(&Kf8HtmlOptions::default());
         assert!(
-            css.contains(&format!("html {{ font-size: {}px; }}", cre_css::FONT_SIZE)),
+            css.contains(&format!(
+                "html {{ font-size: {}px; }}",
+                cre_book::css::FONT_SIZE
+            )),
             "{css}"
         );
         assert!(
@@ -1150,8 +1153,8 @@ mod tests {
             "{css}"
         );
         assert_eq!(
-            cre_css::substitute(&css, 26.0, 10.0).as_ref(),
-            css.replace(cre_css::FONT_SIZE, "26.00")
+            cre_book::css::substitute(&css, 26.0, 10.0).as_ref(),
+            css.replace(cre_book::css::FONT_SIZE, "26.00")
         );
     }
 

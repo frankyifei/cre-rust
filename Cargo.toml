@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/cre-book",
-    "crates/cre-css",
     "crates/cre-epub", "crates/cre-fb2",
     "crates/cre-kf8",
     "crates/cre-mobi",

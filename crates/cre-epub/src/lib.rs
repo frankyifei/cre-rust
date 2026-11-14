@@ -1115,7 +1115,7 @@ impl EpubBook {
              body {{ font-family: serif; font-size: 1em; line-height: {}; \
              padding: {}px {}px; }}\n\
              .cre-spine {{ display: flow-root; page-break-before: always; }}\n",
-            cre_css::FONT_SIZE,
+            cre_book::css::FONT_SIZE,
             options.line_height,
             options.margin_y,
             options.margin_x

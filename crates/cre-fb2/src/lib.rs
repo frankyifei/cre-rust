@@ -113,7 +113,7 @@ blockquote {{ border-left: 3px solid #888; padding-left: 1em; margin: 1em 0; fon
 .cre-author {{ font-style: italic; text-align: right; }}
 .cre-annotation {{ background: #f0f0f0; padding: 0.5em; margin-bottom: 1em; }}
 .poem {{ font-style: normal; }}",
-            cre_css::FONT_SIZE, opts.line_height, opts.margin_y, opts.margin_x,
+            cre_book::css::FONT_SIZE, opts.line_height, opts.margin_y, opts.margin_x,
         );
         let title_html = escape_html(self.title.as_deref().unwrap_or(""));
         format!(

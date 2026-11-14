@@ -8,5 +8,4 @@ rust-version.workspace = true
 [dependencies]
 anyhow = "1"
 cre-book = { path = "../cre-book" }
-cre-css = { path = "../cre-css" }
 cre-pdb = { path = "../cre-pdb" }

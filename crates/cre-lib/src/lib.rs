@@ -1667,8 +1667,8 @@ impl Document {
                          body {{ font-family: serif; font-size: {}px; line-height: 1.2; \
                          padding: {}px; }}\n\
                          img {{ max-width: 100%; height: auto; }}",
-                        cre_css::FONT_SIZE,
-                        cre_css::PAGE_MARGIN
+                        cre_book::css::FONT_SIZE,
+                        cre_book::css::PAGE_MARGIN
                     ),
                 );
                 let directory = path
@@ -7739,10 +7739,11 @@ fn create_document(
     // font or margin change relayout the existing chunks instead of reopening
     // the book, for every format.
     let page_margin_css = options.page_margin / options.viewport_scale.max(0.1);
-    let html_source = match cre_css::substitute(&html_source, options.font_size, page_margin_css) {
-        std::borrow::Cow::Borrowed(_) => html_source,
-        std::borrow::Cow::Owned(substituted) => substituted,
-    };
+    let html_source =
+        match cre_book::css::substitute(&html_source, options.font_size, page_margin_css) {
+            std::borrow::Cow::Borrowed(_) => html_source,
+            std::borrow::Cow::Owned(substituted) => substituted,
+        };
     let from_html_at = started.elapsed().as_secs_f64() * 1000.0;
     let mut doc = HtmlDocument::from_html(html_source.as_str(), config);
     let parsed_at = started.elapsed().as_secs_f64() * 1000.0;

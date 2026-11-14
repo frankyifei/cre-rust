@@ -419,7 +419,7 @@ format has to provide.
 | Path | Content |
 |---|---|
 | `crates/cre-lib` | Engine core: open, layout, pagination, page lookup, positions, images, fonts |
-| `crates/cre-book` | Format-independent book layer: resource table, chunking, HTML helpers, page-fit plates, fonts, ruby |
+| `crates/cre-book` | Format-independent book layer: resource table, chunking, HTML helpers, page-fit plates, fonts, ruby, layout tokens |
 | `crates/cre-epub` | EPUB container, OPF, spine, TOC, HTML chunks |
 | `crates/cre-fb2` | FB2 reader |
 | `crates/cre-text` | TXT and standalone HTML reader |

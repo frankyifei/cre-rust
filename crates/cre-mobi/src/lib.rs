@@ -240,7 +240,7 @@ fn base_css(options: &MobiHtmlOptions) -> String {
          h1, h2, h3, h4, h5, h6 {{ font-family: sans-serif; }}\n\
          .cre-spine {{ display: block; page-break-before: always; }}\n\
          .cre-pagebreak {{ page-break-before: always; }}",
-        cre_css::FONT_SIZE,
+        cre_book::css::FONT_SIZE,
         options.line_height,
         options.margin_y,
         options.margin_x
