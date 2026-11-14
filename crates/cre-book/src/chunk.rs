@@ -739,3 +739,179 @@ where
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod splitting_tests {
+    use super::*;
+
+    #[test]
+    fn sections_are_packed_whole_into_chunks() {
+        let html = "<html><head><title>t</title></head><body>\
+                    <section class=\"cre-spine\" data-spine-index=\"1\"><p>one</p></section>\
+                    <section class=\"cre-spine\" data-spine-index=\"2\"><p>two</p></section>\
+                    <section class=\"cre-spine\" data-spine-index=\"3\"><p>three</p></section>\
+                    </body></html>";
+        // Room for two sections per chunk.
+        let limit = 150;
+        let parts = split_html_document_at_sections(html, limit).expect("sections");
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert!(parts[0].contains("data-spine-index=\"1\""), "{}", parts[0]);
+        assert!(parts[0].contains("data-spine-index=\"2\""), "{}", parts[0]);
+        assert!(!parts[0].contains("data-spine-index=\"3\""), "{}", parts[0]);
+        assert!(parts[1].contains("data-spine-index=\"3\""), "{}", parts[1]);
+        // The head and the closing tags are repeated in every part.
+        for part in &parts {
+            assert!(part.starts_with("<html><head>"), "{part}");
+            assert!(part.ends_with("</body></html>"), "{part}");
+        }
+    }
+
+    #[test]
+    fn a_chunk_stays_within_the_image_budget() {
+        let html = "<html><body>\
+                    <section class=\"cre-spine\"><p>one</p></section>\
+                    <section class=\"cre-spine\"><p>two</p></section>\
+                    <section class=\"cre-spine\"><p>three</p></section>\
+                    </body></html>";
+        // Each section claims 10 bytes of decoded images; the budget fits one.
+        let parts =
+            split_html_document_at_sections_with(html, 1000, 12, 1_000_000, 128, |section| {
+                (section.len(), 10)
+            })
+            .expect("sections");
+        assert_eq!(parts.len(), 3, "{parts:?}");
+    }
+
+    #[test]
+    fn a_leading_stylesheet_is_repeated_in_every_chunk() {
+        // KF8 bodies start with the book's CSS before the first part.
+        let html = "<html><body><style>p{color:red}</style>\
+                    <section class=\"cre-spine\"><p>one</p></section>\
+                    <section class=\"cre-spine\"><p>two</p></section>\
+                    </body></html>";
+        let parts = split_html_document_at_sections(html, 110).expect("sections");
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        for part in &parts {
+            assert!(part.contains("<style>p{color:red}</style>"), "{part}");
+        }
+    }
+
+    #[test]
+    fn streaming_sections_match_the_collected_split() {
+        // The streaming variant is what the MOBI/KF8/FB2 open path uses; it
+        // must produce exactly the chunks the collecting splitter would.
+        let cases = [
+            "<html><head><title>t</title></head><body>\
+             <section class=\"cre-spine\" data-spine-index=\"1\"><p>one</p></section>\
+             <section class=\"cre-spine\" data-spine-index=\"2\"><p>two</p></section>\
+             <section class=\"cre-spine\" data-spine-index=\"3\"><p>three</p></section>\
+             </body></html>",
+            "<html><body><style>p{color:red}</style>\
+             <section class=\"cre-spine\"><p>one</p></section>\
+             <section class=\"cre-spine\"><p>two</p></section>\
+             </body></html>",
+        ];
+        for html in cases {
+            let (head, body, tail) = html_body_parts(html).expect("body parts");
+            for limit in [110, 150, 1000] {
+                let collected = split_html_document_at_sections(html, limit).expect("sections");
+                let mut streamed = Vec::new();
+                assert!(stream_html_document_at_sections_with(
+                    head,
+                    body,
+                    tail,
+                    limit,
+                    usize::MAX,
+                    usize::MAX,
+                    128,
+                    |section| (section.len(), 0),
+                    |chunk| streamed.push(chunk),
+                ));
+                assert_eq!(collected, streamed, "limit {limit}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_body_without_sections_or_with_text_between_them_is_generic() {
+        let plain = "<html><body><p>a</p><p>b</p></body></html>";
+        assert!(split_html_document_at_sections(plain, 10).is_none());
+        let mixed = "<html><body><section class=\"cre-spine\"><p>a</p></section>tail</body></html>";
+        assert!(split_html_document_at_sections(mixed, 10).is_none());
+        // One section larger than the budget: let the generic splitter cut it.
+        let large =
+            "<html><body><section class=\"cre-spine\"><p>aaaaaaaaaa</p></section></body></html>";
+        assert!(split_html_document_at_sections(large, 20).is_none());
+    }
+
+    #[test]
+    fn split_body_html_keeps_content_and_balances_tags() {
+        let body = format!("<div class=\"wrap\">{}</div>", "<p>alpha</p>".repeat(50));
+        let parts = split_body_html(&body, 200);
+        assert!(
+            parts.len() > 1,
+            "expected a split, got {} part(s)",
+            parts.len()
+        );
+        for part in &parts {
+            assert_eq!(
+                part.matches("<div").count(),
+                part.matches("</div>").count(),
+                "unbalanced div in {part:?}"
+            );
+            assert_eq!(
+                part.matches("<p>").count(),
+                part.matches("</p>").count(),
+                "unbalanced p in {part:?}"
+            );
+        }
+        let joined = parts.concat();
+        assert_eq!(joined.matches("alpha").count(), 50);
+    }
+
+    #[test]
+    fn split_body_html_does_not_cut_inside_raw_text_elements() {
+        let body = format!(
+            "<p>start</p><style>p::before {{ content: '<b>not markup</b>'; }}</style>{}",
+            "<p>tail</p>".repeat(20)
+        );
+        let parts = split_body_html(&body, 120);
+        assert!(parts.len() > 1);
+        let styles = parts
+            .iter()
+            .filter(|part| part.contains("<style>"))
+            .collect::<Vec<_>>();
+        assert_eq!(styles.len(), 1, "style element must not be split");
+        assert!(styles[0].contains("'<b>not markup</b>'"));
+    }
+
+    #[test]
+    fn split_body_html_cuts_cjk_text_on_char_boundaries() {
+        let body = format!(
+            "<div>{}</div>",
+            "这是一个用来测试分页切分的很长的中文句子。".repeat(200)
+        );
+        // A limit that is very unlikely to fall on a character boundary.
+        let parts = split_body_html(&body, 1001);
+        assert!(parts.len() > 1);
+        let joined = parts.concat();
+        assert_eq!(
+            joined.matches('中').count(),
+            body.matches('中').count(),
+            "CJK text must survive splitting byte-exactly"
+        );
+        for part in &parts {
+            assert_eq!(
+                part.matches("<div").count(),
+                part.matches("</div>").count(),
+                "unbalanced div in part"
+            );
+        }
+    }
+
+    #[test]
+    fn split_body_html_keeps_small_documents_whole() {
+        let body = "<p>only a line</p>";
+        assert_eq!(split_body_html(body, 4096), vec![body.to_string()]);
+    }
+}
