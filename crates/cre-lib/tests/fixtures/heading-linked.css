@@ -1,0 +1,9 @@
+/* Absolute sizes: a browser resolves these against the user's medium size, not
+   against the parent element. */
+h1 {
+    font-size: x-large;
+}
+
+.note {
+    font-size: small;
+}

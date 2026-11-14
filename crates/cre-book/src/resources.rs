@@ -111,6 +111,14 @@ pub struct ResourceSource {
     /// the net providers - which hold the source, not the document - apply the
     /// setting when they serve a stylesheet.
     fonts_enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// The reader's font size, in CSS pixels, as `f32::to_bits`.
+    ///
+    /// Like the font flag, this is a setting that changes what a served
+    /// stylesheet *means*: a book's `font-size: x-large` is a size only once
+    /// the medium is known, and the engine rewrites it when it hands the sheet
+    /// to Blitz (see `normalise_served_stylesheet` in `cre-lib`). It lives here
+    /// for the same reason: the net provider serves the sheet, not the document.
+    css_font_size: Arc<std::sync::atomic::AtomicU32>,
 }
 
 #[derive(Clone)]
@@ -130,6 +138,9 @@ impl ResourceSource {
             base,
             generated: Arc::new(std::sync::Mutex::new(HashMap::new())),
             fonts_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            // 16px is the browser's medium; the document overwrites it with the
+            // reader's size before the first layout fetches a stylesheet.
+            css_font_size: Arc::new(std::sync::atomic::AtomicU32::new((16.0f32).to_bits())),
         }
     }
 
@@ -197,6 +208,18 @@ impl ResourceSource {
     /// The generated-resource table, shared with the net providers.
     pub fn generated(&self) -> GeneratedResources {
         Arc::clone(&self.generated)
+    }
+
+    /// The reader's font size for the stylesheets served from this source,
+    /// shared with the net providers and with the document itself.
+    pub fn css_font_size(&self) -> Arc<std::sync::atomic::AtomicU32> {
+        Arc::clone(&self.css_font_size)
+    }
+
+    /// Records the reader's font size, before a layout resolves the CSS.
+    pub fn set_css_font_size(&self, font_size: f32) {
+        self.css_font_size
+            .store(font_size.to_bits(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Estimated decoded size of an image, for the chunk memory budget.

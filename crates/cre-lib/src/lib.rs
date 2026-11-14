@@ -1063,6 +1063,10 @@ pub struct Document {
     /// in the chunk HTML at all). An atomic because the network provider holds
     /// the same flag and a relayout copies it into the background worker.
     embedded_fonts_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// The reader's font size, as `f32::to_bits`, shared with the net
+    /// providers: a served stylesheet's absolute `font-size` keywords are
+    /// turned into pixels against it, and a relayout updates it in place.
+    css_font_size: Arc<std::sync::atomic::AtomicU32>,
     chunks: Vec<ChunkMeta>,
     pages: Vec<PageMeta>,
     xpointer_pages: HashMap<String, usize>,
@@ -1355,6 +1359,7 @@ impl Document {
                         svg: svg_raster.clone(),
                         resource_provider: resource_provider.clone(),
                         embedded_fonts: embedded_fonts_flag.clone(),
+                        css_font_size: resources.css_font_size(),
                         generated: resources.generated(),
                     }),
                     resources,
@@ -1424,6 +1429,7 @@ impl Document {
                         svg: svg_raster.clone(),
                         generated: resource_source.generated(),
                         fonts_enabled: resource_source.fonts_enabled(),
+                        css_font_size: resource_source.css_font_size(),
                     }),
                     resource_source,
                     svg_raster.clone(),
@@ -1489,6 +1495,7 @@ impl Document {
                         svg: svg_raster.clone(),
                         generated: resource_source.generated(),
                         fonts_enabled: resource_source.fonts_enabled(),
+                        css_font_size: resource_source.css_font_size(),
                     }),
                     resource_source,
                     svg_raster.clone(),
@@ -1580,6 +1587,7 @@ impl Document {
                         svg: svg_raster.clone(),
                         generated: resource_source.generated(),
                         fonts_enabled: resource_source.fonts_enabled(),
+                        css_font_size: resource_source.css_font_size(),
                     }),
                     resource_source,
                     svg_raster.clone(),
@@ -1745,6 +1753,7 @@ impl Document {
                         root: root.clone(),
                         svg: images.clone(),
                         embedded_fonts: embedded_fonts_flag.clone(),
+                        css_font_size: resources.css_font_size(),
                         generated: resources.generated(),
                     }),
                     resources,
@@ -1885,6 +1894,10 @@ impl Document {
         // The document and its net providers share one font setting; take the
         // handle before `resources` is moved into the struct.
         let embedded_fonts_flag = resources.fonts_enabled();
+        // The font size a served stylesheet resolves its absolute sizes
+        // against, recorded before the first layout fetches one.
+        let css_font_size = resources.css_font_size();
+        resources.set_css_font_size(options.font_size);
         let mut document = Self {
             metadata,
             width: options.width,
@@ -1922,6 +1935,7 @@ impl Document {
             raw_page_map_items: page_map_items,
             embedded_fonts: Vec::new(),
             embedded_fonts_flag,
+            css_font_size,
             layout_done: false,
             lazy_open: lazy,
             active: RefCell::new(None),
@@ -2081,6 +2095,13 @@ impl Document {
         // zeroes its page margin, and the page transform reads this value.
         self.page_margin = options.page_margin;
         self.font_css_size = options.font_size;
+        // A served stylesheet resolves its absolute `font-size` keywords
+        // against this, so a font change must reach the net provider before the
+        // chunk is laid out again.
+        self.css_font_size.store(
+            options.font_size.to_bits(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if self.font_family != options.font_family {
             self.font_family = options.font_family.clone();
             self.rebuild_font_context();
@@ -7325,6 +7346,43 @@ fn absolute_font_size_keywords_become_px(html: &str, base: f32) -> String {
         .into_owned()
 }
 
+/// The rewrites a stylesheet needs before Blitz parses it, whichever way the
+/// book's CSS arrived: a `<style>` block inside a chunk's HTML (where the
+/// passes in [`create_document`] see it) or a `<link>`ed sheet served as a
+/// resource. Both are the same CSS, so both get the same treatment.
+///
+/// - absolute `font-size` keywords become the pixels a browser computes from
+///   the reader's size, or a book's `x-large` heading stays at stylo's 16px
+///   medium whatever the setting (see
+///   [`absolute_font_size_keywords_become_px`]);
+/// - the multi-column declarations and fixed table-cell sizes Blitz lays out
+///   wrongly are removed (see [`strip_multi_column_declarations`] and
+///   [`widen_cell_dimensions_in_stylesheet`]).
+fn normalise_served_stylesheet(css: &str, font_size: f32) -> String {
+    let css = strip_multi_column_declarations(css);
+    let css = widen_cell_dimensions_in_stylesheet(&css);
+    absolute_font_size_keywords_become_px(&css, font_size)
+}
+
+/// The reader's font size a net provider resolves served CSS against.
+fn served_font_size(font_size: &std::sync::atomic::AtomicU32) -> f32 {
+    f32::from_bits(font_size.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The stylesheet bytes a net provider hands to Blitz.
+///
+/// `fonts` is the reader's "use the book's fonts" setting: an `@font-face`
+/// rule is dropped when it is off, which is how the setting reaches a sheet
+/// that is linked rather than inlined.
+fn served_stylesheet(css: &str, font_size: f32, fonts_enabled: bool) -> String {
+    let css = if fonts_enabled {
+        std::borrow::Cow::Borrowed(css)
+    } else {
+        cre_book::fonts::strip_font_faces(css)
+    };
+    normalise_served_stylesheet(css.as_ref(), font_size)
+}
+
 /// Blitz only paints borders, padding and background on boxes it builds for
 /// block-level and atomic inline elements; a bordered `<span>` gets nothing, so
 /// `border: thin dotted black` on an inline element is invisible (and takes no
@@ -9044,6 +9102,9 @@ struct EpubNet {
     /// Shared with the `Document`: a relayout must see the reader's current
     /// "use the book's fonts" setting without rebuilding the provider.
     embedded_fonts: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared with the `Document` too: a stylesheet's absolute `font-size`
+    /// keywords resolve against the reader's size.
+    css_font_size: Arc<std::sync::atomic::AtomicU32>,
     /// Resources the engine generated (page-fit wrappers, decoded `data:`
     /// pictures); consulted before the book itself.
     generated: GeneratedResources,
@@ -9076,14 +9137,13 @@ impl NetProvider for EpubNet {
         // one in the list, which is the reader's font.
         let bytes = if key.to_ascii_lowercase().ends_with(".css") {
             let css = cre_book::css::body_selectors_to_class(&String::from_utf8_lossy(&bytes));
-            if self
-                .embedded_fonts
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
-                css.into_bytes()
-            } else {
-                cre_book::strip_font_faces(&css).into_owned().into_bytes()
-            }
+            served_stylesheet(
+                &css,
+                served_font_size(&self.css_font_size),
+                self.embedded_fonts
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .into_bytes()
         } else {
             bytes
         };
@@ -9102,6 +9162,9 @@ struct MapNet {
     /// A KF8 stylesheet is a served resource, so the "use the book's fonts"
     /// setting is applied when it is read.
     fonts_enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// The reader's size, for the absolute `font-size` keywords in a served
+    /// stylesheet (see [`normalise_served_stylesheet`]).
+    css_font_size: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl NetProvider for MapNet {
@@ -9112,21 +9175,22 @@ impl NetProvider for MapNet {
             .to_string();
         let name = path.strip_prefix("binary/").unwrap_or(&path).to_string();
         let key = normalize_path(&name);
-        // A served stylesheet carries the book's `@font-face` rules, so the font
-        // setting is applied here, before any cache or the generated table.
-        if key.to_ascii_lowercase().ends_with(".css")
-            && !self
-                .fonts_enabled
-                .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        // A KF8 book's CSS is a flow of its own, served from this table, so it
+        // gets the rewrites a chunk's inline `<style>` gets in
+        // `create_document` - and the book's `@font-face` rules are dropped
+        // here when the reader turns its fonts off.
+        if key.to_ascii_lowercase().ends_with(".css") {
             let raw = generated_resource(&self.generated, &key)
                 .map(|bytes| (*bytes).clone())
                 .or_else(|| self.resources.get(&key).map(|bytes| bytes.to_vec()))
                 .unwrap_or_default();
-            let text = String::from_utf8_lossy(&raw).into_owned();
-            let css = cre_book::fonts::strip_font_faces(&text)
-                .into_owned()
-                .into_bytes();
+            let css = served_stylesheet(
+                &String::from_utf8_lossy(&raw),
+                served_font_size(&self.css_font_size),
+                self.fonts_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .into_bytes();
             handler.bytes(request.url.to_string(), Bytes::from(css));
             return;
         }
@@ -9162,6 +9226,7 @@ struct FileNet {
     root: PathBuf,
     svg: Arc<ImageRaster>,
     embedded_fonts: Arc<std::sync::atomic::AtomicBool>,
+    css_font_size: Arc<std::sync::atomic::AtomicU32>,
     generated: GeneratedResources,
 }
 
@@ -9188,15 +9253,16 @@ impl NetProvider for FileNet {
             bytes = std::fs::read(&candidate).unwrap_or_default();
         }
         // Same rule as `EpubNet`: a linked stylesheet carries the book's
-        // `@font-face` rules, so it is where the setting is applied.
-        if !self
-            .embedded_fonts
-            .load(std::sync::atomic::Ordering::Relaxed)
-            && decoded.to_ascii_lowercase().ends_with(".css")
-        {
-            bytes = cre_book::strip_font_faces(&String::from_utf8_lossy(&bytes))
-                .into_owned()
-                .into_bytes();
+        // `@font-face` rules, so it is where the font setting is applied, and
+        // it gets the rewrites an inline `<style>` block gets.
+        if decoded.to_ascii_lowercase().ends_with(".css") {
+            bytes = served_stylesheet(
+                &String::from_utf8_lossy(&bytes),
+                served_font_size(&self.css_font_size),
+                self.embedded_fonts
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .into_bytes();
         }
         let bytes = self.svg.rasterize(&relative, &bytes).unwrap_or(bytes);
         let bytes = self.svg.placeholder(&relative, &bytes).unwrap_or(bytes);

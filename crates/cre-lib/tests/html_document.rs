@@ -116,3 +116,46 @@ fn opens_standalone_html_file() {
     }
     assert!(colored > 20, "expected red text pixels, got {colored}");
 }
+
+/// A book's CSS often arrives as a linked stylesheet rather than an inline
+/// `<style>` block, and an EPUB chapter, a KF8 flow and a standalone HTML all
+/// do. The reader-side rewrites - chiefly the absolute `font-size` keywords,
+/// which are a size only once the medium (the reader's font size) is known -
+/// therefore have to reach the sheet whichever way it is served, or a book's
+/// `x-large` chapter title stays at stylo's 16px medium and ignores the
+/// setting. This pins the invariant: linked CSS renders exactly like the same
+/// rules inline.
+#[test]
+fn a_linked_stylesheet_renders_like_the_same_rules_inline() {
+    require_font();
+
+    let heading_height = |doc: &Document| -> f32 {
+        doc.page_text_boxes(1)
+            .unwrap()
+            .into_iter()
+            .find(|text| text.text.contains("Chapter One"))
+            .expect("the heading should be on page 1")
+            .height
+    };
+
+    let mut heights = Vec::new();
+    for font_size in [18.0, 26.0] {
+        let options = DocumentOptions {
+            font_size,
+            ..options()
+        };
+        let linked = Document::with_options(fixture("heading-linked.html"), &options).unwrap();
+        let inline = Document::with_options(fixture("heading-inline.html"), &options).unwrap();
+        assert_eq!(linked.page_count(), inline.page_count(), "at {font_size}px");
+        assert_eq!(
+            heading_height(&linked),
+            heading_height(&inline),
+            "a linked `x-large` heading must resolve like an inline one, at {font_size}px"
+        );
+        heights.push(heading_height(&linked));
+    }
+    assert!(
+        heights[1] > heights[0] * 1.3,
+        "an absolute heading must scale with the setting: {heights:?}"
+    );
+}

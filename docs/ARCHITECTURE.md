@@ -266,6 +266,17 @@ lookup as a picture. That is what lets a standalone HTML document (which
 has no archive to write into) use the same plate path as an EPUB, and it keeps
 the painter, the net provider and `getImageDataAt` on one namespace.
 
+Being served does not make a stylesheet different CSS, so the net providers run
+the same rewrites on it that `create_document` runs over an inline `<style>`
+block (`normalise_served_stylesheet`): absolute `font-size` keywords become
+pixels measured against the reader's size, multi-column declarations are
+dropped, and a table cell's `width`/`height` becomes a minimum. The keyword
+rewrite is the one that matters most: `xx-small` … `xxx-large` resolve against
+the *medium* size, which stylo fixes at 16px, so a book's `x-large` title would
+ignore the setting. The reader's size reaches the providers through
+`ResourceSource`, next to the "use the book's fonts" flag, and a relayout
+updates it before the chunk is parsed again.
+
 An image-only SVG block is rewritten to a plain `<img>`. It is an image, not a
 drawing.
 
