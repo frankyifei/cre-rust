@@ -1365,6 +1365,7 @@ impl Document {
                         resource_provider: resource_provider.clone(),
                         embedded_fonts: embedded_fonts_flag.clone(),
                         css_font_size: resources.css_font_size(),
+                        font_blobs: std::sync::Mutex::new(HashMap::new()),
                         generated: resources.generated(),
                     }),
                     resources,
@@ -1432,6 +1433,7 @@ impl Document {
                     Arc::new(MapNet {
                         resources: resources.clone(),
                         svg: svg_raster.clone(),
+                        font_blobs: std::sync::Mutex::new(HashMap::new()),
                         generated: resource_source.generated(),
                         fonts_enabled: resource_source.fonts_enabled(),
                         css_font_size: resource_source.css_font_size(),
@@ -1498,6 +1500,7 @@ impl Document {
                     Arc::new(MapNet {
                         resources: resources.clone(),
                         svg: svg_raster.clone(),
+                        font_blobs: std::sync::Mutex::new(HashMap::new()),
                         generated: resource_source.generated(),
                         fonts_enabled: resource_source.fonts_enabled(),
                         css_font_size: resource_source.css_font_size(),
@@ -1590,6 +1593,7 @@ impl Document {
                     Arc::new(MapNet {
                         resources: resources.clone(),
                         svg: svg_raster.clone(),
+                        font_blobs: std::sync::Mutex::new(HashMap::new()),
                         generated: resource_source.generated(),
                         fonts_enabled: resource_source.fonts_enabled(),
                         css_font_size: resource_source.css_font_size(),
@@ -1759,6 +1763,7 @@ impl Document {
                         svg: images.clone(),
                         embedded_fonts: embedded_fonts_flag.clone(),
                         css_font_size: resources.css_font_size(),
+                        font_blobs: std::sync::Mutex::new(HashMap::new()),
                         generated: resources.generated(),
                     }),
                     resources,
@@ -9123,6 +9128,9 @@ struct EpubNet {
     /// Shared with the `Document` too: a stylesheet's absolute `font-size`
     /// keywords resolve against the reader's size.
     css_font_size: Arc<std::sync::atomic::AtomicU32>,
+    /// One buffer per font face, so a chunk's document re-fetches the same
+    /// bytes instead of decompressing (and pinning) its own copy.
+    font_blobs: std::sync::Mutex<HashMap<String, Bytes>>,
     /// Resources the engine generated (page-fit wrappers, decoded `data:`
     /// pictures); consulted before the book itself.
     generated: GeneratedResources,
@@ -9164,6 +9172,30 @@ impl NetProvider for EpubNet {
             handler.bytes(request.url.to_string(), Bytes::from(css.into_bytes()));
             return;
         }
+        // A book's fonts are registered per document, and a document
+        // re-fetches them, so hand out one buffer per face: a fresh copy per
+        // chunk kept one decompressed copy per chunk alive for the session (a
+        // 13 MB book with two TTFs cost 45 MB that way).
+        if is_font_key(&key)
+            && let Some(bytes) = self.resource_provider.get(&key)
+        {
+            let mut cache = self.font_blobs.lock().unwrap();
+            let blob = match cache.get(&key) {
+                Some(blob) => blob.clone(),
+                None => {
+                    let blob = Bytes::from((*bytes).clone());
+                    // A book ships a handful of faces; anything beyond that is
+                    // not worth pinning.
+                    if cache.len() < 8 {
+                        cache.insert(key.clone(), blob.clone());
+                    }
+                    blob
+                }
+            };
+            drop(cache);
+            handler.bytes(request.url.to_string(), blob);
+            return;
+        }
         // A chunk's pictures are laid out through a transparent SVG carrying
         // their intrinsic size, and the painter reads the pixels of the page
         // being drawn. So the layout only needs the image's header - and a zip
@@ -9187,11 +9219,21 @@ impl NetProvider for EpubNet {
     }
 }
 
+/// Whether a resource is a font file, which Blitz reads whole.
+fn is_font_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    [".ttf", ".otf", ".ttc", ".woff", ".woff2"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+}
+
 /// Serves resources held in memory (FB2 binaries, MOBI/KF8 images), under
 /// `binary/<name>` or a bare `<name>`.
 struct MapNet {
     resources: MapResources,
     svg: Arc<ImageRaster>,
+    /// One buffer per font face (see `EpubNet::font_blobs`).
+    font_blobs: std::sync::Mutex<HashMap<String, Bytes>>,
     generated: GeneratedResources,
     /// A KF8 stylesheet is a served resource, so the "use the book's fonts"
     /// setting is applied when it is read.
@@ -9209,6 +9251,27 @@ impl NetProvider for MapNet {
             .to_string();
         let name = path.strip_prefix("binary/").unwrap_or(&path).to_string();
         let key = normalize_path(&name);
+        // A book's fonts are registered per document and every chunk's
+        // document fetches them again, so they are sliced once and shared
+        // instead of copied per chunk.
+        if is_font_key(&key)
+            && let Some(bytes) = self.resources.get(&key)
+        {
+            let mut cache = self.font_blobs.lock().unwrap();
+            let blob = match cache.get(&key) {
+                Some(blob) => blob.clone(),
+                None => {
+                    let blob = Bytes::from(bytes.to_vec());
+                    if cache.len() < 8 {
+                        cache.insert(key.clone(), blob.clone());
+                    }
+                    blob
+                }
+            };
+            drop(cache);
+            handler.bytes(request.url.to_string(), blob);
+            return;
+        }
         // A KF8 book's CSS is a flow of its own, served from this table, so it
         // gets the rewrites a chunk's inline `<style>` gets in
         // `create_document` - and the book's `@font-face` rules are dropped
@@ -9261,6 +9324,8 @@ struct FileNet {
     svg: Arc<ImageRaster>,
     embedded_fonts: Arc<std::sync::atomic::AtomicBool>,
     css_font_size: Arc<std::sync::atomic::AtomicU32>,
+    /// One buffer per font face (see `EpubNet::font_blobs`).
+    font_blobs: std::sync::Mutex<HashMap<String, Bytes>>,
     generated: GeneratedResources,
 }
 
@@ -9279,6 +9344,30 @@ impl NetProvider for FileNet {
             handler.bytes(request.url.to_string(), Bytes::from((*bytes).clone()));
             return;
         }
+        // Same font rule as `EpubNet`: a chunk's document re-fetches the
+        // book's faces, so they are read once and shared.
+        if is_font_key(&decoded)
+            && let Ok(candidate) = std::fs::canonicalize(&decoded)
+            && candidate.starts_with(&self.root)
+            && candidate.is_file()
+        {
+            let mut cache = self.font_blobs.lock().unwrap();
+            let key = candidate.to_string_lossy().to_string();
+            let blob = match cache.get(&key) {
+                Some(blob) => blob.clone(),
+                None => {
+                    let blob = Bytes::from(std::fs::read(&candidate).unwrap_or_default());
+                    if cache.len() < 8 {
+                        cache.insert(key, blob.clone());
+                    }
+                    blob
+                }
+            };
+            drop(cache);
+            handler.bytes(request.url.to_string(), blob);
+            return;
+        }
+
         // Same header rule as `EpubNet`: a content picture is laid out from its
         // header, so a standalone document's large JPEG is not read into memory
         // just to learn its size. Anything else (an SVG to rasterize, a font, a

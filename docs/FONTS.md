@@ -66,8 +66,8 @@ Native x86_64 release build, `perf_probe`, 758×1024, font size 22, page margin
 
 | | Pages | RSS after open | Ink on page 2 |
 |---|---|---|---|
-| Book's fonts enabled (default) | 707 | 80 MB | 5 208 |
-| Toggled off, then relayout | 679 | 56 MB | 0 |
+| Book's fonts enabled (default) | 707 | 39 MB | 5 208 |
+| Toggled off, then relayout | 679 | 57 MB | 0 |
 | Rules removed from the CSS before opening | 679 | 34.6 MB | 0 |
 
 Three things follow from the table:
@@ -75,14 +75,23 @@ Three things follow from the table:
 - the fonts really are in use (page count, page bitmap and memory all move);
 - the toggle is complete without a reopen, which is the path KOReader takes from
   the menu;
-- the switch is worth having on a Kindle: the two embedded TTF files cost about
-  **45 MB** once Blitz has registered them (80 MB → 34.6 MB for a fresh open).
+- with the book's fonts on, the two embedded TTF files (2.25 MB on disk) now
+  cost about **4 MB** (39 MB vs 34.6 MB for a fresh open).
 
-The relayout row keeps 56 MB rather than dropping to 34.6 MB in the same
+That last number used to be 45 MB (80 MB with the fonts on). The cost was not
+the font data itself but **one decompressed copy per chunk**: Blitz registers a
+face into the document's `FontContext` from the bytes it fetched, the collection
+is shared and outlives the chunk, and every chunk's document fetched the same
+files again - 20 chunks × 2.25 MB. `EpubNet`/`FileNet`/`MapNet` now hand out one
+buffer per face (a `bytes::Bytes` clone is a refcount), so the registrations
+share it. `perf_probe` on the same book: 80.3 MB → 38.8 MB, page count and page
+hash unchanged.
+
+The relayout row keeps 57 MB rather than dropping to 34.6 MB in the same
 process: chunks already laid out keep their page tables until the background
-worker replaces them, and the allocator does not hand the font data's arena
-back to the kernel immediately. A fresh open is the steady state; toggling off
-mid-book reaches it as the reader moves through the book.
+worker replaces them, and the relayout's own churn (a second full layout) is
+still resident when `perf_probe` samples it. A fresh open is the steady state;
+toggling off mid-book reaches it as the reader moves through the book.
 
 There is **no disk cache** for layout or fonts. Every open re-parses, re-fetches
 and re-registers; a cache is a possible future optimisation, not something these
