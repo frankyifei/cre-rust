@@ -13,6 +13,7 @@
 //! Same approach as crengine's `pdbfmt.cpp` (`MobiHtmlWriterFilter` +
 //! `preprocessMobiHtmlStream`) and calibre's `mobi6.py`.
 
+use cre_book::html::{escape_html, extract_body, heading_of, strip_tags};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -378,18 +379,6 @@ fn rewrite_tag(tag: &[u8], id_by_offset: &HashMap<u32, String>) -> Vec<u8> {
     }
 }
 
-/// Returns the inside of the document's `<body>`, when the payload has one.
-fn extract_body(data: &[u8]) -> Option<Vec<u8>> {
-    let lower = data.to_ascii_lowercase();
-    let body_at = lower.windows(5).position(|window| window == b"<body")?;
-    let open_end = lower[body_at..].iter().position(|byte| *byte == b'>')? + body_at + 1;
-    let close = lower
-        .windows(7)
-        .rposition(|window| window == b"</body>")
-        .unwrap_or(data.len());
-    (close >= open_end).then(|| data[open_end..close].to_vec())
-}
-
 const PAGEBREAK_MARKER: &[u8] = b"<div class=\"cre-pagebreak\"></div>";
 
 /// Splits the body at page breaks and wraps each part in a spine section.
@@ -554,19 +543,8 @@ fn section_toc(body: &str) -> Vec<MobiTocItem> {
 /// paragraph, often centred and bold. So: a real heading if there is one,
 /// otherwise the first paragraph that carries text.
 fn section_heading(section: &str) -> Option<String> {
-    let lower = section.to_ascii_lowercase();
-    for level in 1..=6 {
-        let open = format!("<h{level}");
-        let close = format!("</h{level}>");
-        let Some(start) = lower.find(&open) else {
-            continue;
-        };
-        let content_start = lower[start..].find('>')? + start + 1;
-        let end = lower[content_start..].find(&close)? + content_start;
-        let text = strip_tags(&section[content_start..end]);
-        if !text.trim().is_empty() {
-            return Some(text.trim().to_string());
-        }
+    if let Some(heading) = heading_of(section) {
+        return Some(heading);
     }
     let text = block_texts(section, 6).into_iter().next()?;
     let shortened: String = text.chars().take(40).collect();
@@ -614,34 +592,6 @@ fn block_texts(html: &str, limit: usize) -> Vec<String> {
             out.push(text);
         }
         at = if end > open_end { end } else { open_end };
-    }
-    out
-}
-
-fn strip_tags(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut inside = false;
-    for ch in text.chars() {
-        match ch {
-            '<' => inside = true,
-            '>' => inside = false,
-            _ if !inside => out.push(ch),
-            _ => {}
-        }
-    }
-    out
-}
-
-pub fn escape_html(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            _ => out.push(ch),
-        }
     }
     out
 }

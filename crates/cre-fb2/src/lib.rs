@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use cre_book::html::{escape_html, escape_text};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -380,19 +381,6 @@ fn inner_html(
     node.children()
         .map(|c| node_to_html(c, binary, h_level))
         .collect()
-}
-
-fn escape_text(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-pub fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 #[cfg(test)]

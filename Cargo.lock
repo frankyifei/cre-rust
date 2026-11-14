@@ -465,6 +465,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "cre-book",
  "cre-css",
  "roxmltree 0.21.1",
 ]
@@ -474,6 +475,7 @@ name = "cre-kf8"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cre-book",
  "cre-css",
  "cre-pdb",
 ]
@@ -537,6 +539,7 @@ name = "cre-mobi"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cre-book",
  "cre-css",
  "cre-pdb",
 ]
@@ -577,6 +580,7 @@ name = "cre-text"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cre-book",
  "cre-css",
 ]
 

@@ -7,6 +7,7 @@ pub mod html;
 pub mod images;
 pub mod resources;
 pub mod ruby;
+pub mod text;
 
 pub use chunk::*;
 pub use fonts::{font_face_declarations, font_faces_in, loadable_font_faces, strip_font_faces};

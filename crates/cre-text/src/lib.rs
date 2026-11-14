@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+use cre_book::html::escape_html;
+use cre_book::text::decode_plain_text;
 use std::path::Path;
 
 pub struct TextBook {
@@ -14,14 +16,14 @@ impl TextBook {
             .file_stem()
             .and_then(|s| s.to_str())
             .map(|s| s.to_string());
-        let text = decode_text(&bytes);
+        let text = decode_plain_text(&bytes);
         Ok(Self { title, text })
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Self {
         Self {
             title: None,
-            text: decode_text(bytes),
+            text: decode_plain_text(bytes),
         }
     }
 
@@ -75,22 +77,6 @@ impl TextBook {
     }
 }
 
-fn decode_text(bytes: &[u8]) -> String {
-    // Strip BOM and decode as UTF-8, falling back to Latin-1 for legacy files
-    let bytes = match bytes {
-        [0xEF, 0xBB, 0xBF, rest @ ..] => rest,
-        b => b,
-    };
-    match std::str::from_utf8(bytes) {
-        Ok(s) => s.replace("\r\n", "\n").replace('\r', "\n"),
-        Err(_) => bytes
-            .iter()
-            .map(|&b| b as char)
-            .collect::<String>()
-            .replace("\r\n", "\n"),
-    }
-}
-
 fn reflow(lines: &[&str]) -> String {
     let joined = lines
         .iter()
@@ -99,13 +85,6 @@ fn reflow(lines: &[&str]) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     escape_html(&joined)
-}
-
-fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 pub struct TextHtmlOptions {

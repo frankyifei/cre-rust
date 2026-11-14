@@ -13,6 +13,7 @@
 //! `id` at the byte offset each link points at, then rewrite the link to a
 //! fragment. All numbers in `kindle:` URLs are base 32.
 
+use cre_book::html::{escape_html, extract_body, heading_of, strip_tags};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -981,18 +982,6 @@ fn viewport_marker(content: &str) -> Option<String> {
     }
 }
 
-/// Returns the inside of the document's `<body>`, when the part has one.
-fn extract_body(data: &[u8]) -> Option<Vec<u8>> {
-    let lower = data.to_ascii_lowercase();
-    let body_at = lower.windows(5).position(|window| window == b"<body")?;
-    let open_end = lower[body_at..].iter().position(|byte| *byte == b'>')? + body_at + 1;
-    let close = lower
-        .windows(7)
-        .rposition(|window| window == b"</body>")
-        .unwrap_or(data.len());
-    (close >= open_end).then(|| data[open_end..close].to_vec())
-}
-
 fn section_toc(body: &str) -> Vec<Kf8TocItem> {
     let mut toc = Vec::new();
     for (index, section) in body.split("<section ").skip(1).enumerate() {
@@ -1015,52 +1004,6 @@ fn section_toc(body: &str) -> Vec<Kf8TocItem> {
         });
     }
     toc
-}
-
-fn heading_of(section: &str) -> Option<String> {
-    let lower = section.to_ascii_lowercase();
-    for level in 1..=6 {
-        let open = format!("<h{level}");
-        let close = format!("</h{level}>");
-        let Some(start) = lower.find(&open) else {
-            continue;
-        };
-        let content_start = lower[start..].find('>')? + start + 1;
-        let end = lower[content_start..].find(&close)? + content_start;
-        let text = strip_tags(&section[content_start..end]);
-        if !text.trim().is_empty() {
-            return Some(text.trim().to_string());
-        }
-    }
-    None
-}
-
-fn strip_tags(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut inside = false;
-    for ch in text.chars() {
-        match ch {
-            '<' => inside = true,
-            '>' => inside = false,
-            _ if !inside => out.push(ch),
-            _ => {}
-        }
-    }
-    out
-}
-
-pub fn escape_html(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            _ => out.push(ch),
-        }
-    }
-    out
 }
 
 #[cfg(test)]

@@ -302,15 +302,81 @@ pub fn parse_pixels(value: String) -> Option<f32> {
 
 /// The text of an HTML fragment with its tags removed.
 pub fn text_without_tags(html: &str) -> String {
-    let mut text = String::new();
-    let mut depth = 0usize;
-    for ch in html.chars() {
+    strip_tags(html)
+}
+
+/// `&`, `<` and `>`: text content.
+pub fn escape_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// `&`, `<`, `>` and `"`: text content and quoted attribute values.
+pub fn escape_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
         match ch {
-            '<' => depth += 1,
-            '>' => depth = depth.saturating_sub(1),
-            _ if depth == 0 => text.push(ch),
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// `&` and `"`: a value that sits between quotes and holds no markup.
+pub fn escape_attr(value: &str) -> String {
+    value.replace('&', "&amp;").replace('"', "&quot;")
+}
+
+/// The text of an HTML fragment with its tags removed.
+pub fn strip_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut inside = false;
+    for ch in text.chars() {
+        match ch {
+            '<' => inside = true,
+            '>' => inside = false,
+            _ if !inside => out.push(ch),
             _ => {}
         }
     }
-    text
+    out
+}
+
+/// The inside of a document's `<body>`, when the part has one.
+pub fn extract_body(data: &[u8]) -> Option<Vec<u8>> {
+    let lower = data.to_ascii_lowercase();
+    let body_at = lower.windows(5).position(|window| window == b"<body")?;
+    let open_end = lower[body_at..].iter().position(|byte| *byte == b'>')? + body_at + 1;
+    let close = lower
+        .windows(7)
+        .rposition(|window| window == b"</body>")
+        .unwrap_or(data.len());
+    (close >= open_end).then(|| data[open_end..close].to_vec())
+}
+
+/// The text of a section's first heading (`h1`..`h6`), when it has one.
+///
+/// Generators use it for a table of contents built from the document itself,
+/// which is what a book without an NCX has.
+pub fn heading_of(section: &str) -> Option<String> {
+    let lower = section.to_ascii_lowercase();
+    for level in 1..=6 {
+        let open = format!("<h{level}");
+        let close = format!("</h{level}>");
+        let Some(start) = lower.find(&open) else {
+            continue;
+        };
+        let content_start = lower[start..].find('>')? + start + 1;
+        let end = lower[content_start..].find(&close)? + content_start;
+        let text = strip_tags(&section[content_start..end]);
+        if !text.trim().is_empty() {
+            return Some(text.trim().to_string());
+        }
+    }
+    None
 }

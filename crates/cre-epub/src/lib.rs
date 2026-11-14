@@ -1,3 +1,4 @@
+use cre_book::html::{escape_attr, escape_text};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -783,7 +784,7 @@ impl EpubBook {
             (
                 format!(
                     "<p class=\"cre-unsupported\">Unsupported spine item: {}</p>",
-                    escape_html(&item.href)
+                    escape_text(&item.href)
                 ),
                 false,
             )
@@ -1070,7 +1071,7 @@ impl EpubBook {
         html.push_str("<!doctype html><html><head><meta charset=\"utf-8\">");
         html.push_str(&format!(
             "<title>{}</title>",
-            escape_html(self.title.as_deref().unwrap_or(""))
+            escape_text(self.title.as_deref().unwrap_or(""))
         ));
         for url in &css_urls {
             html.push_str(&format!(
@@ -2773,17 +2774,6 @@ fn parent_dir(path: &str) -> &str {
 
 fn decode_text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
-}
-
-fn escape_html(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-fn escape_attr(value: &str) -> String {
-    value.replace('&', "&amp;").replace('"', "&quot;")
 }
 
 /// Rewrites a stylesheet so every rule only applies inside `scope`.

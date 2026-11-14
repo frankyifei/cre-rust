@@ -8,5 +8,6 @@ rust-version.workspace = true
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
+cre-book = { path = "../cre-book" }
 cre-css = { path = "../cre-css" }
 roxmltree = "0.21"
