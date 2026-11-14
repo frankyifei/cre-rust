@@ -14,6 +14,20 @@ use percent_encoding::percent_decode_str;
 pub trait ResourceProvider: Send + Sync {
     fn get(&self, key: &str) -> Option<Arc<Vec<u8>>>;
 
+    /// The first `max_bytes` of a resource.
+    ///
+    /// One characterisation decides a page: an image's header gives its format
+    /// and intrinsic size. A zip entry is one deflate stream and cannot be
+    /// seeked into, so materialising a 4 MB picture just to read the twenty
+    /// bytes that say "1000x1500" is the expensive way; a container that can
+    /// stop early overrides this and reads a prefix instead. The default reads
+    /// the resource and truncates it, which is never worse than [`Self::get`].
+    fn header(&self, key: &str, max_bytes: usize) -> Option<Vec<u8>> {
+        let bytes = self.get(key)?;
+        let end = bytes.len().min(max_bytes);
+        Some(bytes[..end].to_vec())
+    }
+
     /// Estimated decoded image size, for the chunk memory budget.
     fn estimated_decoded_bytes(&self, _key: &str) -> Option<usize> {
         None

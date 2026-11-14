@@ -125,7 +125,7 @@ use cre_book::fonts::*;
 use cre_book::html::*;
 #[cfg(test)]
 use cre_book::images::inline_svg_images_to_data_uris;
-use cre_book::images::{PageFitImage, image_mime, image_sources};
+use cre_book::images::{PageFitImage, image_sources};
 #[cfg(test)]
 use cre_book::ruby::ruby_cell;
 
@@ -193,6 +193,10 @@ impl cre_book::ResourceProvider for LazyResource {
         LazyResource::get(self, key)
     }
 
+    fn header(&self, key: &str, max_bytes: usize) -> Option<Vec<u8>> {
+        LazyResource::header(self, key, max_bytes)
+    }
+
     fn estimated_decoded_bytes(&self, key: &str) -> Option<usize> {
         LazyResource::estimated_decoded_bytes(self, key)
     }
@@ -254,22 +258,7 @@ impl LazyResource {
         }
         let mut maybe_archive = self.zip_archive.lock().ok()?;
         let archive = maybe_archive.as_mut()?;
-        let index = (match archive.index_for_name(&key) {
-            Some(index) => Some(index),
-            None => {
-                let mut found: Option<usize> = None;
-                for i in 0..archive.len() {
-                    let Some(name) = archive.name_for_index(i) else {
-                        continue;
-                    };
-                    if normalize_path(name) == key {
-                        found = Some(i);
-                        break;
-                    }
-                }
-                found
-            }
-        })?;
+        let index = entry_index(archive, &key)?;
         let entry = archive.by_index_raw(index).ok()?;
         if entry.is_dir() {
             return None;
@@ -312,31 +301,21 @@ impl LazyResource {
         }
         let mut maybe_archive = self.zip_archive.lock().ok()?;
         let archive = maybe_archive.as_mut()?;
-        let index = match archive.index_for_name(&key) {
-            Some(index) => Some(index),
-            None => {
-                let mut found = None;
-                for index in 0..archive.len() {
-                    if let Some(name) = archive.name_for_index(index)
-                        && normalize_path(name) == key
-                    {
-                        found = Some(index);
-                        break;
-                    }
-                }
-                found
-            }
-        }?;
+        let index = entry_index(archive, &key)?;
         let entry = archive.by_index(index).ok()?;
         Some(entry.size() as usize)
     }
 
     /// Estimated decoded (RGBA) size of an image, from its header when the
     /// bytes are available, else from the file size and format.
+    ///
+    /// The header is read as a prefix (see [`Self::header`]): the chunk budget
+    /// asks this for every image a chunk holds, and decompressing each one to
+    /// answer it is what made an illustrated book expensive to open.
     pub fn estimated_decoded_bytes(&self, key: &str) -> Option<usize> {
         let key = normalize_path(key);
-        if let Some(bytes) = self.get(&key)
-            && let Some((width, height)) = image_dimensions(&bytes)
+        if let Some(probe) = cre_book::images::probe_image(self, &key)
+            && let Some((width, height)) = probe.size
         {
             return Some((width as usize * height as usize * 4).max(64 * 1024));
         }
@@ -387,22 +366,7 @@ impl LazyResource {
     fn read_zip_entry(&self, key: &str) -> Option<Vec<u8>> {
         let mut maybe_archive = self.zip_archive.lock().unwrap();
         let archive = maybe_archive.as_mut()?;
-        let index = (match archive.index_for_name(key) {
-            Some(index) => Some(index),
-            None => {
-                let mut found: Option<usize> = None;
-                for i in 0..archive.len() {
-                    let Some(name) = archive.name_for_index(i) else {
-                        continue;
-                    };
-                    if normalize_path(name) == key {
-                        found = Some(i);
-                        break;
-                    }
-                }
-                found
-            }
-        })?;
+        let index = entry_index(archive, key)?;
         let mut entry = archive.by_index(index).ok()?;
         if entry.is_dir() {
             return None;
@@ -413,6 +377,66 @@ impl LazyResource {
         }
         Some(bytes)
     }
+
+    /// The first `max_bytes` of a resource, inflating no further.
+    ///
+    /// A zip entry is a single deflate stream, so it can be read from its start
+    /// but not seeked into; the point is that it can be abandoned early. An
+    /// image header lives in the first few kilobytes, so probing a picture's
+    /// size costs that instead of the whole entry. Bytes already cached (or an
+    /// engine-generated resource) are truncated instead of read again, and the
+    /// prefix never enters the LRU: it is not what the layout or the painter
+    /// will use.
+    pub fn header(&self, key: &str, max_bytes: usize) -> Option<Vec<u8>> {
+        let key = normalize_path(key);
+        if let Ok(pinned) = self.pinned.lock()
+            && let Some(hit) = pinned.get(&key)
+        {
+            let end = hit.len().min(max_bytes);
+            return Some(hit[..end].to_vec());
+        }
+        if let Ok(cache) = self.cache.lock()
+            && let Some(hit) = cache.entries.get(&key)
+        {
+            let end = hit.len().min(max_bytes);
+            return Some(hit[..end].to_vec());
+        }
+        self.read_zip_prefix(&key, max_bytes)
+    }
+
+    fn read_zip_prefix(&self, key: &str, max_bytes: usize) -> Option<Vec<u8>> {
+        let mut maybe_archive = self.zip_archive.lock().unwrap();
+        let archive = maybe_archive.as_mut()?;
+        let index = entry_index(archive, key)?;
+        let mut entry = archive.by_index(index).ok()?;
+        if entry.is_dir() {
+            return None;
+        }
+        let mut bytes = Vec::with_capacity((entry.size() as usize).min(max_bytes));
+        let mut limited = std::io::Read::take(&mut entry, max_bytes as u64);
+        if std::io::copy(&mut limited, &mut bytes).is_err() {
+            return None;
+        }
+        Some(bytes)
+    }
+}
+
+/// Index of a resource in the archive, tolerating a differently normalised name.
+///
+/// `by_name` needs an exact match; a package may list a path with different
+/// percent-encoding or a leading `./`, so fall back to a normalised scan.
+fn entry_index(archive: &mut LazyResourceZipArchive, key: &str) -> Option<usize> {
+    if let Some(index) = archive.index_for_name(key) {
+        return Some(index);
+    }
+    for index in 0..archive.len() {
+        if let Some(name) = archive.name_for_index(index)
+            && normalize_path(name) == key
+        {
+            return Some(index);
+        }
+    }
+    None
 }
 
 pub struct EpubBook {
@@ -1396,56 +1420,6 @@ fn svg_hrefs_to_book_paths(html: &str, doc_dir: &str) -> String {
 /// Chunk HTML points at resources through `cre://book/`, so no document
 /// directory is needed. `cre-lib` uses this to include the decoded-image cost
 /// of a chunk in its low-memory estimate.
-fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
-    if bytes.len() > 24 && bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
-        let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
-        return Some((width, height));
-    }
-    if bytes.len() > 10 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
-        let width = u16::from_le_bytes(bytes[6..8].try_into().ok()?) as u32;
-        let height = u16::from_le_bytes(bytes[8..10].try_into().ok()?) as u32;
-        return Some((width, height));
-    }
-    if bytes.len() > 4 && bytes.starts_with(b"\xff\xd8") {
-        let mut index = 2usize;
-        while index + 9 < bytes.len() {
-            if bytes[index] != 0xFF {
-                index += 1;
-                continue;
-            }
-            let marker = bytes[index + 1];
-            if marker == 0xD8 || marker == 0xD9 || (0xD0..=0xD7).contains(&marker) {
-                index += 2;
-                continue;
-            }
-            let length = u16::from_be_bytes(bytes[index + 2..index + 4].try_into().ok()?) as usize;
-            if matches!(
-                marker,
-                0xC0 | 0xC1
-                    | 0xC2
-                    | 0xC3
-                    | 0xC5
-                    | 0xC6
-                    | 0xC7
-                    | 0xC9
-                    | 0xCA
-                    | 0xCB
-                    | 0xCD
-                    | 0xCE
-                    | 0xCF
-            ) {
-                let height =
-                    u16::from_be_bytes(bytes[index + 5..index + 7].try_into().ok()?) as u32;
-                let width = u16::from_be_bytes(bytes[index + 7..index + 9].try_into().ok()?) as u32;
-                return Some((width, height));
-            }
-            index += 2 + length;
-        }
-    }
-    None
-}
-
 pub fn chunk_image_bytes(provider: &LazyResource, chunk_html: &str) -> usize {
     image_sources(chunk_html, "")
         .iter()
@@ -2292,15 +2266,16 @@ fn full_page_image_replacement(
         }
         resolve_href(doc_dir, src)
     };
-    let image_bytes = provider.get(&image_key)?;
-    let image_mime = image_mime(&image_bytes, &image_key);
-    let is_svg = image_mime == "image/svg+xml" || image_key.ends_with(".svg");
+    // Only the header decides the fit: reading the whole picture here made
+    // opening an illustrated book decompress every image once.
+    let probe = cre_book::images::probe_image(provider, &image_key)?;
+    let is_svg = probe.mime == "image/svg+xml" || image_key.ends_with(".svg");
     if !full_height {
         // A raster image only needs a fit style when its natural width would
         // overflow the content height. SVG dimensions are harder to read
         // reliably here, so cap every SVG image; max-width/max-height never
         // enlarge a small icon.
-        if let Some((width, height)) = image_dimensions(&image_bytes) {
+        if let Some((width, height)) = probe.size {
             let scaled_height = available_width * height as f32 / width.max(1) as f32;
             if scaled_height <= available_height + 0.5 && !is_svg {
                 return None;
@@ -2311,12 +2286,12 @@ fn full_page_image_replacement(
         return Some(image_fit_tag(&attrs, &image_key, available_height));
     }
 
-    if image_mime == "image/svg+xml" {
+    if probe.mime == "image/svg+xml" {
         return None;
     }
     // The wrapper's size is the page's; the picture is contained in it when
     // its own size is known (the normal case) and fills it otherwise.
-    let dimensions = image_dimensions(&image_bytes);
+    let dimensions = probe.size;
     let (width, height) = dimensions.unwrap_or((
         available_width.round().max(1.0) as u32,
         available_height.round().max(1.0) as u32,
@@ -3066,6 +3041,40 @@ p { font-family: One, serif; }";
             book.toc
                 .iter()
                 .any(|item| item.depth > 1 && item.href.contains("#section_"))
+        );
+    }
+
+    /// A page's layout is decided by the image's header, so the header has to
+    /// come out of the zip entry without inflating the picture: a zip entry is
+    /// one deflate stream, and reading it whole to learn "1000x1500" is what
+    /// made an illustrated book expensive to open.
+    #[test]
+    fn an_image_header_is_read_from_a_prefix() {
+        let book = juliet();
+        let provider = &book.resource_provider;
+        // The largest image, so the prefix is a small part of it.
+        let image = book
+            .manifest
+            .iter()
+            .filter(|item| item.media_type.starts_with("image/"))
+            .max_by_key(|item| provider.entry_size(&item.href).unwrap_or(0))
+            .expect("juliet has an image");
+        let whole = provider.get(&image.href).expect("image bytes");
+        let size = cre_book::image_dimensions(&whole).expect("raster image");
+        assert!(
+            whole.len() > 512 * 1024,
+            "this test needs a picture larger than the probe's largest prefix"
+        );
+
+        let header = provider.header(&image.href, 8 * 1024).expect("prefix");
+        assert_eq!(header.len(), 8 * 1024, "the prefix stops at the limit");
+
+        // The probe sizes the picture from a prefix like that one (`cre-book`
+        // pins the exact step with a counting provider), and it must agree with
+        // a full read.
+        assert_eq!(
+            cre_book::images::probe_image(provider, &image.href).and_then(|probe| probe.size),
+            Some(size)
         );
     }
 

@@ -24,6 +24,7 @@ use crate::html::{
     find_tag_end, is_external, next_tag_start, normalize_path, parse_attrs, parse_pixels,
     replace_attribute_value, text_without_tags,
 };
+use crate::resources::ResourceProvider;
 
 /// Intrinsic pixel size of a raster image, read from its header.
 ///
@@ -43,6 +44,140 @@ pub fn estimated_image_bytes(name: &str, bytes: &[u8]) -> usize {
         return (width * height * 4) as usize;
     }
     estimated_decoded_from_size(name, bytes.len())
+}
+
+/// What an image's header says: its format, and its intrinsic size when the
+/// header carries one (an SVG does not; its size lives in the markup).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageProbe {
+    pub mime: &'static str,
+    pub size: Option<(u32, u32)>,
+}
+
+/// Bytes read to learn an image's format and size, in growing steps.
+///
+/// PNG's `IHDR` sits at offset 16 and GIF's screen descriptor inside the first
+/// 13 bytes; JPEG is why the second step is generous - its `SOF` marker comes
+/// after the `APP0`/`APP1` segments, and a cover with a large EXIF thumbnail
+/// can push it tens of kilobytes in.
+const IMAGE_HEADER_STEPS: [usize; 3] = [8 * 1024, 64 * 1024, 512 * 1024];
+
+/// An image's format and intrinsic size, read from its header.
+///
+/// The header is a few hundred bytes, so a container that can hand out a
+/// prefix ([`ResourceProvider::header`]) never materialises the picture: a zip
+/// entry stops inflating at the prefix instead of decompressing 4 MB to learn
+/// that the image is 1000x1500.
+pub fn probe_image(provider: &dyn ResourceProvider, key: &str) -> Option<ImageProbe> {
+    let bytes = image_header(provider, key)?;
+    let mime = image_mime(&bytes, key);
+    // The fixed-offset parser first (a PNG with a huge colour profile would
+    // send a decoder past the prefix), then the decoder for anything else.
+    let size = header_dimensions(&bytes).or_else(|| image_dimensions(&bytes));
+    Some(ImageProbe { mime, size })
+}
+
+/// The bytes of an image resource that hold its format and intrinsic size.
+///
+/// Reads a prefix and grows it only when the header is incomplete: PNG's
+/// `IHDR` is at offset 16 and GIF's screen descriptor inside the first 13
+/// bytes, while JPEG's `SOF` marker sits behind its `APP0`/`APP1` segments, so
+/// a cover with a large EXIF thumbnail needs more than a few kilobytes. Half a
+/// megabyte of header is already pathological; past that the whole resource is
+/// read once (an SVG that declares its size near the end, an unknown format).
+pub fn image_header(provider: &dyn ResourceProvider, key: &str) -> Option<Vec<u8>> {
+    for step in IMAGE_HEADER_STEPS {
+        let bytes = provider.header(key, step)?;
+        // An SVG has no raster header; its size is read from the markup by the
+        // SVG path, and callers treat `size: None` the same way.
+        if image_mime(&bytes, key) == "image/svg+xml"
+            || header_dimensions(&bytes).is_some()
+            // A short read is the whole resource: this format has no size we
+            // can read, so a longer prefix would not help either.
+            || bytes.len() < step
+        {
+            return Some(bytes);
+        }
+    }
+    provider.get(key).map(|bytes| (*bytes).to_vec())
+}
+
+/// The intrinsic size of the formats whose header puts it at a known place.
+///
+/// A decoder walks the container first - `image`'s PNG decoder reads chunks up
+/// to `IDAT`, and a cover with a large colour profile can push that past half a
+/// megabyte - while PNG, GIF, BMP, WebP (extended) and JPEG each give the size
+/// in the first kilobytes. Several callers only need the size ([`probe_image`]),
+/// so reading it without a decoder is what keeps a header probe cheap.
+fn header_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() >= 24 && bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+        let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+        return Some((width, height));
+    }
+    if bytes.len() >= 10 && bytes.starts_with(b"GIF8") {
+        let width = u16::from_le_bytes(bytes[6..8].try_into().ok()?) as u32;
+        let height = u16::from_le_bytes(bytes[8..10].try_into().ok()?) as u32;
+        return Some((width, height));
+    }
+    if bytes.len() >= 30 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        // The extended format stores the canvas size as 24-bit values, one less
+        // than the real size.
+        if &bytes[12..16] == b"VP8X" {
+            let width = 1 + u32::from_le_bytes([bytes[24], bytes[25], bytes[26], 0]);
+            let height = 1 + u32::from_le_bytes([bytes[27], bytes[28], bytes[29], 0]);
+            return Some((width, height));
+        }
+        return None;
+    }
+    if bytes.len() >= 26 && bytes.starts_with(b"BM") {
+        let width = i32::from_le_bytes(bytes[18..22].try_into().ok()?).max(0) as u32;
+        let height = i32::from_le_bytes(bytes[22..26].try_into().ok()?).unsigned_abs();
+        return Some((width, height));
+    }
+    if bytes.len() >= 4 && bytes[0] == 0xff && bytes[1] == 0xd8 {
+        return jpeg_dimensions(bytes);
+    }
+    None
+}
+
+/// The size from a JPEG's `SOF` marker, walking its segment chain.
+///
+/// `SOF` comes after whichever `APP` segments the file starts with (JFIF,
+/// EXIF, ICC profile), which is why a JPEG needs more header than a PNG.
+fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    let mut index = 2usize;
+    while index + 9 <= bytes.len() {
+        if bytes[index] != 0xff {
+            return None;
+        }
+        let marker = bytes[index + 1];
+        // A fill byte, a marker without a length, or the start of the scan
+        // (no `SOF` after it).
+        if marker == 0xff {
+            index += 1;
+            continue;
+        }
+        if marker == 0x01 || (0xd0..=0xd8).contains(&marker) {
+            index += 2;
+            continue;
+        }
+        if marker == 0xda {
+            return None;
+        }
+        let length = u16::from_be_bytes(bytes[index + 2..index + 4].try_into().ok()?) as usize;
+        if length < 2 {
+            return None;
+        }
+        // `SOF0`-`SOF15`, except `DHT` (C4), `JPG` (C8) and `DAC` (CC).
+        if (0xc0..=0xcf).contains(&marker) && !matches!(marker, 0xc4 | 0xc8 | 0xcc) {
+            let height = u16::from_be_bytes(bytes[index + 5..index + 7].try_into().ok()?) as u32;
+            let width = u16::from_be_bytes(bytes[index + 7..index + 9].try_into().ok()?) as u32;
+            return Some((width, height));
+        }
+        index += 2 + length;
+    }
+    None
 }
 
 /// True when the bytes look like a picture the estimator understands.
@@ -493,4 +628,119 @@ pub fn normalize_page_images(
     }
     out.push_str(&body[cursor..]);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A provider that records how much of the resource was read.
+    struct HeaderOnly {
+        bytes: Vec<u8>,
+        whole_reads: AtomicUsize,
+        largest_prefix: AtomicUsize,
+    }
+
+    impl HeaderOnly {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                bytes,
+                whole_reads: AtomicUsize::new(0),
+                largest_prefix: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl ResourceProvider for HeaderOnly {
+        fn get(&self, _key: &str) -> Option<Arc<Vec<u8>>> {
+            self.whole_reads.fetch_add(1, Ordering::Relaxed);
+            Some(Arc::new(self.bytes.clone()))
+        }
+
+        fn header(&self, _key: &str, max_bytes: usize) -> Option<Vec<u8>> {
+            self.largest_prefix.fetch_max(max_bytes, Ordering::Relaxed);
+            let end = self.bytes.len().min(max_bytes);
+            Some(self.bytes[..end].to_vec())
+        }
+    }
+
+    /// A PNG whose header says `width`x`height`, followed by filler: a decoder
+    /// would walk the chunks after it, the header parser must not.
+    fn png_header(width: u32, height: u32, total: usize) -> Vec<u8> {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        bytes.extend_from_slice(&13u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+        bytes.resize(total, 0x7f);
+        bytes
+    }
+
+    /// A JPEG whose `SOF` sits behind an `APP1` segment of `exif` bytes.
+    fn jpeg_header(width: u16, height: u16, exif: usize, total: usize) -> Vec<u8> {
+        let mut bytes = vec![0xff, 0xd8];
+        // APP1 with a large payload (an EXIF thumbnail, in a real file).
+        let length = (exif + 2) as u16;
+        bytes.extend_from_slice(&[0xff, 0xe1]);
+        bytes.extend_from_slice(&length.to_be_bytes());
+        bytes.resize(bytes.len() + exif, 0x00);
+        // SOF0: length, precision, height, width, components.
+        bytes.extend_from_slice(&[0xff, 0xc0, 0x00, 0x11, 0x08]);
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&[0x03, 0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01]);
+        bytes.resize(total, 0x00);
+        bytes
+    }
+
+    #[test]
+    fn a_png_is_sized_from_its_first_kilobytes() {
+        let provider = HeaderOnly::new(png_header(520, 800, 800 * 1024));
+        let probe = probe_image(&provider, "cover.png").expect("probe");
+        assert_eq!(probe.mime, "image/png");
+        assert_eq!(probe.size, Some((520, 800)));
+        assert_eq!(
+            provider.whole_reads.load(Ordering::Relaxed),
+            0,
+            "no whole read"
+        );
+        assert_eq!(
+            provider.largest_prefix.load(Ordering::Relaxed),
+            8 * 1024,
+            "one small prefix is enough for a PNG"
+        );
+    }
+
+    #[test]
+    fn a_jpeg_sized_behind_a_large_exif_block_grows_the_prefix() {
+        // 32 kB of EXIF pushes SOF past the first step but not the second.
+        let provider = HeaderOnly::new(jpeg_header(1000, 1500, 32 * 1024, 400 * 1024));
+        let probe = probe_image(&provider, "cover.jpg").expect("probe");
+        assert_eq!(probe.mime, "image/jpeg");
+        assert_eq!(probe.size, Some((1000, 1500)));
+        assert_eq!(
+            provider.whole_reads.load(Ordering::Relaxed),
+            0,
+            "no whole read"
+        );
+        assert_eq!(
+            provider.largest_prefix.load(Ordering::Relaxed),
+            64 * 1024,
+            "the prefix grows once, then stops"
+        );
+    }
+
+    #[test]
+    fn a_svg_is_probed_without_a_size() {
+        let mut provider = HeaderOnly::new(Vec::new());
+        provider.bytes =
+            b"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"/>".to_vec();
+        let probe = probe_image(&provider, "drawing.svg").expect("probe");
+        assert_eq!(probe.mime, "image/svg+xml");
+        assert_eq!(probe.size, None);
+        assert_eq!(provider.whole_reads.load(Ordering::Relaxed), 0);
+    }
 }

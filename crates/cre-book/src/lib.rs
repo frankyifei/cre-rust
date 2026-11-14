@@ -13,8 +13,8 @@ pub use chunk::*;
 pub use fonts::{font_face_declarations, font_faces_in, loadable_font_faces, strip_font_faces};
 pub use html::{base64_encode, normalize_path, resolve_href};
 pub use images::{
-    estimated_decoded_from_size, estimated_image_bytes, image_dimensions, image_sources_in,
-    is_image_bytes,
+    ImageProbe, estimated_decoded_from_size, estimated_image_bytes, image_dimensions, image_header,
+    image_sources_in, is_image_bytes, probe_image,
 };
 pub use resources::{
     GeneratedResources, MapResources, ResourceProvider, ResourceSource, generated_resource,

@@ -1254,7 +1254,7 @@ impl Document {
                 let phase_started = std::time::Instant::now();
                 let mut book = EpubBook::open(path)?;
                 let open_book_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
-                let (text_budget, image_budget, layout_budget) =
+                let (text_budget, _image_budget, layout_budget) =
                     chunk_budgets(available_memory_bytes());
                 // The zip directory says how much XHTML the spine holds, so a
                 // book that cannot fit is refused before it is decompressed,
@@ -1303,10 +1303,15 @@ impl Document {
                 let mut embedded_fonts: Vec<String> = Vec::new();
                 let mut chunk_image_bytes = 0u64;
                 let compression_started = std::time::Instant::now();
+                // No image budget: a chunk's pictures are laid out from their
+                // headers (see `EpubNet`), so the layout does not pay for the
+                // bytes a chunk mentions. Splitting on text alone is what every
+                // other format does, and the same section structure now gives
+                // the same chunk boundaries everywhere.
                 book.to_html_chunks_budgeted_stream(
                     &html_options,
                     text_budget,
-                    image_budget,
+                    None,
                     layout_budget,
                     |html| {
                         fixed_layouts.push(parse_fixed_layout(&html));
@@ -8955,6 +8960,19 @@ impl ImageRaster {
         }
     }
 
+    /// Whether this resource is an `<img>` the layout may replace with a size
+    /// placeholder, i.e. one whose pixels the painter reads again.
+    ///
+    /// The net providers use it to read only an image header while laying a
+    /// chunk out: a stylesheet, a font or a CSS `background-image` keeps its
+    /// whole bytes, a content picture does not need them.
+    fn is_content_image(&self, key: &str) -> bool {
+        self.content
+            .lock()
+            .map(|content| content.contains(key))
+            .unwrap_or(false)
+    }
+
     /// Images the renderer paints itself from the original resource.
     fn placeheld_count(&self) -> usize {
         self.placeheld.lock().map(|held| held.len()).unwrap_or(0)
@@ -9121,11 +9139,6 @@ impl NetProvider for EpubNet {
             handler.bytes(request.url.to_string(), Bytes::from((*bytes).clone()));
             return;
         }
-        let bytes = self
-            .resource_provider
-            .get(&key)
-            .map(|data| (*data).clone())
-            .unwrap_or_default();
         // A document's `<body class="…">` becomes a `<section class="…">` in
         // the chunk, so the stylesheet's `body.class` rules have to lose the
         // `body` part to keep matching (a cover's `body.cov2 { background }`).
@@ -9135,20 +9148,41 @@ impl NetProvider for EpubNet {
         // `crengine.doc.embedded.fonts` means dropping them before Blitz parses
         // the sheet: a family that no longer resolves falls back to the next
         // one in the list, which is the reader's font.
-        let bytes = if key.to_ascii_lowercase().ends_with(".css") {
+        if key.to_ascii_lowercase().ends_with(".css") {
+            let bytes = self
+                .resource_provider
+                .get(&key)
+                .map(|data| (*data).clone())
+                .unwrap_or_default();
             let css = cre_book::css::body_selectors_to_class(&String::from_utf8_lossy(&bytes));
-            served_stylesheet(
+            let css = served_stylesheet(
                 &css,
                 served_font_size(&self.css_font_size),
                 self.embedded_fonts
                     .load(std::sync::atomic::Ordering::Relaxed),
-            )
-            .into_bytes()
-        } else {
-            bytes
-        };
+            );
+            handler.bytes(request.url.to_string(), Bytes::from(css.into_bytes()));
+            return;
+        }
+        // A chunk's pictures are laid out through a transparent SVG carrying
+        // their intrinsic size, and the painter reads the pixels of the page
+        // being drawn. So the layout only needs the image's header - and a zip
+        // entry is one deflate stream, which is why reading the header is the
+        // difference between decompressing every picture a chunk mentions and
+        // decompressing none of them.
+        if self.svg.is_content_image(&key)
+            && let Some(header) = cre_book::images::image_header(&*self.resource_provider, &key)
+            && let Some(placeholder) = self.svg.placeholder(&key, &header)
+        {
+            handler.bytes(request.url.to_string(), Bytes::from(placeholder));
+            return;
+        }
+        let bytes = self
+            .resource_provider
+            .get(&key)
+            .map(|data| (*data).clone())
+            .unwrap_or_default();
         let bytes = self.svg.rasterize(&key, &bytes).unwrap_or(bytes);
-        let bytes = self.svg.placeholder(&key, &bytes).unwrap_or(bytes);
         handler.bytes(request.url.to_string(), Bytes::from(bytes));
     }
 }
@@ -9245,6 +9279,25 @@ impl NetProvider for FileNet {
             handler.bytes(request.url.to_string(), Bytes::from((*bytes).clone()));
             return;
         }
+        // Same header rule as `EpubNet`: a content picture is laid out from its
+        // header, so a standalone document's large JPEG is not read into memory
+        // just to learn its size. Anything else (an SVG to rasterize, a font, a
+        // stylesheet) needs the whole file.
+        if self.svg.is_content_image(&relative)
+            && let Ok(candidate) = std::fs::canonicalize(&decoded)
+            && candidate.starts_with(&self.root)
+            && candidate.is_file()
+            && let Ok(file) = std::fs::File::open(&candidate)
+        {
+            let mut header = Vec::new();
+            let mut limited = std::io::Read::take(file, 64 * 1024);
+            if std::io::Read::read_to_end(&mut limited, &mut header).is_ok()
+                && let Some(placeholder) = self.svg.placeholder(&relative, &header)
+            {
+                handler.bytes(request.url.to_string(), Bytes::from(placeholder));
+                return;
+            }
+        }
         let mut bytes = Vec::new();
         if let Ok(candidate) = std::fs::canonicalize(&decoded)
             && candidate.starts_with(&self.root)
@@ -9265,7 +9318,6 @@ impl NetProvider for FileNet {
             .into_bytes();
         }
         let bytes = self.svg.rasterize(&relative, &bytes).unwrap_or(bytes);
-        let bytes = self.svg.placeholder(&relative, &bytes).unwrap_or(bytes);
         handler.bytes(request.url.to_string(), Bytes::from(bytes));
     }
 }

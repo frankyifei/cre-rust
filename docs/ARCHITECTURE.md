@@ -266,6 +266,14 @@ lookup as a picture. That is what lets a standalone HTML document (which
 has no archive to write into) use the same plate path as an EPUB, and it keeps
 the painter, the net provider and `getImageDataAt` on one namespace.
 
+A picture's size decides a page, so it is read from the picture's header rather
+than by materialising the file: a zip entry is one deflate stream, so
+`LazyResource` inflates a prefix and stops (`ResourceProvider::header`), and
+opening a book costs a few kilobytes per picture instead of a full
+decompression. That is also why a chunk's pictures no longer count against its
+layout budget - a chunk is laid out through size placeholders, so every format
+now splits on text bytes alone.
+
 Being served does not make a stylesheet different CSS, so the net providers run
 the same rewrites on it that `create_document` runs over an inline `<style>`
 block (`normalise_served_stylesheet`): absolute `font-size` keywords become
