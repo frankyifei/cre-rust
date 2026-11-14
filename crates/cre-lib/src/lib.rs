@@ -7826,6 +7826,22 @@ fn create_document(
     html_source.push_str(&format!(
         "<style>.cre-page-body {{ min-height: {page_section_height:.0}px; }}</style>"
     ));
+
+    // A page that holds nothing but a picture is laid out through a generated
+    // SVG wrapper (`cre-page-fit-...`) that the painter fills with the picture.
+    // Give it the reader's whole text area - the box a fixed-layout page gets -
+    // so a cover fills the page instead of sitting inside the generator's
+    // 40/32 padding. Only when the reader set the margins: then the body has no
+    // padding of its own, so a percentage width is the page's.
+    if margins.is_explicit() {
+        let margin_top_css = (margins.top / scale).max(0.0);
+        let picture_height = (page_height_css - margin_top_css - margin_bottom_css).max(1.0);
+        html_source.push_str(&format!(
+            "<style>img[src*=\"cre-page-fit\"] {{ display: block; width: 100%; \
+             height: {picture_height:.0}px; margin: {margin_top_css:.0}px 0 0 0; \
+             max-width: none; max-height: none; }}</style>"
+        ));
+    }
     html_source.push_str(&format!(
         "<style>img, svg, video, canvas, object, embed {{ max-width: 100%; \
          max-height: {max_image_height:.0}px; height: auto; }}</style>"
