@@ -7792,6 +7792,12 @@ fn create_document(
         ));
     }
 
+    // A section that carries the book's `<body>` styling is a page of its own:
+    // its background (a KF8 title page's engraving, an EPUB cover's `body.cov`)
+    // covers the whole page in crengine and in a browser, where a body
+    // background propagates to the canvas. `100vh` is the reader's page
+    // height, so the section fills the page whatever the margins are.
+    html_source.push_str("<style>.cre-page-body { min-height: 100vh; }</style>");
     // Keep images whole: cap them to one page's content height (width is
     // already capped), so pagination never has to clip an image. crengine
     // scales oversized images the same way.

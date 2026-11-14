@@ -1271,6 +1271,12 @@ fn push_section_html(
         class.push(' ');
         class.push_str(extra);
     }
+    // Mark the section as a page with the book's `<body>` styling (`<body
+    // class="cover">` with a page-sized background): the engine makes it
+    // page-tall, which is the canvas a body background covers in a browser.
+    if doc.body_class.is_some() || doc.body_style.is_some() {
+        class.push_str(" cre-page-body");
+    }
     let style = doc
         .body_style
         .as_deref()

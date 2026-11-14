@@ -217,8 +217,17 @@ impl Kf8Book {
             } else {
                 section_page_attrs(&part.bytes)
             };
+            // A part whose `<body>` carries a class/style is a page of its own
+            // (`body.background` with a page-sized `background-image`); the
+            // marker lets the engine make the section page-tall, which is what
+            // a body background covers in a browser (its canvas).
+            let page_body = if page_class.is_some() || page_style.is_some() {
+                " cre-page-body"
+            } else {
+                ""
+            };
             body.push_str(&format!(
-                "<section class=\"cre-spine{}\" data-spine-index=\"{}\" \
+                "<section class=\"cre-spine{}{page_body}\" data-spine-index=\"{}\" \
                  id=\"cre-sec-{section_count}\"{fixed}{}>",
                 page_class
                     .map(|class| format!(" {class}"))
