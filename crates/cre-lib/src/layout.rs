@@ -26,13 +26,13 @@ use crate::page_breaks;
 use crate::xpointer;
 use crate::{
     ActiveChunk, BackgroundLayout, CHUNK_DOM_BYTES_PER_HTML_BYTE, ChunkLayout, ChunkSource,
-    ContentBox, Document, DocumentOptions, FontBlob, LAYOUT_MEMORY_RESERVE, LineBox, LineEntry,
-    LocalPage, PageMargins, PageStart, StageTimer, collect_anchor_maps, collect_content_boxes,
-    collect_line_flows, collect_lines, collect_math_boxes, contains_ignore_ascii_case,
-    create_document, css_page_geometry, document_css_for_svg, extend_lines_for_math,
-    first_non_blank_line_flow, page_chunk_clip_bottom, page_for_node, page_for_spine_node,
-    paginate, parse_text_position, prepare_inline_svgs, rendered_text_nodes, resident_bytes,
-    trim_memory,
+    ContentBox, Document, DocumentOptions, FontBlob, LAYOUT_MEMORY_RESERVE, LayoutPhase, LineBox,
+    LineEntry, LocalPage, PageMargins, PageStart, StageTimer, collect_anchor_maps,
+    collect_content_boxes, collect_line_flows, collect_lines, collect_math_boxes,
+    contains_ignore_ascii_case, create_document, css_page_geometry, document_css_for_svg,
+    extend_lines_for_math, first_non_blank_line_flow, page_chunk_clip_bottom, page_for_node,
+    page_for_spine_node, paginate, parse_text_position, prepare_inline_svgs, rendered_text_nodes,
+    resident_bytes, trim_memory,
 };
 
 /// Trims freed heap pages back to the OS, but only once the resident set has
@@ -607,7 +607,7 @@ impl Document {
     /// the pass ends (cre-lua reports that through `hasPendingRerendering`, and
     /// KOReader's plugin refreshes page totals and the TOC then).
     fn begin_lazy_open(&mut self) -> Result<()> {
-        self.layout_done = true;
+        self.phase = LayoutPhase::Complete;
         let count = self.sources.len();
         self.page_table.reset(count);
         if count == 0 {
@@ -743,7 +743,10 @@ impl Document {
             .map(|layout| layout.pages.len())
             .unwrap_or(1);
         self.current_page = first_page + anchor_local.min(page_count.saturating_sub(1));
-        self.layout_done = true;
+        // `can_relayout_with` guarantees a pass has started, so this is the
+        // live one (Complete or Completing) and ends up Complete, cancelling a
+        // worker that still belongs to the old settings.
+        self.stop_background_layout();
         trim_memory();
         // The current chunk is laid out, so the page under the reader is
         // usable; the rest are laid out in the background, in reading order,
@@ -768,11 +771,12 @@ impl Document {
         if indices.is_empty() {
             return;
         }
-        let generation = self
-            .background_generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
-        let generation_source = Arc::clone(&self.background_generation);
+        // A pass that is still running belongs to the settings that were in
+        // force when it started, so it goes now. `stop` leaves the book
+        // `Complete`; the new pass replaces that below.
+        self.phase.stop();
+        let cancel = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cancel_source = Arc::clone(&cancel);
         let sources = Arc::clone(&self.sources);
         let base_url = self.base_url.clone();
         let net = self.net.clone();
@@ -803,7 +807,7 @@ impl Document {
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             for (slot, &index) in indices.iter().enumerate() {
-                if generation_source.load(std::sync::atomic::Ordering::SeqCst) != generation {
+                if cancel_source.load(std::sync::atomic::Ordering::SeqCst) != 0 {
                     break;
                 }
                 let Ok(html) = sources[index].text() else {
@@ -835,10 +839,11 @@ impl Document {
                 }
             }
         });
-        self.background = Some(BackgroundLayout {
+        self.phase = LayoutPhase::Completing(BackgroundLayout {
             total,
             done: 0,
             receiver,
+            cancel,
         });
     }
 
@@ -852,7 +857,7 @@ impl Document {
         let mut finished = false;
         let none_left;
         {
-            let Some(job) = self.background.as_mut() else {
+            let LayoutPhase::Completing(job) = &mut self.phase else {
                 return false;
             };
             loop {
@@ -890,7 +895,7 @@ impl Document {
         }
         if installed == 0 {
             if none_left {
-                self.background = None;
+                self.phase = LayoutPhase::Complete;
             }
             return false;
         }
@@ -908,12 +913,12 @@ impl Document {
         // the reader back on its XPointer (ReaderRolling:handlePartialRerendering).
         self.background_installs = self.background_installs.saturating_add(installed as i64);
         let mut stop = false;
-        if let Some(job) = self.background.as_mut() {
+        if let LayoutPhase::Completing(job) = &mut self.phase {
             job.done += installed;
             stop = finished || job.done >= job.total;
         }
         if stop {
-            self.background = None;
+            self.phase = LayoutPhase::Complete;
         }
         true
     }
@@ -1006,13 +1011,13 @@ impl Document {
     /// (cre-lua's deferred open), so a decision taken in the constructor would
     /// never run there.
     pub fn ensure_layout(&mut self) -> Result<()> {
-        if self.layout_done {
+        if self.phase.started() {
             return Ok(());
         }
         if self.prefers_lazy_open() {
             return self.begin_lazy_open();
         }
-        self.layout_done = true;
+        self.phase = LayoutPhase::Complete;
         self.page_table.reset(self.sources.len());
         let count = self.sources.len();
         let mut trim_guard = TrimGuard::new();

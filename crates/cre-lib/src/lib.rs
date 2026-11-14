@@ -853,12 +853,14 @@ pub struct Document {
     /// Raw TOC/page-map items, kept until the layout can give them pages.
     raw_toc: Vec<RawTocItem>,
     raw_page_map_items: Vec<RawPageMapItem>,
-    /// False until the pages have been laid out by [`Document::ensure_layout`].
-    layout_done: bool,
+    /// Where the book is in its layout pass (see [`LayoutPhase`]).
+    phase: LayoutPhase,
     /// What the caller asked for: `Some(true)`/`Some(false)` force the lazy or
     /// the full open, `None` decides by book size. The decision is taken in
     /// [`Document::ensure_layout`], because the reader parses on `loadDocument`
-    /// and lays out on `renderDocument` (see `cre-lua`).
+    /// and lays out on `renderDocument` (see `cre-lua`). This is a policy
+    /// input - which pass to choose - not the pass that is running: that is
+    /// [`LayoutPhase`].
     lazy_open: Option<bool>,
     active: RefCell<Option<ActiveChunk>>,
     current_page: usize,
@@ -869,16 +871,51 @@ pub struct Document {
     /// Glyph masks reused across page renders. Cleared when the font context
     /// changes, because the masks carry the face's outlines.
     paint_cache: RefCell<cre_paint::PaintCache>,
-    /// Chunks being laid out again after a settings change, in reading order.
-    /// Filled by [`Document::start_background_layout`] and installed by
-    /// [`Document::drain_background_layouts`] on the reader's thread.
-    background: Option<BackgroundLayout>,
-    /// Incremented on every new settings change; a worker with an older value
-    /// stops at its next chunk, and dropping the document stops it too.
-    background_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Layouts installed by the background worker, so `cre-lua` can report a
-    /// changed `getPartialRerenderingsCount()` to KOReader.
+    /// changed `getPartialRerenderingsCount()` to KOReader. A running total
+    /// across passes, deliberately not part of [`LayoutPhase`]: the reader
+    /// compares it with the value it saw last to notice that page numbers
+    /// changed under it.
     background_installs: i64,
+}
+
+/// Where the book is in its layout pass.
+///
+/// The three states are exclusive, which is the point: this used to be
+/// `layout_done: bool` plus `background: Option<BackgroundLayout>`, two fields
+/// that could say "laid out and still starting" and left every reader to know
+/// which combinations meant something. A book is either not laid out yet, or
+/// has a complete page list, or is filling one in on a worker.
+enum LayoutPhase {
+    /// [`Document::ensure_layout`] has not run: there is no page list yet.
+    Unstarted,
+    /// Every chunk is laid out for the current settings.
+    Complete,
+    /// The opening chunk is laid out and a worker is filling in the rest, in
+    /// reading order.
+    Completing(BackgroundLayout),
+}
+
+impl LayoutPhase {
+    /// True once a layout pass has started; the lazy/full choice is only
+    /// available before that.
+    fn started(&self) -> bool {
+        !matches!(self, LayoutPhase::Unstarted)
+    }
+
+    /// Stops the worker, if one is running.
+    ///
+    /// A started pass ends up `Complete`; a book that has not been laid out yet
+    /// stays `Unstarted`. The worker checks the cancel token before each chunk,
+    /// so a pass that was replaced does not spend a chunk's layout on a page
+    /// list nobody will see; dropping the receiver stops it right after the
+    /// chunk in flight either way.
+    fn stop(&mut self) {
+        if let LayoutPhase::Completing(job) = self {
+            job.cancel.store(1, std::sync::atomic::Ordering::SeqCst);
+            *self = LayoutPhase::Complete;
+        }
+    }
 }
 
 /// A background layout job: one worker, laying chunks out in reading order.
@@ -891,6 +928,9 @@ struct BackgroundLayout {
     total: usize,
     done: usize,
     receiver: std::sync::mpsc::Receiver<(usize, ChunkLayout)>,
+    /// Shared with the worker: set to non-zero by [`LayoutPhase::stop`], and
+    /// checked before each chunk.
+    cancel: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Drop for Document {
@@ -972,7 +1012,7 @@ impl Document {
     /// `cre-css`. The page *size* is different: image normalisation and the
     /// page-size CSS are baked into the chunk HTML, so it needs a reopen.
     pub fn can_relayout_with(&self, options: &DocumentOptions) -> bool {
-        self.layout_done
+        self.phase.started()
             && !self.sources.is_empty()
             && !self.page_table.is_empty()
             && options.width == self.width
@@ -986,14 +1026,12 @@ impl Document {
 
     /// Whether the background worker still has chunks to lay out.
     pub fn has_background_layout(&self) -> bool {
-        self.background.is_some()
+        matches!(self.phase, LayoutPhase::Completing(_))
     }
 
     /// Stops the background worker, if any (a new settings change or a close).
     fn stop_background_layout(&mut self) {
-        self.background = None;
-        self.background_generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.phase.stop();
     }
 
     /// Remaps the page indices that move when chunk `chunk` is laid out again and

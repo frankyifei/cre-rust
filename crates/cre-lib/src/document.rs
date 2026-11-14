@@ -816,7 +816,7 @@ impl Document {
             embedded_fonts: Vec::new(),
             embedded_fonts_flag,
             css_font_size,
-            layout_done: false,
+            phase: LayoutPhase::Unstarted,
             lazy_open: lazy,
             active: RefCell::new(None),
             current_page: 1,
@@ -825,8 +825,6 @@ impl Document {
             page_cache_order: RefCell::new(Vec::new()),
             page_boxes_cache: RefCell::new(None),
             paint_cache: RefCell::new(cre_paint::PaintCache::new()),
-            background: None,
-            background_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             background_installs: 0,
         };
         if !defer_layout {
@@ -863,7 +861,7 @@ impl Document {
     /// `Some(false)` forces the full pass, which is what a caller wanting exact
     /// page numbers from the first draw asks for.
     pub fn set_lazy_open(&mut self, lazy: Option<bool>) {
-        if !self.layout_done {
+        if !self.phase.started() {
             self.lazy_open = lazy;
         }
     }
