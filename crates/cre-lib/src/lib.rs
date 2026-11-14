@@ -7710,6 +7710,14 @@ fn create_document(
     let profile = std::env::var_os("CRE_LAYOUT_PROFILE").is_some();
     let started = std::time::Instant::now();
     let config = DocumentConfig {
+        // The Blitz viewport is the *document's* layout box, not a page: its
+        // height is `layout_height` (the whole chunk), so `vh` and `vmin`
+        // resolve against that and not against the reader's page. Nothing in
+        // our own CSS may use a viewport unit for a page-sized rule - a
+        // `min-height: 100vh` on a page-level section made it as tall as the
+        // chunk, and `background-size: cover` then zoomed a picture 100x, so a
+        // corrected page showed one corner of its background. Use the page
+        // geometry in pixels (see `.cre-page-body` below) instead.
         viewport: Some(Viewport::new(
             options.width,
             options.layout_height,
@@ -7792,12 +7800,6 @@ fn create_document(
         ));
     }
 
-    // A section that carries the book's `<body>` styling is a page of its own:
-    // its background (a KF8 title page's engraving, an EPUB cover's `body.cov`)
-    // covers the whole page in crengine and in a browser, where a body
-    // background propagates to the canvas. `100vh` is the reader's page
-    // height, so the section fills the page whatever the margins are.
-    html_source.push_str("<style>.cre-page-body { min-height: 100vh; }</style>");
     // Keep images whole: cap them to one page's content height (width is
     // already capped), so pagination never has to clip an image. crengine
     // scales oversized images the same way.
@@ -7808,6 +7810,17 @@ fn create_document(
         options.page_margin,
     );
     let max_image_height = (page_height_css - page_margin_css - margin_bottom_css).max(1.0);
+
+    // A section that carries the book's `<body>` styling is a page of its own:
+    // its background (a KF8 title page's engraving, an EPUB cover's `body.cov`)
+    // covers the whole page in crengine and in a browser, where a body
+    // background propagates to the canvas. The height is the page's, in pixels
+    // rather than `100vh`, so it does not depend on what a document-relative
+    // viewport unit resolves to inside the layout engine.
+    let page_section_height = (page_height_css - margin_bottom_css).max(1.0);
+    html_source.push_str(&format!(
+        "<style>.cre-page-body {{ min-height: {page_section_height:.0}px; }}</style>"
+    ));
     html_source.push_str(&format!(
         "<style>img, svg, video, canvas, object, embed {{ max-width: 100%; \
          max-height: {max_image_height:.0}px; height: auto; }}</style>"
