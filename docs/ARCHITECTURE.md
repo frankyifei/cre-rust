@@ -40,6 +40,7 @@ spine item. The chunk size comes from a memory budget.
 
 | Crate | Job |
 |---|---|
+| `cre-book` | Format-independent book layer: resource table, chunking and budgets, HTML/CSS/image/font helpers, page-fit plates |
 | `cre-epub` | ZIP container, OPF, spine, TOC, page map, CSS collection, image and SVG rewrite |
 | `cre-fb2` | FB2 XML, base64 binaries |
 | `cre-text` | TXT and standalone HTML |
