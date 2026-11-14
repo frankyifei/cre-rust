@@ -1505,6 +1505,9 @@ fn gradient_shader(gradient: &Gradient, transform: Affine) -> Option<Shader<'sta
             );
             SkRadialGradient::new(
                 start,
+                // 0.12 added a start radius; 0.0 is the old behaviour (a point
+                // source).
+                0.0,
                 end,
                 position.end_radius.max(0.0001),
                 stops,

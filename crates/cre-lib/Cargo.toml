@@ -45,7 +45,7 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 percent-encoding = "2"
 regex.workspace = true
-png = "0.17"
+png = "0.18"
 resvg = { version = "0.48.1", default-features = false, features = [
     "text",
     "system-fonts",
