@@ -207,13 +207,29 @@ impl Kf8Book {
             let fixed = part_viewport(&part.bytes)
                 .map(|viewport| format!(" data-cre-fixed-layout=\"{viewport}\""))
                 .unwrap_or_default();
+            // Only one `<body>` exists in the generated chunk, so a part after
+            // the first has to carry its own `<body class="…">` on its section:
+            // a KF8 title page is often `<body class="background">` with the
+            // page's background image in the stylesheet, and without the class
+            // that rule stops matching and the background disappears.
+            let (page_class, page_style) = if section_count == 1 {
+                (None, None)
+            } else {
+                section_page_attrs(&part.bytes)
+            };
             body.push_str(&format!(
-                "<section class=\"cre-spine\" data-spine-index=\"{}\" \
-                 id=\"cre-sec-{section_count}\"{fixed}>",
+                "<section class=\"cre-spine{}\" data-spine-index=\"{}\" \
+                 id=\"cre-sec-{section_count}\"{fixed}{}>",
+                page_class
+                    .map(|class| format!(" {class}"))
+                    .unwrap_or_default(),
                 // Zero-based, like the EPUB generator: cre-lib adds one to get
                 // the 1-based `DocFragment[n]` crengine uses, so the first part
                 // must be `DocFragment[1]`.
-                section_count - 1
+                section_count - 1,
+                page_style
+                    .map(|style| format!(" style=\"{}\"", cre_book::html::escape_attr(&style)))
+                    .unwrap_or_default()
             ));
             body.push_str(trimmed);
             body.push_str("</section>\n");
@@ -910,6 +926,22 @@ fn resource_name(index: usize, data: &[u8]) -> Option<String> {
     Some(format!("mobi-image-{index}"))
 }
 
+/// The `class` and `style` of one part's `<body>`, for its section.
+///
+/// The chunk has a single `<body>` (the first part's attributes travel there),
+/// and a part's `body` styles the page it opens: keep the two attributes that
+/// CSS matches, so `.background` / `body > …` rules still apply to that page.
+fn section_page_attrs(part: &[u8]) -> (Option<String>, Option<String>) {
+    let attrs = body_tag_attrs(part);
+    let class = cre_book::html::attr_value(&attrs, "class")
+        .map(|class| class.trim().to_string())
+        .filter(|class| !class.is_empty());
+    let style = cre_book::html::attr_value(&attrs, "style")
+        .map(|style| style.trim().to_string())
+        .filter(|style| !style.is_empty());
+    (class, style)
+}
+
 /// The `<body>` tag's attributes of one part, with a leading space.
 ///
 /// The generated document has a body of its own, so the book's `body class="…"`
@@ -1132,6 +1164,19 @@ mod tests {
                        <body class="calibre" aid="0"><p>x</p></body></html>"#;
         assert_eq!(body_tag_attrs(part), " class=\"calibre\" aid=\"0\"");
         assert_eq!(body_tag_attrs(b"<p>no body here</p>"), "");
+    }
+
+    #[test]
+    fn a_part_body_class_can_reach_its_section() {
+        // A KF8 title page styles itself with `<body class="background">`; the
+        // generated chunk has one body, so the part's class has to move onto
+        // its section or the background image disappears.
+        let part = br#"<html><head><title>t</title></head>
+                       <body class="background" style="margin:0"><p>x</p></body></html>"#;
+        let (class, style) = section_page_attrs(part);
+        assert_eq!(class.as_deref(), Some("background"));
+        assert_eq!(style.as_deref(), Some("margin:0"));
+        assert_eq!(section_page_attrs(b"<p>no body here</p>"), (None, None));
     }
 
     #[test]
