@@ -83,3 +83,26 @@ could drift: the budgets (`chunk_budgets`, `plan_chunk_bytes`,
 (`split_html_document_at_sections_with`) and the per-section cost (an
 `image_sources_in` walk over the resource table). S5-6 was left as a documented
 decision for that reason.
+
+## Why `cre-css` stays a crate of its own
+
+It is 81 lines with **no dependencies**: two token constants
+(`__CRE_FONT_SIZE_PX__`, `__CRE_PAGE_MARGIN_PX__`) and `substitute`, which the
+layout engine calls once per chunk. That is the whole contract between a
+generator (which writes a token instead of a size, so a font or margin change is
+a relayout) and the engine.
+
+Folding it into `cre-book` would put `cre-book`'s dependency set in front of
+`cre-fb2`, `cre-text`, `cre-mobi` and `cre-kf8`, which today depend on
+`anyhow + cre-css` only:
+
+```
+cre-text  -> anyhow, cre-css
+cre-book  -> anyhow, base64, cre-pdb, image (png/jpeg/gif/webp/bmp), libc,
+             percent-encoding, regex
+```
+
+Those four crates would build an image decoder stack to spell two string
+constants. The token crate is the lightest possible way to keep one definition
+of the protocol, so it stays separate; revisit only if the generators ever move
+into `cre-book` themselves.
