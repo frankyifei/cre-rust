@@ -57,3 +57,12 @@ in-memory map, a file next to a standalone document, or something the engine
 generated (a page-fit wrapper, a decoded `data:` picture). The generated table is
 consulted first, and the net providers serve it, so a generated key behaves like
 a file for layout, painting, `getImageDataAt` and long-press.
+
+Two consequences worth knowing when adding a format:
+
+- a **stylesheet** is served through the table, not inlined into the HTML when
+  it can be avoided (a KF8 flow is published as `cre-flow-N.css` and linked from
+  the generated head, exactly like an EPUB's manifest CSS), so the "use the
+  book's fonts" setting is applied once, where the sheet is read;
+- the **cover** is only a key. `Document::cover_image()` reads it from the table
+  on demand instead of copying a few megabytes at open.

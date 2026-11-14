@@ -258,8 +258,10 @@ its TOC anchors.
 `ResourceSource` is the one place that answers "give me the bytes for this key":
 a zip entry, a PalmDB record range, an in-memory map, or a file next to a
 standalone document. It also carries a *generated* table, consulted first, for
-what the engine makes up while preparing the book — page-fit wrappers and
-decoded `data:` pictures. That is what lets a standalone HTML document (which
+what the engine makes up while preparing the book — page-fit wrappers, decoded
+`data:` pictures, and a KF8 book's stylesheet flows. Stylesheets are served
+rather than inlined, and the cover is only a key, so both go through the same
+lookup as a picture. That is what lets a standalone HTML document (which
 has no archive to write into) use the same plate path as an EPUB, and it keeps
 the painter, the net provider and `getImageDataAt` on one namespace.
 
