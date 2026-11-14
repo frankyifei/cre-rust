@@ -66,3 +66,20 @@ Two consequences worth knowing when adding a format:
   book's fonts" setting is applied once, where the sheet is read;
 - the **cover** is only a key. `Document::cover_image()` reads it from the table
   on demand instead of copying a few megabytes at open.
+
+## Why there are two chunk packers
+
+`stream_single_document_chunks` (with `pack_sections`) packs sections of one
+already-generated body: one constant head, a fixed prefix and no per-section
+break rule. EPUB packs its spine documents as they are decoded - the whole body
+never exists - builds the head of each chunk from the documents that chunk holds,
+and gives a pre-paginated page or a split continuation a chunk of its own.
+
+Forcing both through one function would need flags for the prefix and the
+break-after rule, and it would move EPUB's chunk boundaries, which the page
+numbers are derived from, for no user-visible gain. What *is* shared is what
+could drift: the budgets (`chunk_budgets`, `plan_chunk_bytes`,
+`LAYOUT_BYTES_PER_HTML_BYTE`, `DOM_BYTES_PER_HTML_BYTE`), the section splitter
+(`split_html_document_at_sections_with`) and the per-section cost (an
+`image_sources_in` walk over the resource table). S5-6 was left as a documented
+decision for that reason.
