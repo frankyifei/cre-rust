@@ -25,14 +25,14 @@ use cre_book::images::fit_cover_images;
 use crate::page_breaks;
 use crate::xpointer;
 use crate::{
-    ActiveChunk, BackgroundLayout, CHUNK_DOM_BYTES_PER_HTML_BYTE, ChunkEntry, ChunkLayout,
-    ChunkSource, ContentBox, Document, DocumentOptions, FontBlob, LAYOUT_MEMORY_RESERVE, LineBox,
-    LineEntry, LocalPage, PageMargins, PageStart, StageTimer, collect_anchor_maps,
-    collect_content_boxes, collect_line_flows, collect_lines, collect_math_boxes,
-    contains_ignore_ascii_case, create_document, css_page_geometry, document_css_for_svg,
-    extend_lines_for_math, first_non_blank_line_flow, page_chunk_clip_bottom, page_for_node,
-    page_for_spine_node, paginate, parse_text_position, prepare_inline_svgs, rendered_text_nodes,
-    resident_bytes, trim_memory,
+    ActiveChunk, BackgroundLayout, CHUNK_DOM_BYTES_PER_HTML_BYTE, ChunkLayout, ChunkSource,
+    ContentBox, Document, DocumentOptions, FontBlob, LAYOUT_MEMORY_RESERVE, LineBox, LineEntry,
+    LocalPage, PageMargins, PageStart, StageTimer, collect_anchor_maps, collect_content_boxes,
+    collect_line_flows, collect_lines, collect_math_boxes, contains_ignore_ascii_case,
+    create_document, css_page_geometry, document_css_for_svg, extend_lines_for_math,
+    first_non_blank_line_flow, page_chunk_clip_bottom, page_for_node, page_for_spine_node,
+    paginate, parse_text_position, prepare_inline_svgs, rendered_text_nodes, resident_bytes,
+    trim_memory,
 };
 
 /// Trims freed heap pages back to the OS, but only once the resident set has
@@ -609,24 +609,14 @@ impl Document {
     fn begin_lazy_open(&mut self) -> Result<()> {
         self.layout_done = true;
         let count = self.sources.len();
-        self.entries = (0..count)
-            .map(|_| ChunkEntry {
-                layout: None,
-                stale: true,
-                provisional_pages: 0,
-            })
-            .collect();
+        self.page_table.reset(count);
         if count == 0 {
             self.rebuild_view();
             return Ok(());
         }
         let (layout, doc, lines, page_starts) = self.layout_chunk(0)?;
         let opening_pages = layout.pages.len();
-        self.entries[0] = ChunkEntry {
-            layout: Some(layout),
-            stale: false,
-            provisional_pages: 0,
-        };
+        self.page_table.install(0, layout);
         self.estimate_provisional_pages(opening_pages);
         self.rebuild_view();
         trim_memory();
@@ -656,34 +646,29 @@ impl Document {
         } else {
             2048.0
         };
-        for (index, entry) in self.entries.iter_mut().enumerate() {
-            if entry.layout.is_some() {
+        for index in 0..self.page_table.len() {
+            if self.page_table.layout(index).is_some() {
                 continue;
             }
-            if self
+            let pages = if self
                 .fixed_layouts
                 .get(index)
                 .and_then(|fixed| *fixed)
                 .is_some()
             {
-                entry.provisional_pages = 1;
-                continue;
-            }
-            let pages = self.sources[index].text_len as f32 / bytes_per_page;
-            entry.provisional_pages = pages.round().max(1.0) as usize;
+                1
+            } else {
+                let pages = self.sources[index].text_len as f32 / bytes_per_page;
+                pages.round().max(1.0) as usize
+            };
+            self.page_table.set_provisional(index, pages);
         }
     }
 
     /// Lays out `chunk_index` and keeps its DOM active, ready to draw.
     fn lay_out_chunk_now(&mut self, chunk_index: usize) -> Result<()> {
         let (layout, doc, lines, page_starts) = self.layout_chunk(chunk_index)?;
-        if let Some(entry) = self.entries.get_mut(chunk_index) {
-            *entry = ChunkEntry {
-                layout: Some(layout),
-                stale: false,
-                provisional_pages: 0,
-            };
-        }
+        self.page_table.install(chunk_index, layout);
         *self.active.borrow_mut() = Some(ActiveChunk {
             index: chunk_index,
             rendered_text_nodes: rendered_text_nodes(&doc, &lines),
@@ -713,16 +698,11 @@ impl Document {
         let anchor = self
             .current_page
             .saturating_sub(1)
-            .min(self.pages.len().saturating_sub(1));
-        let (anchor_chunk, anchor_local) = match self.pages.get(anchor) {
+            .min(self.page_table.pages().len().saturating_sub(1));
+        let (anchor_chunk, anchor_local) = match self.page_table.pages().get(anchor) {
             Some(page) => (
                 page.chunk,
-                anchor + 1
-                    - self
-                        .chunks
-                        .get(page.chunk)
-                        .map(|c| c.first_page)
-                        .unwrap_or(1),
+                anchor + 1 - self.page_table.first_page(page.chunk),
             ),
             None => (0, 0),
         };
@@ -730,15 +710,12 @@ impl Document {
         // Every chunk has to be laid out for the new settings. A chunk that
         // already has a layout keeps it as a provisional page list until it is
         // laid out again; a chunk that never had one keeps its estimate.
-        for entry in self.entries.iter_mut() {
-            entry.stale = true;
-        }
+        self.page_table.mark_all_stale();
         *self.page_boxes_cache.borrow_mut() = None;
         self.clear_page_image_cache();
         let old_anchor_pages = self
-            .entries
-            .get(anchor_chunk)
-            .and_then(|entry| entry.layout.as_ref())
+            .page_table
+            .layout(anchor_chunk)
             .map(|layout| layout.pages.len())
             .unwrap_or(0);
         self.lay_out_chunk_now(anchor_chunk)?;
@@ -747,42 +724,22 @@ impl Document {
         // total the reader is shown is close to the truth until it settles.
         if old_anchor_pages > 0 {
             let new_anchor_pages = self
-                .entries
-                .get(anchor_chunk)
-                .and_then(|entry| entry.layout.as_ref())
+                .page_table
+                .layout(anchor_chunk)
                 .map(|layout| layout.pages.len())
                 .unwrap_or(0);
             if new_anchor_pages > 0 {
                 let ratio = new_anchor_pages as f32 / old_anchor_pages as f32;
                 if (ratio - 1.0).abs() > 0.02 {
-                    for entry in self.entries.iter_mut() {
-                        if !entry.stale {
-                            continue;
-                        }
-                        if let Some(layout) = entry.layout.as_mut() {
-                            let target =
-                                (layout.pages.len() as f32 * ratio).round().max(1.0) as usize;
-                            layout.resample(target);
-                        } else if entry.provisional_pages > 0 {
-                            // A chunk that was never laid out: scale its estimate
-                            // the same way, so the total moves by the same factor.
-                            entry.provisional_pages =
-                                (entry.provisional_pages as f32 * ratio).round().max(1.0) as usize;
-                        }
-                    }
+                    self.page_table.resample_stale(ratio);
                 }
             }
         }
         self.rebuild_view();
-        let first_page = self
-            .chunks
-            .get(anchor_chunk)
-            .map(|c| c.first_page)
-            .unwrap_or(1);
+        let first_page = self.page_table.first_page(anchor_chunk);
         let page_count = self
-            .entries
-            .get(anchor_chunk)
-            .and_then(|entry| entry.layout.as_ref())
+            .page_table
+            .layout(anchor_chunk)
             .map(|layout| layout.pages.len())
             .unwrap_or(1);
         self.current_page = first_page + anchor_local.min(page_count.saturating_sub(1));
@@ -807,13 +764,7 @@ impl Document {
         if std::env::var_os("CRE_NO_BACKGROUND_LAYOUT").is_some() {
             return;
         }
-        let indices: Vec<usize> = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.stale)
-            .map(|(index, _)| index)
-            .collect();
+        let indices: Vec<usize> = self.page_table.pending();
         if indices.is_empty() {
             return;
         }
@@ -919,24 +870,22 @@ impl Document {
         // Remember where the reader is by (chunk, local page): the page numbers
         // of the earlier chunks change as their layouts are installed.
         let anchor = self
-            .pages
+            .page_table
+            .pages()
             .get(self.current_page.saturating_sub(1))
             .map(|page| {
-                let first = self
-                    .chunks
-                    .get(page.chunk)
-                    .map(|meta| meta.first_page)
-                    .unwrap_or(1);
-                (page.chunk, self.current_page.saturating_sub(first))
+                (
+                    page.chunk,
+                    self.current_page
+                        .saturating_sub(self.page_table.first_page(page.chunk)),
+                )
             });
         let mut installed = 0usize;
         for (index, layout) in received {
-            if !self.entries.get(index).is_some_and(|entry| entry.stale) {
+            if !self.page_table.needs_layout(index) {
                 continue;
             }
-            self.entries[index].layout = Some(layout);
-            self.entries[index].stale = false;
-            self.entries[index].provisional_pages = 0;
+            self.page_table.install(index, layout);
             installed += 1;
         }
         if installed == 0 {
@@ -947,15 +896,10 @@ impl Document {
         }
         self.rebuild_view();
         if let Some((chunk, local)) = anchor {
-            let first = self
-                .chunks
-                .get(chunk)
-                .map(|meta| meta.first_page)
-                .unwrap_or(1);
+            let first = self.page_table.first_page(chunk);
             let count = self
-                .entries
-                .get(chunk)
-                .and_then(|entry| entry.layout.as_ref())
+                .page_table
+                .layout(chunk)
                 .map(|layout| layout.pages.len())
                 .unwrap_or(1);
             self.current_page = first + local.min(count.saturating_sub(1));
@@ -982,31 +926,25 @@ impl Document {
         let Some(index) = page.checked_sub(1) else {
             return Ok(page);
         };
-        let Some(snapshot) = self.pages.get(index) else {
+        let Some(snapshot) = self.page_table.pages().get(index) else {
             return Ok(page);
         };
         let chunk = snapshot.chunk;
-        if !self.entries.get(chunk).is_some_and(|entry| entry.stale) {
+        if !self.page_table.needs_layout(chunk) {
             return Ok(page);
         }
-        let old_head = self
-            .chunks
-            .get(chunk)
-            .map(|meta| meta.first_page)
-            .unwrap_or(1);
+        let old_head = self.page_table.first_page(chunk);
         let old_count = self
-            .entries
-            .get(chunk)
-            .and_then(|entry| entry.layout.as_ref())
+            .page_table
+            .layout(chunk)
             .map(|layout| layout.pages.len())
             .unwrap_or(0);
         let local = page.saturating_sub(old_head);
         self.lay_out_chunk_now(chunk)?;
         self.rebuild_view();
         let new_count = self
-            .entries
-            .get(chunk)
-            .and_then(|entry| entry.layout.as_ref())
+            .page_table
+            .layout(chunk)
             .map(|layout| layout.pages.len())
             .unwrap_or(1);
         self.rebase_pages(chunk, old_count, new_count);
@@ -1025,12 +963,8 @@ impl Document {
         let Some(chunk) = self.spine_to_chunk.get(&position.spine_index).copied() else {
             return Ok(());
         };
-        if self.entries.get(chunk).is_some_and(|entry| entry.stale) {
-            let head = self
-                .chunks
-                .get(chunk)
-                .map(|meta| meta.first_page)
-                .unwrap_or(1);
+        if self.page_table.needs_layout(chunk) {
+            let head = self.page_table.first_page(chunk);
             let _ = self.ensure_page_layout(head)?;
         }
         Ok(())
@@ -1043,13 +977,7 @@ impl Document {
     /// search walks every page. It is exactly the background pass's work, so it
     /// is only worth calling when the answer has to be complete right now.
     pub fn ensure_layout_complete(&mut self) -> Result<()> {
-        let missing: Vec<usize> = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.stale || entry.layout.is_none())
-            .map(|(index, _)| index)
-            .collect();
+        let missing: Vec<usize> = self.page_table.pending();
         if missing.is_empty() {
             return Ok(());
         }
@@ -1061,11 +989,7 @@ impl Document {
             drop(doc);
             drop(lines);
             drop(page_starts);
-            self.entries[index] = ChunkEntry {
-                layout: Some(layout),
-                stale: false,
-                provisional_pages: 0,
-            };
+            self.page_table.install(index, layout);
         }
         self.rebuild_view();
         if let Some(anchor) = anchor {
@@ -1089,13 +1013,7 @@ impl Document {
             return self.begin_lazy_open();
         }
         self.layout_done = true;
-        self.entries = (0..self.sources.len())
-            .map(|_| ChunkEntry {
-                layout: None,
-                stale: false,
-                provisional_pages: 0,
-            })
-            .collect();
+        self.page_table.reset(self.sources.len());
         let count = self.sources.len();
         let mut trim_guard = TrimGuard::new();
         if count == 0 {
@@ -1130,11 +1048,7 @@ impl Document {
         // Measured before the DOM is released: this is what one chunk's layout
         // costs while it is resident.
         let rss_after = resident_bytes();
-        self.entries[probe_index] = ChunkEntry {
-            layout: Some(probe_layout),
-            stale: false,
-            provisional_pages: 0,
-        };
+        self.page_table.install(probe_index, probe_layout);
         // When the probe is the opening chunk (a cover, usually the most
         // image-heavy chunk of all) its DOM is what the first page needs, so
         // keep it instead of dropping it and parsing it again.
@@ -1228,11 +1142,7 @@ impl Document {
                 Some(active) => active,
                 None => {
                     let (layout, doc, lines, page_starts) = work.layout(0)?;
-                    self.entries[0] = ChunkEntry {
-                        layout: Some(layout),
-                        stale: false,
-                        provisional_pages: 0,
-                    };
+                    self.page_table.install(0, layout);
                     (doc, lines, page_starts)
                 }
             };
@@ -1241,11 +1151,7 @@ impl Document {
             }
             for (index, layout) in results.into_inner().unwrap().into_iter().enumerate() {
                 if let Some(layout) = layout {
-                    self.entries[index] = ChunkEntry {
-                        layout: Some(layout),
-                        stale: false,
-                        provisional_pages: 0,
-                    };
+                    self.page_table.install(index, layout);
                 }
             }
             let (doc, lines, page_starts) = opening;
@@ -1265,11 +1171,7 @@ impl Document {
                 continue;
             }
             let (layout, doc, lines, page_starts) = self.layout_chunk(chunk_index)?;
-            self.entries[chunk_index] = ChunkEntry {
-                layout: Some(layout),
-                stale: false,
-                provisional_pages: 0,
-            };
+            self.page_table.install(chunk_index, layout);
             // The chunk's DOM and line boxes are only needed to derive page
             // metadata; release them now so the pass stays flat in RSS instead
             // of accumulating one chunk's arenas per iteration.
@@ -1282,11 +1184,7 @@ impl Document {
             Some(active) => active,
             None => {
                 let (layout, doc, lines, page_starts) = self.layout_chunk(0)?;
-                self.entries[0] = ChunkEntry {
-                    layout: Some(layout),
-                    stale: false,
-                    provisional_pages: 0,
-                };
+                self.page_table.install(0, layout);
                 (doc, lines, page_starts)
             }
         };

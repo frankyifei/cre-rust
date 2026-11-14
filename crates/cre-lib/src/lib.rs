@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 mod layout;
 mod net;
+mod page_table;
 
 use anyhow::{Context, Result, bail};
 use anyrender::Scene;
@@ -31,6 +32,7 @@ use cre_paint::render_page as paint_page;
 use cre_paint::render_page_cached as paint_page_cached;
 use cre_paint::render_page_rgba as paint_page_rgba;
 use net::{EmptyNet, EpubNet, FileNet, MapNet};
+use page_table::{PageMeta, PageTable};
 
 pub use cre_paint::ColorPageBitmap;
 pub use cre_paint::PageBitmap;
@@ -462,11 +464,6 @@ fn resident_bytes() -> Option<u64> {
 
 const PAGE_IMAGE_CACHE_CAPACITY: usize = 2usize;
 
-struct ChunkMeta {
-    first_page: usize,
-    line_base: usize,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum FixedLayout {
     Pixel {
@@ -503,15 +500,6 @@ struct PageImage {
     bitmap: Arc<PageBitmap>,
     image_count: usize,
     image_surface: usize,
-}
-
-struct PageMeta {
-    chunk: usize,
-    local_start: PageStart,
-    local_clip_bottom: f32,
-    doc_top: f32,
-    render_height: f32,
-    page_flow: i64,
 }
 
 /// Byte counts for what [`Document`] keeps resident between page renders.
@@ -736,19 +724,6 @@ impl ChunkLayout {
     }
 }
 
-struct ChunkEntry {
-    /// `None` before this chunk has ever been laid out.
-    layout: Option<ChunkLayout>,
-    /// True when `layout` does not reflect the current settings: it is either
-    /// missing (a lazily opened book) or was laid out before a settings change.
-    /// The chunk is laid out again when it is next used.
-    stale: bool,
-    /// Pages assumed for this chunk while it has no layout for the current
-    /// settings. Set when a book is opened lazily; zero when there is nothing
-    /// to assume.
-    provisional_pages: usize,
-}
-
 /// Absolute vertical extent of a replaced element (image) inside a chunk's
 /// layout, so pagination can keep it on one page instead of clipping it.
 #[derive(Clone, Copy, Debug)]
@@ -842,7 +817,7 @@ pub struct Document {
     net: Arc<dyn NetProvider>,
     font_context: Arc<FontContext>,
     /// Every chunk's own layout, parallel to `sources`.
-    entries: Vec<ChunkEntry>,
+    page_table: PageTable,
     /// Family names from the book's `@font-face` rules, in the order they are
     /// declared. The fonts themselves are loaded by Blitz (see
     /// `cre_book::font_faces_in` / `font_faces_in_stylesheets`); this is the
@@ -861,8 +836,6 @@ pub struct Document {
     /// providers: a served stylesheet's absolute `font-size` keywords are
     /// turned into pixels against it, and a relayout updates it in place.
     css_font_size: Arc<std::sync::atomic::AtomicU32>,
-    chunks: Vec<ChunkMeta>,
-    pages: Vec<PageMeta>,
     xpointer_pages: HashMap<String, usize>,
     href_pages: HashMap<(String, Option<String>), usize>,
     spine_to_chunk: HashMap<u32, usize>,
@@ -1720,9 +1693,7 @@ impl Document {
             has_non_linear_flows,
             net,
             font_context,
-            entries: Vec::new(),
-            chunks: Vec::new(),
-            pages: Vec::new(),
+            page_table: PageTable::new(),
             xpointer_pages: HashMap::new(),
             href_pages: HashMap::new(),
             spine_to_chunk: HashMap::new(),
@@ -1927,96 +1898,15 @@ impl Document {
     /// Rebuilds the flattened page list, TOC page numbers and page map from the
     /// per-chunk layouts.
     fn rebuild_view(&mut self) {
-        self.pages.clear();
-        self.chunks.clear();
-        self.xpointer_pages.clear();
-        self.href_pages.clear();
-        self.spine_to_chunk.clear();
-        self.spine_real_index.clear();
-        let mut line_base = 0usize;
-        let mut running_doc_top = 0.0f32;
-        let mut max_flow = 0i64;
+        let index = self.page_table.rebuild(&self.sources, self.height as f32);
+        self.xpointer_pages = index.xpointers;
+        self.href_pages = index.anchors;
+        self.spine_to_chunk = index.spine_to_chunk;
+        self.spine_real_index = index.spine_real_index;
         // First page of the chunk each spine resource lives in. Only used for
         // navigation targets whose chunk has no layout yet (lazy open).
-        let mut href_first_page: HashMap<String, usize> = HashMap::new();
-        for (chunk_index, entry) in self.entries.iter().enumerate() {
-            let first_page = self.pages.len() + 1;
-            if let Some(layout) = entry.layout.as_ref() {
-                for (local_index, page) in layout.pages.iter().enumerate() {
-                    let doc_top = running_doc_top;
-                    running_doc_top += page.render_height;
-                    // The XPointer stays in the chunk layout (one copy for the
-                    // page table and one as the reverse-map key); copying it
-                    // into the flattened page list as well was a third copy.
-                    if let Some(xpointer) = layout.xpointers.get(local_index).cloned().flatten() {
-                        self.xpointer_pages
-                            .insert(xpointer, first_page + local_index);
-                    }
-                    self.pages.push(PageMeta {
-                        chunk: chunk_index,
-                        local_start: page.start,
-                        local_clip_bottom: page.clip_bottom,
-                        doc_top,
-                        render_height: page.render_height,
-                        page_flow: page.page_flow,
-                    });
-                }
-                for (key, local_page) in layout.href_pages.iter() {
-                    self.href_pages
-                        .entry(key.clone())
-                        .or_insert(first_page + local_page);
-                }
-                max_flow = max_flow.max(layout.max_flow);
-            } else {
-                // Never laid out (a lazily opened book, or a chunk the worker
-                // has not reached yet): stand in with the estimated page count
-                // so that page numbers, the total and navigation exist from the
-                // first draw. `ensure_page_layout` replaces them with real ones.
-                for _ in 0..entry.provisional_pages.max(1) {
-                    self.pages.push(PageMeta {
-                        chunk: chunk_index,
-                        local_start: PageStart {
-                            top: 0.0,
-                            clip_top: 0.0,
-                        },
-                        local_clip_bottom: 0.0,
-                        doc_top: running_doc_top,
-                        render_height: 0.0,
-                        page_flow: 0,
-                    });
-                    running_doc_top += self.height as f32;
-                }
-            }
-            // The chunk → spine map is read from the chunk's markup, so it is
-            // available whether or not the chunk has a layout. That is what lets
-            // an XPointer jump into a chunk that has not been laid out yet.
-            for section in self
-                .sources
-                .get(chunk_index)
-                .map(|s| s.spine.as_slice())
-                .unwrap_or(&[])
-            {
-                self.spine_to_chunk
-                    .entry(section.slot)
-                    .or_insert(chunk_index);
-                self.spine_real_index
-                    .entry(section.slot)
-                    .or_insert(section.real);
-                if let Some(href) = section.href.as_ref() {
-                    href_first_page.entry(href.clone()).or_insert(first_page);
-                }
-            }
-            self.chunks.push(ChunkMeta {
-                first_page,
-                line_base,
-            });
-            line_base += entry
-                .layout
-                .as_ref()
-                .map(|layout| layout.line_count)
-                .unwrap_or(0);
-        }
-        self.spine_to_chunk.entry(1).or_insert(0);
+        let href_first_page = index.first_page_by_href;
+        let max_flow = index.max_flow;
 
         let toc = self
             .raw_toc
@@ -2046,7 +1936,8 @@ impl Document {
                     .or_else(|| provisional_page_for_href(&href_first_page, &item.href))?;
                 let xpointer = self.page_xpointer(page);
                 let doc_y = self
-                    .pages
+                    .page_table
+                    .pages()
                     .get(page.saturating_sub(1))
                     .map(|snapshot| snapshot.doc_top.max(0.0).round() as i64)
                     .unwrap_or(page.saturating_sub(1) as i64 * self.height as i64);
@@ -2076,7 +1967,7 @@ impl Document {
     pub fn can_relayout_with(&self, options: &DocumentOptions) -> bool {
         self.layout_done
             && !self.sources.is_empty()
-            && !self.entries.is_empty()
+            && !self.page_table.is_empty()
             && options.width == self.width
             && options.height == self.height
     }
@@ -2101,7 +1992,12 @@ impl Document {
     /// Remaps the page indices that move when chunk `chunk` is laid out again and
     /// its page count changes from `old_count` to `new_count`.
     fn rebase_pages(&mut self, chunk: usize, old_count: usize, new_count: usize) {
-        let Some(head) = self.chunks.get(chunk).map(|meta| meta.first_page) else {
+        let Some(head) = self
+            .page_table
+            .chunks()
+            .get(chunk)
+            .map(|meta| meta.first_page)
+        else {
             return;
         };
         let page = self.current_page;
@@ -2118,12 +2014,11 @@ impl Document {
     /// numbers moving under it (installing a chunk before the current one shifts
     /// every number after it).
     fn current_anchor(&self) -> Option<(usize, usize)> {
-        let page = self.pages.get(self.current_page.saturating_sub(1))?;
-        let first = self
-            .chunks
-            .get(page.chunk)
-            .map(|meta| meta.first_page)
-            .unwrap_or(1);
+        let page = self
+            .page_table
+            .pages()
+            .get(self.current_page.saturating_sub(1))?;
+        let first = self.page_table.first_page(page.chunk);
         Some((page.chunk, self.current_page.saturating_sub(first)))
     }
 
@@ -2131,23 +2026,8 @@ impl Document {
     /// [`Self::current_anchor`], wherever that chunk starts now.
     fn restore_anchor(&mut self, anchor: (usize, usize)) {
         let (chunk, local) = anchor;
-        let first = self
-            .chunks
-            .get(chunk)
-            .map(|meta| meta.first_page)
-            .unwrap_or(1);
-        let count = self
-            .entries
-            .get(chunk)
-            .and_then(|entry| {
-                entry
-                    .layout
-                    .as_ref()
-                    .map(|layout| layout.pages.len())
-                    .or(Some(entry.provisional_pages))
-            })
-            .unwrap_or(1)
-            .max(1);
+        let first = self.page_table.first_page(chunk);
+        let count = self.page_table.page_count(chunk).max(1);
         self.current_page = first + local.min(count.saturating_sub(1));
     }
 
@@ -2196,7 +2076,7 @@ impl Document {
     }
 
     pub fn page_count(&self) -> usize {
-        self.pages.len().max(1)
+        self.page_table.pages().len().max(1)
     }
 
     /// What the document keeps resident, for diagnostics (`perf_probe`).
@@ -2206,7 +2086,7 @@ impl Document {
     pub fn memory_breakdown(&self) -> MemoryBreakdown {
         let mut breakdown = MemoryBreakdown {
             chunk_count: self.sources.len(),
-            page_count: self.pages.len(),
+            page_count: self.page_table.pages().len(),
             font_bytes: self
                 .font_blobs
                 .iter()
@@ -2219,10 +2099,7 @@ impl Document {
             breakdown.source_bytes += source.text_len;
             breakdown.compressed_source_bytes += source.compressed.len();
         }
-        for entry in &self.entries {
-            let Some(layout) = entry.layout.as_ref() else {
-                continue;
-            };
+        for layout in self.page_table.layouts() {
             breakdown.laid_out_chunks += 1;
             breakdown.line_entries += layout.lines.len();
             breakdown.anchor_entries += layout.href_pages.len();
@@ -2281,7 +2158,7 @@ impl Document {
 
     pub fn full_height(&self) -> u64 {
         let mut max_bottom: f32 = 0.0;
-        for snapshot in &self.pages {
+        for snapshot in self.page_table.pages() {
             max_bottom = max_bottom.max(snapshot.doc_top + snapshot.render_height);
         }
         let calculated = render_length_to_u64(max_bottom);
@@ -2295,7 +2172,8 @@ impl Document {
 
     pub fn page_start_y(&self, page: usize) -> i64 {
         let index = page.saturating_sub(1);
-        self.pages
+        self.page_table
+            .pages()
             .get(index)
             .map(|snapshot| render_length_to_i64(snapshot.doc_top))
             .unwrap_or(0)
@@ -2305,7 +2183,8 @@ impl Document {
         let Some(index) = page.checked_sub(1) else {
             return -1;
         };
-        self.pages
+        self.page_table
+            .pages()
             .get(index)
             .map(|snapshot| render_length_to_i64(snapshot.doc_top))
             .unwrap_or(-1)
@@ -2313,7 +2192,8 @@ impl Document {
 
     pub fn page_render_height(&self, page: usize) -> i64 {
         let index = page.saturating_sub(1);
-        self.pages
+        self.page_table
+            .pages()
             .get(index)
             .map(|snapshot| render_length_to_i64(snapshot.render_height))
             .unwrap_or(i64::from(self.height))
@@ -2344,7 +2224,8 @@ impl Document {
         let Some(index) = page.checked_sub(1) else {
             return 0;
         };
-        self.pages
+        self.page_table
+            .pages()
             .get(index)
             .map(|snapshot| snapshot.page_flow)
             .unwrap_or(0)
@@ -2380,7 +2261,11 @@ impl Document {
         let Some(index) = position.page.checked_sub(1) else {
             bail!("page numbers are 1-based");
         };
-        let snapshot = self.pages.get(index).context("page snapshot is missing")?;
+        let snapshot = self
+            .page_table
+            .pages()
+            .get(index)
+            .context("page snapshot is missing")?;
         let chunk_index = snapshot.chunk;
         let page_top = snapshot.local_start.top;
         // The image's document rectangle can extend past this page. Only the
@@ -2514,7 +2399,7 @@ impl Document {
         let Some(index) = page.checked_sub(1) else {
             bail!("page numbers are 1-based");
         };
-        let Some(snapshot) = self.pages.get(index) else {
+        let Some(snapshot) = self.page_table.pages().get(index) else {
             bail!("page {page} is outside 1..={}", self.page_count());
         };
         let chunk_index = snapshot.chunk;
@@ -2681,7 +2566,7 @@ impl Document {
         let Some(index) = page.checked_sub(1) else {
             bail!("page numbers are 1-based");
         };
-        let Some(snapshot) = self.pages.get(index) else {
+        let Some(snapshot) = self.page_table.pages().get(index) else {
             bail!("page {page} is outside 1..={}", self.page_count());
         };
         let chunk_index = snapshot.chunk;
@@ -3004,12 +2889,13 @@ impl Document {
         };
 
         let snapshot = self
-            .pages
+            .page_table
+            .pages()
             .get(position.page - 1)
             .context("page snapshot is missing")?;
         let chunk_index = snapshot.chunk;
         let page_top = snapshot.local_start.top;
-        let local_line = line_index - self.chunks[chunk_index].line_base;
+        let local_line = line_index - self.page_table.chunks()[chunk_index].line_base;
 
         self.with_active_chunk(chunk_index, |active| {
             let line = active
@@ -3093,11 +2979,11 @@ impl Document {
         line_index: usize,
         line_byte_offset: usize,
     ) -> Result<Option<(usize, usize)>> {
-        let Some(snapshot) = self.pages.get(page.saturating_sub(1)) else {
+        let Some(snapshot) = self.page_table.pages().get(page.saturating_sub(1)) else {
             return Ok(None);
         };
         let chunk_index = snapshot.chunk;
-        let line_base = self.chunks[chunk_index].line_base;
+        let line_base = self.page_table.chunks()[chunk_index].line_base;
         let Some(local_line) = line_index.checked_sub(line_base) else {
             return Ok(None);
         };
@@ -3160,11 +3046,12 @@ impl Document {
         };
 
         let snapshot = self
-            .pages
+            .page_table
+            .pages()
             .get(hit.page.saturating_sub(1))
             .context("page snapshot is missing")?;
         let chunk_index = snapshot.chunk;
-        let line_base = self.chunks[chunk_index].line_base;
+        let line_base = self.page_table.chunks()[chunk_index].line_base;
         let local_line = hit
             .line_index
             .checked_sub(line_base)
@@ -3287,11 +3174,11 @@ impl Document {
             if page == 0 || page > self.page_count() {
                 continue;
             }
-            let Some(snapshot) = self.pages.get(page - 1) else {
+            let Some(snapshot) = self.page_table.pages().get(page - 1) else {
                 continue;
             };
             let chunk_index = snapshot.chunk;
-            let line_base = self.chunks[chunk_index].line_base;
+            let line_base = self.page_table.chunks()[chunk_index].line_base;
             for (global_line, rect) in self.page_text_boxes_with_lines(page)? {
                 let Some(local_line) = global_line.checked_sub(line_base) else {
                     continue;
@@ -3396,11 +3283,11 @@ impl Document {
         slice_start: usize,
         slice_end: usize,
     ) -> Result<Option<(f32, f32)>> {
-        let Some(snapshot) = self.pages.get(page.saturating_sub(1)) else {
+        let Some(snapshot) = self.page_table.pages().get(page.saturating_sub(1)) else {
             return Ok(None);
         };
         let chunk_index = snapshot.chunk;
-        let line_base = self.chunks[chunk_index].line_base;
+        let line_base = self.page_table.chunks()[chunk_index].line_base;
         let Some(local_line) = line_index.checked_sub(line_base) else {
             return Ok(None);
         };
@@ -3510,11 +3397,11 @@ impl Document {
     }
 
     pub fn page_links(&self, page: usize, internal_only: bool) -> Result<Vec<PageLink>> {
-        let Some(snapshot) = self.pages.get(page.saturating_sub(1)) else {
+        let Some(snapshot) = self.page_table.pages().get(page.saturating_sub(1)) else {
             bail!("page {page} is outside 1..={}", self.page_count());
         };
         let chunk_index = snapshot.chunk;
-        let line_base = self.chunks[chunk_index].line_base;
+        let line_base = self.page_table.chunks()[chunk_index].line_base;
         let lines = self.page_text_boxes_with_lines(page)?;
 
         let mut links: Vec<PageLink> = Vec::new();
@@ -3610,11 +3497,11 @@ impl Document {
 
         let mut lines = Vec::new();
         for page in start_page..=end_page {
-            let Some(snapshot) = self.pages.get(page.saturating_sub(1)) else {
+            let Some(snapshot) = self.page_table.pages().get(page.saturating_sub(1)) else {
                 continue;
             };
             let chunk_index = snapshot.chunk;
-            let line_base = self.chunks[chunk_index].line_base;
+            let line_base = self.page_table.chunks()[chunk_index].line_base;
             let page_boxes = self.page_text_boxes_with_lines(page)?;
             let clipped = self.with_active_chunk(chunk_index, |active| {
                 let root = active.doc.root_element();
@@ -3717,11 +3604,11 @@ impl Document {
         line_index: usize,
         target: &TextPosition,
     ) -> Result<Option<usize>> {
-        let Some(snapshot) = self.pages.get(page.saturating_sub(1)) else {
+        let Some(snapshot) = self.page_table.pages().get(page.saturating_sub(1)) else {
             return Ok(None);
         };
         let chunk_index = snapshot.chunk;
-        let line_base = self.chunks[chunk_index].line_base;
+        let line_base = self.page_table.chunks()[chunk_index].line_base;
         let Some(local_line) = line_index.checked_sub(line_base) else {
             return Ok(None);
         };
@@ -3915,11 +3802,7 @@ impl Document {
         if query.is_empty() {
             bail!("search query must not be empty");
         }
-        if self
-            .entries
-            .iter()
-            .any(|entry| entry.stale || entry.layout.is_none())
-        {
+        if !self.page_table.all_fresh() {
             // A lazily opened book (or one whose background pass is still
             // running) has no lines for its unlaid chunks, and skipping them
             // would silently hide matches.
@@ -3948,9 +3831,9 @@ impl Document {
 
         let mut hits = Vec::new();
         for page in 1..=self.page_count() {
-            let meta = &self.pages[page - 1];
+            let meta = &self.page_table.pages()[page - 1];
             let chunk_index = meta.chunk;
-            let line_base = self.chunks[chunk_index].line_base;
+            let line_base = self.page_table.chunks()[chunk_index].line_base;
             let snapshot = self.page_snapshot_boxes(page)?;
             let mut page_text = String::new();
             let mut spans = Vec::with_capacity(snapshot.len());
@@ -4148,7 +4031,7 @@ impl Document {
         let Some(index) = page.checked_sub(1) else {
             bail!("page numbers are 1-based");
         };
-        let Some(snapshot) = self.pages.get(index) else {
+        let Some(snapshot) = self.page_table.pages().get(index) else {
             bail!("page {page} is outside 1..={}", self.page_count());
         };
         if let Some(xpointer) = self.page_xpointer(page) {
@@ -4156,7 +4039,7 @@ impl Document {
         }
 
         let chunk_index = snapshot.chunk;
-        let local_page = page - self.chunks[chunk_index].first_page + 1;
+        let local_page = page - self.page_table.chunks()[chunk_index].first_page + 1;
         let height = self.height;
         let page_margin = self.page_margin;
         self.with_active_chunk(chunk_index, |active| {
@@ -4179,10 +4062,10 @@ impl Document {
     /// and ~1.3 MB on the 24 MB text book). A page that is in the list always
     /// has a laid-out chunk, so this is a lookup, never a layout.
     fn page_xpointer(&self, page: usize) -> Option<String> {
-        let snapshot = self.pages.get(page.checked_sub(1)?)?;
-        let first_page = self.chunks.get(snapshot.chunk)?.first_page;
+        let snapshot = self.page_table.pages().get(page.checked_sub(1)?)?;
+        let first_page = self.page_table.first_page(snapshot.chunk);
         let local = page.checked_sub(first_page)?;
-        let layout = self.entries.get(snapshot.chunk)?.layout.as_ref()?;
+        let layout = self.page_table.layout(snapshot.chunk)?;
         layout.xpointers.get(local).cloned().flatten()
     }
 
@@ -4221,7 +4104,7 @@ impl Document {
         let local_page = self.with_active_chunk(chunk_index, |active| {
             xpointer::page_from_xpointer(&active.doc, &active.page_starts, trimmed)
         })?;
-        Ok(self.chunks[chunk_index].first_page + local_page - 1)
+        Ok(self.page_table.chunks()[chunk_index].first_page + local_page - 1)
     }
 
     fn page_from_text_position_by_line_ranges(
@@ -4229,17 +4112,10 @@ impl Document {
         position: &TextPosition,
         chunk_index: usize,
     ) -> Result<Option<usize>> {
-        let Some(entry) = self.entries.get(chunk_index) else {
+        let Some(layout) = self.page_table.layout(chunk_index) else {
             return Ok(None);
         };
-        let Some(layout) = entry.layout.as_ref() else {
-            return Ok(None);
-        };
-        let head = self
-            .chunks
-            .get(chunk_index)
-            .map(|meta| meta.first_page)
-            .unwrap_or(1);
+        let head = self.page_table.first_page(chunk_index);
         // The last line whose start is <= the position holds it (a line's text
         // runs to the next line's start). "Is <=" has to be document order, so
         // the key is the resolved text node plus the offset in it — the same key
@@ -4292,7 +4168,7 @@ impl Document {
         left: &TextPosition,
         right: &TextPosition,
     ) -> Result<Option<std::cmp::Ordering>> {
-        let Some(snapshot) = self.pages.get(page.saturating_sub(1)) else {
+        let Some(snapshot) = self.page_table.pages().get(page.saturating_sub(1)) else {
             return Ok(None);
         };
         self.compare_positions_in_chunk(snapshot.chunk, left, right)
@@ -4522,7 +4398,8 @@ impl Document {
 
     fn page_meta(&self, page: usize) -> Result<&PageMeta> {
         let index = page.checked_sub(1).context("page numbers are 1-based")?;
-        self.pages
+        self.page_table
+            .pages()
             .get(index)
             .with_context(|| format!("page {page} is outside 1..={}", self.page_count()))
     }
@@ -4536,7 +4413,7 @@ impl Document {
         let meta = self.page_meta(page)?;
         let (chunk_index, local_start, clip_bottom) =
             (meta.chunk, meta.local_start, meta.local_clip_bottom);
-        let line_base = self.chunks[chunk_index].line_base;
+        let line_base = self.page_table.chunks()[chunk_index].line_base;
         let boxes = self.with_active_chunk(chunk_index, |active| {
             let root = active.doc.root_element();
             Ok(snapshot_page_boxes(
@@ -4565,7 +4442,7 @@ impl Document {
         let Some(index) = page.checked_sub(1) else {
             bail!("page numbers are 1-based");
         };
-        if self.pages.get(index).is_none() {
+        if self.page_table.pages().get(index).is_none() {
             bail!("page {page} is outside 1..={}", self.page_count());
         }
 
@@ -4573,7 +4450,7 @@ impl Document {
         let scale = self.viewport_scale;
         let fixed_layout = self
             .fixed_layouts
-            .get(self.pages[index].chunk)
+            .get(self.page_table.pages()[index].chunk)
             .and_then(|fixed| *fixed);
         let fixed = fixed_layout.map(|fixed| self.fixed_page_transform(fixed));
         Ok(snapshot
