@@ -68,7 +68,7 @@ no per-format branch anywhere: the layout inliner, the painter, long-press and
 
 | Format | Source | Trait / shape | Why that one |
 |---|---|---|---|
-| EPUB | the zip archive (`LazyResource`) | `ResourceProvider` | a deflate entry has to be decompressed, so the bytes are owned anyway; it also overrides `header()` so the intrinsic-size probe reads a prefix instead of the whole picture |
+| EPUB | the zip archive (`LazyResource`) | `ResourceProvider` | a deflate entry has to be decompressed, so the bytes are owned anyway; it also overrides `header()` so the intrinsic-size probe reads a prefix instead of the whole picture. `zip` is built with `deflate-flate2-zlib-rs` only: the reader inflates and never compresses, so zopfli and the other compressors stay out of the build |
 | MOBI / AZW | PalmDB record ranges | `ResourceIndex` | the records are already in the mapping; **borrowing** keeps the open pass from faulting every picture in |
 | KF8 / AZW3 | PalmDB record ranges | `ResourceIndex` | same container as MOBI |
 | FB2 | the `<binary>` map decoded from the XML | `ResourceIndex` (in-memory) | the base64 is already decoded into memory, so there is nothing to map and nothing to copy |

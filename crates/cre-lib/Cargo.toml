@@ -58,5 +58,5 @@ url = "2"
 [dev-dependencies]
 # The integration tests build a synthetic EPUB; nothing in the engine
 # reads or writes a zip (that is `cre-epub`'s container).
-zip = { version = "4", default-features = false, features = ["deflate"] }
+zip = { version = "4", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 # Building small EPUBs on the fly for the image-placeholder tests.

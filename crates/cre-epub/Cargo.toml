@@ -11,4 +11,4 @@ cre-book = { path = "../cre-book" }
 percent-encoding = "2"
 roxmltree = "0.21"
 url = "2"
-zip = { version = "4", default-features = false, features = ["deflate"] }
+zip = { version = "4", default-features = false, features = ["deflate-flate2-zlib-rs"] }
