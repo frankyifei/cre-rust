@@ -33,7 +33,6 @@ cre-kf8 = { path = "../cre-kf8" }
 cre-mathml = { path = "../cre-mathml" }
 cre-mobi = { path = "../cre-mobi" }
 cre-paint = { path = "../cre-paint" }
-cre-pdb = { path = "../cre-pdb" }
 cre-text = { path = "../cre-text" }
 libc = "0.2"
 memmap2 = "0.9"

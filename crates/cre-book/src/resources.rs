@@ -6,96 +6,74 @@ use std::sync::Arc;
 
 use percent_encoding::percent_decode_str;
 
-/// A container that can hand out its resources by key.
-///
-/// A zip archive, a PalmDB record index, a directory of files: the format crate
-/// decides the key scheme, and everything downstream (layout, painting,
-/// long-press, `@font-face`) only uses [`ResourceSource::get`].
-pub trait ResourceProvider: Send + Sync {
-    fn get(&self, key: &str) -> Option<Arc<Vec<u8>>>;
-
-    /// The first `max_bytes` of a resource.
-    ///
-    /// One characterisation decides a page: an image's header gives its format
-    /// and intrinsic size. A zip entry is one deflate stream and cannot be
-    /// seeked into, so materialising a 4 MB picture just to read the twenty
-    /// bytes that say "1000x1500" is the expensive way; a container that can
-    /// stop early overrides this and reads a prefix instead. The default reads
-    /// the resource and truncates it, which is never worse than [`Self::get`].
-    fn header(&self, key: &str, max_bytes: usize) -> Option<Vec<u8>> {
-        let bytes = self.get(key)?;
-        let end = bytes.len().min(max_bytes);
-        Some(bytes[..end].to_vec())
-    }
-
-    /// Estimated decoded image size, for the chunk memory budget.
-    fn estimated_decoded_bytes(&self, _key: &str) -> Option<usize> {
-        None
-    }
-
-    /// Bytes a decompressed-resource cache holds, and how much of it is pinned.
-    fn cache_stats(&self) -> (usize, usize) {
-        (0, 0)
-    }
-
-    /// Bytes that cannot be evicted (generated resources without a backing
-    /// entry).
-    fn pinned_bytes(&self) -> usize {
-        0
-    }
-
-    /// Drops the container's pages after the open pass.
-    fn drop_pages(&self) {}
-}
+pub use cre_resource::{ResourceIndex, ResourceProvider};
 
 /// Resources carried in memory or indexed in the book file.
+///
+/// One trait object, so this layer does not know what a PalmDB record index or
+/// an in-memory map is: the container implements [`ResourceIndex`] and this
+/// holds it. The slice it lends is load-bearing - see that trait.
 #[derive(Clone)]
-pub enum MapResources {
-    Owned(Arc<HashMap<String, Vec<u8>>>),
-    Mapped(Arc<cre_pdb::BookResources>),
-}
+pub struct MapResources(Arc<dyn ResourceIndex>);
 
 impl MapResources {
+    /// Resources another crate indexes (a PalmDB backed by the book file).
+    pub fn index(index: Arc<dyn ResourceIndex>) -> Self {
+        Self(index)
+    }
+
+    /// Resources the caller already has in memory (FB2 binaries).
+    pub fn owned(map: HashMap<String, Vec<u8>>) -> Self {
+        Self(Arc::new(OwnedIndex(map)))
+    }
+
     pub fn get(&self, key: &str) -> Option<&[u8]> {
-        match self {
-            Self::Owned(map) => map.get(key).map(Vec::as_slice),
-            Self::Mapped(index) => index.get(key),
-        }
+        self.0.get(key)
     }
 
     pub fn contains_key(&self, key: &str) -> bool {
-        match self {
-            Self::Owned(map) => map.contains_key(key),
-            Self::Mapped(index) => index.contains_key(key),
-        }
+        self.0.contains_key(key)
     }
 
     pub fn len(&self) -> usize {
-        match self {
-            Self::Owned(map) => map.len(),
-            Self::Mapped(index) => index.len(),
-        }
+        self.0.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.0.is_empty()
     }
 
     /// Bytes of the resources the index can reach. For a mapped PalmDB these
     /// are file pages, not anonymous memory.
     pub fn bytes(&self) -> usize {
-        match self {
-            Self::Owned(map) => map.values().map(Vec::len).sum(),
-            Self::Mapped(index) => index.bytes(),
-        }
+        self.0.bytes()
     }
 
     /// Drops the mapped pages the open pass faulted in; a page that paints a
     /// picture faults it back in from the page cache.
     pub fn drop_pages(&self) {
-        if let Self::Mapped(index) = self {
-            index.drop_pages();
-        }
+        self.0.drop_pages();
+    }
+}
+
+/// An in-memory table, as a [`ResourceIndex`].
+struct OwnedIndex(HashMap<String, Vec<u8>>);
+
+impl ResourceIndex for OwnedIndex {
+    fn get(&self, key: &str) -> Option<&[u8]> {
+        self.0.get(key).map(Vec::as_slice)
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        self.0.contains_key(key)
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn bytes(&self) -> usize {
+        self.0.values().map(Vec::len).sum()
     }
 }
 

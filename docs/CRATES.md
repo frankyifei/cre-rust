@@ -5,14 +5,20 @@ rule is one-directional: a format crate may depend on `cre-book` and `cre-pdb`;
 it must never depend on `cre-lib`.
 
 ```
-cre-book                                   the format-independent book layer
-   ↑
+cre-resource                               the two resource traits, nothing else
+   ↑                    ↑
+cre-book            cre-pdb                format-independent layer / PalmDB
+   ↑                    ↑
 cre-epub  cre-kf8  cre-mobi  cre-fb2  cre-text      container → HTML + metadata
-   ↑ (cre-kf8 / cre-mobi also use cre-pdb)
+   ↑
 cre-lib                                    layout, pagination, XPointers, paint
    ↑
 cre-lua                                    the KOReader module
 ```
+
+`cre-book` and `cre-pdb` do not know each other: `cre-book` holds a
+`ResourceIndex` and `cre-pdb` implements it, so the format-independent layer
+never learns that a PalmDB exists.
 
 ## `cre-book`
 
@@ -20,7 +26,7 @@ What every format shares, and what the layout engine consumes:
 
 | Module | Contents |
 |---|---|
-| `resources` | `ResourceProvider` (the container side: `get`, decoded-size estimate, cache/pin accounting, `drop_pages`), `ResourceSource` (provider / in-memory map / files next to a standalone document, plus the generated table), `MapResources` |
+| `resources` | `ResourceSource` (provider / `MapResources` / files next to a standalone document, plus the generated table) and `MapResources` (a newtype over the container's `ResourceIndex`). The traits themselves are in `cre-resource`, see below |
 | `chunk` | splitting generated HTML at section boundaries, chunk budgets from the free memory, `stream_single_document_chunks` |
 | `html` | attribute/tag scanning, `normalize_path`, `resolve_href`, `encode_path`, percent and base64 helpers |
 | `images` | `<img>` sources, image header reader, decoded-size estimates, page-fit wrappers, picture-only part detection, `data:` decoding |
@@ -28,8 +34,27 @@ What every format shares, and what the layout engine consumes:
 | `ruby` | the stacked ruby cell rewriting (Blitz has no ruby box) |
 | `css` | the layout tokens (`__CRE_FONT_SIZE_PX__`, `__CRE_PAGE_MARGIN_PX__`) and `substitute`, plus `body_selectors_to_class` |
 
-It depends only on `cre-pdb`, `image`, `regex`, `base64`, `percent-encoding`,
-`anyhow` and `libc` - never on blitz - so a format can be tested on its own.
+It depends only on `cre-resource`, `image`, `regex`, `base64`,
+`percent-encoding`, `anyhow` and `libc` - never on blitz and never on a
+container crate - so a format can be tested on its own.
+
+## `cre-resource`
+
+Two traits, one per direction the bytes are read from:
+
+- `ResourceProvider` hands out owned bytes (`Arc<Vec<u8>>`): a zip entry is
+  decompressed, a file is read. `cre-epub` implements it, and so does a
+  directory of files.
+- `ResourceIndex` lends a slice (`&[u8]`): a memory-mapped container already has
+  the bytes in its mapping, and the readers below it (the intrinsic-size probe,
+  the image placeholder) only look at the first bytes of a picture. Copying the
+  record to answer them faults every page of every picture in during the layout
+  pass, which is the whole reason `apo.azw` opens in 85 MB instead of several
+  hundred. `cre-pdb` implements it for its record index; an in-memory map is the
+  same trait implemented in `cre-book`.
+
+Keeping the traits in their own crate is what lets `cre-book` stay
+format-independent while `cre-pdb` gains no dependency on the book layer.
 
 ## What a new format implements
 
@@ -50,9 +75,10 @@ layers. See "Extending" in [`ARCHITECTURE.md`](ARCHITECTURE.md#resources).
 
 ## Resource table
 
-One namespace for every kind of byte: a zip entry, a PalmDB record range, an
-in-memory map, a file next to a standalone document, or something the engine
-generated (a page-fit wrapper, a decoded `data:` picture). The generated table is
+One namespace for every kind of byte: a zip entry, a PalmDB record range (a
+`ResourceIndex`), an in-memory map (`MapResources::owned`), a file next to a
+standalone document, or something the engine generated (a page-fit wrapper, a
+decoded `data:` picture). The generated table is
 consulted first, and the net providers serve it, so a generated key behaves like
 a file for layout, painting, `getImageDataAt` and long-press.
 

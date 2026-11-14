@@ -18,4 +18,4 @@ image = { version = "0.25", default-features = false, features = [
     "webp",
     "bmp",
 ] }
-cre-pdb = { path = "../cre-pdb" }
+cre-resource = { path = "../cre-resource" }

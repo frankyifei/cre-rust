@@ -171,6 +171,30 @@ impl BookResources {
     }
 }
 
+/// A PalmDB record index is exactly what a mapped container looks like to the
+/// reader: names to byte ranges, sliced out of the file on demand.
+impl cre_resource::ResourceIndex for BookResources {
+    fn get(&self, key: &str) -> Option<&[u8]> {
+        BookResources::get(self, key)
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        BookResources::contains_key(self, key)
+    }
+
+    fn len(&self) -> usize {
+        BookResources::len(self)
+    }
+
+    fn bytes(&self) -> usize {
+        BookResources::bytes(self)
+    }
+
+    fn drop_pages(&self) {
+        BookResources::drop_pages(self);
+    }
+}
+
 /// A Palm Database file: header fields plus the record table.
 pub struct Pdb {
     data: PdbData,

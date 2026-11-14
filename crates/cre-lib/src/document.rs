@@ -290,8 +290,8 @@ impl Document {
                 // Move the pictures and the cover out instead of cloning a
                 // second copy of every base64-decoded image.
                 let cover_image = book.binary.keys().next().cloned();
-                let binary = Arc::new(std::mem::take(&mut book.binary));
-                let resources = MapResources::Owned(binary);
+                let binary = std::mem::take(&mut book.binary);
+                let resources = MapResources::owned(binary);
                 let resource_source = ResourceSource::map(resources.clone());
                 let mut sink = ChunkSink::new();
                 stream_single_document_chunks(&head, &body, &resource_source, |html| {
@@ -354,7 +354,7 @@ impl Document {
                     .collect();
                 let head = book.html_head(&html_options);
                 let cover_image = book.cover_image.take();
-                let resources = MapResources::Mapped(Arc::new(std::mem::take(&mut book.resources)));
+                let resources = MapResources::index(Arc::new(std::mem::take(&mut book.resources)));
                 let resource_source = ResourceSource::map(resources.clone());
                 let body = prepare_page_images(
                     book.body_html().to_string(),
@@ -420,7 +420,7 @@ impl Document {
                     .collect();
                 let head = book.html_head(&html_options);
                 let cover_image = book.cover_image.take();
-                let resources = MapResources::Mapped(Arc::new(std::mem::take(&mut book.resources)));
+                let resources = MapResources::index(Arc::new(std::mem::take(&mut book.resources)));
                 let resource_source = ResourceSource::map(resources.clone());
                 let body = prepare_page_images(
                     book.body_html().to_string(),

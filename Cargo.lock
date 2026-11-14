@@ -435,7 +435,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
- "cre-pdb",
+ "cre-resource",
  "image",
  "libc",
  "percent-encoding",
@@ -491,7 +491,6 @@ dependencies = [
  "cre-mathml",
  "cre-mobi",
  "cre-paint",
- "cre-pdb",
  "cre-text",
  "image",
  "libc",
@@ -555,6 +554,7 @@ name = "cre-pdb"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cre-resource",
  "memmap2",
 ]
 
@@ -565,6 +565,10 @@ dependencies = [
  "anyhow",
  "cre-lib",
 ]
+
+[[package]]
+name = "cre-resource"
+version = "0.1.0"
 
 [[package]]
 name = "cre-text"

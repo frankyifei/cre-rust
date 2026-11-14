@@ -4755,7 +4755,7 @@ mod map_page_image_tests {
     fn source_with(image: Vec<u8>) -> ResourceSource {
         let mut map = HashMap::new();
         map.insert("page.jpg".to_string(), image);
-        ResourceSource::map(MapResources::Owned(Arc::new(map)))
+        ResourceSource::map(MapResources::owned(map))
     }
 
     #[test]

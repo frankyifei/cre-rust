@@ -6,6 +6,7 @@ members = [
     "crates/cre-kf8",
     "crates/cre-mobi",
     "crates/cre-pdb",
+    "crates/cre-resource",
     "crates/cre-lib",
     "crates/cre-lua",
     "crates/cre-mathml",
