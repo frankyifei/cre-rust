@@ -15,11 +15,11 @@
 --   * on every "PageUpdate"/"PosUpdate", re-read the page total and send
 --     "TocReset" when it moved, which is what makes ReaderFooter re-read it;
 --   * while `document:hasPendingRerendering()` says the worker still has
---     chunks, poll once a second (reading the page count is also what installs
---     the chunks that are ready, and it applies a deferred settings change, so
---     the pass advances while the reader is idle), and send one
---     "DocumentRerendered" when it is over, so ReaderToc rebuilds with the
---     final page numbers.
+--     chunks, poll once a second. Each poll calls
+--     `document:pollPendingRerendering()`, the engine's explicit "install what
+--     is ready" call, then reads the page total (which also applies a deferred
+--     settings change), and sends one "DocumentRerendered" when the pass is
+--     over, so ReaderToc rebuilds with the final page numbers.
 --
 -- Everything here goes through events and the document's public API, so
 -- KOReader can keep following upstream without a local patch.
@@ -82,6 +82,13 @@ function BackgroundLayout:observe()
     local doc, inner = engine_document(self)
     if not doc then
         return nil
+    end
+    -- Explicit poll: installs the chunk layouts the worker has finished. The
+    -- page read below installs them too, but progress should not depend on that
+    -- side effect, so ask the engine directly when it offers the call (a
+    -- libkoreader-cre.so built before it does still works through the read).
+    if inner.pollPendingRerendering then
+        inner:pollPendingRerendering()
     end
     local pages = doc:getPageCount()
     if pages ~= self.pages then

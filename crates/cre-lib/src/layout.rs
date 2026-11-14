@@ -74,30 +74,68 @@ impl TrimGuard {
     }
 }
 
-/// Shared state of the parallel layout pass, so every worker runs the same
-/// pull loop and the opening chunk can be laid out by the main thread.
-struct ChunkLayoutWork<'a> {
-    sources: &'a [ChunkSource],
-    base_url: &'a str,
+/// One layout pass over the book's chunks: the inputs every chunk layout
+/// needs, plus the two memory safeguards.
+///
+/// Every pass - the parallel open, a single-threaded open, the background
+/// worker, and the synchronous whole-book completion - goes through here, so the
+/// safeguards cannot drift apart between them. A pass must drop a chunk's DOM
+/// and line boxes as soon as the page metadata is extracted, and trim the
+/// arenas they leave behind; the background pass once did neither, which is the
+/// pass that runs longest on a device.
+struct ChunkLayoutPass {
+    sources: Arc<[ChunkSource]>,
+    base_url: String,
     net: Arc<dyn NetProvider>,
     font_context: Arc<FontContext>,
-    font_blobs: &'a [FontBlob],
-    options: &'a [DocumentOptions],
-    fixed_heights: &'a [Option<f32>],
-    results: &'a std::sync::Mutex<Vec<Option<ChunkLayout>>>,
-    failure: &'a std::sync::Mutex<Option<anyhow::Error>>,
-    stop: &'a std::sync::atomic::AtomicBool,
-    next: &'a std::sync::atomic::AtomicUsize,
-    gate: &'a LayoutMemoryGate,
-    probe_index: usize,
-    count: usize,
-    resources: &'a ResourceSource,
-    margins: &'a [PageMargins],
+    font_blobs: Vec<FontBlob>,
+    resources: ResourceSource,
     /// Whether the book's own `@font-face` fonts may be used.
     embedded_fonts: bool,
+    /// Per-chunk settings, resolved once: a fixed-layout chunk zeroes its page
+    /// margin and has its own page height.
+    options: Vec<DocumentOptions>,
+    margins: Vec<PageMargins>,
+    fixed_heights: Vec<Option<f32>>,
+    /// Keeps concurrent layouts inside the memory the chunk planner assumed.
+    gate: LayoutMemoryGate,
+    trim: std::sync::Mutex<TrimGuard>,
 }
 
-impl ChunkLayoutWork<'_> {
+impl ChunkLayoutPass {
+    /// Resolves everything a pass needs from the document, once.
+    fn new(document: &Document, count: usize) -> Self {
+        Self {
+            sources: Arc::clone(&document.sources),
+            base_url: document.base_url.clone(),
+            net: document.net.clone(),
+            font_context: Arc::clone(&document.font_context),
+            font_blobs: document.font_blobs.clone(),
+            resources: document.resources.clone(),
+            embedded_fonts: document
+                .embedded_fonts_flag
+                .load(std::sync::atomic::Ordering::SeqCst),
+            options: (0..count)
+                .map(|index| document.layout_options_for_chunk(index))
+                .collect(),
+            margins: (0..count)
+                .map(|index| document.chunk_margins(index))
+                .collect(),
+            fixed_heights: (0..count)
+                .map(|index| {
+                    document
+                        .fixed_layouts
+                        .get(index)
+                        .and_then(|fixed| *fixed)
+                        .map(|fixed| document.fixed_size(fixed).1)
+                })
+                .collect(),
+            gate: LayoutMemoryGate::new(),
+            trim: std::sync::Mutex::new(TrimGuard::new()),
+        }
+    }
+
+    /// Lays one chunk out and keeps its DOM, for a caller about to draw from it.
     fn layout(
         &self,
         index: usize,
@@ -105,20 +143,69 @@ impl ChunkLayoutWork<'_> {
         layout_chunk_html(
             &self.sources[index].text()?,
             index,
-            self.base_url,
+            &self.base_url,
             self.net.clone(),
             self.font_context.clone(),
-            self.font_blobs,
+            &self.font_blobs,
             &self.options[index],
             self.margins[index],
             self.fixed_heights[index],
-            self.resources,
+            &self.resources,
             self.embedded_fonts,
         )
     }
 
+    /// Lays one chunk out for the page list and keeps nothing else.
+    ///
+    /// This is the shape every pass uses: wait for memory, lay out, keep the
+    /// page metadata, release the DOM and line boxes, trim what they left.
+    fn layout_pages(&self, index: usize) -> Result<ChunkLayout> {
+        let mut trim = self
+            .trim
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.layout_pages_trimmed(index, &mut trim)
+    }
+
+    /// [`Self::layout_pages`] with the caller's own trim guard.
+    ///
+    /// The parallel pass gives every worker a guard, as it always has: the guard
+    /// measures growth against its own last trim, so one guard per worker trims
+    /// more often than a shared one and keeps the open-time peak measurably
+    /// lower (about 7 MB on a four-worker pass). The single-threaded passes have
+    /// nothing to share, so they use the one inside the pass.
+    fn layout_pages_trimmed(&self, index: usize, trim: &mut TrimGuard) -> Result<ChunkLayout> {
+        self.gate.enter();
+        let laid_out = self.layout(index);
+        self.gate.leave();
+        let (layout, doc, lines, page_starts) = laid_out?;
+        // The DOM belongs to the pass; only the page metadata has to survive.
+        drop(doc);
+        drop(lines);
+        drop(page_starts);
+        trim.maybe_trim();
+        Ok(layout)
+    }
+}
+
+/// Coordination of the parallel open-time pass: the chunk list is pulled from a
+/// shared cursor, so the opening chunk can be laid out by the main thread while
+/// the workers take the rest.
+struct ChunkLayoutWork<'a> {
+    pass: &'a ChunkLayoutPass,
+    results: &'a std::sync::Mutex<Vec<Option<ChunkLayout>>>,
+    failure: &'a std::sync::Mutex<Option<anyhow::Error>>,
+    stop: &'a std::sync::atomic::AtomicBool,
+    next: &'a std::sync::atomic::AtomicUsize,
+    probe_index: usize,
+    count: usize,
+}
+
+impl ChunkLayoutWork<'_> {
     fn run(&self) {
-        let mut trim_guard = TrimGuard::new();
+        // One guard per worker, so the trims are as frequent as they were
+        // before the passes shared their per-chunk work.
+        let mut trim = TrimGuard::new();
         loop {
             if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
@@ -130,25 +217,14 @@ impl ChunkLayoutWork<'_> {
             if index == self.probe_index {
                 continue;
             }
-            self.gate.enter();
-            let laid_out = self.layout(index);
-            self.gate.leave();
-            match laid_out {
-                Ok((layout, doc, lines, page_starts)) => {
-                    // The DOM belongs to the worker; only the page metadata
-                    // has to survive.
-                    drop(doc);
-                    drop(lines);
-                    drop(page_starts);
-                    self.results.lock().unwrap()[index] = Some(layout);
-                }
+            match self.pass.layout_pages_trimmed(index, &mut trim) {
+                Ok(layout) => self.results.lock().unwrap()[index] = Some(layout),
                 Err(error) => {
                     *self.failure.lock().unwrap() = Some(error);
                     self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
                     break;
                 }
             }
-            trim_guard.maybe_trim();
         }
     }
 }
@@ -758,9 +834,10 @@ impl Document {
     /// Lays the remaining stale chunks out on a worker thread, in reading
     /// order, and hands each layout back over a channel.
     ///
-    /// The worker gets owned `Arc`s (sources, fonts, net, resources), so the
-    /// document can keep rendering pages; `Document` itself is not `Send` and
-    /// is never touched by the worker.
+    /// The worker owns a [`ChunkLayoutPass`] (sources, fonts, net, resources,
+    /// settings and the memory safeguards), so the document can keep rendering
+    /// pages; `Document` itself is not `Send` and is never touched by the
+    /// worker.
     fn start_background_layout(&mut self) {
         // Testing knob: keep the old behaviour (only the chunk under the reader
         // is laid out) so the two can be compared on a device.
@@ -777,63 +854,19 @@ impl Document {
         self.phase.stop();
         let cancel = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let cancel_source = Arc::clone(&cancel);
-        let sources = Arc::clone(&self.sources);
-        let base_url = self.base_url.clone();
-        let net = self.net.clone();
-        let font_context = Arc::clone(&self.font_context);
-        let font_blobs = self.font_blobs.clone();
-        let resources = self.resources.clone();
-        let embedded_fonts = self
-            .embedded_fonts_flag
-            .load(std::sync::atomic::Ordering::SeqCst);
-        let options: Vec<DocumentOptions> = indices
-            .iter()
-            .map(|&index| self.layout_options_for_chunk(index))
-            .collect();
-        let margins: Vec<PageMargins> = indices
-            .iter()
-            .map(|&index| self.chunk_margins(index))
-            .collect();
-        let fixed_heights: Vec<Option<f32>> = indices
-            .iter()
-            .map(|&index| {
-                self.fixed_layouts
-                    .get(index)
-                    .and_then(|fixed| *fixed)
-                    .map(|fixed| self.fixed_size(fixed).1)
-            })
-            .collect();
+        // The pass owns everything the worker needs; `Document` itself is not
+        // `Send`, and both memory safeguards travel with the pass.
+        let pass = ChunkLayoutPass::new(self, self.sources.len());
         let total = indices.len();
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            for (slot, &index) in indices.iter().enumerate() {
+            for &index in &indices {
                 if cancel_source.load(std::sync::atomic::Ordering::SeqCst) != 0 {
                     break;
                 }
-                let Ok(html) = sources[index].text() else {
+                let Ok(layout) = pass.layout_pages(index) else {
                     break;
                 };
-                let laid_out = layout_chunk_html(
-                    &html,
-                    index,
-                    &base_url,
-                    net.clone(),
-                    Arc::clone(&font_context),
-                    &font_blobs,
-                    &options[slot],
-                    margins[slot],
-                    fixed_heights[slot],
-                    &resources,
-                    embedded_fonts,
-                );
-                let Ok((layout, doc, lines, page_starts)) = laid_out else {
-                    break;
-                };
-                // The DOM belongs to the worker; only the page metadata is
-                // needed on the reader's side.
-                drop(doc);
-                drop(lines);
-                drop(page_starts);
                 if sender.send((index, layout)).is_err() {
                     break;
                 }
@@ -987,13 +1020,11 @@ impl Document {
             return Ok(());
         }
         let anchor = self.current_anchor();
+        let pass = ChunkLayoutPass::new(self, self.sources.len());
         for index in missing {
-            let (layout, doc, lines, page_starts) = self.layout_chunk(index)?;
             // Only the page metadata is needed here; the DOM of the chunk that
             // is on screen stays the active one.
-            drop(doc);
-            drop(lines);
-            drop(page_starts);
+            let layout = pass.layout_pages(index)?;
             self.page_table.install(index, layout);
         }
         self.rebuild_view();
@@ -1020,7 +1051,6 @@ impl Document {
         self.phase = LayoutPhase::Complete;
         self.page_table.reset(self.sources.len());
         let count = self.sources.len();
-        let mut trim_guard = TrimGuard::new();
         if count == 0 {
             self.rebuild_view();
             return Ok(());
@@ -1047,9 +1077,12 @@ impl Document {
                 (source.images, source.text_len)
             })
             .unwrap_or(0);
+        // Everything the pass needs, resolved once: options, margins, page
+        // heights and the two memory safeguards.
+        let pass = ChunkLayoutPass::new(self, count);
         let pass_started = std::time::Instant::now();
         let rss_before = resident_bytes();
-        let (probe_layout, doc, lines, page_starts) = self.layout_chunk(probe_index)?;
+        let (probe_layout, doc, lines, page_starts) = pass.layout(probe_index)?;
         // Measured before the DOM is released: this is what one chunk's layout
         // costs while it is resident.
         let rss_after = resident_bytes();
@@ -1089,46 +1122,20 @@ impl Document {
             // Options are cheap to build here because `Document` itself is not
             // `Send` (it holds `RefCell` caches), so the workers only get the
             // pieces they need.
-            let options: Vec<DocumentOptions> = (0..count)
-                .map(|index| self.layout_options_for_chunk(index))
-                .collect();
-            let fixed_heights: Vec<Option<f32>> = (0..count)
-                .map(|index| {
-                    self.fixed_layouts
-                        .get(index)
-                        .and_then(|fixed| *fixed)
-                        .map(|fixed| self.fixed_size(fixed).1)
-                })
-                .collect();
             let results: std::sync::Mutex<Vec<Option<ChunkLayout>>> =
                 std::sync::Mutex::new((0..count).map(|_| None).collect());
             let failure: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
             let stop = std::sync::atomic::AtomicBool::new(false);
             // Workers take every chunk except the probe and the opening one.
             let next = std::sync::atomic::AtomicUsize::new(1);
-            let gate = LayoutMemoryGate::new();
-            let chunk_margins: Vec<PageMargins> =
-                (0..count).map(|index| self.chunk_margins(index)).collect();
             let work = ChunkLayoutWork {
-                sources: &self.sources,
-                base_url: &self.base_url,
-                net: self.net.clone(),
-                font_context: self.font_context.clone(),
-                font_blobs: &self.font_blobs,
-                options: &options,
-                fixed_heights: &fixed_heights,
+                pass: &pass,
                 results: &results,
                 failure: &failure,
                 stop: &stop,
                 next: &next,
-                gate: &gate,
                 probe_index,
                 count,
-                resources: &self.resources,
-                margins: &chunk_margins,
-                embedded_fonts: self
-                    .embedded_fonts_flag
-                    .load(std::sync::atomic::Ordering::SeqCst),
             };
             std::thread::scope(|scope| {
                 for _ in 1..workers {
@@ -1146,7 +1153,7 @@ impl Document {
             let opening = match opening.take() {
                 Some(active) => active,
                 None => {
-                    let (layout, doc, lines, page_starts) = work.layout(0)?;
+                    let (layout, doc, lines, page_starts) = pass.layout(0)?;
                     self.page_table.install(0, layout);
                     (doc, lines, page_starts)
                 }
@@ -1175,20 +1182,15 @@ impl Document {
             if chunk_index == probe_index {
                 continue;
             }
-            let (layout, doc, lines, page_starts) = self.layout_chunk(chunk_index)?;
+            // Lays the chunk out and releases its DOM; the page metadata is all
+            // the page list needs.
+            let layout = pass.layout_pages(chunk_index)?;
             self.page_table.install(chunk_index, layout);
-            // The chunk's DOM and line boxes are only needed to derive page
-            // metadata; release them now so the pass stays flat in RSS instead
-            // of accumulating one chunk's arenas per iteration.
-            drop(doc);
-            drop(lines);
-            drop(page_starts);
-            trim_guard.maybe_trim();
         }
         let (doc, lines, page_starts) = match opening.take() {
             Some(active) => active,
             None => {
-                let (layout, doc, lines, page_starts) = self.layout_chunk(0)?;
+                let (layout, doc, lines, page_starts) = pass.layout(0)?;
                 self.page_table.install(0, layout);
                 (doc, lines, page_starts)
             }

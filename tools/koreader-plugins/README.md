@@ -37,15 +37,19 @@ The plugin closes that hole using only events and the document API:
   `hasPendingRerendering()`: the engine defers a settings change to the next
   document call, so the flag can still be false at the moment the event arrives;
 - while `_document:hasPendingRerendering()` says the worker still has chunks, it
-  polls once a second (reading the page count also installs the ready chunks, so
-  the pass advances while the reader is idle) and sends one `DocumentRerendered`
-  when it is over, so `ReaderToc` drops its cached page numbers (the footer's
+  polls once a second: each poll calls `_document:pollPendingRerendering()`, the
+  engine's explicit "install the chunks that are ready" call, and then reads the
+  page count (which also applies a deferred settings change), so the pass
+  advances while the reader is idle. It sends one `DocumentRerendered` when the
+  pass is over, so `ReaderToc` drops its cached page numbers (the footer's
   marker rebuild then fills it with the final ones) and `ReaderUI` saves the
   final page count with the book.
 
 `hasPendingRerendering()` is reached through `document._document`: adding it to
 the `CreDocument` wrapper would mean editing `frontend/document/credocument.lua`,
-which is exactly what this plugin avoids.
+which is exactly what this plugin avoids. `pollPendingRerendering()` is optional:
+with a `libkoreader-cre.so` that predates it the plugin falls back to the page
+read, which still installs the finished layouts.
 
 ### Install
 

@@ -3559,6 +3559,35 @@ unsafe extern "C-unwind" fn doc_has_pending_rerendering(l: *mut lua_State) -> c_
     1
 }
 
+/// Installs the chunk layouts the background worker has finished and reports
+/// whether the pass is still running.
+///
+/// This is the *poll*: the engine can only install a finished layout on the
+/// thread that owns the document, so a host that wants the page numbers to
+/// settle while it is otherwise idle has to give it a call to run on. Reading
+/// the laid out document installs them too (every read goes through
+/// `sync_layout`), but that is a side effect; a host should not have to know
+/// that asking for a page number is what makes progress happen.
+///
+/// `hasPendingRerendering` stays a pure predicate: it does not install
+/// anything, so a caller can watch the state without driving it.
+unsafe extern "C-unwind" fn doc_poll_pending_rerendering(l: *mut lua_State) -> c_int {
+    // SAFETY: `l` is the active Lua state. Deliberately not `doc_ref_mut`:
+    // polling must not apply a pending settings change, which is a much bigger
+    // step than installing what the worker has already finished.
+    unsafe {
+        let pending = match doc_mut(l).and_then(|doc| doc.inner.as_mut()) {
+            Some(inner) => {
+                inner.drain_background_layouts();
+                inner.has_background_layout()
+            }
+            None => false,
+        };
+        push_bool(l, pending);
+    }
+    1
+}
+
 unsafe extern "C-unwind" fn doc_rerender_delayed(l: *mut lua_State) -> c_int {
     // Always false: answering true here does not mean "skip the render", it
     // starts ReaderRolling's background-rerendering automation (wait 3 s,
@@ -5061,6 +5090,7 @@ const DOC_METHODS: &[lua::luaL_Reg] = &regs![
     ("enablePartialRerendering", doc_enable_partial),
     ("getPartialRerenderingsCount", doc_partial_count),
     ("hasPendingRerendering", doc_has_pending_rerendering),
+    ("pollPendingRerendering", doc_poll_pending_rerendering),
     ("isRerenderingDelayed", doc_rerender_delayed),
     ("getPages", doc_pages),
     ("getCurrentPage", doc_current_page),
